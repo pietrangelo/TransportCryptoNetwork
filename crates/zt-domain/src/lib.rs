@@ -18,10 +18,12 @@
 mod crypto;
 mod error;
 mod events;
+pub mod flow;
 mod frame;
 mod ids;
 pub mod limits;
 mod payload;
+mod policy;
 
 pub use crypto::{AuthToken, Fingerprint};
 pub use error::DomainError;
@@ -29,3 +31,4 @@ pub use events::{AuthFailureReason, DomainEvent};
 pub use frame::{CloseReason, Credit, Frame, FrameKind, RejectReason};
 pub use ids::{NodeId, SessionId, StreamId};
 pub use payload::FramePayload;
+pub use policy::{AccessPolicy, AllowedNodes, ClientGrant, PeerRole};

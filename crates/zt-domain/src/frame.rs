@@ -121,6 +121,9 @@ pub enum CloseReason {
     Drained = 0x03,
     /// L'altra estremità dello stream è scomparsa.
     PeerGone = 0x04,
+    /// L'agent ha rifiutato l'identità end-to-end del client (difesa in profondità: il
+    /// relay l'aveva autorizzato, ma l'agent non si fida del relay).
+    Unauthorized = 0x05,
 }
 
 impl TryFrom<u8> for CloseReason {
@@ -133,6 +136,7 @@ impl TryFrom<u8> for CloseReason {
             0x02 => Self::ProtocolViolation,
             0x03 => Self::Drained,
             0x04 => Self::PeerGone,
+            0x05 => Self::Unauthorized,
             other => return Err(DomainError::UnknownCloseReason(other)),
         })
     }

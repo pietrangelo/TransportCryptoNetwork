@@ -3,9 +3,12 @@ resolver = "3"
 members = [
     "crates/zt-domain",
     "crates/zt-proto",
+    "crates/zt-crypto",
+    "crates/zt-application",
+    "crates/zt-net",
     "bins/zt-relay",
     "bins/zt-agent",
-    "bins/zt-client",
+    "bins/zt-client", "crates/zt-crypto", "crates/zt-application", "crates/zt-net",
 ]
 
 [workspace.package]
@@ -21,6 +24,9 @@ publish = false
 # --- interni ---
 zt-domain = { path = "crates/zt-domain" }
 zt-proto  = { path = "crates/zt-proto" }
+zt-crypto = { path = "crates/zt-crypto" }
+zt-application = { path = "crates/zt-application" }
+zt-net    = { path = "crates/zt-net" }
 
 # --- dominio (puro, senza I/O) ---
 thiserror = "2.0.21"
@@ -37,8 +43,15 @@ tracing    = { version = "0.1.44", default-features = false, features = ["std", 
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
 
 # --- crittografia (Fase 2: handshake Noise e identità Ed25519) ---
-snow          = { version = "0.10.0", default-features = false, features = ["default-resolver"] }
+snow          = { version = "0.10.0", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+sha2          = "0.11.1"
+hex           = "0.4.3"
+getrandom     = "0.4.3"
+
+# --- configurazione ---
+serde = { version = "1.0.229", features = ["derive"] }
+toml  = "1.2.1"
 
 # --- test ---
 proptest   = "1.12.0"

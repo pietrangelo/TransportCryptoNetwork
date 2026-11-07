@@ -1,0 +1,13 @@
+[package]
+name = "zt-net"
+description = "Adapter di rete tokio di TCN: canale Noise, server relay, agent, libreria client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
