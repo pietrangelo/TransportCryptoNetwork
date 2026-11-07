@@ -15,6 +15,10 @@ use zt_domain::{CloseReason, Credit, Frame, FramePayload, StreamId};
 
 use crate::{NetError, Timeouts};
 
+/// Plaintext del primo messaggio di trasporto end-to-end, inviato dal client per provare di
+/// aver completato l'handshake (un relay che rigioca il messaggio 1 non sa produrlo).
+pub(crate) const CONFIRM: &[u8] = b"TCN/1 ready";
+
 /// Byte locali letti per ogni `Data`.
 pub(crate) const CHUNK: usize = 16 * 1024;
 

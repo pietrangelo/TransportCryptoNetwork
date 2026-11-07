@@ -11,14 +11,14 @@
 //! per un peer che rispetta il credito) quella connessione viene chiusa.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout_at;
-use zt_application::ratelimit::KeyedRateLimiter;
+use zt_application::ratelimit::{KeyedRateLimiter, source_key};
 use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Identity;
 use zt_crypto::noise::Channel;
@@ -170,7 +170,7 @@ impl RelayServer {
         tokio::spawn(hub(core, hub_rx));
 
         let slots = Arc::new(Semaphore::new(config.max_connections));
-        let mut limiter: KeyedRateLimiter<IpAddr> = KeyedRateLimiter::new(
+        let mut limiter: KeyedRateLimiter<[u8; 9]> = KeyedRateLimiter::new(
             config.max_tracked_ips,
             config.handshake_burst,
             config.handshake_refill,
@@ -192,7 +192,7 @@ impl RelayServer {
                 tracing::warn!(%addr, "connection limit reached");
                 continue;
             };
-            if !limiter.check(&addr.ip(), std::time::Instant::now()) {
+            if !limiter.check(&source_key(addr.ip()), std::time::Instant::now()) {
                 tracing::warn!(%addr, "handshake rate limit");
                 continue;
             }

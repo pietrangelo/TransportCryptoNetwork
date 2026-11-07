@@ -127,6 +127,10 @@ L'initiator pinna la chiave del responder. Il responder impara l'identità dell'
 primo messaggio e, se non è nella sua whitelist, **non risponde**: chiude senza inviare il
 secondo messaggio.
 
+Sul canale end-to-end il primo messaggio di trasporto del client DEVE avere come plaintext
+`TCN/1 ready`. Il messaggio 1 di IK è rigiocabile da chi lo osserva (il relay): solo dopo
+questa conferma l'agent contatta sshd e registra la sessione.
+
 ## 8. Ciclo di vita
 
 1. L'agent si connette, completa l'handshake e invia `Register` entro 10 s con il nome che la
@@ -142,6 +146,10 @@ secondo messaggio.
    `PeerGone` tutti i suoi stream.
 
 Un peer che viola una regola (ordine dei frame, ruolo, credito, rate) perde la connessione.
+Fanno eccezione i frame **in volo** su uno stream già chiuso (per esempio `Data` o `Close`
+che incrociano un `Close`): vengono scartati in silenzio. Un frame su uno stream mai aperto
+resta una violazione. Gli stream id che il relay assegna agli agent sono strettamente
+crescenti; l'agent rifiuta id già visti.
 
 ## 9. Controllo di flusso
 
@@ -162,7 +170,8 @@ peer è quindi limitata a `stream × MAX_WINDOW`.
 | Limite | Valore |
 | :- | -: |
 | connessioni contemporanee al relay | 4 096 |
-| handshake per IP | 20 a raffica, poi 1 ogni 3 s |
+| handshake per IPv4 o per prefisso /64 IPv6 | 20 a raffica, poi 1 ogni 3 s |
+| `Open` per connessione client | 64 a raffica, poi 10 al secondo |
 | stream per client / per agent | 32 / 64 |
 | `Ping` per connessione | 10 a raffica, poi 1 ogni 5 s |
 | handshake / inattività / scrittura | 10 s / 90 s / 30 s |

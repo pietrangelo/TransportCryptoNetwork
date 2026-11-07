@@ -8,7 +8,7 @@
 //! - ogni violazione chiude la connessione del colpevole e libera tutte le sue risorse;
 //! - nessuna tabella cresce oltre i limiti configurati.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -88,6 +88,10 @@ pub struct RelayLimits {
     pub ping_burst: u32,
     /// Un `Ping` in più ogni `ping_refill`.
     pub ping_refill: Duration,
+    /// `Open` ammessi a raffica per connessione client.
+    pub open_burst: u32,
+    /// Un `Open` in più ogni `open_refill`.
+    pub open_refill: Duration,
 }
 
 impl Default for RelayLimits {
@@ -98,6 +102,8 @@ impl Default for RelayLimits {
             register_timeout: Duration::from_secs(10),
             ping_burst: 10,
             ping_refill: Duration::from_secs(5),
+            open_burst: 64,
+            open_refill: Duration::from_millis(100),
         }
     }
 }
@@ -113,12 +119,67 @@ enum Role {
     Client,
 }
 
+/// Stream chiusi di recente da un client, per cui frame in volo vanno scartati in silenzio.
+///
+/// Gli stream lato agent non ne hanno bisogno: i loro id crescono e non vengono riusati, quindi
+/// ogni id sotto `next_stream` non più aperto è per forza uno stream chiuso.
+#[derive(Debug, Default)]
+struct RecentlyClosed {
+    order: VecDeque<StreamId>,
+    set: HashSet<StreamId>,
+}
+
+impl RecentlyClosed {
+    /// Quanti id ricordare. Un client che ne chiude di più in volo perde solo il proprio stream.
+    const CAPACITY: usize = 256;
+
+    fn insert(&mut self, stream: StreamId) {
+        if !self.set.insert(stream) {
+            return;
+        }
+        self.order.push_back(stream);
+        if self.order.len() > Self::CAPACITY
+            && let Some(old) = self.order.pop_front()
+        {
+            self.set.remove(&old);
+        }
+    }
+
+    fn contains(&self, stream: StreamId) -> bool {
+        self.set.contains(&stream)
+    }
+
+    fn reopen(&mut self, stream: StreamId) {
+        if self.set.remove(&stream) {
+            self.order.retain(|s| *s != stream);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Conn {
     peer: Fingerprint,
     role: Role,
     streams: BTreeSet<StreamId>,
     pings: TokenBucket,
+    opens: TokenBucket,
+    closed: RecentlyClosed,
+}
+
+impl Conn {
+    /// `true` se `stream` è esistito su questa connessione ed è stato chiuso: un frame su di esso
+    /// è un normale frame in volo, non una violazione (finding 0002-1, -2, -6).
+    fn is_stale(&self, stream: StreamId) -> bool {
+        match &self.role {
+            Role::Agent { next_stream, .. } => stream.get() < *next_stream,
+            Role::Client => self.closed.contains(stream),
+        }
+    }
+
+    fn forget(&mut self, stream: StreamId) {
+        self.streams.remove(&stream);
+        self.closed.insert(stream);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +284,7 @@ impl<S: SessionIds> RelayCore<S> {
             Some(PeerRole::Client { .. }) => Role::Client,
         };
         let pings = TokenBucket::new(self.limits.ping_burst, self.limits.ping_refill, now);
+        let opens = TokenBucket::new(self.limits.open_burst, self.limits.open_refill, now);
         self.conns.insert(
             conn,
             Conn {
@@ -230,6 +292,8 @@ impl<S: SessionIds> RelayCore<S> {
                 role,
                 streams: BTreeSet::new(),
                 pings,
+                opens,
+                closed: RecentlyClosed::default(),
             },
         );
     }
@@ -272,6 +336,14 @@ impl<S: SessionIds> RelayCore<S> {
             Frame::Pong { .. } => Err("unsolicited pong"),
             Frame::Register { node } => self.on_register(conn, node, out),
             other => {
+                if let Some(stream) = other.stream()
+                    && !matches!(other, Frame::Open { .. })
+                    && !self.routes.contains_key(&(conn, stream))
+                    && c.is_stale(stream)
+                {
+                    // Frame in volo su uno stream già chiuso: si scarta.
+                    return Ok(());
+                }
                 let is_agent = match &c.role {
                     Role::Agent {
                         registered: false, ..
@@ -281,7 +353,7 @@ impl<S: SessionIds> RelayCore<S> {
                 };
                 match other {
                     Frame::Open { stream, target } if !is_agent => {
-                        self.on_open(conn, stream, target, out)
+                        self.on_open(conn, stream, target, now, out)
                     }
                     Frame::Open { .. } => Err("agents cannot open streams"),
                     Frame::OpenAck { stream } if is_agent => self.on_open_ack(conn, stream, out),
@@ -395,9 +467,10 @@ impl<S: SessionIds> RelayCore<S> {
         conn: ConnId,
         stream: StreamId,
         target: NodeId,
+        now: Instant,
         out: &mut Vec<Output>,
     ) -> Result<(), Violation> {
-        let c = self.conns.get(&conn).ok_or("unknown connection")?;
+        let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
         let client = c.peer;
         if c.streams.contains(&stream) {
             return Err("stream id reuse");
@@ -406,6 +479,13 @@ impl<S: SessionIds> RelayCore<S> {
             conn,
             frame: Frame::Reject { stream, reason },
         };
+        // Ogni `Open` costa lavoro all'agent e una riga di audit: se ne limita la frequenza,
+        // prima di qualsiasi altro controllo (finding 0002-4).
+        if !c.opens.try_take(now) {
+            out.push(reject(RejectReason::RateLimited));
+            return Ok(());
+        }
+        c.closed.reopen(stream);
         // Prima l'autorizzazione: «negato» e «inesistente» devono essere indistinguibili.
         if !self.policy.may_open(&client, &target) {
             out.push(Output::Audit(DomainEvent::AccessDenied { client, target }));
@@ -528,10 +608,10 @@ impl<S: SessionIds> RelayCore<S> {
         let (peer, peer_stream) = route.peer;
         self.routes.remove(&(peer, peer_stream));
         if let Some(c) = self.conns.get_mut(&conn) {
-            c.streams.remove(&stream);
+            c.forget(stream);
         }
         if let Some(p) = self.conns.get_mut(&peer) {
-            p.streams.remove(&peer_stream);
+            p.forget(peer_stream);
         }
         Some(route)
     }
@@ -577,7 +657,7 @@ impl<S: SessionIds> RelayCore<S> {
             let (peer, peer_stream) = route.peer;
             self.routes.remove(&(peer, peer_stream));
             if let Some(p) = self.conns.get_mut(&peer) {
-                p.streams.remove(&peer_stream);
+                p.forget(peer_stream);
             }
             out.push(Output::Send {
                 conn: peer,

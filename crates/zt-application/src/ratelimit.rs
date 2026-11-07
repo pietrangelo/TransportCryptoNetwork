@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 /// Token bucket: fino a `capacity` eventi a raffica, poi uno ogni `refill_every`.
@@ -66,6 +67,32 @@ impl TokenBucket {
         self.refill(now);
         self.tokens == self.capacity
     }
+}
+
+/// Chiave di rate limiting per un indirizzo sorgente.
+///
+/// IPv4 (anche nella forma IPv4-mapped) per indirizzo; IPv6 per prefisso /64, perché un
+/// singolo cliente riceve tipicamente un intero /64 e potrebbe altrimenti presentarsi con
+/// 2^64 indirizzi diversi (finding 0002-5).
+#[must_use]
+pub fn source_key(addr: IpAddr) -> [u8; 9] {
+    let mut key = [0_u8; 9];
+    match addr.to_canonical() {
+        IpAddr::V4(v4) => {
+            if let Some(slot) = key.get_mut(1..5) {
+                slot.copy_from_slice(&v4.octets());
+            }
+        }
+        IpAddr::V6(v6) => {
+            if let Some(tag) = key.first_mut() {
+                *tag = 6;
+            }
+            if let (Some(slot), Some(prefix)) = (key.get_mut(1..9), v6.octets().get(..8)) {
+                slot.copy_from_slice(prefix);
+            }
+        }
+    }
+    key
 }
 
 /// Un token bucket per chiave (per esempio per indirizzo IP), con numero di chiavi limitato.

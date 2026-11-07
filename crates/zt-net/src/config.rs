@@ -66,27 +66,34 @@ pub enum ConfigError {
 }
 
 fn read_limited(path: &Path) -> Result<String, ConfigError> {
-    let display = path.display().to_string();
-    let io = |source| ConfigError::Io {
-        path: display.clone(),
+    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
         source,
-    };
-    let file = std::fs::File::open(path).map_err(io)?;
+    })?;
+    read_file_limited(file, path)
+}
+
+fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigError> {
+    let display = path.display().to_string();
     let mut text = String::new();
     file.take(MAX_FILE_LEN.saturating_add(1))
         .read_to_string(&mut text)
-        .map_err(io)?;
+        .map_err(|source| ConfigError::Io {
+            path: display.clone(),
+            source,
+        })?;
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_FILE_LEN {
         return Err(ConfigError::TooLarge(display));
     }
     Ok(text)
 }
 
+/// Verifica i permessi sul file **già aperto**: nessuna finestra tra controllo e lettura.
 #[cfg(unix)]
-fn check_private(path: &Path) -> Result<(), ConfigError> {
+fn check_private(file: &std::fs::File, path: &Path) -> Result<(), ConfigError> {
     use std::os::unix::fs::PermissionsExt;
     let display = path.display().to_string();
-    let meta = std::fs::metadata(path).map_err(|source| ConfigError::Io {
+    let meta = file.metadata().map_err(|source| ConfigError::Io {
         path: display.clone(),
         source,
     })?;
@@ -97,7 +104,7 @@ fn check_private(path: &Path) -> Result<(), ConfigError> {
 }
 
 #[cfg(not(unix))]
-fn check_private(_path: &Path) -> Result<(), ConfigError> {
+fn check_private(_file: &std::fs::File, _path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
@@ -106,8 +113,12 @@ fn check_private(_path: &Path) -> Result<(), ConfigError> {
 /// # Errors
 /// File illeggibile, permessi insicuri, contenuto non valido.
 pub fn load_identity(path: &Path) -> Result<Identity, ConfigError> {
-    check_private(path)?;
-    let text = zeroize::Zeroizing::new(read_limited(path)?);
+    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    check_private(&file, path)?;
+    let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
     Identity::from_secret_hex(&text).map_err(|source| ConfigError::Key {
         path: path.display().to_string(),
         entry: "secret key".into(),

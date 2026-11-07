@@ -7,10 +7,11 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, timeout_at};
 use zt_crypto::noise::{self, Channel};
 use zt_crypto::{Identity, PublicKey};
+use zt_domain::flow::Window;
 use zt_domain::{Frame, NodeId, StreamId};
 
 use crate::channel::Established;
-use crate::stream::{STREAM_QUEUE, StreamIo, pump};
+use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
 /// Configurazione di una connessione client.
@@ -68,7 +69,8 @@ where
         let (msg1, waiting) = noise::initiate(identity, &config.node_key, Channel::EndToEnd)?;
         io.send_data(msg1).await?;
         let msg2 = io.recv_message(t).await?;
-        let transport = waiting.complete(&msg2)?;
+        let mut transport = waiting.complete(&msg2)?;
+        io.send_data(transport.encrypt(CONFIRM)?).await?;
         pump(io, transport, local, t).await
     };
     let (link, session) = tokio::join!(relay_link, session);
@@ -100,6 +102,8 @@ async fn drive(
     keepalive.tick().await;
     let mut deadline = crate::deadline(t.idle);
     let mut nonce: u64 = 0;
+    // Credito del relay verso lo stream, applicato prima di accodare (finding 0002-14).
+    let mut recv = Window::initial();
     loop {
         tokio::select! {
             inbound = timeout_at(deadline, ch.recv()) => {
@@ -109,6 +113,9 @@ async fn drive(
                     Frame::Data { stream: s, .. } | Frame::WindowUpdate { stream: s, .. } | Frame::Close { stream: s, .. }
                         if *s == stream =>
                     {
+                        if let Frame::Data { payload, .. } = &frame {
+                            recv.consume(payload.len()).map_err(NetError::Protocol)?;
+                        }
                         if to_stream.try_send(frame).is_err() {
                             return Err(NetError::Protocol("stream queue overflow"));
                         }
@@ -118,7 +125,12 @@ async fn drive(
                 }
             }
             outbound = out_rx.recv() => match outbound {
-                Some(frame) => ch.send(&frame, t).await?,
+                Some(frame) => {
+                    if let Frame::WindowUpdate { credit, .. } = &frame {
+                        recv.grant(credit.get()).map_err(NetError::Protocol)?;
+                    }
+                    ch.send(&frame, t).await?;
+                }
                 None => return Ok(()),
             },
             _ = keepalive.tick() => {

@@ -922,3 +922,215 @@ fn nothing_leaks_after_everyone_leaves() {
     assert_eq!(h.core.route_count(), 0);
     assert_eq!(h.core.connection_count(), 0);
 }
+
+// ======================= regressioni dell'adversary review 0002 =======================
+
+/// Seconda sessione innocente: admin (conn 3) → web-01. Restituisce lo stream lato agent.
+fn add_innocent_session(h: &mut Harness) -> StreamId {
+    h.connect(3, ADMIN);
+    let out = h.recv(
+        3,
+        Frame::Open {
+            stream: sid(1),
+            target: node("web-01"),
+        },
+    );
+    let a = sent_to(&out, 1)
+        .iter()
+        .find_map(|f| match f {
+            Frame::Open { stream, .. } => Some(*stream),
+            _ => None,
+        })
+        .unwrap();
+    h.recv(1, Frame::OpenAck { stream: a });
+    a
+}
+
+fn untouched(out: &[Output]) -> bool {
+    closed(out).is_empty() && out.iter().all(|o| !matches!(o, Output::Send { .. }))
+}
+
+/// Finding 0002-1/2: un `Close` incrociato è normale e non deve far cadere l'agent.
+#[test]
+fn crossing_close_is_dropped_silently() {
+    let (mut h, a) = Harness::with_open_session();
+    add_innocent_session(&mut h);
+    h.recv(
+        2,
+        Frame::Close {
+            stream: sid(7),
+            reason: CloseReason::Normal,
+        },
+    );
+    let out = h.recv(
+        1,
+        Frame::Close {
+            stream: a,
+            reason: CloseReason::Timeout,
+        },
+    );
+    assert!(untouched(&out), "{out:?}");
+}
+
+/// Finding 0002-2: dati o credito dell'agent in volo dopo la chiusura del client.
+#[test]
+fn agent_frames_in_flight_after_client_close_are_dropped() {
+    let (mut h, a) = Harness::with_open_session();
+    add_innocent_session(&mut h);
+    h.recv(
+        2,
+        Frame::Close {
+            stream: sid(7),
+            reason: CloseReason::Normal,
+        },
+    );
+    let credit = Credit::try_from(4096).unwrap();
+    for frame in [
+        Frame::Data {
+            stream: a,
+            payload: data(100),
+        },
+        Frame::WindowUpdate { stream: a, credit },
+    ] {
+        let out = h.recv(1, frame);
+        assert!(untouched(&out), "{out:?}");
+    }
+}
+
+/// Finding 0002-2: `Open` seguito da `Close` prima dell'`OpenAck`.
+#[test]
+fn late_open_ack_or_reject_after_client_close_is_dropped() {
+    for late in [true, false] {
+        let mut h = Harness::with_web_agent();
+        add_innocent_session(&mut h);
+        h.connect(2, ANSIBLE);
+        let out = h.recv(
+            2,
+            Frame::Open {
+                stream: sid(9),
+                target: node("web-01"),
+            },
+        );
+        let Some(Frame::Open { stream: a, .. }) = sent_to(&out, 1).pop() else {
+            panic!()
+        };
+        h.recv(
+            2,
+            Frame::Close {
+                stream: sid(9),
+                reason: CloseReason::Normal,
+            },
+        );
+        let frame = if late {
+            Frame::OpenAck { stream: a }
+        } else {
+            Frame::Reject {
+                stream: a,
+                reason: RejectReason::ResourceExhausted,
+            }
+        };
+        assert!(untouched(&h.recv(1, frame)));
+    }
+}
+
+/// Finding 0002-6: dati del client in volo dopo la chiusura dell'agent.
+#[test]
+fn client_frames_in_flight_after_agent_close_are_dropped() {
+    let (mut h, a) = Harness::with_open_session();
+    h.recv(
+        1,
+        Frame::Close {
+            stream: a,
+            reason: CloseReason::Normal,
+        },
+    );
+    let out = h.recv(
+        2,
+        Frame::Data {
+            stream: sid(7),
+            payload: data(100),
+        },
+    );
+    assert!(untouched(&out), "{out:?}");
+    // Lo stesso id può poi essere riaperto.
+    let out = h.recv(
+        2,
+        Frame::Open {
+            stream: sid(7),
+            target: node("web-01"),
+        },
+    );
+    assert_eq!(sent_to(&out, 1).len(), 1);
+}
+
+/// Il perdono vale solo per stream davvero esistiti: id mai aperti restano violazioni.
+#[test]
+fn frames_on_never_opened_streams_are_still_violations() {
+    let (mut h, _) = Harness::with_open_session();
+    assert!(is_violation_of(
+        &h.recv(
+            1,
+            Frame::Data {
+                stream: sid(999),
+                payload: data(1)
+            }
+        ),
+        1
+    ));
+    let (mut h, _) = Harness::with_open_session();
+    assert!(is_violation_of(
+        &h.recv(
+            2,
+            Frame::Data {
+                stream: sid(8),
+                payload: data(1)
+            }
+        ),
+        2
+    ));
+}
+
+/// Finding 0002-4: un flood di `Open`/`Close` non arriva all'agent oltre il rate concesso.
+#[test]
+fn open_floods_are_rate_limited() {
+    let mut h = Harness::with_web_agent();
+    h.connect(2, ANSIBLE);
+    let limits = RelayLimits::default();
+    let mut forwarded = 0_u32;
+    let mut rate_limited = 0_u32;
+    for i in 0..10_000_u32 {
+        let s = sid(1 + (i % 4));
+        let mut out = h.recv(
+            2,
+            Frame::Open {
+                stream: s,
+                target: node("web-01"),
+            },
+        );
+        out.extend(h.recv(
+            2,
+            Frame::Close {
+                stream: s,
+                reason: CloseReason::Normal,
+            },
+        ));
+        if sent_to(&out, 2).contains(&Frame::Reject {
+            stream: s,
+            reason: RejectReason::RateLimited,
+        }) {
+            rate_limited += 1;
+        }
+        forwarded += u32::try_from(
+            sent_to(&out, 1)
+                .iter()
+                .filter(|f| matches!(f, Frame::Open { .. }))
+                .count(),
+        )
+        .unwrap();
+    }
+    assert!(
+        forwarded <= limits.open_burst,
+        "{forwarded} opens reached the agent"
+    );
+    assert!(rate_limited > 9_000);
+}

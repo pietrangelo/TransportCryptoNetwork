@@ -13,12 +13,13 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout, timeout_at};
 use zt_crypto::noise::{self, Channel};
 use zt_crypto::{Identity, PublicKey};
+use zt_domain::flow::Window;
 use zt_domain::{
     AuthFailureReason, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
 };
 
 use crate::relay::audit;
-use crate::stream::{STREAM_QUEUE, StreamIo, pump};
+use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
 /// Configurazione dell'agent.
@@ -86,7 +87,7 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(1024);
     let (done_tx, mut done_rx) = mpsc::channel::<StreamId>(config.max_streams.saturating_add(1));
-    let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
+    let mut streams = Streams::default();
     let mut keepalive = tokio::time::interval(t.keepalive);
     keepalive.tick().await;
     let mut deadline = crate::deadline(t.idle);
@@ -100,9 +101,12 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
                     ch.send(&reply, t).await?;
                 }
             }
-            Some(frame) = out_rx.recv() => ch.send(&frame, t).await?,
+            Some(frame) = out_rx.recv() => {
+                streams.on_outbound(&frame);
+                ch.send(&frame, t).await?;
+            }
             Some(stream) = done_rx.recv() => {
-                streams.remove(&stream);
+                streams.slots.remove(&stream);
             }
             _ = keepalive.tick() => {
                 nonce = nonce.wrapping_add(1);
@@ -112,11 +116,39 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
     }
 }
 
+/// Coda e credito in ingresso di uno stream.
+struct Slot {
+    tx: mpsc::Sender<Frame>,
+    /// Credito che il relay ha verso questo stream: si applica **prima** di accodare, così un
+    /// relay compromesso non può riempire la coda oltre la finestra (finding 0002-14).
+    recv: Window,
+}
+
+/// Gli stream aperti sulla connessione con il relay.
+#[derive(Default)]
+struct Streams {
+    slots: HashMap<StreamId, Slot>,
+    /// L'ultimo id accettato: il relay assegna id crescenti e non li riusa.
+    last: u32,
+}
+
+impl Streams {
+    /// Restituisce credito al relay quando lo stream lo concede.
+    fn on_outbound(&mut self, frame: &Frame) {
+        if let Frame::WindowUpdate { stream, credit } = frame
+            && let Some(slot) = self.slots.get_mut(stream)
+        {
+            // Il task dello stream applica gli stessi limiti: qui non può fallire.
+            let _ = slot.recv.grant(credit.get());
+        }
+    }
+}
+
 fn on_relay_frame(
     frame: Frame,
     identity: &Arc<Identity>,
     config: &AgentConfig,
-    streams: &mut HashMap<StreamId, mpsc::Sender<Frame>>,
+    streams: &mut Streams,
     out_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<StreamId>,
 ) -> Result<Option<Frame>, NetError> {
@@ -128,17 +160,24 @@ fn on_relay_frame(
                     reason: RejectReason::NotAuthorized,
                 }));
             }
-            if streams.contains_key(&stream) {
+            if stream.get() <= streams.last {
                 return Err(NetError::Protocol("relay reused a stream id"));
             }
-            if streams.len() >= config.max_streams {
+            streams.last = stream.get();
+            if streams.slots.len() >= config.max_streams {
                 return Ok(Some(Frame::Reject {
                     stream,
                     reason: RejectReason::ResourceExhausted,
                 }));
             }
             let (tx, rx) = mpsc::channel(STREAM_QUEUE);
-            streams.insert(stream, tx);
+            streams.slots.insert(
+                stream,
+                Slot {
+                    tx,
+                    recv: Window::initial(),
+                },
+            );
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
@@ -157,24 +196,25 @@ fn on_relay_frame(
         | Frame::WindowUpdate { stream, .. }
         | Frame::Close { stream, .. } => {
             let closing = matches!(frame, Frame::Close { .. });
-            if let Some(tx) = streams.get(&stream) {
-                match tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Solo un relay che non applica il credito può riempire la coda.
-                        streams.remove(&stream);
-                        return Ok(Some(Frame::Close {
-                            stream,
-                            reason: CloseReason::ProtocolViolation,
-                        }));
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        streams.remove(&stream);
-                    }
-                }
+            let Some(slot) = streams.slots.get_mut(&stream) else {
+                // Stream già chiuso da questa parte: frame in volo, si scarta.
+                return Ok(None);
+            };
+            let within_credit = match &frame {
+                Frame::Data { payload, .. } => slot.recv.consume(payload.len()).is_ok(),
+                _ => true,
+            };
+            let queued = within_credit && slot.tx.try_send(frame).is_ok();
+            if !queued {
+                // Solo un relay che non applica il credito può arrivare qui.
+                streams.slots.remove(&stream);
+                return Ok(Some(Frame::Close {
+                    stream,
+                    reason: CloseReason::ProtocolViolation,
+                }));
             }
             if closing {
-                streams.remove(&stream);
+                streams.slots.remove(&stream);
             }
             Ok(None)
         }
@@ -205,6 +245,8 @@ impl StreamTask {
         } = self;
         let pending = match io.recv_message(&timeouts).await {
             Ok(msg1) => noise::respond(&identity, &msg1, Channel::EndToEnd),
+            // Il client ha già chiuso: rispondere con un altro `Close` non serve (finding 0002-1).
+            Err(NetError::StreamClosed(_)) => return,
             Err(err) => {
                 tracing::debug!(error = %err, "stream ended before handshake");
                 io.close(CloseReason::Timeout).await;
@@ -228,12 +270,31 @@ impl StreamTask {
             io.close(CloseReason::Unauthorized).await;
             return;
         }
-        let Ok((msg2, transport)) = pending.accept() else {
+        let Ok((msg2, mut transport)) = pending.accept() else {
             io.close(CloseReason::ProtocolViolation).await;
             return;
         };
         if io.send_data(msg2).await.is_err() {
             return;
+        }
+        // Il primo messaggio IK si può ripetere: un relay compromesso che lo registra può
+        // rigiocarlo. Solo il vero client sa produrre un messaggio di trasporto valido, quindi
+        // sshd si contatta e la sessione si registra solo dopo la conferma (finding 0002-3).
+        match io.recv_message(&timeouts).await {
+            Ok(confirm) if transport.decrypt(&confirm).is_ok_and(|p| p == CONFIRM) => {}
+            Ok(_) => {
+                audit(&DomainEvent::AuthenticationFailed {
+                    peer: Some(client),
+                    reason: AuthFailureReason::HandshakeFailed,
+                });
+                io.close(CloseReason::ProtocolViolation).await;
+                return;
+            }
+            Err(NetError::StreamClosed(_)) => return,
+            Err(_) => {
+                io.close(CloseReason::Timeout).await;
+                return;
+            }
         }
         let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, TcpStream::connect(&ssh_target)).await
         else {
