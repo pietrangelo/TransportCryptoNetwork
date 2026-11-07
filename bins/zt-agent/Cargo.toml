@@ -1,0 +1,18 @@
+[package]
+name = "zt-agent"
+description = "Binario zt-agent di TCN (scheletro della Fase 1: la logica di rete arriva nella Fase 2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zt-domain.workspace = true
+zt-proto = { workspace = true, features = ["codec"] }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
