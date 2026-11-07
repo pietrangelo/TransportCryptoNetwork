@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/zt-domain",
+    "crates/zt-proto",
+    "bins/zt-relay",
+    "bins/zt-agent",
+    "bins/zt-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/pietrangelo/TransportCryptoNetwork"
+publish = false
+
+# Una sola fonte di verità per le versioni. I crate le ereditano con `workspace = true`.
+[workspace.dependencies]
+# --- interni ---
+zt-domain = { path = "crates/zt-domain" }
+zt-proto  = { path = "crates/zt-proto" }
+
+# --- dominio (puro, senza I/O) ---
+thiserror = "2.0.21"
+bytes     = { version = "1.12.1", default-features = false, features = ["std"] }
+subtle    = { version = "2.6.1", default-features = false, features = ["std"] }
+zeroize   = { version = "1.9.1", features = ["zeroize_derive"] }
+
+# --- adapter / runtime (usati da zt-proto feature `codec` e dai binari) ---
+tokio      = { version = "1.54.1", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false, features = ["codec"] }
+futures    = { version = "0.3.34", default-features = false, features = ["std"] }
+clap       = { version = "4.6.7", features = ["derive"] }
+tracing    = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
+
+# --- crittografia (Fase 2: handshake Noise e identità Ed25519) ---
+snow          = { version = "0.10.0", default-features = false, features = ["default-resolver"] }
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+
+# --- test ---
+proptest   = "1.12.0"
+tokio-test = "0.4.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Nessun panic implicito nel codice di produzione (i test lo riabilitano localmente).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+dbg_macro = "deny"
+print_stdout = "warn"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
+# Hardening dei binari di rilascio.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"          # un panic non deve mai lasciare un tunnel in stato inconsistente
+overflow-checks = true   # gli overflow aritmetici restano errori anche in release
+debug = false
+strip = "symbols"
+incremental = false
+
+[profile.dev]
+overflow-checks = true
+
+# I test di proprietà sono CPU-bound: ottimizziamo le dipendenze anche in debug.
+[profile.test.package.proptest]
+opt-level = 3

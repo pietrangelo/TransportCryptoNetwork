@@ -1,0 +1,33 @@
+[package]
+name = "zt-proto"
+description = "Wire format di TCN: encoder/decoder sans-IO dei frame, più adapter tokio-util opzionale."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Adapter infrastrutturale: implementa tokio_util::codec::{Decoder, Encoder}.
+codec = ["dep:tokio-util"]
+
+[dependencies]
+zt-domain.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tokio-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+tokio-util = { workspace = true }
+futures = { workspace = true, features = ["std", "async-await"] }
+tokio-test.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "codec_duplex"
+required-features = ["codec"]

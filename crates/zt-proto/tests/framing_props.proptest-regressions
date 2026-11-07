@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 17a3dfa014f8f2c68f4e0cf2e08a0ee58ef036c0ba8c18181186a44cea7ac4f6 # shrinks to kind = Register, len = 1
+cc e48b43e430f20cbee6195d65d3fd34308d062400d638489f321501434ad795d1 # shrinks to frames = [Register { node: NodeId(0) }], chunk = 1
+cc 71d2524ee6e6cc4740d3ad2d88d1615eb0a2d2a685e4fd9ddd5d1624482b9fbf # shrinks to frame = Register { node: NodeId(a) }, cut = Index(0)
