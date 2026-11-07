@@ -1,0 +1,24 @@
+[package]
+name = "zt-crypto"
+description = "Adapter crittografico di TCN: identità Ed25519, handshake Noise sans-IO con typestate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zt-domain.workspace = true
+thiserror.workspace = true
+snow.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

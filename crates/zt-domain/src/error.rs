@@ -63,4 +63,10 @@ pub enum DomainError {
     /// Codice di chiusura sconosciuto.
     #[error("unknown close reason code {0:#04x}")]
     UnknownCloseReason(u8),
+    /// La stessa chiave compare due volte nella policy.
+    #[error("peer {0} appears more than once in the access policy")]
+    DuplicatePeer(crate::Fingerprint),
+    /// Due agent dichiarano lo stesso nome di nodo.
+    #[error("node {0} is assigned to more than one agent key")]
+    DuplicateNode(crate::NodeId),
 }

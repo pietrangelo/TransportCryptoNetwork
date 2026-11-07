@@ -69,7 +69,7 @@ pub fn arb_reject() -> impl Strategy<Value = RejectReason> {
 }
 
 pub fn arb_close() -> impl Strategy<Value = CloseReason> {
-    (0_u8..=4).prop_map(|c| CloseReason::try_from(c).unwrap())
+    (0_u8..=5).prop_map(|c| CloseReason::try_from(c).unwrap())
 }
 
 pub fn arb_frame() -> impl Strategy<Value = Frame> {

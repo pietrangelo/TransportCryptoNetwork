@@ -1,31 +1,56 @@
 //! `zt-client`: bridge stdio per OpenSSH `ProxyCommand` verso un nodo, attraverso il relay.
 //!
-//! Fase 1: solo l'interfaccia a riga di comando. La logica di rete arriva nella Fase 2.
+//! Fase 2: generazione della chiave. Il bridge stdio (già disponibile in `zt_net::client`)
+//! viene collegato e verificato con OpenSSH e Ansible nella Fase 3.
 #![forbid(unsafe_code)]
 
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use zt_net::config;
 
-/// bridge stdio per OpenSSH `ProxyCommand` verso un nodo, attraverso il relay.
+/// Client TCN.
 #[derive(Debug, Parser)]
 #[command(version, about)]
-struct Args {
-    /// Indirizzo del relay (host:porta).
-    #[arg(long)]
-    relay: String,
-    /// Nodo di destinazione (in `ssh_config`: `ProxyCommand zt-client --relay R %h`).
-    node: String,
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Genera la chiave del client (file nuovo, permessi 0600) e stampa la chiave pubblica.
+    Keygen {
+        /// File da creare.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
-    // I log vanno sempre su stderr.
-    // Per zt-client è vitale: stdout è il canale SSH e un solo byte estraneo lo corrompe.
+    // I log vanno sempre su stderr: in modalità ProxyCommand stdout è il canale SSH.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_target(false)
         .init();
-    let args = Args::parse();
-    tracing::error!(?args, "network layer not implemented yet (phase 2)");
-    ExitCode::FAILURE
+    let Command::Keygen { out } = Cli::parse().command;
+    let result = config::create_identity(&out)
+        .map_err(|e| e.to_string())
+        .and_then(|identity| {
+            writeln!(
+                std::io::stdout(),
+                "public_key  = \"{}\"\nfingerprint = {}",
+                identity.public_key(),
+                identity.fingerprint()
+            )
+            .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            tracing::error!("{message}");
+            ExitCode::FAILURE
+        }
+    }
 }

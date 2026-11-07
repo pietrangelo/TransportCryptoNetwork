@@ -50,6 +50,20 @@ pub enum DomainEvent {
         /// Il motivo.
         reason: AuthFailureReason,
     },
+    /// Un client autenticato ha chiesto un nodo che la policy non gli concede.
+    AccessDenied {
+        /// L'identità del client.
+        client: Fingerprint,
+        /// Il nodo richiesto.
+        target: NodeId,
+    },
+    /// Un peer ha violato il protocollo e la sua connessione è stata chiusa.
+    ProtocolViolation {
+        /// L'identità del peer.
+        peer: Fingerprint,
+        /// Che cosa ha violato (testo statico, mai dati ricevuti).
+        rule: &'static str,
+    },
     /// Una sessione è terminata e le sue risorse sono state rilasciate.
     ConnectionDrained {
         /// La sessione.
