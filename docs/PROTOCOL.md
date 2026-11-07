@@ -177,7 +177,24 @@ peer è quindi limitata a `stream × MAX_WINDOW`.
 | handshake / inattività / scrittura | 10 s / 90 s / 30 s |
 | keepalive di agent e client | 30 s |
 
-## 11. Fuori dall'ambito della Fase 2
+## 11. Il client come `ProxyCommand`
 
-Il bridge stdio di `zt-client` per OpenSSH e la verifica con Ansible (Fase 3); rekey dei
-canali di lunga durata, revoca a caldo delle chiavi e fuzzing con `cargo-fuzz` (Fase 4).
+`zt-client connect <nodo>` apre una connessione al relay con un solo stream verso il nodo e
+collega stdin/stdout di OpenSSH al canale end-to-end.
+
+- **Chiavi pinnate, niente TOFU.** Chiave del relay e chiave dell'agent di ogni nodo vengono da
+  `client.toml`. Un nodo senza chiave pinnata, un nome non valido, un file di trust
+  scrivibile da altri o una chiave segreta leggibile da altri fanno fallire il client prima di
+  qualsiasi connessione.
+- **stdout è il canale SSH.** Ci finiscono solo byte decifrati dal canale end-to-end; log ed
+  errori vanno su stderr. Ogni messaggio consegnato viene scritto e svuotato subito (stdout è
+  bufferizzato a righe e SSH non manda righe).
+- **Chiusura.** EOF su stdin chiude lo stream (`Close Normal`); la chiusura dal lato del nodo
+  chiude stdout e termina il processo anche se stdin resta aperto. Non c'è half-close: SSH non
+  ne ha bisogno, perché il suo EOF di canale viaggia dentro il protocollo SSH.
+- **Codice d'uscita.** 0 a chiusura ordinata, 1 per ogni errore, 2 per argomenti non validi.
+
+## 12. Fuori dall'ambito della Fase 3
+
+Rekey dei canali di lunga durata, revoca a caldo delle chiavi, `cargo-fuzz` e pacchetti
+(Fase 4).

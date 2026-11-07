@@ -13,8 +13,9 @@ admin / Ansible                        relay pubblico                     server
        └──────────────── tunnel end-to-end client ↔ agent ───────────────────┘
 ```
 
-> **Stato:** Fase 2 (handshake Noise, relay e agent). Relay e agent sono funzionanti; il
-> collegamento di `zt-client` a OpenSSH arriva nella Fase 3. Vedi `docs/OPERATIONS.md`.
+> **Stato:** Fase 3. Relay, agent e `zt-client` sono funzionanti; `ssh`, `scp` e
+> `ansible-playbook` passano attraverso TCN (verificato in CI con OpenSSH e Ansible veri).
+> L'hardening (fuzzing, rekey, revoca a caldo, pacchetti) è la Fase 4. Vedi `docs/OPERATIONS.md`.
 
 ## Struttura
 
@@ -29,7 +30,7 @@ admin / Ansible                        relay pubblico                     server
 | `bins/zt-agent` | agent sui server target, solo connessioni in uscita |
 | `bins/zt-client` | `ProxyCommand` per OpenSSH |
 | `docs/PROTOCOL.md` | specifica di framing, handshake, ciclo di vita e controllo di flusso |
-| `docs/OPERATIONS.md` | chiavi, policy, avvio di relay e agent |
+| `docs/OPERATIONS.md` | chiavi, policy, avvio di relay e agent, OpenSSH e Ansible |
 | `docs/METHODOLOGY.md` | DDD esagonale, Adversarial TDD, regole di codice |
 | `docs/adversary/` | registro delle adversary review |
 
@@ -39,14 +40,23 @@ admin / Ansible                        relay pubblico                     server
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 PROPTEST_CASES=100000 cargo test -p zt-proto --test framing_props   # fuzzing più profondo
+cargo test -p zt-client --test openssh -- --ignored   # richiede sshd, ssh, scp e ansible-playbook
 ```
 
-## Uso previsto (Fase 2)
+## Uso
 
 ```sshconfig
-Host *.fleet
-    ProxyCommand zt-client --relay relay.example.org:7443 %n
+# ~/.ssh/config
+Host *.tcn
+    ProxyCommand zt-client connect --strip-suffix .tcn %h
 ```
+
+```bash
+ssh web-01.tcn
+ansible-playbook -i inventory.ini site.yml   # inventario con web-01.tcn, db-01.tcn, ...
+```
+
+Il relay e le chiavi pinnate stanno in `~/.config/tcn/client.toml` (vedi `docs/OPERATIONS.md`).
 
 ## Licenza
 

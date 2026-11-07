@@ -28,3 +28,16 @@ jobs:
         env:
           PROPTEST_CASES: "10000"
       - run: cargo build --release --workspace --locked
+
+  e2e-openssh:
+    # ssh, scp e ansible-playbook veri attraverso relay, agent e zt-client (ProxyCommand).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+      - run: pipx install ansible-core
+      - run: cargo test -p zt-client --test openssh -- --ignored
