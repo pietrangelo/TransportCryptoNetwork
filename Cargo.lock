@@ -672,6 +672,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mio"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+dependencies = [
+ "libc",
+ "wasi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -929,6 +940,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -997,6 +1017,16 @@ dependencies = [
  "rustc_version",
  "sha2 0.10.9",
  "subtle",
+]
+
+[[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1082,8 +1112,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
+ "libc",
+ "mio",
  "pin-project-lite",
+ "socket2",
  "tokio-macros",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1134,6 +1168,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.2.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,6 +1211,12 @@ checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.2.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "tracing"
@@ -1447,10 +1502,12 @@ name = "zt-agent"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "zt-crypto",
  "zt-domain",
- "zt-proto",
+ "zt-net",
 ]
 
 [[package]]
@@ -1466,10 +1523,12 @@ name = "zt-client"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "zt-crypto",
  "zt-domain",
- "zt-proto",
+ "zt-net",
 ]
 
 [[package]]
@@ -1500,6 +1559,22 @@ dependencies = [
 [[package]]
 name = "zt-net"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "getrandom 0.4.3",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "zeroize",
+ "zt-application",
+ "zt-crypto",
+ "zt-domain",
+ "zt-proto",
+]
 
 [[package]]
 name = "zt-proto"
@@ -1520,8 +1595,10 @@ name = "zt-relay"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "zt-crypto",
  "zt-domain",
- "zt-proto",
+ "zt-net",
 ]

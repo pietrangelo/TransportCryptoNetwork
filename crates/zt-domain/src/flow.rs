@@ -9,8 +9,11 @@
 /// Credito iniziale di ogni direzione di ogni stream: 256 KiB.
 pub const INITIAL_WINDOW: u32 = 256 * 1024;
 
-/// Credito massimo accumulabile: 16 MiB. Concederne di più è una violazione.
-pub const MAX_WINDOW: u32 = 16 * 1024 * 1024;
+/// Credito massimo accumulabile: 1 MiB. Concederne di più è una violazione.
+///
+/// Limita la memoria che un destinatario può farsi accodare dal relay a
+/// `stream × MAX_WINDOW` (64 MiB per un agent con i limiti di default).
+pub const MAX_WINDOW: u32 = 1024 * 1024;
 
 /// Costo minimo di un frame `Data`, anche se più corto.
 ///

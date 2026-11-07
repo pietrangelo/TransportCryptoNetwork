@@ -1,6 +1,6 @@
 [package]
 name = "zt-net"
-description = "Adapter di rete tokio di TCN: canale Noise, server relay, agent, libreria client."
+description = "Adapter di rete tokio di TCN: canale Noise, server relay, agent, libreria client, configurazione."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,23 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+zt-domain.workspace = true
+zt-proto.workspace = true
+zt-crypto.workspace = true
+zt-application.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+toml.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

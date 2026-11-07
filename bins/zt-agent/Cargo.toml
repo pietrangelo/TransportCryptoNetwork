@@ -1,6 +1,6 @@
 [package]
 name = "zt-agent"
-description = "Binario zt-agent di TCN (scheletro della Fase 1: la logica di rete arriva nella Fase 2)."
+description = "Binario zt-agent di TCN."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,9 @@ publish.workspace = true
 
 [dependencies]
 zt-domain.workspace = true
-zt-proto = { workspace = true, features = ["codec"] }
+zt-crypto.workspace = true
+zt-net.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-std"] }
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
