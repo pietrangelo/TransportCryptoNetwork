@@ -155,7 +155,9 @@ impl TryFrom<u32> for Credit {
     type Error = DomainError;
 
     fn try_from(raw: u32) -> Result<Self, Self::Error> {
-        NonZeroU32::new(raw).map(Self).ok_or(DomainError::CreditZero)
+        NonZeroU32::new(raw)
+            .map(Self)
+            .ok_or(DomainError::CreditZero)
     }
 }
 
@@ -272,8 +274,17 @@ mod tests {
     fn stream_scope_matches_frame_stream() {
         let node = NodeId::try_from("web-01").unwrap();
         let stream = StreamId::try_from(1).unwrap();
-        let control = [Frame::Register { node: node.clone() }, Frame::Ping { nonce: 1 }];
-        let scoped = [Frame::Open { stream, target: node }, Frame::OpenAck { stream }];
+        let control = [
+            Frame::Register { node: node.clone() },
+            Frame::Ping { nonce: 1 },
+        ];
+        let scoped = [
+            Frame::Open {
+                stream,
+                target: node,
+            },
+            Frame::OpenAck { stream },
+        ];
         for f in control {
             assert!(!f.kind().is_stream_scoped());
             assert_eq!(f.stream(), None);
@@ -286,8 +297,14 @@ mod tests {
 
     #[test]
     fn unknown_reason_codes_are_rejected() {
-        assert_eq!(RejectReason::try_from(0x00), Err(DomainError::UnknownRejectReason(0)));
-        assert_eq!(CloseReason::try_from(0xff), Err(DomainError::UnknownCloseReason(0xff)));
+        assert_eq!(
+            RejectReason::try_from(0x00),
+            Err(DomainError::UnknownRejectReason(0))
+        );
+        assert_eq!(
+            CloseReason::try_from(0xff),
+            Err(DomainError::UnknownCloseReason(0xff))
+        );
         assert_eq!(Credit::try_from(0), Err(DomainError::CreditZero));
     }
 }

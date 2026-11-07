@@ -1,5 +1,11 @@
 //! Test di proprietà del framing: input generati e fuzzati, bordi esatti dei limiti.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::doc_markdown
+)]
 
 mod common;
 

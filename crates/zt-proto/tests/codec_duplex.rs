@@ -1,5 +1,11 @@
 //! Test dell'adapter `tokio-util` su stream in memoria: frammentazione reale dell'I/O.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::doc_markdown
+)]
 
 mod common;
 
@@ -13,9 +19,17 @@ use zt_proto::{DecodeError, encode};
 
 fn sample_frames() -> Vec<Frame> {
     vec![
-        Frame::Register { node: node("web-01") },
-        Frame::Open { stream: stream(1), target: node("db-01") },
-        Frame::Data { stream: stream(1), payload: FramePayload::try_from(vec![7; 4096]).unwrap() },
+        Frame::Register {
+            node: node("web-01"),
+        },
+        Frame::Open {
+            stream: stream(1),
+            target: node("db-01"),
+        },
+        Frame::Data {
+            stream: stream(1),
+            payload: FramePayload::try_from(vec![7; 4096]).unwrap(),
+        },
         Frame::Ping { nonce: 42 },
     ]
 }
@@ -48,11 +62,14 @@ async fn byte_by_byte_reads_with_a_scripted_mock() {
     let mut wire = BytesMut::new();
     encode(&Frame::Ping { nonce: 7 }, &mut wire);
     let mut mock = tokio_test::io::Builder::new();
-    for byte in wire.iter() {
+    for byte in &wire {
         mock.read(&[*byte]);
     }
     let mut source = FramedRead::new(mock.build(), FrameCodec::default());
-    assert_eq!(source.next().await.unwrap().unwrap(), Frame::Ping { nonce: 7 });
+    assert_eq!(
+        source.next().await.unwrap().unwrap(),
+        Frame::Ping { nonce: 7 }
+    );
     assert!(source.next().await.is_none());
 }
 

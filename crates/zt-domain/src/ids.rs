@@ -51,7 +51,10 @@ impl TryFrom<&[u8]> for NodeId {
             return Err(DomainError::NodeIdEmpty);
         }
         if len > MAX_NODE_ID_LEN {
-            return Err(DomainError::NodeIdTooLong { len, max: MAX_NODE_ID_LEN });
+            return Err(DomainError::NodeIdTooLong {
+                len,
+                max: MAX_NODE_ID_LEN,
+            });
         }
         if let Some(position) = bytes
             .iter()
@@ -63,8 +66,9 @@ impl TryFrom<&[u8]> for NodeId {
             return Err(DomainError::NodeIdHyphenAtEdge);
         }
         // Tutti i byte sono ASCII: la conversione non può fallire, ma la gestiamo senza panic.
-        let text = core::str::from_utf8(bytes)
-            .map_err(|e| DomainError::NodeIdInvalidByte { position: e.valid_up_to() })?;
+        let text = core::str::from_utf8(bytes).map_err(|e| DomainError::NodeIdInvalidByte {
+            position: e.valid_up_to(),
+        })?;
         Ok(Self(text.into()))
     }
 }
@@ -160,7 +164,9 @@ impl TryFrom<u32> for StreamId {
     type Error = DomainError;
 
     fn try_from(raw: u32) -> Result<Self, Self::Error> {
-        NonZeroU32::new(raw).map(Self).ok_or(DomainError::StreamIdZero)
+        NonZeroU32::new(raw)
+            .map(Self)
+            .ok_or(DomainError::StreamIdZero)
     }
 }
 
@@ -171,7 +177,13 @@ impl fmt::Display for StreamId {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::doc_markdown
+)]
 mod tests {
     use super::*;
 
@@ -199,13 +211,13 @@ mod tests {
     #[test]
     fn node_id_rejects_forbidden_bytes() {
         let cases: [(&[u8], usize); 7] = [
-            (b"Web", 0),             // maiuscole: niente case folding ambiguo
-            (b"web.01", 3),          // niente FQDN: un'etichetta sola
-            (b"web 01", 3),          // spazi
-            (b"web\n01", 3),         // log injection
-            (b"web\x0001", 3),       // NUL byte
-            (b"w\xc3\xa9b", 1),      // UTF-8 non ASCII (omografie)
-            (b"../etc", 0),          // path traversal se usato in un path
+            (b"Web", 0),        // maiuscole: niente case folding ambiguo
+            (b"web.01", 3),     // niente FQDN: un'etichetta sola
+            (b"web 01", 3),     // spazi
+            (b"web\n01", 3),    // log injection
+            (b"web\x0001", 3),  // NUL byte
+            (b"w\xc3\xa9b", 1), // UTF-8 non ASCII (omografie)
+            (b"../etc", 0),     // path traversal se usato in un path
         ];
         for (input, position) in cases {
             assert_eq!(
@@ -225,10 +237,17 @@ mod tests {
 
     #[test]
     fn session_id_rejects_all_zeros_and_wrong_length() {
-        assert_eq!(SessionId::from_bytes([0; 16]), Err(DomainError::SessionIdZero));
+        assert_eq!(
+            SessionId::from_bytes([0; 16]),
+            Err(DomainError::SessionIdZero)
+        );
         assert_eq!(
             SessionId::try_from(&[1_u8; 15][..]),
-            Err(DomainError::InvalidLength { what: "session id", expected: 16, actual: 15 })
+            Err(DomainError::InvalidLength {
+                what: "session id",
+                expected: 16,
+                actual: 15
+            })
         );
         assert!(SessionId::try_from(&[7_u8; 16][..]).is_ok());
     }

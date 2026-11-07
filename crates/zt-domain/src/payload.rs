@@ -47,9 +47,10 @@ impl TryFrom<Bytes> for FramePayload {
     fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
         match bytes.len() {
             0 => Err(DomainError::PayloadEmpty),
-            len if len > MAX_PAYLOAD_LEN => {
-                Err(DomainError::PayloadTooLarge { len, max: MAX_PAYLOAD_LEN })
-            }
+            len if len > MAX_PAYLOAD_LEN => Err(DomainError::PayloadTooLarge {
+                len,
+                max: MAX_PAYLOAD_LEN,
+            }),
             _ => Ok(Self(bytes)),
         }
     }
@@ -85,12 +86,18 @@ mod tests {
 
     #[test]
     fn payload_bounds_are_enforced() {
-        assert_eq!(FramePayload::try_from(&[][..]), Err(DomainError::PayloadEmpty));
+        assert_eq!(
+            FramePayload::try_from(&[][..]),
+            Err(DomainError::PayloadEmpty)
+        );
         assert!(FramePayload::try_from(vec![0; 1]).is_ok());
         assert!(FramePayload::try_from(vec![0; MAX_PAYLOAD_LEN]).is_ok());
         assert_eq!(
             FramePayload::try_from(vec![0; MAX_PAYLOAD_LEN + 1]),
-            Err(DomainError::PayloadTooLarge { len: MAX_PAYLOAD_LEN + 1, max: MAX_PAYLOAD_LEN })
+            Err(DomainError::PayloadTooLarge {
+                len: MAX_PAYLOAD_LEN + 1,
+                max: MAX_PAYLOAD_LEN
+            })
         );
     }
 

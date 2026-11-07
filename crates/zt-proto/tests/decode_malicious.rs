@@ -2,7 +2,13 @@
 //!
 //! Regola generale: qualunque violazione è un errore **fatale** per la connessione. Il decoder
 //! non tenta mai di risincronizzarsi su un flusso corrotto.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::doc_markdown
+)]
 
 mod common;
 
@@ -30,7 +36,12 @@ fn decode_one(mut buf: BytesMut) -> Result<Option<Frame>, DecodeError> {
 #[test]
 fn ping_has_a_stable_wire_encoding() {
     let mut buf = BytesMut::new();
-    encode(&Frame::Ping { nonce: 0x0102_0304_0506_0708 }, &mut buf);
+    encode(
+        &Frame::Ping {
+            nonce: 0x0102_0304_0506_0708,
+        },
+        &mut buf,
+    );
     assert_eq!(
         &buf[..],
         &[0x01, 0x20, 0, 0, 0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8],
@@ -41,8 +52,17 @@ fn ping_has_a_stable_wire_encoding() {
 #[test]
 fn open_has_a_stable_wire_encoding() {
     let mut buf = BytesMut::new();
-    encode(&Frame::Open { stream: stream(0x0a0b_0c0d), target: node("db1") }, &mut buf);
-    assert_eq!(&buf[..], &[0x01, 0x02, 0x0a, 0x0b, 0x0c, 0x0d, 0, 3, b'd', b'b', b'1']);
+    encode(
+        &Frame::Open {
+            stream: stream(0x0a0b_0c0d),
+            target: node("db1"),
+        },
+        &mut buf,
+    );
+    assert_eq!(
+        &buf[..],
+        &[0x01, 0x02, 0x0a, 0x0b, 0x0c, 0x0d, 0, 3, b'd', b'b', b'1']
+    );
 }
 
 #[test]
@@ -167,7 +187,12 @@ fn rejects_empty_data_frames() {
     let err = decode_one(raw(1, DATA, 1, 0, &[])).unwrap_err();
     assert_eq!(
         err,
-        DecodeError::LengthOutOfBounds { kind: FrameKind::Data, len: 0, min: 1, max: MAX_PAYLOAD_LEN }
+        DecodeError::LengthOutOfBounds {
+            kind: FrameKind::Data,
+            len: 0,
+            min: 1,
+            max: MAX_PAYLOAD_LEN
+        }
     );
 }
 
@@ -223,5 +248,8 @@ fn errors_never_echo_attacker_bytes() {
     let err = decode_one(raw_v1(REGISTER, 0, b"SECRET")).unwrap_err();
     let rendered = format!("{err} {err:?}");
     assert!(!rendered.contains("SECRET"), "{rendered}");
-    assert!(!rendered.contains(core::str::from_utf8(secret).unwrap()), "{rendered}");
+    assert!(
+        !rendered.contains(core::str::from_utf8(secret).unwrap()),
+        "{rendered}"
+    );
 }

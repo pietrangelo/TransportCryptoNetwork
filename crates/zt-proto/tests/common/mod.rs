@@ -1,5 +1,13 @@
 //! Helper condivisi dai test di integrazione di `zt-proto`.
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    dead_code,
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::doc_markdown
+)]
 
 use bytes::{BufMut, BytesMut};
 use proptest::prelude::*;
@@ -19,7 +27,13 @@ pub fn raw(version: u8, kind: u8, stream: u32, len: u16, payload: &[u8]) -> Byte
 
 /// Come [`raw`], con `len` coerente con il payload.
 pub fn raw_v1(kind: u8, stream: u32, payload: &[u8]) -> BytesMut {
-    raw(1, kind, stream, u16::try_from(payload.len()).unwrap(), payload)
+    raw(
+        1,
+        kind,
+        stream,
+        u16::try_from(payload.len()).unwrap(),
+        payload,
+    )
 }
 
 pub fn node(name: &str) -> NodeId {

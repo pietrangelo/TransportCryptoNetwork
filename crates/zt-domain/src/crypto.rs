@@ -35,11 +35,14 @@ impl TryFrom<&[u8]> for Fingerprint {
     type Error = DomainError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        bytes.try_into().map(Self).map_err(|_| DomainError::InvalidLength {
-            what: "fingerprint",
-            expected: Self::LEN,
-            actual: bytes.len(),
-        })
+        bytes
+            .try_into()
+            .map(Self)
+            .map_err(|_| DomainError::InvalidLength {
+                what: "fingerprint",
+                expected: Self::LEN,
+                actual: bytes.len(),
+            })
     }
 }
 
@@ -145,7 +148,11 @@ mod tests {
         assert!(Fingerprint::try_from(&[0_u8; 32][..]).is_ok());
         assert_eq!(
             Fingerprint::try_from(&[0_u8; 31][..]),
-            Err(DomainError::InvalidLength { what: "fingerprint", expected: 32, actual: 31 })
+            Err(DomainError::InvalidLength {
+                what: "fingerprint",
+                expected: 32,
+                actual: 31
+            })
         );
     }
 
