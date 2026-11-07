@@ -103,7 +103,9 @@ impl AccessPolicy {
         if let Some(node) = self.agents.get(peer) {
             return Some(PeerRole::Agent { node });
         }
-        self.clients.get(peer).map(|grant| PeerRole::Client { grant })
+        self.clients
+            .get(peer)
+            .map(|grant| PeerRole::Client { grant })
     }
 
     /// `true` se il client `peer` può aprire uno stream verso `target`.
@@ -112,7 +114,10 @@ impl AccessPolicy {
     #[must_use]
     pub fn may_open(&self, peer: &Fingerprint, target: &NodeId) -> bool {
         self.nodes.contains(target)
-            && self.clients.get(peer).is_some_and(|grant| grant.allowed.permits(target))
+            && self
+                .clients
+                .get(peer)
+                .is_some_and(|grant| grant.allowed.permits(target))
     }
 }
 
@@ -135,10 +140,22 @@ mod tests {
         let mut p = AccessPolicy::new();
         p.add_agent(fp(1), node("web-01")).unwrap();
         p.add_agent(fp(2), node("db-01")).unwrap();
-        p.add_client(fp(10), ClientGrant { name: node("ansible"), allowed: only(&["web-01"]) })
-            .unwrap();
-        p.add_client(fp(11), ClientGrant { name: node("admin"), allowed: AllowedNodes::All })
-            .unwrap();
+        p.add_client(
+            fp(10),
+            ClientGrant {
+                name: node("ansible"),
+                allowed: only(&["web-01"]),
+            },
+        )
+        .unwrap();
+        p.add_client(
+            fp(11),
+            ClientGrant {
+                name: node("admin"),
+                allowed: AllowedNodes::All,
+            },
+        )
+        .unwrap();
         p
     }
 
@@ -152,7 +169,12 @@ mod tests {
     #[test]
     fn roles_are_resolved_by_key() {
         let p = policy();
-        assert_eq!(p.role(&fp(1)), Some(PeerRole::Agent { node: &node("web-01") }));
+        assert_eq!(
+            p.role(&fp(1)),
+            Some(PeerRole::Agent {
+                node: &node("web-01")
+            })
+        );
         assert!(matches!(p.role(&fp(10)), Some(PeerRole::Client { .. })));
         assert_eq!(p.role(&fp(99)), None);
     }
@@ -177,10 +199,22 @@ mod tests {
     fn a_key_has_exactly_one_role_and_a_node_one_agent() {
         let mut p = policy();
         assert_eq!(
-            p.add_client(fp(1), ClientGrant { name: node("x"), allowed: AllowedNodes::All }),
+            p.add_client(
+                fp(1),
+                ClientGrant {
+                    name: node("x"),
+                    allowed: AllowedNodes::All
+                }
+            ),
             Err(DomainError::DuplicatePeer(fp(1)))
         );
-        assert_eq!(p.add_agent(fp(10), node("new")), Err(DomainError::DuplicatePeer(fp(10))));
-        assert_eq!(p.add_agent(fp(3), node("web-01")), Err(DomainError::DuplicateNode(node("web-01"))));
+        assert_eq!(
+            p.add_agent(fp(10), node("new")),
+            Err(DomainError::DuplicatePeer(fp(10)))
+        );
+        assert_eq!(
+            p.add_agent(fp(3), node("web-01")),
+            Err(DomainError::DuplicateNode(node("web-01")))
+        );
     }
 }

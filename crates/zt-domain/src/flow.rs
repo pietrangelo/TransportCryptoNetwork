@@ -54,7 +54,10 @@ impl Window {
     /// # Errors
     /// Il nome della regola violata se il credito non basta.
     pub fn consume(&mut self, len: usize) -> Result<(), &'static str> {
-        self.0 = self.0.checked_sub(charge(len)).ok_or("data exceeds flow-control window")?;
+        self.0 = self
+            .0
+            .checked_sub(charge(len))
+            .ok_or("data exceeds flow-control window")?;
         Ok(())
     }
 

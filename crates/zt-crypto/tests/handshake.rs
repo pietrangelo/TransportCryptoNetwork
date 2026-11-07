@@ -1,13 +1,26 @@
 //! Specifica e attacchi dell'adapter crittografico (Adversarial TDD, Fase 2).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 
 use zt_crypto::noise::{self, Channel, MAX_PLAINTEXT_LEN};
 use zt_crypto::{CryptoError, Identity, PublicKey};
 
-fn pair(initiator: &Identity, responder: &Identity, ch: Channel) -> (noise::Transport, noise::Transport) {
+fn pair(
+    initiator: &Identity,
+    responder: &Identity,
+    ch: Channel,
+) -> (noise::Transport, noise::Transport) {
     let (msg1, waiting) = noise::initiate(initiator, &responder.public_key(), ch).unwrap();
     let pending = noise::respond(responder, &msg1, ch).unwrap();
-    assert_eq!(pending.peer(), initiator.fingerprint(), "responder learns initiator identity");
+    assert_eq!(
+        pending.peer(),
+        initiator.fingerprint(),
+        "responder learns initiator identity"
+    );
     let (msg2, resp) = pending.accept().unwrap();
     let init = waiting.complete(&msg2).unwrap();
     (init, resp)
@@ -49,7 +62,10 @@ fn maximum_plaintext_fits_one_noise_message() {
     let ct = x.encrypt(&big).unwrap();
     assert_eq!(ct.len(), 65_535);
     assert_eq!(y.decrypt(&ct).unwrap(), big);
-    assert!(matches!(x.encrypt(&[0; MAX_PLAINTEXT_LEN + 1]), Err(CryptoError::MessageTooLarge)));
+    assert!(matches!(
+        x.encrypt(&vec![0; MAX_PLAINTEXT_LEN + 1]),
+        Err(CryptoError::MessageTooLarge)
+    ));
 }
 
 // ---------- attacchi ----------
@@ -65,7 +81,10 @@ fn initiator_rejects_an_impostor_responder() {
     assert!(noise::respond(&mitm, &msg1, Channel::Outer).is_err());
     // Né può forgiare una risposta che il client accetti.
     let (fake1, _) = noise::initiate(&mitm, &mitm.public_key(), Channel::Outer).unwrap();
-    let (fake2, _) = noise::respond(&mitm, &fake1, Channel::Outer).unwrap().accept().unwrap();
+    let (fake2, _) = noise::respond(&mitm, &fake1, Channel::Outer)
+        .unwrap()
+        .accept()
+        .unwrap();
     assert!(waiting.complete(&fake2).is_err());
 }
 
@@ -112,7 +131,10 @@ fn replayed_and_reordered_transport_messages_are_rejected() {
 fn garbage_handshake_inputs_never_panic() {
     let b = Identity::generate().unwrap();
     for len in [0, 1, 31, 32, 95, 96, 97, 1000, 65_535, 70_000] {
-        assert!(noise::respond(&b, &vec![0xff; len], Channel::Outer).is_err(), "len {len}");
+        assert!(
+            noise::respond(&b, &vec![0xff; len], Channel::Outer).is_err(),
+            "len {len}"
+        );
     }
 }
 
@@ -121,7 +143,10 @@ fn weak_and_malformed_public_keys_are_rejected() {
     // Il punto identità (y = 1) è di ordine piccolo: un DH con esso dà un segreto noto.
     let mut identity = [0_u8; 32];
     identity[0] = 1;
-    assert!(matches!(hex::encode(identity).parse::<PublicKey>(), Err(CryptoError::WeakKey)));
+    assert!(matches!(
+        hex::encode(identity).parse::<PublicKey>(),
+        Err(CryptoError::WeakKey)
+    ));
     for bad in ["", "zz", &"0".repeat(63), &"0".repeat(65), &"g".repeat(64)] {
         assert!(bad.parse::<PublicKey>().is_err(), "{bad:?}");
     }
