@@ -281,9 +281,14 @@ impl Downlink<'_> {
                         .consume(payload.len())
                         .map_err(NetError::Protocol)?;
                     let plaintext = lock(self.transport)?.decrypt(payload.as_bytes())?;
-                    timeout(timeouts.write, writer.write_all(&plaintext))
-                        .await
-                        .map_err(|_| NetError::Timeout("local write"))??;
+                    // Flush a ogni messaggio: lo stdout di `zt-client` è bufferizzato a righe e
+                    // SSH non manda righe (finding 0003-1).
+                    timeout(timeouts.write, async {
+                        writer.write_all(&plaintext).await?;
+                        writer.flush().await
+                    })
+                    .await
+                    .map_err(|_| NetError::Timeout("local write"))??;
                     self.consumed = self.consumed.saturating_add(charge(payload.len()));
                     if self.consumed >= UPDATE_THRESHOLD {
                         let credit = Credit::try_from(self.consumed)

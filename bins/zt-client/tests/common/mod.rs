@@ -2,6 +2,8 @@
 //! processo figlio (come lo lancia OpenSSH).
 #![allow(
     dead_code,
+    unreachable_pub,
+    clippy::format_push_string,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

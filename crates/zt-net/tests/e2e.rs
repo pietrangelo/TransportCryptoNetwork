@@ -193,6 +193,26 @@ async fn ssh_bytes_round_trip_through_the_relay() {
     assert!(result.is_ok(), "{result:?}");
 }
 
+/// Regressione 0003-1: lo stdout di `zt-client` è bufferizzato; senza flush i byte di SSH
+/// (che non terminano a fine riga) restano nel buffer e la sessione si blocca.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivered_bytes_are_flushed_to_a_buffered_local_writer() {
+    let fleet = Fleet::start(test_relay_config()).await;
+    fleet.start_agent().await;
+    let (mut app, local) = tokio::io::duplex(64 * 1024);
+    let local = tokio::io::BufWriter::with_capacity(8192, local);
+    let config = fleet.client_config("web-01");
+    let _session =
+        tokio::spawn(async move { client::connect(&fleet.ansible, &config, local).await });
+    app.write_all(b"no newline").await.unwrap();
+    let mut echoed = [0_u8; 10];
+    tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut echoed))
+        .await
+        .expect("bytes stuck in the local write buffer")
+        .unwrap();
+    assert_eq!(&echoed, b"no newline");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_transfer_is_flow_controlled_and_intact() {
     // 8 MiB: 32 volte la finestra iniziale, quindi servono molti WindowUpdate.

@@ -10,7 +10,8 @@
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
     clippy::panic,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::similar_names
 )]
 
 mod common;
@@ -35,11 +36,10 @@ fn sshd_path() -> PathBuf {
 }
 
 async fn run(cmd: &mut Command) -> std::process::Output {
-    let out = tokio::time::timeout(Duration::from_secs(120), cmd.output())
+    tokio::time::timeout(Duration::from_secs(120), cmd.output())
         .await
         .expect("command timed out")
-        .unwrap();
-    out
+        .unwrap()
 }
 
 fn text(b: &[u8]) -> String {
@@ -113,7 +113,7 @@ impl Lab {
 
         let host_pub = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
         std::fs::write(dir.join("known_hosts"), format!("web-01 {host_pub}")).unwrap();
-        let user = text(&run(&mut Command::new("id").arg("-un")).await.stdout)
+        let user = text(&run(Command::new("id").arg("-un")).await.stdout)
             .trim()
             .to_owned();
         let ssh_config = dir.join("ssh_config");

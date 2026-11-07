@@ -72,11 +72,14 @@ pub enum ConfigError {
     },
 }
 
+/// Legge un file di trust: rifiuta file scrivibili da gruppo o altri (finding 0003, come
+/// `StrictModes` di OpenSSH), con il controllo fatto sul file già aperto.
 fn read_limited(path: &Path) -> Result<String, ConfigError> {
     let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
         path: path.display().to_string(),
         source,
     })?;
+    check_not_writable(&file, path)?;
     read_file_limited(file, path)
 }
 
@@ -107,6 +110,25 @@ fn check_private(file: &std::fs::File, path: &Path) -> Result<(), ConfigError> {
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(ConfigError::InsecurePermissions(display));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_not_writable(file: &std::fs::File, path: &Path) -> Result<(), ConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+    let display = path.display().to_string();
+    let meta = file.metadata().map_err(|source| ConfigError::Io {
+        path: display.clone(),
+        source,
+    })?;
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Err(ConfigError::WritableByOthers(display));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_not_writable(_file: &std::fs::File, _path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
@@ -200,6 +222,16 @@ struct PolicyFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NodesFile {
+    #[serde(default)]
+    nodes: Vec<NodeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientFile {
+    relay: String,
+    relay_key: String,
+    key: String,
     #[serde(default)]
     nodes: Vec<NodeEntry>,
 }
@@ -340,6 +372,9 @@ pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PublicKey>, Confi
     parse_known_nodes(&path.display().to_string(), &read_limited(path)?)
 }
 
+/// Lunghezza massima dell'indirizzo del relay (nome DNS completo più porta).
+const MAX_RELAY_LEN: usize = 261;
+
 /// Configurazione di `zt-client`.
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
@@ -349,7 +384,8 @@ pub struct ClientSettings {
     pub relay_key: PublicKey,
     /// File della chiave segreta del client.
     pub key: std::path::PathBuf,
-    /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent.
+    /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent. Un nodo assente non
+    /// è raggiungibile: non esiste trust-on-first-use.
     pub nodes: HashMap<NodeId, PublicKey>,
 }
 
@@ -363,28 +399,98 @@ impl ClientSettings {
         node: &NodeId,
         timeouts: crate::Timeouts,
     ) -> Result<crate::client::ClientConfig, ConfigError> {
-        let _ = timeouts;
-        Err(ConfigError::UnknownNode(node.to_string()))
+        let node_key = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| ConfigError::UnknownNode(node.to_string()))?;
+        Ok(crate::client::ClientConfig {
+            relay: self.relay.clone(),
+            relay_key: self.relay_key,
+            node: node.clone(),
+            node_key: *node_key,
+            timeouts,
+        })
     }
 }
 
-/// Interpreta la configurazione del client.
+/// `host:porta` con porta numerica non nulla, senza spazi né caratteri di controllo.
+fn valid_relay(text: &str) -> bool {
+    if text.is_empty()
+        || text.len() > MAX_RELAY_LEN
+        || text.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    match text.rsplit_once(':') {
+        Some((host, port)) => {
+            !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0) && !port.starts_with('+')
+        }
+        None => false,
+    }
+}
+
+/// Interpreta la configurazione del client. `base` è la directory del file: un percorso
+/// relativo della chiave si risolve rispetto a essa.
+///
+/// ```toml
+/// relay = "relay.example.org:7443"
+/// relay_key = "<64 hex>"
+/// key = "client.key"
+///
+/// [[nodes]]
+/// node = "web-01"
+/// public_key = "<64 hex>"
+/// ```
 ///
 /// # Errors
-/// Qualsiasi voce non valida.
+/// Qualsiasi voce non valida, duplicata o in conflitto.
 pub fn parse_client_settings(
     origin: &str,
     base: &Path,
     text: &str,
 ) -> Result<ClientSettings, ConfigError> {
-    let _ = (base, text);
-    Err(ConfigError::TooLarge(origin.into()))
+    let ctx = Ctx(origin);
+    let file: ClientFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    if !valid_relay(&file.relay) {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "relay must be host:port".into(),
+        });
+    }
+    if file.key.is_empty() {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "key must name the client secret key file".into(),
+        });
+    }
+    let relay_key = ctx.key("relay_key", &file.relay_key)?;
+    let mut nodes = HashMap::new();
+    for entry in &file.nodes {
+        let node = ctx.node(&entry.node, &entry.node)?;
+        let key = ctx.key(&entry.node, &entry.public_key)?;
+        if key.fingerprint() == relay_key.fingerprint() {
+            return Err(ctx.domain(&entry.node, DomainError::DuplicatePeer(key.fingerprint())));
+        }
+        if nodes.insert(node.clone(), key).is_some() {
+            return Err(ctx.domain(&entry.node, DomainError::DuplicateNode(node)));
+        }
+    }
+    Ok(ClientSettings {
+        relay: file.relay,
+        relay_key,
+        key: base.join(&file.key),
+        nodes,
+    })
 }
 
 /// Legge e interpreta la configurazione del client.
 ///
 /// # Errors
-/// Vedi [`parse_client_settings`].
+/// Vedi [`parse_client_settings`]; inoltre file scrivibile da gruppo o altri.
 pub fn load_client_settings(path: &Path) -> Result<ClientSettings, ConfigError> {
-    Err(ConfigError::TooLarge(path.display().to_string()))
+    let base = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    parse_client_settings(&path.display().to_string(), base, &read_limited(path)?)
 }
