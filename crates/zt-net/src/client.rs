@@ -71,7 +71,7 @@ where
         let msg2 = io.recv_message(t).await?;
         let mut transport = waiting.complete(&msg2)?;
         io.send_data(transport.encrypt(CONFIRM)?).await?;
-        pump(io, transport, local, t).await
+        pump(io, transport, local, None).await
     };
     let (link, session) = tokio::join!(relay_link, session);
     session.and(link)

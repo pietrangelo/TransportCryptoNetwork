@@ -55,7 +55,7 @@ esponenziale (1 s → 60 s, con jitter) e inoltra solo a `127.0.0.1:22`
 
 ## 5. Client: `zt-client`
 
-`~/.config/tcn/client.toml` (permessi `0600` o `0644`, mai scrivibile da gruppo o altri):
+`~/.config/tcn/client.toml`:
 
 ```toml
 relay = "relay.example.org:7443"
@@ -70,6 +70,11 @@ public_key = "<chiave pubblica dell'agent di web-01>"
 node = "db-01"
 public_key = "<chiave pubblica dell'agent di db-01>"
 ```
+
+Come per `StrictModes` di OpenSSH, ogni file di trust (questo, la policy del relay, i client
+autorizzati dell'agent) deve essere un file regolare, dell'utente che esegue il binario o di
+root, non scrivibile da gruppo o altri, in una directory con le stesse regole; le chiavi
+segrete inoltre non devono essere leggibili da gruppo o altri (`chmod 600`).
 
 Non c'è trust-on-first-use: un nodo senza voce in `[[nodes]]` non si raggiunge, e
 `zt-client` lo rifiuta prima di aprire qualsiasi connessione. Il percorso si sceglie con
@@ -91,6 +96,9 @@ Host *.tcn
 `ssh web-01.tcn` apre lo stream verso il nodo `web-01`. Senza suffisso si può elencare gli
 host (`Host web-01 db-01`) e usare `ProxyCommand zt-client connect %n`. Il nome deve essere
 già un nome di nodo valido (`[a-z0-9-]`, 1..=63): `zt-client` non lo normalizza.
+`%n` conserva le maiuscole scritte dall'utente (`ssh WEB-01` fallisce); `%h` è già in
+minuscolo. Le opzioni di `zt-client` vanno prima del nome del nodo
+(`zt-client --config ~/tcn.toml connect %n`): dopo il nome non si legge nessuna opzione.
 
 TCN non sostituisce l'autenticazione SSH: l'host key del server e la chiave dell'utente si
 verificano come sempre, end-to-end attraverso il tunnel. `zt-client` scrive su stdout solo i

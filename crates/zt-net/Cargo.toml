@@ -23,6 +23,9 @@ toml.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros"] }
 

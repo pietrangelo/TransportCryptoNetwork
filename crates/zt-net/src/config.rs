@@ -39,6 +39,17 @@ pub enum ConfigError {
     /// o altri: chi può scriverlo può sostituire una chiave.
     #[error("{0}: trust file must not be writable by group or others (chmod go-w)")]
     WritableByOthers(String),
+    /// Il file non è un file regolare (FIFO, dispositivo, directory).
+    #[error("{0}: not a regular file")]
+    NotRegular(String),
+    /// Il file appartiene a un utente diverso da quello corrente e da root.
+    #[error("{0}: must be owned by the current user or root")]
+    UntrustedOwner(String),
+    /// La directory che contiene il file è di un altro utente o scrivibile da gruppo o altri.
+    #[error(
+        "{0}: directory must be owned by the current user or root and not writable by group or others"
+    )]
+    InsecureDirectory(String),
     /// Nodo senza chiave pinnata nella configurazione del client.
     #[error("unknown node {0}: no pinned key in the client configuration")]
     UnknownNode(String),
@@ -72,15 +83,105 @@ pub enum ConfigError {
     },
 }
 
-/// Legge un file di trust: rifiuta file scrivibili da gruppo o altri (finding 0003, come
-/// `StrictModes` di OpenSSH), con il controllo fatto sul file già aperto.
-fn read_limited(path: &Path) -> Result<String, ConfigError> {
-    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
-        path: path.display().to_string(),
+/// Apre un file di trust o una chiave segreta e verifica, sul file **già aperto** (nessuna
+/// finestra tra controllo e lettura), ciò che verifica OpenSSH con `StrictModes`
+/// (finding 0003-1): file regolare, proprietario l'utente corrente o root, nessun permesso di
+/// scrittura per gruppo e altri (per una chiave segreta: nessun permesso per gruppo e altri).
+/// La directory che lo contiene deve rispettare le stesse regole di proprietà e scrittura,
+/// perché chi può scriverci può sostituire il file.
+fn open_trusted(path: &Path, private: bool) -> Result<std::fs::File, ConfigError> {
+    let display = || path.display().to_string();
+    let io = |source| ConfigError::Io {
+        path: display(),
+        source,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // Un FIFO aperto senza O_NONBLOCK blocca finché qualcuno non lo apre in scrittura.
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
+    let file = options.open(path).map_err(io)?;
+    let meta = file.metadata().map_err(io)?;
+    let uid = current_uid();
+    check_trusted(&meta, uid, path, private)?;
+    check_directory(path, uid)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// Controllo puro sui metadati di un file di configurazione aperto: `uid` è l'utente per cui
+/// il file deve essere affidabile. `private` vale per le chiavi segrete.
+///
+/// # Errors
+/// [`ConfigError::NotRegular`], [`ConfigError::UntrustedOwner`],
+/// [`ConfigError::InsecurePermissions`] (solo `private`), [`ConfigError::WritableByOthers`].
+pub fn check_trusted(
+    meta: &std::fs::Metadata,
+    uid: u32,
+    path: &Path,
+    private: bool,
+) -> Result<(), ConfigError> {
+    let display = path.display().to_string();
+    if !meta.is_file() {
+        return Err(ConfigError::NotRegular(display));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(ConfigError::UntrustedOwner(display));
+        }
+        let mode = meta.mode();
+        if private && mode & 0o077 != 0 {
+            return Err(ConfigError::InsecurePermissions(display));
+        }
+        if mode & 0o022 != 0 {
+            return Err(ConfigError::WritableByOthers(display));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (uid, private);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_directory(path: &Path, uid: u32) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let display = dir.display().to_string();
+    let meta = std::fs::metadata(dir).map_err(|source| ConfigError::Io {
+        path: display.clone(),
         source,
     })?;
-    check_not_writable(&file, path)?;
-    read_file_limited(file, path)
+    if (meta.uid() != uid && meta.uid() != 0) || meta.mode() & 0o022 != 0 {
+        return Err(ConfigError::InsecureDirectory(display));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_directory(_path: &Path, _uid: u32) -> Result<(), ConfigError> {
+    Ok(())
+}
+
+/// Legge un file di trust (vedi [`open_trusted`]).
+fn read_limited(path: &Path) -> Result<String, ConfigError> {
+    read_file_limited(open_trusted(path, false)?, path)
 }
 
 fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigError> {
@@ -98,55 +199,13 @@ fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigE
     Ok(text)
 }
 
-/// Verifica i permessi sul file **già aperto**: nessuna finestra tra controllo e lettura.
-#[cfg(unix)]
-fn check_private(file: &std::fs::File, path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::PermissionsExt;
-    let display = path.display().to_string();
-    let meta = file.metadata().map_err(|source| ConfigError::Io {
-        path: display.clone(),
-        source,
-    })?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(ConfigError::InsecurePermissions(display));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn check_not_writable(file: &std::fs::File, path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::PermissionsExt;
-    let display = path.display().to_string();
-    let meta = file.metadata().map_err(|source| ConfigError::Io {
-        path: display.clone(),
-        source,
-    })?;
-    if meta.permissions().mode() & 0o022 != 0 {
-        return Err(ConfigError::WritableByOthers(display));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_not_writable(_file: &std::fs::File, _path: &Path) -> Result<(), ConfigError> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_private(_file: &std::fs::File, _path: &Path) -> Result<(), ConfigError> {
-    Ok(())
-}
-
-/// Carica un'identità da file, rifiutando permessi troppo larghi (come fa OpenSSH).
+/// Carica un'identità da file, con le stesse verifiche di OpenSSH sulle chiavi private.
 ///
 /// # Errors
-/// File illeggibile, permessi insicuri, contenuto non valido.
+/// File illeggibile, non regolare, di un altro utente, con permessi insicuri o in una
+/// directory insicura; contenuto non valido.
 pub fn load_identity(path: &Path) -> Result<Identity, ConfigError> {
-    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    check_private(&file, path)?;
+    let file = open_trusted(path, true)?;
     let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
     Identity::from_secret_hex(&text).map_err(|source| ConfigError::Key {
         path: path.display().to_string(),

@@ -28,7 +28,8 @@ const CONFIG_ENV: &str = "TCN_CLIENT_CONFIG";
 struct Cli {
     /// Configurazione del client. Default: `$TCN_CLIENT_CONFIG`, poi
     /// `$XDG_CONFIG_HOME/tcn/client.toml`, poi `~/.config/tcn/client.toml`.
-    #[arg(long, global = true)]
+    /// Va indicata prima del comando: dopo il nome del nodo non si legge nessuna opzione.
+    #[arg(long)]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -48,8 +49,11 @@ enum Command {
         /// `Host *.tcn`). Se indicato, il nome deve terminare con esso.
         #[arg(long)]
         strip_suffix: Option<String>,
-        /// Nodo di destinazione.
-        node: String,
+        /// Nodo di destinazione. È l'ultimo argomento: tutto ciò che segue finisce qui e
+        /// viene rifiutato, così un nome host con spazi passato da `ssh` tramite `sh -c` non
+        /// può aggiungere opzioni (finding 0003-4).
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        node: Vec<String>,
     },
 }
 
@@ -65,9 +69,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Keygen { out } => keygen(&out),
-        Command::Connect { strip_suffix, node } => {
-            connect(cli.config, strip_suffix.as_deref(), &node)
-        }
+        Command::Connect { strip_suffix, node } => match node.as_slice() {
+            [name] => connect(cli.config, strip_suffix.as_deref(), name),
+            _ => Err("expected exactly one node name, and no option after it".into()),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -164,9 +169,19 @@ fn describe(err: &NetError, node: &NodeId) -> String {
         NetError::StreamClosed(CloseReason::Unauthorized) => {
             format!("access denied by the agent of {node} (client key not authorized there)")
         }
-        NetError::Crypto(_) | NetError::Closed => {
+        NetError::StreamClosed(CloseReason::PeerGone) => format!(
+            "node {node}: the agent closed the session (ssh daemon unreachable, or agent restarting)"
+        ),
+        NetError::StreamClosed(CloseReason::Drained) => {
+            format!("node {node} is draining (maintenance or shutdown)")
+        }
+        NetError::StreamClosed(reason) => format!("node {node}: session closed: {reason:?}"),
+        NetError::Crypto(_) => {
             format!("secure channel failed: check relay_key and the pinned key of {node} ({err})")
         }
+        NetError::Closed => "the relay closed the connection (wrong relay_key, client key \
+             not in the relay policy, or relay restart)"
+            .into(),
         other => other.to_string(),
     }
 }

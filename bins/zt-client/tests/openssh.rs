@@ -261,7 +261,7 @@ async fn ansible_playbook_runs_through_tcn() {
         d.join("ansible.cfg"),
         format!(
             "[defaults]\nhost_key_checking = True\nlocal_tmp = {d}/ansible-local\nremote_tmp = /tmp/.tcn-ansible\n\
-             [ssh_connection]\nssh_args = -F {cfg}\npipelining = True\n",
+             [ssh_connection]\nssh_args = -F {cfg} -o ControlMaster=auto -o ControlPersist=5s -o ControlPath={d}/cm-%%C\npipelining = True\n",
             d = d.display(),
             cfg = lab.ssh_config.display()
         ),

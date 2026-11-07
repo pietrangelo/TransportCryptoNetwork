@@ -183,16 +183,20 @@ peer è quindi limitata a `stream × MAX_WINDOW`.
 collega stdin/stdout di OpenSSH al canale end-to-end.
 
 - **Chiavi pinnate, niente TOFU.** Chiave del relay e chiave dell'agent di ogni nodo vengono da
-  `client.toml`. Un nodo senza chiave pinnata, un nome non valido, un file di trust
-  scrivibile da altri o una chiave segreta leggibile da altri fanno fallire il client prima di
-  qualsiasi connessione.
+  `client.toml`. Un nodo senza chiave pinnata, un nome non valido, un file di trust non
+  regolare, di un altro utente o scrivibile da altri (anche tramite la directory), o una chiave
+  segreta leggibile da altri fanno fallire il client prima di qualsiasi connessione.
 - **stdout è il canale SSH.** Ci finiscono solo byte decifrati dal canale end-to-end; log ed
   errori vanno su stderr. Ogni messaggio consegnato viene scritto e svuotato subito (stdout è
   bufferizzato a righe e SSH non manda righe).
 - **Chiusura.** EOF su stdin chiude lo stream (`Close Normal`); la chiusura dal lato del nodo
   chiude stdout e termina il processo anche se stdin resta aperto. Non c'è half-close: SSH non
   ne ha bisogno, perché il suo EOF di canale viaggia dentro il protocollo SSH.
-- **Codice d'uscita.** 0 a chiusura ordinata, 1 per ogni errore, 2 per argomenti non validi.
+- **Codice d'uscita.** 0 solo per `Close Normal` o EOF locale; 1 per ogni altro esito,
+  compresa una `Close` d'errore dell'agent (per esempio sshd irraggiungibile); 2 per argomenti
+  non validi.
+- **Nessun timeout di scrittura su stdout.** Un `ssh` sospeso smette di leggere: la finestra
+  limita la memoria e la sessione riprende quando ssh torna a leggere.
 
 ## 12. Fuori dall'ambito della Fase 3
 

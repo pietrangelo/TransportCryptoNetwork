@@ -1574,6 +1574,7 @@ dependencies = [
  "bytes",
  "futures",
  "getrandom 0.4.3",
+ "rustix",
  "serde",
  "thiserror",
  "tokio",

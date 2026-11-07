@@ -212,3 +212,54 @@ async fn trace_logging_never_reaches_stdout_nor_leaks_the_secret() {
     assert!(!out.stderr.contains(secret.as_str()), "secret key in logs");
     assert!(!out.stderr.contains("payload marker"), "payload in logs");
 }
+
+// ======================= regressioni adversary review 0003 =======================
+
+/// 0003-3: se l'agent non raggiunge sshd il client usciva con 0 e senza messaggi.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unreachable_sshd_is_an_error_with_a_message() {
+    let fleet = Fleet::start().await;
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    fleet.start_agent(closed).await;
+    let dir = fleet.client_dir(&fleet.ansible);
+    let mut child = dir.spawn("web-01");
+    let _stdin = child.stdin.take();
+    let out = tokio::time::timeout(LIMIT, child.wait_with_output())
+        .await
+        .expect("hung")
+        .unwrap();
+    assert!(!out.status.success(), "exit 0 although no session was made");
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("web-01") && stderr.contains("unreachable"),
+        "stderr: {stderr}"
+    );
+}
+
+/// 0003-4: ssh esegue `sh -c "exec zt-client ... %n"`. Con un OpenSSH vecchio un nome host
+/// con spazi diventa argomenti in più: nessuna opzione dopo il nome del nodo viene letta.
+#[tokio::test]
+async fn options_after_the_node_name_are_never_parsed() {
+    let me = Identity::generate().unwrap();
+    let (good_relay, good) = bait_dir(&me, &[("web-01", some_key())]).await;
+    let (evil_relay, evil) = bait_dir(&me, &[("web-01", some_key())]).await;
+    let g = good.config();
+    let e = evil.config();
+    for extra in [
+        vec!["--config", e.to_str().unwrap()],
+        vec!["--strip-suffix", "-01"],
+        vec!["db-01"],
+    ] {
+        let mut args = vec!["--config", g.to_str().unwrap(), "connect", "web-01"];
+        args.extend(extra.iter().copied());
+        let out = finish(spawn_with(&args, &[]), LIMIT).await;
+        assert!(!out.success, "accepted {args:?}");
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(good_relay.count(), 0);
+    assert_eq!(evil_relay.count(), 0);
+}

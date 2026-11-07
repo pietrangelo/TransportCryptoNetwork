@@ -276,3 +276,110 @@ fn trust_files_writable_by_others_are_refused() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ======================= regressioni adversary review 0003 =======================
+
+/// 0003-1: un file di trust di un altro utente (non root) viene rifiutato anche se i bit di
+/// modo sono corretti. Il controllo è puro, così si prova senza `chown`.
+#[cfg(unix)]
+#[test]
+fn trust_files_owned_by_another_user_are_refused() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = std::env::temp_dir().join(format!("zt-config-owner-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("f.toml");
+    std::fs::write(&p, "").unwrap();
+    let meta = std::fs::metadata(&p).unwrap();
+    let owner = meta.uid();
+    assert!(zt_net::config::check_trusted(&meta, owner, &p, false).is_ok());
+    let stranger = if owner == 1234 { 4321 } else { 1234 };
+    if owner != 0 {
+        assert!(matches!(
+            zt_net::config::check_trusted(&meta, stranger, &p, false),
+            Err(ConfigError::UntrustedOwner(_))
+        ));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 0003-1: un FIFO al posto del file bloccava per sempre `open`; ora è rifiutato subito.
+#[cfg(unix)]
+#[test]
+fn non_regular_trust_and_key_files_are_refused_without_blocking() {
+    let dir = std::env::temp_dir().join(format!("zt-config-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("f.toml");
+    let _ = std::fs::remove_file(&fifo);
+    assert!(
+        std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let a = matches!(
+            zt_net::config::load_policy(&path),
+            Err(ConfigError::NotRegular(_))
+        );
+        let b = matches!(
+            zt_net::config::load_identity(&path),
+            Err(ConfigError::NotRegular(_))
+        );
+        let c = matches!(
+            zt_net::config::load_client_settings(&path),
+            Err(ConfigError::NotRegular(_))
+        );
+        let _ = tx.send(a && b && c);
+    });
+    let ok = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("open blocked on a FIFO");
+    assert!(ok);
+    // Anche una directory non è un file di configurazione.
+    assert!(matches!(
+        zt_net::config::load_policy(&dir),
+        Err(ConfigError::NotRegular(_))
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 0003-1: chi può scrivere nella directory può sostituire il file (rename), quindi la
+/// directory che lo contiene deve essere protetta quanto il file.
+#[cfg(unix)]
+#[test]
+fn trust_files_in_a_directory_writable_by_others_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("zt-config-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let k = key();
+    let p = dir.join("nodes.toml");
+    std::fs::write(
+        &p,
+        format!("[[nodes]]\nnode = \"web-01\"\npublic_key = \"{k}\""),
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    for mode in [0o755, 0o700] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            zt_net::config::load_known_nodes(&p).is_ok(),
+            "dir {mode:o} refused"
+        );
+    }
+    for mode in [0o775, 0o757, 0o777, 0o1777] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(
+                zt_net::config::load_known_nodes(&p),
+                Err(ConfigError::InsecureDirectory(_))
+            ),
+            "dir {mode:o} accepted"
+        );
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
