@@ -8,11 +8,11 @@ dall'altra parte del socket ci sia un attaccante. La metodologia unisce tre prat
 | Crate | Strato | Regola |
 | :- | :- | :- |
 | `zt-domain` | Domain core | puro: niente async, niente I/O, niente orologio, niente casualità |
+| `zt-application` | Application layer | casi d'uso sans-IO (relay core); tempo e casualità entrano come parametri o porte |
 | `zt-proto` | Adapter (wire format) | sans-IO; l'integrazione con tokio è dietro la feature `codec` |
-| `zt-relay`, `zt-agent`, `zt-client` | Adapter inbound/outbound + composition root | wiring, CLI, rete |
-
-Gli use case (application layer) entreranno in un crate `zt-application` nella Fase 2,
-dipendendo solo da `zt-domain` e da trait (porte) implementati dagli adapter.
+| `zt-crypto` | Adapter (crittografia) | sans-IO; handshake con typestate |
+| `zt-net` | Adapter (rete, file) | tokio; ogni I/O ha un timeout, ogni coda è limitata |
+| `zt-relay`, `zt-agent`, `zt-client` | Composition root | CLI e wiring |
 
 **Invalid states are unrepresentable**: i value object si costruiscono solo tramite
 `TryFrom`/factory che validano; un `Frame` esistente è valido per costruzione, quindi

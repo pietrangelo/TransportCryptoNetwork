@@ -74,7 +74,8 @@ non compila.
 `0x05` ResourceExhausted.
 
 ### 4.4 `CloseReason`
-`0x00` Normal, `0x01` Timeout, `0x02` ProtocolViolation, `0x03` Drained, `0x04` PeerGone.
+`0x00` Normal, `0x01` Timeout, `0x02` ProtocolViolation, `0x03` Drained, `0x04` PeerGone,
+`0x05` Unauthorized (l'agent rifiuta l'identità end-to-end del client).
 
 ## 5. Regole del decoder
 
@@ -101,8 +102,73 @@ Open { stream: 0x0a0b0c0d, target: "db1" }
 01 02 0a 0b 0c 0d 00 03 64 62 31
 ```
 
-## 7. Fuori dall'ambito della Fase 1
+## 7. Trasporto e handshake
 
-Handshake Noise e legame tra chiave statica e `NodeId`, controllo di flusso a credito,
-rate limiting, timeout e keepalive: sono responsabilità degli use case e degli adapter di
-rete (Fase 2). Il framing garantisce solo che ogni frame ricevuto sia ben formato.
+### 7.1 Messaggi su TCP
+Ogni messaggio Noise è preceduto dalla sua lunghezza come `u16` big-endian (massimo 65 535).
+Dopo l'handshake ogni messaggio Noise contiene **esattamente un** frame: byte in eccesso o un
+frame incompleto sono violazioni fatali.
+
+### 7.2 Identità
+Ogni nodo ha una chiave Ed25519 a lungo termine (file esadecimale, permessi `0600`). Per Noise
+si usa la sua forma X25519 (mappa Edwards → Montgomery). La **fingerprint** è
+`SHA-256("TCN fingerprint v1\0" || x25519_public)`, mostrata come `SHA256:<hex>`.
+Chiavi pubbliche di ordine piccolo sono rifiutate al caricamento.
+
+### 7.3 Handshake
+`Noise_IK_25519_ChaChaPoly_BLAKE2s`, payload vuoti, con prologue diverso per canale:
+
+| Canale | Initiator | Responder | Prologue |
+| :- | :- | :- | :- |
+| esterno | agent o client | relay | `TCN/1 outer` |
+| end-to-end | client | agent (dentro frame `Data`) | `TCN/1 end-to-end` |
+
+L'initiator pinna la chiave del responder. Il responder impara l'identità dell'initiator dal
+primo messaggio e, se non è nella sua whitelist, **non risponde**: chiude senza inviare il
+secondo messaggio.
+
+## 8. Ciclo di vita
+
+1. L'agent si connette, completa l'handshake e invia `Register` entro 10 s con il nome che la
+   policy associa alla sua chiave. Un secondo agent con la stessa chiave sostituisce il primo.
+2. Il client si connette e invia `Open { stream, target }`. Il relay risponde `Reject
+   NotAuthorized` sia per nodi non concessi sia per nodi inesistenti (nessun oracolo),
+   `NodeOffline` o `ResourceExhausted`; altrimenti inoltra `Open` all'agent con uno stream id
+   scelto dal relay (crescente, mai riusato).
+3. L'agent risponde `OpenAck`. Il primo `Data` del client contiene il messaggio 1
+   dell'handshake end-to-end; l'agent verifica il client contro il **proprio** elenco e, se
+   non lo conosce, chiude con `Close Unauthorized`. Poi i `Data` portano i byte SSH cifrati.
+4. `Close` da una parte viene inoltrato all'altra. La caduta di una connessione chiude con
+   `PeerGone` tutti i suoi stream.
+
+Un peer che viola una regola (ordine dei frame, ruolo, credito, rate) perde la connessione.
+
+## 9. Controllo di flusso
+
+| Costante | Valore |
+| :- | -: |
+| `INITIAL_WINDOW` | 256 KiB per direzione per stream |
+| `MAX_WINDOW` | 1 MiB |
+| `MIN_CHARGE` | 512 byte: un `Data` costa `max(len, 512)` |
+| `MIN_WINDOW_UPDATE` | 512 byte |
+
+Chi riceve restituisce credito con `WindowUpdate` dopo aver consegnato i dati. Il relay
+applica le stesse regole: un `Data` oltre il credito, un `WindowUpdate` sotto il minimo o che
+porta la finestra oltre `MAX_WINDOW` sono violazioni. La memoria che il relay accoda verso un
+peer è quindi limitata a `stream × MAX_WINDOW`.
+
+## 10. Limiti e timeout di default
+
+| Limite | Valore |
+| :- | -: |
+| connessioni contemporanee al relay | 4 096 |
+| handshake per IP | 20 a raffica, poi 1 ogni 3 s |
+| stream per client / per agent | 32 / 64 |
+| `Ping` per connessione | 10 a raffica, poi 1 ogni 5 s |
+| handshake / inattività / scrittura | 10 s / 90 s / 30 s |
+| keepalive di agent e client | 30 s |
+
+## 11. Fuori dall'ambito della Fase 2
+
+Il bridge stdio di `zt-client` per OpenSSH e la verifica con Ansible (Fase 3); rekey dei
+canali di lunga durata, revoca a caldo delle chiavi e fuzzing con `cargo-fuzz` (Fase 4).

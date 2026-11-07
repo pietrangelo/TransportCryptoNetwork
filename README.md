@@ -13,19 +13,23 @@ admin / Ansible                        relay pubblico                     server
        └──────────────── tunnel end-to-end client ↔ agent ───────────────────┘
 ```
 
-> **Stato:** Fase 1 (workspace, dominio, framing). La logica di rete non è ancora
-> implementata: i binari espongono solo la CLI.
+> **Stato:** Fase 2 (handshake Noise, relay e agent). Relay e agent sono funzionanti; il
+> collegamento di `zt-client` a OpenSSH arriva nella Fase 3. Vedi `docs/OPERATIONS.md`.
 
 ## Struttura
 
 | Percorso | Ruolo |
 | :- | :- |
 | `crates/zt-domain` | domain core puro: value object, frame, eventi, errori |
+| `crates/zt-application` | casi d'uso sans-IO: relay core, rate limiting |
 | `crates/zt-proto` | wire format sans-IO + adapter `tokio-util` (feature `codec`) |
+| `crates/zt-crypto` | identità Ed25519, handshake Noise IK sans-IO con typestate |
+| `crates/zt-net` | adapter tokio: canale Noise, server relay, agent, libreria client, configurazione |
 | `bins/zt-relay` | punto d'incontro pubblico |
 | `bins/zt-agent` | agent sui server target, solo connessioni in uscita |
 | `bins/zt-client` | `ProxyCommand` per OpenSSH |
-| `docs/PROTOCOL.md` | specifica del framing |
+| `docs/PROTOCOL.md` | specifica di framing, handshake, ciclo di vita e controllo di flusso |
+| `docs/OPERATIONS.md` | chiavi, policy, avvio di relay e agent |
 | `docs/METHODOLOGY.md` | DDD esagonale, Adversarial TDD, regole di codice |
 | `docs/adversary/` | registro delle adversary review |
 
