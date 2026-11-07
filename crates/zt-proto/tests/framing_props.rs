@@ -23,7 +23,11 @@ fn encode_to_vec(frame: &Frame) -> Vec<u8> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 2_000, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        // 2 000 casi in locale; la CI ne chiede di più con PROPTEST_CASES.
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000),
+        ..ProptestConfig::default()
+    })]
 
     /// decode(encode(f)) == f, e il buffer viene consumato per intero.
     #[test]
@@ -103,12 +107,13 @@ proptest! {
     /// Per ogni tipo, ogni lunghezza dichiarata oltre il massimo è rifiutata dal solo header.
     #[test]
     fn oversized_lengths_rejected_before_buffering(
-        kind in proptest::sample::select(FrameKind::ALL.to_vec()),
-        len in any::<u16>(),
+        (kind, len) in proptest::sample::select(FrameKind::ALL.to_vec()).prop_flat_map(|kind| {
+            let (_, max) = zt_proto::wire::length_bounds(kind);
+            let first_bad = u16::try_from(max + 1).unwrap();
+            (Just(kind), first_bad..=u16::MAX)
+        }),
     ) {
         let stream = u32::from(kind.is_stream_scoped());
-        let (_, max) = zt_proto::wire::length_bounds(kind);
-        prop_assume!(usize::from(len) > max);
         let mut buf = raw(1, kind.code(), stream, len, &[]);
         prop_assert_eq!(buf.len(), FRAME_HEADER_LEN);
         let is_length_error = matches!(
