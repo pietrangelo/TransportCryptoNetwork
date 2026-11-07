@@ -35,6 +35,13 @@ pub enum ConfigError {
     /// Il file della chiave segreta è leggibile da altri utenti.
     #[error("{0}: secret key file must not be accessible by group or others (chmod 600)")]
     InsecurePermissions(String),
+    /// Un file di trust (pin delle chiavi, policy, client autorizzati) è scrivibile da gruppo
+    /// o altri: chi può scriverlo può sostituire una chiave.
+    #[error("{0}: trust file must not be writable by group or others (chmod go-w)")]
+    WritableByOthers(String),
+    /// Nodo senza chiave pinnata nella configurazione del client.
+    #[error("unknown node {0}: no pinned key in the client configuration")]
+    UnknownNode(String),
     /// TOML non valido.
     #[error("{path}: {message}")]
     Syntax {
@@ -331,4 +338,53 @@ pub fn load_authorized_clients(path: &Path) -> Result<HashSet<Fingerprint>, Conf
 /// Vedi [`parse_known_nodes`].
 pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PublicKey>, ConfigError> {
     parse_known_nodes(&path.display().to_string(), &read_limited(path)?)
+}
+
+/// Configurazione di `zt-client`.
+#[derive(Debug, Clone)]
+pub struct ClientSettings {
+    /// Indirizzo del relay (`host:porta`).
+    pub relay: String,
+    /// Chiave pubblica del relay, pinnata.
+    pub relay_key: PublicKey,
+    /// File della chiave segreta del client.
+    pub key: std::path::PathBuf,
+    /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent.
+    pub nodes: HashMap<NodeId, PublicKey>,
+}
+
+impl ClientSettings {
+    /// Configurazione di connessione verso `node`.
+    ///
+    /// # Errors
+    /// [`ConfigError::UnknownNode`] se il nodo non ha una chiave pinnata.
+    pub fn client_config(
+        &self,
+        node: &NodeId,
+        timeouts: crate::Timeouts,
+    ) -> Result<crate::client::ClientConfig, ConfigError> {
+        let _ = timeouts;
+        Err(ConfigError::UnknownNode(node.to_string()))
+    }
+}
+
+/// Interpreta la configurazione del client.
+///
+/// # Errors
+/// Qualsiasi voce non valida.
+pub fn parse_client_settings(
+    origin: &str,
+    base: &Path,
+    text: &str,
+) -> Result<ClientSettings, ConfigError> {
+    let _ = (base, text);
+    Err(ConfigError::TooLarge(origin.into()))
+}
+
+/// Legge e interpreta la configurazione del client.
+///
+/// # Errors
+/// Vedi [`parse_client_settings`].
+pub fn load_client_settings(path: &Path) -> Result<ClientSettings, ConfigError> {
+    Err(ConfigError::TooLarge(path.display().to_string()))
 }
