@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use zt_crypto::Keyring;
+use zt_domain::AccessPolicy;
 use zt_net::logging::{self, LogFormat};
 use zt_net::relay::{RelayConfig, RelayServer};
 use zt_net::reload::{self, Hangups, ReloadEvents};
@@ -56,6 +58,11 @@ enum Command {
         /// aperte; un file non valido lascia in vigore quella precedente.
         #[arg(long)]
         policy: PathBuf,
+        /// Denylist di certificati e chiavi (`revoked.toml`, PROTOCOL §15.8). Obbligatoria se
+        /// la policy pinna una CA (`[[authorities]]`), anche vuota. `SIGHUP` la ricarica
+        /// insieme alla policy: se uno dei due file non è valido restano entrambi i precedenti.
+        #[arg(long)]
+        revocations: Option<PathBuf>,
     },
 }
 
@@ -75,6 +82,38 @@ fn main() -> ExitCode {
     }
 }
 
+/// I file che servono a ricaricare le chiavi del relay.
+struct KeyFiles {
+    key: PathBuf,
+    previous_key: Option<PathBuf>,
+    policy: PathBuf,
+    revocations: Option<PathBuf>,
+}
+
+/// Ricarica le chiavi del relay (`SIGHUP`, PROTOCOL §14) e rifiuta una chiave uguale a una CA
+/// (§15.9, finding 0006-2). Lo stesso `SIGHUP` ricarica policy e chiavi in due task, quindi la
+/// chiave nuova si confronta sia con la policy in vigore sia con quella sul disco: una rotazione
+/// della chiave e una CA nuova uguali, nella stessa ricarica, non entrano insieme. La policy si
+/// confronta solo con le chiavi in vigore: un file di chiave sbagliato non blocca una revoca
+/// urgente.
+fn reload_keys(
+    files: &KeyFiles,
+    policy_in_force: &Revocable<AccessPolicy>,
+) -> Result<Keyring, config::ConfigError> {
+    let keys = config::load_keyring(&files.key, files.previous_key.as_deref())?;
+    let forbidden = config::own_keys(&keys, "relay");
+    let origin = files.policy.display().to_string();
+    config::reject_infrastructure_keys_as_authority(
+        &origin,
+        policy_in_force.current().cert_trust(),
+        &forbidden,
+    )?;
+    if let Ok(next) = config::load_relay_policy(&files.policy, files.revocations.as_deref()) {
+        config::reject_infrastructure_keys_as_authority(&origin, next.cert_trust(), &forbidden)?;
+    }
+    Ok(keys)
+}
+
 fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Keygen { out } => {
@@ -92,6 +131,7 @@ fn run(command: Command) -> Result<(), String> {
             key,
             previous_key,
             policy,
+            revocations,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -111,19 +151,41 @@ fn run(command: Command) -> Result<(), String> {
                     keys.clone(),
                     zt_net::keys::ROTATION_REMINDER,
                 ));
+                let path = policy;
+                let (path_for_keys, revocations_for_keys) = (path.clone(), revocations.clone());
+                // Policy e denylist in un solo passo; una CA uguale alla chiave del relay
+                // (corrente o precedente, quella in vigore al momento) è rifiutata (PROTOCOL
+                // §15.9), all'avvio e a ogni ricarica.
+                let relay_keys = keys.clone();
+                let load = move || {
+                    let policy = config::load_relay_policy(&path, revocations.as_deref())?;
+                    config::reject_infrastructure_keys_as_authority(
+                        &path.display().to_string(),
+                        policy.cert_trust(),
+                        &config::own_keys(&relay_keys.current(), "relay"),
+                    )?;
+                    Ok(policy)
+                };
+                let policy = load().map_err(|e: config::ConfigError| e.to_string())?;
+                let (policy, updater) = Revocable::new(policy);
+                // Lo stesso controllo nel verso opposto (finding 0006-2), vedi `reload_keys`.
                 let key_events = ReloadEvents {
                     reloaded: "relay_keys_reloaded",
                     failed: "relay_keys_reload_failed",
                 };
+                let files = KeyFiles {
+                    key,
+                    previous_key,
+                    policy: path_for_keys,
+                    revocations: revocations_for_keys,
+                };
+                let policy_in_force = policy.clone();
                 tokio::spawn(reload::on_sighup(
                     key_hangups,
                     key_updater,
                     key_events,
-                    move || config::load_keyring(&key, previous_key.as_deref()),
+                    move || reload_keys(&files, &policy_in_force),
                 ));
-                let path = policy;
-                let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
-                let (policy, updater) = Revocable::new(policy);
                 // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
                 // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
                 tokio::spawn(zt_net::keys::watch_agent_rotations(
@@ -134,12 +196,18 @@ fn run(command: Command) -> Result<(), String> {
                     reloaded: "policy_reloaded",
                     failed: "policy_reload_failed",
                 };
-                tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
-                    config::load_policy(&path)
-                }));
+                tokio::spawn(reload::on_sighup(hangups, updater, events, load));
+                let authorities = policy.clone();
                 let server = RelayServer::bind(listen, keys, policy, RelayConfig::default())
                     .await
                     .map_err(|e| e.to_string())?;
+                // CA pinnate e denylist annunciate dopo «relay listening» e a ogni ricarica; le
+                // rotazioni di CA non completate ogni ora (PROTOCOL §15.11).
+                tokio::spawn(zt_net::keys::watch_authorities(
+                    "relay",
+                    authorities,
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 systemd::notify_ready();
                 server.run().await.map_err(|e| e.to_string())
             })

@@ -9,7 +9,6 @@
     clippy::missing_panics_doc
 )]
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use zt_crypto::Identity;
-use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant, CloseReason, Fingerprint, NodeId};
+use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant, CloseReason, NodeId};
 use zt_net::agent::{self, AgentConfig};
 use zt_net::client::{self, ClientConfig};
 use zt_net::relay::{RelayConfig, RelayServer};
@@ -60,7 +59,7 @@ struct Lab {
     ansible: Arc<Identity>,
     admin: Arc<Identity>,
     policy: Updater<AccessPolicy>,
-    clients: Updater<HashSet<Fingerprint>>,
+    clients: Updater<zt_domain::AuthorizedClients>,
 }
 
 fn policy_for(agent: &Identity, clients: &[(&Identity, &str, Option<&[&str]>)]) -> AccessPolicy {
@@ -109,8 +108,11 @@ impl Lab {
         .unwrap();
         let relay = server.local_addr().unwrap();
         tokio::spawn(server.run());
-        let (clients_rx, clients) =
-            Revocable::new(HashSet::from([ansible.fingerprint(), admin.fingerprint()]));
+        let (clients_rx, clients) = Revocable::new(
+            [ansible.fingerprint(), admin.fingerprint()]
+                .into_iter()
+                .collect::<zt_domain::AuthorizedClients>(),
+        );
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay.to_string(),
@@ -148,6 +150,7 @@ impl Lab {
             }],
             node: node("web-01"),
             node_key: self.agent_id.public_key(),
+            certificate: None,
             timeouts: fast(),
         }
     }
@@ -227,8 +230,11 @@ async fn agent_revocation_cuts_the_session_even_if_the_relay_still_allows_it() {
     let lab = Lab::start().await;
     let (_app, revoked) = lab.session(&lab.ansible).await;
     let (mut other, _survivor) = lab.session(&lab.admin).await;
-    lab.clients
-        .replace(HashSet::from([lab.admin.fingerprint()]));
+    lab.clients.replace(
+        [lab.admin.fingerprint()]
+            .into_iter()
+            .collect::<zt_domain::AuthorizedClients>(),
+    );
     assert!(matches!(
         ended(revoked).await,
         Err(NetError::StreamClosed(CloseReason::Unauthorized))

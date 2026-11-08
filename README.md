@@ -13,10 +13,13 @@ admin / Ansible                        relay pubblico                     server
        └──────────────── tunnel end-to-end client ↔ agent ───────────────────┘
 ```
 
-> **Stato:** Fase 5 (alta disponibilità e rotazione delle chiavi). Più relay con failover,
-> rotazione delle chiavi di relay e agent senza ripinning simultaneo di tutta la flotta,
-> oltre a quanto fatto in Fase 4: revoca a caldo, rekey dei canali, audit log JSON, fuzzing
-> continuo, binari statici firmati e unit systemd blindate. Vedi `docs/OPERATIONS.md`.
+> **Stato:** Fase 6 (certificati client brevi da una CA offline). `zt-ca` firma certificati
+> che legano la chiave di un client a un nome, a un elenco di nodi e a una scadenza; relay e
+> agent pinnano la CA, verificano i certificati nell'handshake, chiudono le sessioni alla
+> scadenza e applicano una denylist ricaricabile (PROTOCOL §15, OPERATIONS §10). Restano le funzioni
+> delle fasi precedenti: più relay con failover, rotazione delle chiavi, revoca a caldo, rekey
+> dei canali, audit log JSON, fuzzing continuo, binari statici firmati e unit systemd blindate.
+> Vedi `docs/OPERATIONS.md`.
 
 ## Struttura
 
@@ -30,6 +33,7 @@ admin / Ansible                        relay pubblico                     server
 | `bins/zt-relay` | punto d'incontro pubblico |
 | `bins/zt-agent` | agent sui server target, solo connessioni in uscita |
 | `bins/zt-client` | `ProxyCommand` per OpenSSH |
+| `bins/zt-ca` | CA offline: chiave, firma e ispezione dei certificati client |
 | `docs/PROTOCOL.md` | specifica di framing, handshake, ciclo di vita e controllo di flusso |
 | `docs/OPERATIONS.md` | chiavi, policy, avvio di relay e agent, OpenSSH e Ansible |
 | `docs/METHODOLOGY.md` | DDD esagonale, Adversarial TDD, regole di codice |

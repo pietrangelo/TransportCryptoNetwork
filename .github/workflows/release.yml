@@ -76,7 +76,7 @@ jobs:
           targets: ${{ matrix.target }}
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - run: cargo test --workspace --locked
-      - run: cargo build --release --locked --target "$TARGET" -p zt-relay -p zt-agent -p zt-client
+      - run: cargo build --release --locked --target "$TARGET" -p zt-relay -p zt-agent -p zt-client -p zt-ca
         env:
           TARGET: ${{ matrix.target }}
       - name: package
@@ -85,7 +85,7 @@ jobs:
         run: |
           name="tcn-${GITHUB_REF_NAME}-${TARGET}"
           mkdir -p "dist/$name"
-          cp "target/${TARGET}/release/"zt-{relay,agent,client} "dist/$name/"
+          cp "target/${TARGET}/release/"zt-{relay,agent,client,ca} "dist/$name/"
           cp -r packaging/systemd LICENSE README.md docs/OPERATIONS.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")

@@ -51,3 +51,17 @@ path = "fuzz_targets/relay_core.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cert_decoder"
+path = "fuzz_targets/cert_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_verify"
+path = "fuzz_targets/cert_verify.rs"
+test = false
+doc = false
+bench = false

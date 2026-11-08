@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use zt_domain::flow::Window;
 use zt_domain::{
-    AccessPolicy, AuthFailureReason, CloseReason, DomainEvent, Fingerprint, Frame, NodeId,
-    PeerRole, RejectReason, SessionId, StreamId,
+    AccessPolicy, Admission, AuthFailureReason, CertClaims, CertRef, ClientCredential, CloseReason,
+    DomainEvent, Fingerprint, Frame, NodeId, RejectReason, SessionId, StreamId, UnixTime,
 };
 
 use crate::ratelimit::TokenBucket;
@@ -23,6 +23,16 @@ use crate::ratelimit::TokenBucket;
 /// Identificativo di una connessione autenticata, assegnato dall'adapter di rete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnId(pub u64);
+
+/// L'orologio visto dal core: monotono per i timeout, di sistema (UTC) per i certificati
+/// (PROTOCOL §15.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Now {
+    /// Tempo monotono.
+    pub instant: Instant,
+    /// Tempo di sistema, in secondi Unix.
+    pub unix: UnixTime,
+}
 
 /// Eventi in ingresso al relay core.
 #[derive(Debug)]
@@ -33,6 +43,9 @@ pub enum Input {
         conn: ConnId,
         /// L'identità del peer.
         peer: Fingerprint,
+        /// Il certificato presentato nel messaggio 1, già verificato (passi 3–6 di
+        /// PROTOCOL §15.4); `None` senza certificato.
+        certificate: Option<Arc<CertClaims>>,
     },
     /// Frame ben formato ricevuto su una connessione.
     Received {
@@ -121,7 +134,19 @@ enum Role {
         since: Instant,
         next_stream: u32,
     },
-    Client,
+    Client {
+        /// La credenziale con cui il client è stato ammesso: una connessione con certificato
+        /// tiene solo i dati verificati, mai i byte del certificato.
+        credential: ClientCredential,
+    },
+}
+
+/// Il riferimento di audit di una credenziale: `None` per la whitelist.
+fn cert_ref(credential: &ClientCredential) -> Option<CertRef> {
+    match credential {
+        ClientCredential::Key => None,
+        ClientCredential::Certificate(claims) => Some(claims.reference()),
+    }
 }
 
 /// Stream chiusi di recente da un client, per cui frame in volo vanno scartati in silenzio.
@@ -177,7 +202,7 @@ impl Conn {
     fn is_stale(&self, stream: StreamId) -> bool {
         match &self.role {
             Role::Agent { next_stream, .. } => stream.get() < *next_stream,
-            Role::Client => self.closed.contains(stream),
+            Role::Client { .. } => self.closed.contains(stream),
         }
     }
 
@@ -201,6 +226,8 @@ struct Route {
     session: SessionId,
     client: Fingerprint,
     target: NodeId,
+    /// Il certificato del client, per l'audit (`None` per la whitelist).
+    certificate: Option<CertRef>,
     /// Credito che questo lato ha per inviare `Data` verso `peer`.
     send: Window,
 }
@@ -244,10 +271,14 @@ impl<S: SessionIds> RelayCore<S> {
     }
 
     /// Elabora un evento e restituisce le azioni da eseguire, in ordine.
-    pub fn handle(&mut self, input: Input, now: Instant) -> Vec<Output> {
+    pub fn handle(&mut self, input: Input, now: Now) -> Vec<Output> {
         let mut out = Vec::new();
         match input {
-            Input::Connected { conn, peer } => self.on_connected(conn, peer, now, &mut out),
+            Input::Connected {
+                conn,
+                peer,
+                certificate,
+            } => self.on_connected(conn, peer, certificate.as_ref(), now, &mut out),
             Input::Received { conn, frame } => {
                 if self.conns.contains_key(&conn)
                     && let Err(rule) = self.on_frame(conn, frame, now, &mut out)
@@ -257,7 +288,7 @@ impl<S: SessionIds> RelayCore<S> {
             }
             Input::Disconnected { conn } => self.teardown(conn, &mut out),
             Input::Tick => self.on_tick(now, &mut out),
-            Input::PolicyUpdated { policy } => self.on_policy(policy, &mut out),
+            Input::PolicyUpdated { policy } => self.on_policy(policy, now.unix, &mut out),
         }
         out
     }
@@ -266,29 +297,35 @@ impl<S: SessionIds> RelayCore<S> {
         &mut self,
         conn: ConnId,
         peer: Fingerprint,
-        now: Instant,
+        certificate: Option<&Arc<CertClaims>>,
+        now: Now,
         out: &mut Vec<Output>,
     ) {
         if self.conns.contains_key(&conn) {
             return;
         }
-        let role = match self.policy.role(&peer) {
-            None => {
+        // Passi 1, 5 e 7–11 di PROTOCOL §15.4 ricontrollati con la policy e l'orologio del
+        // momento in cui la connessione arriva al core: una ricarica nel frattempo non si perde.
+        let role = match self.policy.admit(&peer, certificate, now.unix) {
+            Err(reason) => {
                 out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                     peer: Some(peer),
-                    reason: AuthFailureReason::UnknownPeer,
+                    reason,
+                    // Le claims vengono dalla verifica della firma in `zt-crypto`.
+                    certificate: reason.certificate_ref(certificate.map(AsRef::as_ref)),
                 }));
                 out.push(Output::Close { conn });
                 return;
             }
-            Some(PeerRole::Agent { node }) => Role::Agent {
+            Ok(Admission::Agent { node }) => Role::Agent {
                 node: node.clone(),
                 registered: false,
-                since: now,
+                since: now.instant,
                 next_stream: 1,
             },
-            Some(PeerRole::Client { .. }) => Role::Client,
+            Ok(Admission::Client { credential }) => Role::Client { credential },
         };
+        let now = now.instant;
         let pings = TokenBucket::new(self.limits.ping_burst, self.limits.ping_refill, now);
         let opens = TokenBucket::new(self.limits.open_burst, self.limits.open_refill, now);
         self.conns.insert(
@@ -304,33 +341,101 @@ impl<S: SessionIds> RelayCore<S> {
         );
     }
 
-    fn on_tick(&mut self, now: Instant, out: &mut Vec<Output>) {
+    fn on_tick(&mut self, now: Now, out: &mut Vec<Output>) {
         let timeout = self.limits.register_timeout;
-        let expired: Vec<ConnId> = self
+        let mut expired: Vec<ConnId> = self
             .conns
             .iter()
             .filter(|(_, c)| {
                 matches!(c.role, Role::Agent { registered: false, since, .. }
-                    if now.saturating_duration_since(since) >= timeout)
+                    if now.instant.saturating_duration_since(since) >= timeout)
             })
             .map(|(id, _)| *id)
             .collect();
+        expired.sort_unstable();
         for conn in expired {
             self.violation(conn, "agent did not register in time", out);
         }
+        // PROTOCOL §15.7: una sessione autorizzata da un certificato finisce alla scadenza,
+        // secondo l'orologio di sistema (non quello monotono).
+        let mut lapsed: Vec<(ConnId, Fingerprint, CertRef)> = self
+            .conns
+            .iter()
+            .filter_map(|(id, c)| match &c.role {
+                Role::Client {
+                    credential: ClientCredential::Certificate(claims),
+                } if now.unix >= claims.not_after() => Some((*id, c.peer, claims.reference())),
+                _ => None,
+            })
+            .collect();
+        lapsed.sort_unstable_by_key(|(id, _, _)| *id);
+        for (conn, peer, certificate) in lapsed {
+            self.close_streams_unauthorized(conn, out);
+            out.push(Output::Audit(DomainEvent::CertificateExpired {
+                peer,
+                certificate,
+            }));
+            self.teardown(conn, out);
+            out.push(Output::Close { conn });
+        }
+    }
+
+    /// Chiude con `Close Unauthorized`, a entrambi i lati, ogni stream di `conn` verso un nodo
+    /// per cui `keep` è falso; restituisce i nodi persi.
+    fn close_streams_where(
+        &mut self,
+        conn: ConnId,
+        keep: impl Fn(&NodeId) -> bool,
+        out: &mut Vec<Output>,
+    ) -> BTreeSet<NodeId> {
+        let Some(c) = self.conns.get(&conn) else {
+            return BTreeSet::new();
+        };
+        let lost: Vec<(StreamId, NodeId)> = c
+            .streams
+            .iter()
+            .filter_map(|s| self.routes.get(&(conn, *s)).map(|r| (*s, r.target.clone())))
+            .filter(|(_, target)| !keep(target))
+            .collect();
+        let mut targets = BTreeSet::new();
+        for (stream, target) in lost {
+            let Some(route) = self.remove_route(conn, stream) else {
+                continue;
+            };
+            let (agent, agent_stream) = route.peer;
+            for (to, s) in [(conn, stream), (agent, agent_stream)] {
+                out.push(Output::Send {
+                    conn: to,
+                    frame: Frame::Close {
+                        stream: s,
+                        reason: CloseReason::Unauthorized,
+                    },
+                });
+            }
+            out.push(Output::Audit(DomainEvent::ConnectionDrained {
+                session: route.session,
+                reason: CloseReason::Unauthorized,
+            }));
+            targets.insert(target);
+        }
+        targets
+    }
+
+    fn close_streams_unauthorized(&mut self, conn: ConnId, out: &mut Vec<Output>) {
+        self.close_streams_where(conn, |_| false, out);
     }
 
     fn on_frame(
         &mut self,
         conn: ConnId,
         frame: Frame,
-        now: Instant,
+        now: Now,
         out: &mut Vec<Output>,
     ) -> Result<(), Violation> {
         let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
         match frame {
             Frame::Ping { nonce } => {
-                if !c.pings.try_take(now) {
+                if !c.pings.try_take(now.instant) {
                     return Err("ping rate exceeded");
                 }
                 out.push(Output::Send {
@@ -355,7 +460,7 @@ impl<S: SessionIds> RelayCore<S> {
                         registered: false, ..
                     } => return Err("frame before register"),
                     Role::Agent { .. } => true,
-                    Role::Client => false,
+                    Role::Client { .. } => false,
                 };
                 match other {
                     Frame::Open { stream, target } if !is_agent => {
@@ -448,6 +553,7 @@ impl<S: SessionIds> RelayCore<S> {
             out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                 peer: Some(peer),
                 reason: AuthFailureReason::NodeIdMismatch,
+                certificate: None,
             }));
             self.teardown(conn, out);
             out.push(Output::Close { conn });
@@ -473,7 +579,7 @@ impl<S: SessionIds> RelayCore<S> {
         conn: ConnId,
         stream: StreamId,
         target: NodeId,
-        now: Instant,
+        now: Now,
         out: &mut Vec<Output>,
     ) -> Result<(), Violation> {
         let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
@@ -481,20 +587,32 @@ impl<S: SessionIds> RelayCore<S> {
         if c.streams.contains(&stream) {
             return Err("stream id reuse");
         }
+        let Role::Client { credential } = &c.role else {
+            return Err("agents cannot open streams");
+        };
+        let credential = credential.clone();
+        let certificate = cert_ref(&credential);
         let reject = |reason| Output::Send {
             conn,
             frame: Frame::Reject { stream, reason },
         };
         // Ogni `Open` costa lavoro all'agent e una riga di audit: se ne limita la frequenza,
         // prima di qualsiasi altro controllo (finding 0002-4).
-        if !c.opens.try_take(now) {
+        if !c.opens.try_take(now.instant) {
             out.push(reject(RejectReason::RateLimited));
             return Ok(());
         }
         c.closed.reopen(stream);
         // Prima l'autorizzazione: «negato» e «inesistente» devono essere indistinguibili.
-        if !self.policy.may_open(&client, &target) {
-            out.push(Output::Audit(DomainEvent::AccessDenied { client, target }));
+        if !self
+            .policy
+            .may_open_with(&client, &credential, &target, now.unix)
+        {
+            out.push(Output::Audit(DomainEvent::AccessDenied {
+                client,
+                target,
+                certificate,
+            }));
             out.push(reject(RejectReason::NotAuthorized));
             return Ok(());
         }
@@ -522,6 +640,7 @@ impl<S: SessionIds> RelayCore<S> {
             session,
             client,
             target: target.clone(),
+            certificate: certificate.clone(),
             send: Window::initial(),
         };
         self.routes
@@ -560,6 +679,7 @@ impl<S: SessionIds> RelayCore<S> {
             session: route.session,
             client: route.client,
             target: route.target.clone(),
+            certificate: route.certificate.clone(),
         };
         if let Some(back) = self.routes.get_mut(&(peer, peer_stream)) {
             back.state = StreamState::Open;
@@ -622,8 +742,8 @@ impl<S: SessionIds> RelayCore<S> {
         Some(route)
     }
 
-    /// Applica una nuova policy alle connessioni aperte (revoca a caldo).
-    fn on_policy(&mut self, policy: Arc<AccessPolicy>, out: &mut Vec<Output>) {
+    /// Applica una nuova policy alle connessioni aperte (revoca a caldo, PROTOCOL §12 e §15.8).
+    fn on_policy(&mut self, policy: Arc<AccessPolicy>, now: UnixTime, out: &mut Vec<Output>) {
         self.policy = policy;
         let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
         ids.sort_unstable();
@@ -632,54 +752,80 @@ impl<S: SessionIds> RelayCore<S> {
                 continue;
             };
             let peer = c.peer;
-            let keeps_role = match (&c.role, self.policy.role(&peer)) {
-                (Role::Agent { node, .. }, Some(PeerRole::Agent { node: now })) => node == now,
-                (Role::Client, Some(PeerRole::Client { .. })) => true,
-                _ => false,
+            // La credenziale salvata vale ancora con la policy nuova? (denylist, CA ancora
+            // pinnata per chiave, durata massima, ruolo.)
+            let (keeps, credential) = match &c.role {
+                Role::Agent { node, .. } => (
+                    matches!(
+                        self.policy.admit(&peer, None, now),
+                        Ok(Admission::Agent { node: current }) if current == node
+                    ),
+                    None,
+                ),
+                Role::Client { credential } => match credential {
+                    ClientCredential::Key => (
+                        matches!(
+                            self.policy.admit(&peer, None, now),
+                            Ok(Admission::Client {
+                                credential: ClientCredential::Key
+                            })
+                        ),
+                        Some(ClientCredential::Key),
+                    ),
+                    // La whitelist ha la precedenza anche sulle connessioni aperte (PROTOCOL
+                    // §15.5, finding 0006-4): se la chiave è entrata nella whitelist la
+                    // connessione passa alla credenziale `Key` e ai suoi permessi, anche se più
+                    // stretti del certificato.
+                    ClientCredential::Certificate(claims) => {
+                        match self.policy.admit(&peer, Some(claims), now) {
+                            Ok(Admission::Client { credential }) => (true, Some(credential)),
+                            _ => (false, Some(credential.clone())),
+                        }
+                    }
+                },
             };
-            if !keeps_role {
+            // I campi del certificato con cui la connessione è stata autorizzata finora.
+            let certificate = match &c.role {
+                Role::Client { credential } => cert_ref(credential),
+                Role::Agent { .. } => None,
+            };
+            if !keeps {
                 out.push(Output::Audit(DomainEvent::AccessRevoked {
                     peer,
                     target: None,
+                    certificate,
                 }));
+                // Un certificato revocato chiude i suoi stream con `Close Unauthorized` (PROTOCOL
+                // §15.8); un peer che perde la voce della whitelist li chiude come prima (§12).
+                if matches!(credential, Some(ClientCredential::Certificate(_))) {
+                    self.close_streams_unauthorized(conn, out);
+                }
                 self.teardown(conn, out);
                 out.push(Output::Close { conn });
                 continue;
             }
-            if !matches!(c.role, Role::Client) {
+            let Some(credential) = credential else {
                 continue;
+            };
+            if let Some(Conn {
+                role: Role::Client { credential: held },
+                ..
+            }) = self.conns.get_mut(&conn)
+            {
+                // Una connessione passata alla whitelist non scade più con il certificato.
+                held.clone_from(&credential);
             }
-            let lost: Vec<(StreamId, NodeId)> = c
-                .streams
-                .iter()
-                .filter_map(|s| self.routes.get(&(conn, *s)).map(|r| (*s, r.target.clone())))
-                .filter(|(_, target)| !self.policy.may_open(&peer, target))
-                .collect();
-            let mut targets = BTreeSet::new();
-            for (stream, target) in lost {
-                let Some(route) = self.remove_route(conn, stream) else {
-                    continue;
-                };
-                let (agent, agent_stream) = route.peer;
-                for (to, s) in [(conn, stream), (agent, agent_stream)] {
-                    out.push(Output::Send {
-                        conn: to,
-                        frame: Frame::Close {
-                            stream: s,
-                            reason: CloseReason::Unauthorized,
-                        },
-                    });
-                }
-                out.push(Output::Audit(DomainEvent::ConnectionDrained {
-                    session: route.session,
-                    reason: CloseReason::Unauthorized,
-                }));
-                targets.insert(target);
-            }
+            let policy = Arc::clone(&self.policy);
+            let targets = self.close_streams_where(
+                conn,
+                |target| policy.may_open_with(&peer, &credential, target, now),
+                out,
+            );
             for target in targets {
                 out.push(Output::Audit(DomainEvent::AccessRevoked {
                     peer,
                     target: Some(target),
+                    certificate: certificate.clone(),
                 }));
             }
         }

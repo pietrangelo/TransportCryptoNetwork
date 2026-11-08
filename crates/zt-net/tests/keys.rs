@@ -1,6 +1,11 @@
 //! Finding 0005-3: le chiavi accettate sono visibili nei log, e una chiave precedente rimasta
 //! attiva viene ricordata finché non la si toglie.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -164,4 +169,203 @@ async fn an_agent_rotation_left_in_the_policy_is_reported_until_it_is_completed(
     tokio::time::sleep(Duration::from_secs(3600)).await;
     assert_eq!(log.kinds().len(), 4, "{:?}", log.kinds());
     task.abort();
+}
+
+// ---------- Fase 6, passo 8: CA pinnate e denylist (PROTOCOL §15.9, §15.11) ----------
+
+use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
+use zt_domain::trust::{CertTrust, Revocations, TrustedCaKey};
+use zt_domain::{AllowedNodes, CertSerial, NodeId};
+use zt_net::keys::{announce_authorities, watch_authorities};
+
+fn node(n: &str) -> NodeId {
+    NodeId::try_from(n).unwrap()
+}
+
+fn ca_key() -> TrustedCaKey {
+    zt_crypto::trusted_ca_key(&id().public_key())
+}
+
+fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+    let log = Captured::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || writer.clone())
+        .finish();
+    (log, tracing::subscriber::set_default(subscriber))
+}
+
+fn lines_of<'a>(text: &'a str, kind: &str) -> Vec<&'a str> {
+    text.lines()
+        .filter(|l| serde_json_lite(l, "event_kind").as_deref() == Some(kind))
+        .collect()
+}
+
+/// `ops-ca` con `keys`, `lab-ca` con una chiave, e una denylist di 2 serie e 1 chiave.
+fn trust(ops: &[TrustedCaKey], lab: &TrustedCaKey) -> CertTrust {
+    let mut t = CertTrust::new();
+    t.add_authority(
+        node("ops-ca"),
+        ops,
+        AllowedNodes::All,
+        DEFAULT_AUTHORITY_LIFETIME_SECS,
+    )
+    .unwrap();
+    t.add_authority(
+        node("lab-ca"),
+        std::slice::from_ref(lab),
+        AllowedNodes::Only([node("lab-01")].into_iter().collect()),
+        3_600,
+    )
+    .unwrap();
+    t.set_revocations(
+        Revocations::new(
+            [
+                CertSerial::try_from([0x3f; 16]).unwrap(),
+                CertSerial::try_from([0x40; 16]).unwrap(),
+            ],
+            [id().fingerprint()],
+        )
+        .unwrap(),
+    );
+    t
+}
+
+#[test]
+fn authorities_and_revocations_are_announced() {
+    let (log, _guard) = capture();
+    let (ops, lab) = (ca_key(), ca_key());
+    announce_authorities("relay", &trust(std::slice::from_ref(&ops), &lab));
+    let text = log.text();
+
+    let authorities = lines_of(&text, "authorities_in_use");
+    assert_eq!(authorities.len(), 2, "{text}");
+    let ops_line = authorities
+        .iter()
+        .find(|l| serde_json_lite(l, "authority").as_deref() == Some("ops-ca"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        ops_line.contains(&ops.fingerprint.to_string()),
+        "{ops_line}"
+    );
+    assert!(ops_line.contains("\"max_lifetime\":28800"), "{ops_line}");
+    assert!(ops_line.contains("\"level\":\"INFO\""), "{ops_line}");
+    let lab_line = authorities
+        .iter()
+        .find(|l| serde_json_lite(l, "authority").as_deref() == Some("lab-ca"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        lab_line.contains(&lab.fingerprint.to_string()),
+        "{lab_line}"
+    );
+    assert!(lab_line.contains("\"max_lifetime\":3600"), "{lab_line}");
+
+    let revocations = lines_of(&text, "revocations_in_use");
+    assert_eq!(revocations.len(), 1, "{text}");
+    assert!(
+        revocations[0].contains("\"serials\":2"),
+        "{}",
+        revocations[0]
+    );
+    assert!(revocations[0].contains("\"keys\":1"), "{}", revocations[0]);
+    assert!(lines_of(&text, "ca_rotation_pending").is_empty(), "{text}");
+
+    // Una CA con due chiavi è annunciata come WARN, con entrambe le fingerprint.
+    let (log, _guard2) = capture();
+    let (new, old) = (ca_key(), ca_key());
+    announce_authorities("agent", &trust(&[new, old], &lab));
+    let text = log.text();
+    let rotating = lines_of(&text, "authorities_in_use")
+        .into_iter()
+        .find(|l| serde_json_lite(l, "authority").as_deref() == Some("ops-ca"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(rotating.contains("\"level\":\"WARN\""), "{rotating}");
+    assert!(
+        rotating.contains(&new.fingerprint.to_string()),
+        "{rotating}"
+    );
+    assert!(
+        rotating.contains(&old.fingerprint.to_string()),
+        "{rotating}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ca_rotation_is_reported_until_it_is_completed() {
+    let (log, _guard) = capture();
+    let (new, old, lab) = (ca_key(), ca_key(), ca_key());
+    let (current, updater) = Revocable::new(trust(&[new, old], &lab));
+    let task = tokio::spawn(watch_authorities(
+        "relay",
+        current,
+        Duration::from_secs(3_600),
+    ));
+    let pending = |log: &Captured| lines_of(&log.text(), "ca_rotation_pending").len();
+
+    // All'avvio: annunci e un avviso per la sola CA in rotazione.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let text = log.text();
+    assert_eq!(lines_of(&text, "authorities_in_use").len(), 2, "{text}");
+    assert_eq!(lines_of(&text, "revocations_in_use").len(), 1, "{text}");
+    let warn = lines_of(&text, "ca_rotation_pending");
+    assert_eq!(warn.len(), 1, "{text}");
+    assert!(warn[0].contains("ops-ca"), "{}", warn[0]);
+    assert!(!warn[0].contains("lab-ca"), "{}", warn[0]);
+    assert!(warn[0].contains(&new.fingerprint.to_string()));
+    assert!(warn[0].contains(&old.fingerprint.to_string()));
+    assert!(warn[0].contains("\"level\":\"WARN\""));
+
+    // Ogni ora.
+    tokio::time::sleep(Duration::from_secs(2 * 3_600)).await;
+    assert_eq!(pending(&log), 3, "{}", log.text());
+
+    // Ricarica ancora in rotazione: annunci e avviso subito.
+    updater.replace(trust(&[new, old], &lab));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(pending(&log), 4, "{}", log.text());
+    assert_eq!(lines_of(&log.text(), "authorities_in_use").len(), 4);
+    assert_eq!(lines_of(&log.text(), "revocations_in_use").len(), 2);
+
+    // Rotazione completata: annunci nuovi, niente più avvisi.
+    updater.replace(trust(&[new], &lab));
+    tokio::time::sleep(Duration::from_secs(10 * 3_600)).await;
+    assert_eq!(pending(&log), 4, "{}", log.text());
+    assert_eq!(lines_of(&log.text(), "authorities_in_use").len(), 6);
+    task.abort();
+}
+
+#[test]
+fn announcements_never_contain_certificate_bytes_or_secrets() {
+    let (log, _guard) = capture();
+    let ca = zt_crypto::CaSigningKey::generate().unwrap();
+    let trusted = zt_crypto::trusted_ca_key(&ca.public_key());
+    let revoked_key = id().fingerprint();
+    let serial = CertSerial::try_from([0x77; 16]).unwrap();
+    let mut t = CertTrust::new();
+    t.add_authority(
+        node("ops-ca"),
+        &[trusted, ca_key()],
+        AllowedNodes::All,
+        DEFAULT_AUTHORITY_LIFETIME_SECS,
+    )
+    .unwrap();
+    t.set_revocations(Revocations::new([serial], [revoked_key]).unwrap());
+    announce_authorities("relay", &t);
+    let text = log.text();
+    // Controllo positivo: gli annunci ci sono, con la fingerprint della CA.
+    assert!(text.contains(&trusted.fingerprint.to_string()), "{text}");
+    assert_eq!(lines_of(&text, "revocations_in_use").len(), 1, "{text}");
+    // Solo fingerprint e conteggi.
+    let secret = ca.to_secret_text();
+    assert!(!secret.is_empty());
+    assert!(!text.contains(secret.trim()), "{text}");
+    assert!(
+        !text.contains(zt_crypto::CaSigningKey::FILE_PREFIX),
+        "{text}"
+    );
+    assert!(!text.contains(&ca.public_key().to_string()), "{text}");
+    assert!(!text.contains(&serial.to_string()), "{text}");
+    assert!(!text.contains(&revoked_key.to_string()), "{text}");
+    assert!(!text.contains(zt_crypto::CERT_FILE_PREFIX), "{text}");
 }

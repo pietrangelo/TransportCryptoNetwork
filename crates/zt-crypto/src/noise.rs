@@ -61,6 +61,9 @@ fn builder(
     Ok((builder, secret))
 }
 
+/// Payload massimo del messaggio 1: un certificato client (PROTOCOL §15.3).
+pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = zt_domain::limits::MAX_CERT_LEN;
+
 /// Initiator: produce il primo messaggio verso un responder di cui conosce la chiave.
 ///
 /// # Errors
@@ -70,6 +73,24 @@ pub fn initiate(
     remote: &PublicKey,
     channel: Channel,
 ) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    initiate_with_payload(local, remote, channel, &[])
+}
+
+/// Come [`initiate`], con `payload` cifrato nel messaggio 1 (il certificato del client,
+/// PROTOCOL §15.3).
+///
+/// # Errors
+/// [`CryptoError::MessageTooLarge`] oltre [`MAX_HANDSHAKE_PAYLOAD_LEN`],
+/// [`CryptoError::Handshake`] se lo stato Noise non può essere costruito.
+pub fn initiate_with_payload(
+    local: &Identity,
+    remote: &PublicKey,
+    channel: Channel,
+    payload: &[u8],
+) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    if payload.len() > MAX_HANDSHAKE_PAYLOAD_LEN {
+        return Err(CryptoError::MessageTooLarge);
+    }
     let (builder, secret) = builder(local, channel)?;
     let remote_static = remote.x25519();
     let mut state = builder
@@ -77,7 +98,7 @@ pub fn initiate(
         .and_then(|b| b.remote_public_key(&remote_static))
         .and_then(Builder::build_initiator)
         .map_err(|_| CryptoError::Handshake)?;
-    let msg1 = write(&mut state)?;
+    let msg1 = write(&mut state, payload)?;
     Ok((
         msg1,
         AwaitingResponse {
@@ -104,12 +125,24 @@ pub fn respond(
         .local_private_key(secret.as_ref())
         .and_then(Builder::build_responder)
         .map_err(|_| CryptoError::Handshake)?;
-    let mut payload = vec![0_u8; MAX_MESSAGE_LEN];
-    state
-        .read_message(msg1, &mut payload)
+    // Il payload decifrato non supera mai `msg1`.
+    let mut buffer = vec![0_u8; msg1.len()];
+    let len = state
+        .read_message(msg1, &mut buffer)
         .map_err(|_| CryptoError::Handshake)?;
+    // Oltre il massimo il payload non è interpretato, e l'errore è lo stesso di un messaggio
+    // non valido (nessun oracolo).
+    if len > MAX_HANDSHAKE_PAYLOAD_LEN {
+        return Err(CryptoError::Handshake);
+    }
+    buffer.truncate(len);
+    buffer.shrink_to_fit();
     let peer = remote_fingerprint(&state)?;
-    Ok(AuthorizationPending { state, peer })
+    Ok(AuthorizationPending {
+        state,
+        peer,
+        payload: buffer,
+    })
 }
 
 /// Responder con un [`Keyring`]: accetta un `msg1` cifrato verso la chiave corrente o verso
@@ -148,10 +181,15 @@ impl AwaitingResponse {
         if msg2.len() > MAX_MESSAGE_LEN {
             return Err(CryptoError::Handshake);
         }
-        let mut payload = vec![0_u8; MAX_MESSAGE_LEN];
-        self.state
+        let mut payload = vec![0_u8; msg2.len()];
+        let len = self
+            .state
             .read_message(msg2, &mut payload)
             .map_err(|_| CryptoError::Handshake)?;
+        // Il messaggio 2 è sempre vuoto (PROTOCOL §15.3).
+        if len != 0 {
+            return Err(CryptoError::Handshake);
+        }
         Transport::from_handshake(self.state, self.responder)
     }
 }
@@ -165,6 +203,7 @@ impl AwaitingResponse {
 pub struct AuthorizationPending {
     state: HandshakeState,
     peer: Fingerprint,
+    payload: Vec<u8>,
 }
 
 impl AuthorizationPending {
@@ -174,12 +213,19 @@ impl AuthorizationPending {
         self.peer
     }
 
+    /// Il payload del messaggio 1, autenticato da Noise (vuoto se l'initiator non ne ha
+    /// inviato uno).
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
     /// Accetta l'initiator: produce `msg2` e il canale di trasporto.
     ///
     /// # Errors
     /// [`CryptoError::Handshake`] se lo stato Noise non può avanzare.
     pub fn accept(mut self) -> Result<(Vec<u8>, Transport), CryptoError> {
-        let msg2 = write(&mut self.state)?;
+        let msg2 = write(&mut self.state, &[])?;
         let transport = Transport::from_handshake(self.state, self.peer)?;
         Ok((msg2, transport))
     }
@@ -281,10 +327,10 @@ impl Transport {
     }
 }
 
-fn write(state: &mut HandshakeState) -> Result<Vec<u8>, CryptoError> {
+fn write(state: &mut HandshakeState, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut out = vec![0_u8; MAX_MESSAGE_LEN];
     let len = state
-        .write_message(&[], &mut out)
+        .write_message(payload, &mut out)
         .map_err(|_| CryptoError::Handshake)?;
     out.truncate(len);
     Ok(out)

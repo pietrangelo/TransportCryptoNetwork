@@ -9,6 +9,7 @@ members = [
     "bins/zt-relay",
     "bins/zt-agent",
     "bins/zt-client",
+    "bins/zt-ca",
 ]
 # I target di cargo-fuzz richiedono nightly: restano fuori dal workspace (vedi fuzz/README.md).
 exclude = ["fuzz"]

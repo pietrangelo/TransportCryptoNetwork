@@ -161,3 +161,178 @@ fn secrets_never_appear_in_debug_output() {
     assert!(!rendered.contains(secret.as_str()), "{rendered}");
     assert!(rendered.contains("redacted"));
 }
+
+// ======================= Fase 6: payload del messaggio 1 (PROTOCOL §15.3) =======================
+
+use zt_crypto::Keyring;
+use zt_crypto::noise::MAX_HANDSHAKE_PAYLOAD_LEN;
+
+const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+
+fn prologue(ch: Channel) -> &'static [u8] {
+    match ch {
+        Channel::Outer => b"TCN/1 outer",
+        Channel::EndToEnd => b"TCN/1 end-to-end",
+    }
+}
+
+/// Un'identità con il seme noto, per costruire a mano stati Noise equivalenti.
+fn seeded(b: u8) -> ([u8; 32], Identity) {
+    let seed = [b; 32];
+    (seed, Identity::from_secret_hex(&hex::encode(seed)).unwrap())
+}
+
+/// Il segreto X25519 che Noise usa per un seme Ed25519 (come `Identity`).
+fn x25519_secret(seed: [u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&seed).to_scalar_bytes()
+}
+
+/// Un initiator scritto con `snow`, senza i controlli di `zt-crypto`: msg1 con `payload`.
+fn raw_msg1(
+    initiator_seed: [u8; 32],
+    responder: &PublicKey,
+    ch: Channel,
+    payload: &[u8],
+) -> Vec<u8> {
+    let secret = x25519_secret(initiator_seed);
+    let remote = responder.x25519();
+    let mut state = snow::Builder::new(PATTERN.parse().unwrap())
+        .prologue(prologue(ch))
+        .unwrap()
+        .local_private_key(&secret)
+        .unwrap()
+        .remote_public_key(&remote)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let mut out = vec![0_u8; 65_535];
+    let len = state.write_message(payload, &mut out).unwrap();
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn msg1_payload_reaches_the_responder_intact() {
+    let relay = Identity::generate().unwrap();
+    let client = Identity::generate().unwrap();
+    for ch in [Channel::Outer, Channel::EndToEnd] {
+        for len in [1, 187, 4_328] {
+            let payload: Vec<u8> = (0..len)
+                .map(|i: usize| u8::try_from(i % 251).unwrap())
+                .collect();
+            let (msg1, waiting) =
+                noise::initiate_with_payload(&client, &relay.public_key(), ch, &payload).unwrap();
+            let pending = noise::respond(&relay, &msg1, ch).unwrap();
+            assert_eq!(pending.peer(), client.fingerprint());
+            assert_eq!(pending.payload(), payload.as_slice(), "{ch:?} {len}");
+            // L'handshake si completa normalmente.
+            let (msg2, mut resp) = pending.accept().unwrap();
+            let mut init = waiting.complete(&msg2).unwrap();
+            let ct = init.encrypt(b"after").unwrap();
+            assert_eq!(resp.decrypt(&ct).unwrap(), b"after");
+        }
+    }
+    // Anche con `respond_any` sulla chiave precedente (rotazione, PROTOCOL §14).
+    let (old, new) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let old_pin = old.public_key();
+    let keys = Keyring::rotating(new, old).unwrap();
+    for ch in [Channel::Outer, Channel::EndToEnd] {
+        let (msg1, _) =
+            noise::initiate_with_payload(&client, &old_pin, ch, b"certificate").unwrap();
+        let pending = noise::respond_any(&keys, &msg1, ch).unwrap();
+        assert_eq!(pending.payload(), b"certificate");
+    }
+}
+
+#[test]
+fn initiate_without_payload_is_unchanged() {
+    let relay = Identity::generate().unwrap();
+    let client = Identity::generate().unwrap();
+    for ch in [Channel::Outer, Channel::EndToEnd] {
+        let (msg1, _) = noise::initiate(&client, &relay.public_key(), ch).unwrap();
+        // e (32) + s cifrata (48) + tag del payload vuoto (16).
+        assert_eq!(msg1.len(), 96);
+        let pending = noise::respond(&relay, &msg1, ch).unwrap();
+        assert!(pending.payload().is_empty());
+        let (msg1, _) =
+            noise::initiate_with_payload(&client, &relay.public_key(), ch, &[]).unwrap();
+        assert_eq!(msg1.len(), 96);
+        assert!(
+            noise::respond(&relay, &msg1, ch)
+                .unwrap()
+                .payload()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn an_oversized_msg1_payload_is_refused_on_both_sides() {
+    let relay = Identity::generate().unwrap();
+    let (seed, client) = seeded(0x21);
+    let max = vec![0x42; MAX_HANDSHAKE_PAYLOAD_LEN];
+    let over = vec![0x42; MAX_HANDSHAKE_PAYLOAD_LEN + 1];
+    assert_eq!(MAX_HANDSHAKE_PAYLOAD_LEN, 4_328);
+    for ch in [Channel::Outer, Channel::EndToEnd] {
+        // Initiator: il massimo passa, uno in più no.
+        assert!(noise::initiate_with_payload(&client, &relay.public_key(), ch, &max).is_ok());
+        assert!(matches!(
+            noise::initiate_with_payload(&client, &relay.public_key(), ch, &over),
+            Err(CryptoError::MessageTooLarge)
+        ));
+        // Responder, con un initiator che non rispetta il limite.
+        let ok = raw_msg1(seed, &relay.public_key(), ch, &max);
+        assert_eq!(
+            noise::respond(&relay, &ok, ch).unwrap().payload(),
+            max.as_slice()
+        );
+        for len in [MAX_HANDSHAKE_PAYLOAD_LEN + 1, 10_000, 65_535 - 96] {
+            let msg1 = raw_msg1(seed, &relay.public_key(), ch, &vec![0x42; len]);
+            assert!(
+                matches!(
+                    noise::respond(&relay, &msg1, ch),
+                    Err(CryptoError::Handshake)
+                ),
+                "{ch:?}: payload of {len} bytes accepted"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_non_empty_msg2_payload_is_refused_by_the_initiator() {
+    let (relay_seed, relay) = seeded(0x31);
+    let client = Identity::generate().unwrap();
+    // Un responder modificato, scritto con `snow`, che mette un payload nel messaggio 2.
+    let reply = |msg1: &[u8], ch: Channel, payload: &[u8]| {
+        let secret = x25519_secret(relay_seed);
+        let mut state = snow::Builder::new(PATTERN.parse().unwrap())
+            .prologue(prologue(ch))
+            .unwrap()
+            .local_private_key(&secret)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut buf = vec![0_u8; 65_535];
+        state.read_message(msg1, &mut buf).unwrap();
+        let len = state.write_message(payload, &mut buf).unwrap();
+        buf.truncate(len);
+        buf
+    };
+    for ch in [Channel::Outer, Channel::EndToEnd] {
+        // Controllo: lo stesso responder con payload vuoto è accettato.
+        let (msg1, waiting) = noise::initiate(&client, &relay.public_key(), ch).unwrap();
+        assert!(waiting.complete(&reply(&msg1, ch, &[])).is_ok());
+        for payload in [&b"x"[..], &[0; 64][..], &[0xff; 4_328][..]] {
+            let (msg1, waiting) = noise::initiate(&client, &relay.public_key(), ch).unwrap();
+            assert!(
+                matches!(
+                    waiting.complete(&reply(&msg1, ch, payload)),
+                    Err(CryptoError::Handshake)
+                ),
+                "{ch:?}: msg2 with a {}-byte payload accepted",
+                payload.len()
+            );
+        }
+    }
+}

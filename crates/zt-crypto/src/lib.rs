@@ -10,11 +10,16 @@
 //!   solo dopo una decisione esplicita di autorizzazione.
 #![forbid(unsafe_code)]
 
+pub mod cert;
 mod error;
 mod identity;
 mod keyring;
 pub mod noise;
 
+pub use cert::{
+    CERT_FILE_PREFIX, CaSigningKey, cert_key, decode_certificate_text, encode_certificate_text,
+    sign_certificate, trusted_ca_key, verify_certificate,
+};
 pub use error::CryptoError;
 pub use identity::{Identity, PublicKey, fingerprint_of_x25519};
 pub use keyring::Keyring;

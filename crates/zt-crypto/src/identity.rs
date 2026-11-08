@@ -59,6 +59,20 @@ impl Identity {
         })
     }
 
+    /// `true` se `bytes` sono il seme segreto di questa identità (confronto senza uscite
+    /// anticipate). Serve a riconoscere un segreto finito per errore dove va una chiave
+    /// pubblica, per esempio come `subject_key` di un certificato (finding 0006-6).
+    #[must_use]
+    pub fn is_own_secret(&self, bytes: &[u8; 32]) -> bool {
+        let diff = self
+            .key
+            .as_bytes()
+            .iter()
+            .zip(bytes)
+            .fold(0_u8, |acc, (a, b)| acc | (a ^ b));
+        std::hint::black_box(diff) == 0
+    }
+
     /// La forma esadecimale del segreto, da scrivere su un file con permessi `0600`.
     #[must_use]
     pub fn to_secret_hex(&self) -> Zeroizing<String> {
@@ -109,6 +123,39 @@ impl PublicKey {
     #[must_use]
     pub fn fingerprint(&self) -> Fingerprint {
         fingerprint_of_x25519(&self.x25519())
+    }
+
+    /// Una chiave da 32 byte Ed25519 che DEVONO essere la codifica canonica di un punto valido
+    /// e non di ordine piccolo (PROTOCOL §15.1 regola 8).
+    ///
+    /// # Errors
+    /// [`CryptoError::InvalidKey`] per un punto non valido o non canonico,
+    /// [`CryptoError::WeakKey`] per un punto di ordine piccolo.
+    pub fn from_canonical_bytes(bytes: &[u8; 32]) -> Result<Self, CryptoError> {
+        let key = VerifyingKey::from_bytes(bytes).map_err(|_| CryptoError::InvalidKey)?;
+        // `from_bytes` accetta anche `y >= p` e un bit di segno su `x = 0`: la ricodifica del
+        // punto decompresso deve restituire gli stessi 32 byte.
+        if key.to_edwards().compress().to_bytes() != *bytes {
+            return Err(CryptoError::InvalidKey);
+        }
+        if key.is_weak() {
+            return Err(CryptoError::WeakKey);
+        }
+        Ok(Self { key })
+    }
+
+    /// I 32 byte Ed25519 della chiave.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
+
+    pub(crate) const fn from_verifying_key(key: VerifyingKey) -> Self {
+        Self { key }
+    }
+
+    pub(crate) const fn verifying_key(&self) -> &VerifyingKey {
+        &self.key
     }
 }
 

@@ -4,6 +4,9 @@
 //! Proprietà: nessun panic; un messaggio d'errore non riporta mai una sequenza esadecimale
 //! lunga presa dal file, dove starebbe una chiave segreta incollata per sbaglio. (Un controllo
 //! sulle righe intere darebbe falsi positivi: il fuzzer impara a scrivere il testo degli errori.)
+//!
+//! Fase 6: i blocchi `[[authorities]]` di policy e client autorizzati (arrivano dagli stessi
+//! parser), la denylist `revoked.toml` e il file del certificato del client.
 #![no_main]
 
 use std::path::Path;
@@ -40,6 +43,14 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Err(e) = config::parse_known_nodes("f", text) {
         check(text, e);
+    }
+    if let Err(e) = config::parse_revocations("f", text) {
+        check(text, e);
+    }
+    match config::parse_certificate_file("f", text) {
+        // Un file accettato contiene un certificato che rispetta il formato.
+        Ok(file) => assert!(zt_domain::decode_certificate(&file.bytes).is_ok()),
+        Err(e) => check(text, e),
     }
     match config::parse_client_settings("f", Path::new("/etc/tcn"), text) {
         Ok(settings) => {

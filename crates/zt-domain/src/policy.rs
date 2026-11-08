@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
+use crate::cert::{CertClaims, CertRejection, UnixTime};
 use crate::crypto::Fingerprint;
 use crate::error::DomainError;
+use crate::events::AuthFailureReason;
 use crate::ids::NodeId;
+use crate::trust::CertTrust;
 
 /// Nodi che un client può raggiungere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +52,30 @@ pub enum PeerRole<'a> {
     },
 }
 
+/// Con quale credenziale un client è stato ammesso (PROTOCOL §15.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientCredential {
+    /// La whitelist per chiave: nessuna scadenza in sessione.
+    Key,
+    /// Un certificato verificato: vale fino a `not_after`.
+    Certificate(Arc<CertClaims>),
+}
+
+/// Esito positivo di [`AccessPolicy::admit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission<'a> {
+    /// Un agent, che può registrarsi solo con questo nome.
+    Agent {
+        /// Il nome assegnato alla chiave.
+        node: &'a NodeId,
+    },
+    /// Un client, con la credenziale che lo ha ammesso.
+    Client {
+        /// La credenziale.
+        credential: ClientCredential,
+    },
+}
+
 /// Chiavi di agent ammesse per un nodo: la corrente e, durante una rotazione, la nuova.
 pub const MAX_AGENT_KEYS: usize = 2;
 
@@ -60,6 +88,7 @@ pub struct AccessPolicy {
     agents: HashMap<Fingerprint, NodeId>,
     nodes: BTreeSet<NodeId>,
     clients: HashMap<Fingerprint, ClientGrant>,
+    cert_trust: CertTrust,
 }
 
 impl AccessPolicy {
@@ -70,7 +99,10 @@ impl AccessPolicy {
     }
 
     fn ensure_new_peer(&self, peer: &Fingerprint) -> Result<(), DomainError> {
-        if self.agents.contains_key(peer) || self.clients.contains_key(peer) {
+        if self.agents.contains_key(peer)
+            || self.clients.contains_key(peer)
+            || self.cert_trust.ca_fingerprints().any(|ca| ca == *peer)
+        {
             return Err(DomainError::DuplicatePeer(*peer));
         }
         Ok(())
@@ -155,6 +187,95 @@ impl AccessPolicy {
             by_node.entry(node).or_default().push(*key);
         }
         by_node
+    }
+
+    /// Imposta le CA pinnate e la denylist (PROTOCOL §15.8, §15.9).
+    ///
+    /// # Errors
+    /// [`DomainError::DuplicatePeer`] se una chiave di CA è anche la chiave di un peer.
+    pub fn set_cert_trust(&mut self, trust: CertTrust) -> Result<(), DomainError> {
+        for ca in trust.ca_fingerprints() {
+            if self.agents.contains_key(&ca) || self.clients.contains_key(&ca) {
+                return Err(DomainError::DuplicatePeer(ca));
+            }
+        }
+        self.cert_trust = trust;
+        Ok(())
+    }
+
+    /// Le CA pinnate e la denylist.
+    #[must_use]
+    pub const fn cert_trust(&self) -> &CertTrust {
+        &self.cert_trust
+    }
+
+    /// Passi 1, 2, 5, 7–11 di PROTOCOL §15.4 e la tabella di §15.5.
+    ///
+    /// # Errors
+    /// Il motivo del rifiuto, per l'audit.
+    pub fn admit(
+        &self,
+        peer: &Fingerprint,
+        cert: Option<&Arc<CertClaims>>,
+        now: UnixTime,
+    ) -> Result<Admission<'_>, AuthFailureReason> {
+        // Passo 1: la denylist vale per qualsiasi credenziale e qualsiasi ruolo.
+        if self.cert_trust.is_key_revoked(peer) {
+            return Err(AuthFailureReason::KeyRevoked);
+        }
+        // Passi 5 e 7–10: un certificato presentato si verifica sempre (fail closed), anche
+        // per una chiave della whitelist.
+        if let Some(claims) = cert {
+            // Difesa in profondità: il binding (passo 4) è già stato verificato in `zt-crypto`.
+            if claims.subject() != peer {
+                return Err(AuthFailureReason::Certificate(CertRejection::KeyMismatch));
+            }
+            self.cert_trust
+                .check(claims, now)
+                .map_err(AuthFailureReason::Certificate)?;
+        }
+        match self.role(peer) {
+            // Passo 11: una chiave ha un solo ruolo.
+            Some(PeerRole::Agent { .. }) if cert.is_some() => {
+                Err(AuthFailureReason::Certificate(CertRejection::RoleConflict))
+            }
+            Some(PeerRole::Agent { node }) => Ok(Admission::Agent { node }),
+            // La whitelist ha la precedenza: nessuna unione dei permessi.
+            Some(PeerRole::Client { .. }) => Ok(Admission::Client {
+                credential: ClientCredential::Key,
+            }),
+            None => match cert {
+                Some(claims) => Ok(Admission::Client {
+                    credential: ClientCredential::Certificate(Arc::clone(claims)),
+                }),
+                None => Err(AuthFailureReason::UnknownPeer),
+            },
+        }
+    }
+
+    /// [`Self::may_open`] generalizzato: nodi della policy ∩ ambito effettivo della credenziale.
+    #[must_use]
+    pub fn may_open_with(
+        &self,
+        peer: &Fingerprint,
+        credential: &ClientCredential,
+        target: &NodeId,
+        now: UnixTime,
+    ) -> bool {
+        if self.cert_trust.is_key_revoked(peer) || !self.nodes.contains(target) {
+            return false;
+        }
+        match credential {
+            ClientCredential::Key => self.may_open(peer, target),
+            ClientCredential::Certificate(claims) => {
+                claims.subject() == peer
+                    && !self.agents.contains_key(peer)
+                    && self
+                        .cert_trust
+                        .check(claims, now)
+                        .is_ok_and(|authority| authority.permits(claims, target))
+            }
+        }
     }
 
     /// `true` se il client `peer` può aprire uno stream verso `target`.

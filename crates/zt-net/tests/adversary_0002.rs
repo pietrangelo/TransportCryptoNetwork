@@ -8,7 +8,6 @@
     clippy::too_many_lines
 )]
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -115,7 +114,11 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
-            authorized_clients: zt_net::Revocable::fixed(HashSet::from([ansible.fingerprint()])),
+            authorized_clients: zt_net::Revocable::fixed(
+                [ansible.fingerprint()]
+                    .into_iter()
+                    .collect::<zt_domain::AuthorizedClients>(),
+            ),
             timeouts: timeouts(),
             max_streams: 16,
         },
@@ -127,6 +130,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
         }],
         node: node("web-01"),
         node_key: agent_id.public_key(),
+        certificate: None,
         timeouts: timeouts(),
     };
 
@@ -216,7 +220,11 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
-            authorized_clients: zt_net::Revocable::fixed(HashSet::from([client_id.fingerprint()])),
+            authorized_clients: zt_net::Revocable::fixed(
+                [client_id.fingerprint()]
+                    .into_iter()
+                    .collect::<zt_domain::AuthorizedClients>(),
+            ),
             timeouts: timeouts(),
             max_streams: 16,
         },
@@ -304,7 +312,11 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
-            authorized_clients: zt_net::Revocable::fixed(HashSet::from([client_id.fingerprint()])),
+            authorized_clients: zt_net::Revocable::fixed(
+                [client_id.fingerprint()]
+                    .into_iter()
+                    .collect::<zt_domain::AuthorizedClients>(),
+            ),
             timeouts: slow,
             max_streams: 16,
         },

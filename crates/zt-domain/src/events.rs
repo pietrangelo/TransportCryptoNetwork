@@ -1,3 +1,4 @@
+use crate::cert::{CertClaims, CertRef, CertRejection};
 use crate::crypto::Fingerprint;
 use crate::frame::CloseReason;
 use crate::ids::{NodeId, SessionId};
@@ -17,6 +18,27 @@ pub enum AuthFailureReason {
     NodeIdMismatch,
     /// Troppi tentativi dallo stesso indirizzo.
     RateLimited,
+    /// La chiave è nella denylist (`keys`, PROTOCOL §15.8), con qualsiasi credenziale.
+    KeyRevoked,
+    /// Il certificato presentato non è stato accettato (PROTOCOL §15.4).
+    Certificate(CertRejection),
+}
+
+impl AuthFailureReason {
+    /// Il certificato da riportare in un `authentication_failed` (PROTOCOL §15.11, finding
+    /// 0006-3): solo se la firma è stata verificata (`verified` viene da `zt-crypto`) e il
+    /// rifiuto viene da un controllo successivo (passi 7–12 di §15.4). Prima della firma i campi
+    /// del certificato non sono di nessuno: un evento che nomina una serie riguarda sempre un
+    /// certificato davvero firmato da una CA pinnata.
+    #[must_use]
+    pub fn certificate_ref(self, verified: Option<&CertClaims>) -> Option<CertRef> {
+        match self {
+            Self::Certificate(check) if check.after_signature() => {
+                verified.map(CertClaims::reference)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Fatti significativi del dominio, emessi dai casi d'uso e consumati dagli adapter
@@ -42,6 +64,8 @@ pub enum DomainEvent {
         client: Fingerprint,
         /// Il nodo di destinazione.
         target: NodeId,
+        /// Il certificato che ha autorizzato il client, se non è la whitelist.
+        certificate: Option<CertRef>,
     },
     /// Un tentativo di autenticazione è fallito.
     AuthenticationFailed {
@@ -49,6 +73,9 @@ pub enum DomainEvent {
         peer: Option<Fingerprint>,
         /// Il motivo.
         reason: AuthFailureReason,
+        /// Il certificato rifiutato, solo dopo la verifica della firma
+        /// ([`AuthFailureReason::certificate_ref`]).
+        certificate: Option<CertRef>,
     },
     /// Un client autenticato ha chiesto un nodo che la policy non gli concede.
     AccessDenied {
@@ -56,6 +83,8 @@ pub enum DomainEvent {
         client: Fingerprint,
         /// Il nodo richiesto.
         target: NodeId,
+        /// Il certificato del client, se non è la whitelist.
+        certificate: Option<CertRef>,
     },
     /// Un peer ha violato il protocollo e la sua connessione è stata chiusa.
     ProtocolViolation {
@@ -78,6 +107,16 @@ pub enum DomainEvent {
         peer: Fingerprint,
         /// Il nodo non più concesso; `None` se il peer ha perso il proprio ruolo.
         target: Option<NodeId>,
+        /// Il certificato del client, se non è la whitelist.
+        certificate: Option<CertRef>,
+    },
+    /// Una connessione autorizzata da un certificato è stata chiusa alla scadenza
+    /// (PROTOCOL §15.7).
+    CertificateExpired {
+        /// L'identità del client.
+        peer: Fingerprint,
+        /// Il certificato scaduto.
+        certificate: CertRef,
     },
 }
 
@@ -94,6 +133,7 @@ impl DomainEvent {
             Self::ProtocolViolation { .. } => "protocol_violation",
             Self::ConnectionDrained { .. } => "connection_drained",
             Self::AccessRevoked { .. } => "access_revoked",
+            Self::CertificateExpired { .. } => "certificate_expired",
         }
     }
 

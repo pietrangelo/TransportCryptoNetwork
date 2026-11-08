@@ -11,7 +11,6 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -166,9 +165,11 @@ impl Fleet {
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
-            authorized_clients: zt_net::Revocable::fixed(HashSet::from([self
-                .ansible
-                .fingerprint()])),
+            authorized_clients: zt_net::Revocable::fixed(
+                [self.ansible.fingerprint()]
+                    .into_iter()
+                    .collect::<zt_domain::AuthorizedClients>(),
+            ),
             timeouts: fast_timeouts(),
             max_streams: 16,
         };
@@ -334,4 +335,90 @@ pub async fn echo_through(child: &mut Child, data: &[u8]) -> Vec<u8> {
     child.stdin = Some(writer.await.unwrap());
     child.stdout = Some(stdout);
     got
+}
+
+// ---------- Fase 6: certificati client ----------
+
+/// L'orologio di sistema in secondi Unix.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Un certificato emesso da una CA nuova: (byte, chiave della CA, serie).
+pub fn issue(
+    subject: &PublicKey,
+    nodes: &[&str],
+    not_before: u64,
+    not_after: u64,
+) -> (Vec<u8>, PublicKey, zt_domain::CertSerial) {
+    let ca = zt_crypto::CaSigningKey::generate().unwrap();
+    let serial = zt_domain::CertSerial::try_from([0x3c; 16]).unwrap();
+    let body = zt_domain::CertBody::new(
+        zt_crypto::cert_key(&ca.public_key()),
+        zt_crypto::cert_key(subject),
+        serial,
+        zt_domain::UnixTime::from_secs(not_before),
+        zt_domain::UnixTime::from_secs(not_after),
+        node("alice"),
+        zt_domain::CertScope::Only(nodes.iter().map(|n| node(n)).collect()),
+    )
+    .unwrap();
+    let bytes = zt_crypto::sign_certificate(&ca, &body).unwrap();
+    (bytes, ca.public_key(), serial)
+}
+
+impl ClientDir {
+    /// Scrive `client.cert` con `mode` e aggiunge `certificate = "client.cert"` a
+    /// `client.toml`.
+    pub fn add_certificate(&self, bytes: &[u8], mode: u32) {
+        let path = self.dir.join("client.cert");
+        std::fs::write(&path, zt_crypto::encode_certificate_text(bytes)).unwrap();
+        set_mode(&path, mode);
+        let toml = std::fs::read_to_string(self.config()).unwrap();
+        std::fs::write(
+            self.config(),
+            format!("certificate = \"client.cert\"\n{toml}"),
+        )
+        .unwrap();
+        set_mode(&self.config(), 0o644);
+    }
+}
+
+/// Un indirizzo su cui non ascolta nessuno (connessione rifiutata subito).
+pub async fn closed_port() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap()
+}
+
+/// Attende che `bait` riceva una connessione da `child` (entro `limit`), poi lo ferma.
+pub async fn reaches(bait: &Counting, mut child: Child, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if bait.count() > 0 {
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = child.kill().await;
+    bait.count() > 0
+}
+
+/// La data UTC `AAAA-MM-GG` di un istante Unix (algoritmo dei giorni civili).
+pub fn utc_date(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap() + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }

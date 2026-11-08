@@ -19,11 +19,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout_at;
 use zt_application::ratelimit::HandshakeGate;
-use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
+use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
-use zt_domain::{AccessPolicy, AuthFailureReason, DomainEvent, Fingerprint, Frame, SessionId};
+use zt_domain::{
+    AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
+    SessionId,
+};
 
 use crate::{NetError, Timeouts, channel};
 
@@ -66,6 +69,43 @@ impl Default for RelayConfig {
     }
 }
 
+/// Una riga di audit (`target: "zt_audit"`), a livello WARN per un allarme e INFO altrimenti.
+macro_rules! audit_line {
+    ($alert:expr, $kind:expr, $($fields:tt)*) => {
+        if $alert {
+            tracing::warn!(target: "zt_audit", event_kind = $kind, $($fields)*);
+        } else {
+            tracing::info!(target: "zt_audit", event_kind = $kind, $($fields)*);
+        }
+    };
+}
+
+/// `authentication_failed`: i campi del certificato solo dopo la firma verificata (PROTOCOL
+/// §15.11, finding 0006-3); senza certificato sono vuoti e non compaiono.
+fn authentication_failed(
+    alert: bool,
+    kind: &'static str,
+    peer: Option<&Fingerprint>,
+    reason: AuthFailureReason,
+    certificate: Option<&CertRef>,
+) {
+    let (reason, cert_check) = failure_fields(reason);
+    let peer = peer.map(ToString::to_string);
+    let c = CertFields::of(certificate);
+    audit_line!(
+        alert,
+        kind,
+        peer = peer.as_deref(),
+        reason = reason.as_str(),
+        cert_check,
+        ca = c.ca.as_deref(),
+        serial = c.serial.as_deref(),
+        cert_name = c.cert_name.as_deref(),
+        not_after = c.not_after,
+        "authentication failed"
+    );
+}
+
 /// Registra un evento di audit. Gli eventi contengono solo identità e metadati.
 ///
 /// `event_kind` è il nome stabile dell'evento ([`DomainEvent::kind`]), su cui filtrare un SIEM;
@@ -75,13 +115,7 @@ pub(crate) fn audit(event: &DomainEvent) {
     let kind = event.kind();
     let alert = event.is_security_alert();
     macro_rules! emit {
-        ($($fields:tt)*) => {
-            if alert {
-                tracing::warn!(target: "zt_audit", event_kind = kind, $($fields)*);
-            } else {
-                tracing::info!(target: "zt_audit", event_kind = kind, $($fields)*);
-            }
-        };
+        ($($fields:tt)*) => { audit_line!(alert, kind, $($fields)*) };
     }
     match event {
         DomainEvent::AgentRegistered { node, fingerprint } => {
@@ -91,15 +125,42 @@ pub(crate) fn audit(event: &DomainEvent) {
             session,
             client,
             target,
+            certificate,
         } => {
-            emit!(session = %session_hex(session), peer = %client, node = %target, "session established");
+            let c = CertFields::of(certificate.as_ref());
+            emit!(
+                session = %session_hex(session),
+                peer = %client,
+                node = %target,
+                credential = c.credential,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "session established"
+            );
         }
-        DomainEvent::AuthenticationFailed { peer, reason } => match peer {
-            Some(peer) => emit!(%peer, ?reason, "authentication failed"),
-            None => emit!(?reason, "authentication failed"),
-        },
-        DomainEvent::AccessDenied { client, target } => {
-            emit!(peer = %client, node = %target, "access denied");
+        DomainEvent::AuthenticationFailed {
+            peer,
+            reason,
+            certificate,
+        } => authentication_failed(alert, kind, peer.as_ref(), *reason, certificate.as_ref()),
+        DomainEvent::AccessDenied {
+            client,
+            target,
+            certificate,
+        } => {
+            let c = CertFields::of(certificate.as_ref());
+            emit!(
+                peer = %client,
+                node = %target,
+                credential = c.credential,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "access denied"
+            );
         }
         DomainEvent::ProtocolViolation { peer, rule } => {
             emit!(%peer, rule = *rule, "protocol violation");
@@ -107,12 +168,79 @@ pub(crate) fn audit(event: &DomainEvent) {
         DomainEvent::ConnectionDrained { session, reason } => {
             emit!(session = %session_hex(session), ?reason, "connection drained");
         }
-        DomainEvent::AccessRevoked { peer, target } => match target {
-            Some(target) => emit!(%peer, node = %target, "access revoked"),
-            None => emit!(%peer, "access revoked"),
-        },
+        DomainEvent::AccessRevoked {
+            peer,
+            target,
+            certificate,
+        } => {
+            let c = CertFields::of(certificate.as_ref());
+            let node = target.as_ref().map(ToString::to_string);
+            emit!(
+                %peer,
+                node = node.as_deref(),
+                credential = c.credential,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "access revoked"
+            );
+        }
+        DomainEvent::CertificateExpired { peer, certificate } => {
+            let c = CertFields::of(Some(certificate));
+            emit!(
+                %peer,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "certificate expired"
+            );
+        }
         // `DomainEvent` è `non_exhaustive`: un evento nuovo resta almeno leggibile.
         other => emit!(event = ?other, "audit event"),
+    }
+}
+
+/// I campi di audit di una credenziale (PROTOCOL §15.11): mai i byte del certificato, solo
+/// la CA, la serie, il nome e la scadenza.
+pub(crate) struct CertFields {
+    /// `key` o `certificate`.
+    pub(crate) credential: &'static str,
+    pub(crate) ca: Option<String>,
+    pub(crate) serial: Option<String>,
+    pub(crate) cert_name: Option<String>,
+    pub(crate) not_after: Option<u64>,
+}
+
+impl CertFields {
+    pub(crate) fn of(certificate: Option<&CertRef>) -> Self {
+        match certificate {
+            None => Self {
+                credential: "key",
+                ca: None,
+                serial: None,
+                cert_name: None,
+                not_after: None,
+            },
+            Some(c) => Self {
+                credential: "certificate",
+                ca: Some(c.ca.to_string()),
+                serial: Some(c.serial.to_string()),
+                cert_name: Some(c.name.to_string()),
+                not_after: Some(c.not_after.as_secs()),
+            },
+        }
+    }
+}
+
+/// `reason` e `cert_check` di un `authentication_failed`. I motivi precedenti alla Fase 6
+/// restano nella forma di sempre (`UnknownPeer`, ...), per non rompere i filtri esistenti.
+fn failure_fields(reason: AuthFailureReason) -> (String, Option<&'static str>) {
+    match reason {
+        AuthFailureReason::KeyRevoked => ("key_revoked".into(), None),
+        AuthFailureReason::Certificate(check) => ("certificate".into(), Some(check.as_str())),
+        other => (format!("{other:?}"), None),
     }
 }
 
@@ -157,6 +285,7 @@ enum HubEvent {
     Connected {
         conn: ConnId,
         peer: Fingerprint,
+        certificate: Option<Arc<CertClaims>>,
         tx: mpsc::Sender<Frame>,
     },
     Core(Input),
@@ -193,10 +322,16 @@ impl RelayServer {
         config: RelayConfig,
     ) -> Result<Self, NetError> {
         let policy = policy.into();
+        let keys = keys.into();
         let listener = TcpListener::bind(addr).await?;
+        // Il socket accetta già connessioni (in coda fino a `run`): lo si dichiara qui, così
+        // ciò che il processo registra dopo `bind` viene sempre dopo questa riga.
+        if let Ok(addr) = listener.local_addr() {
+            tracing::info!(%addr, relay = %keys.current().current().fingerprint(), "relay listening");
+        }
         Ok(Self {
             listener,
-            keys: keys.into(),
+            keys,
             policy,
             config,
         })
@@ -240,9 +375,6 @@ impl RelayServer {
         );
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
-        if let Ok(addr) = listener.local_addr() {
-            tracing::info!(%addr, relay = %keys.current().current().fingerprint(), "relay listening");
-        }
         loop {
             let (tcp, addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -299,20 +431,26 @@ impl Connection {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: None,
                     reason: AuthFailureReason::HandshakeFailed,
+                    certificate: None,
                 });
                 tracing::debug!(%addr, error = %err, "handshake failed");
                 return;
             }
         };
         let peer = pending.peer();
-        // Una chiave sconosciuta non riceve nemmeno il secondo messaggio dell'handshake.
-        if self.policy.current().role(&peer).is_none() {
-            audit(&DomainEvent::AuthenticationFailed {
-                peer: Some(peer),
-                reason: AuthFailureReason::UnknownPeer,
-            });
-            return;
-        }
+        // PROTOCOL §15.4, prima del messaggio 2: un rifiuto equivale a una chiave sconosciuta,
+        // che non riceve nemmeno il secondo messaggio dell'handshake.
+        let certificate = match admit(&self.policy.current(), &peer, pending.payload()) {
+            Ok(certificate) => certificate,
+            Err((reason, certificate)) => {
+                audit(&DomainEvent::AuthenticationFailed {
+                    peer: Some(peer),
+                    reason,
+                    certificate,
+                });
+                return;
+            }
+        };
         let Ok(mut ch) = pending.establish(&self.timeouts).await else {
             return;
         };
@@ -322,7 +460,12 @@ impl Connection {
         let conn = self.conn;
         if self
             .hub
-            .send(HubEvent::Connected { conn, peer, tx })
+            .send(HubEvent::Connected {
+                conn,
+                peer,
+                certificate,
+                tx,
+            })
             .await
             .is_err()
         {
@@ -364,6 +507,39 @@ impl Connection {
     }
 }
 
+/// Passi 1–11 di PROTOCOL §15.4 sul canale esterno: denylist della chiave, verifica del
+/// certificato (se il payload non è vuoto) e decisione della policy. Restituisce i dati
+/// verificati del certificato, che il core ricontrolla con la policy del momento.
+/// Il rifiuto di [`admit`]: il motivo e, dopo la verifica della firma, il certificato
+/// (PROTOCOL §15.11).
+type Refusal = (AuthFailureReason, Option<CertRef>);
+
+fn admit(
+    policy: &AccessPolicy,
+    peer: &Fingerprint,
+    payload: &[u8],
+) -> Result<Option<Arc<CertClaims>>, Refusal> {
+    let trust = policy.cert_trust();
+    // Passo 1, anche senza certificato.
+    if trust.is_key_revoked(peer) {
+        return Err((AuthFailureReason::KeyRevoked, None));
+    }
+    // Passi 3–6 (passo 2: payload vuoto, nessun certificato). Un rifiuto qui non nomina mai
+    // CA e serie: la firma non è verificata.
+    let certificate = if payload.is_empty() {
+        None
+    } else {
+        let claims = zt_crypto::verify_certificate(payload, peer, trust)
+            .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
+        Some(Arc::new(claims))
+    };
+    // Passi 5 e 7–11 e la precedenza della whitelist.
+    policy
+        .admit(peer, certificate.as_ref(), crate::unix_now())
+        .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))?;
+    Ok(certificate)
+}
+
 async fn hub(
     mut core: RelayCore<RandomIds>,
     mut events: mpsc::Receiver<HubEvent>,
@@ -379,9 +555,9 @@ async fn hub(
             () = policy.changed() => Input::PolicyUpdated { policy: policy.current() },
             event = events.recv() => match event {
                 None => return,
-                Some(HubEvent::Connected { conn, peer, tx }) => {
+                Some(HubEvent::Connected { conn, peer, certificate, tx }) => {
                     peers.insert(conn, tx);
-                    Input::Connected { conn, peer }
+                    Input::Connected { conn, peer, certificate }
                 }
                 Some(HubEvent::Core(input)) => {
                     if let Input::Disconnected { conn } = &input {
@@ -394,7 +570,11 @@ async fn hub(
         };
         let mut pending = vec![input];
         while let Some(input) = pending.pop() {
-            for output in core.handle(input, std::time::Instant::now()) {
+            let now = Now {
+                instant: std::time::Instant::now(),
+                unix: crate::unix_now(),
+            };
+            for output in core.handle(input, now) {
                 match output {
                     Output::Send { conn, frame } => {
                         let Some(tx) = peers.get(&conn) else { continue };

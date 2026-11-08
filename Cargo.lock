@@ -403,6 +403,7 @@ dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519",
  "sha2 0.11.1",
+ "signature",
  "subtle",
  "zeroize",
 ]
@@ -1000,6 +1001,9 @@ name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "digest 0.11.3",
+]
 
 [[package]]
 name = "slab"
@@ -1529,6 +1533,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zt-ca"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "getrandom 0.4.3",
+ "hex",
+ "rustix",
+ "zt-crypto",
+ "zt-domain",
+ "zt-net",
+]
+
+[[package]]
 name = "zt-client"
 version = "0.1.0"
 dependencies = [
@@ -1571,10 +1588,13 @@ name = "zt-net"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ed25519-dalek",
  "futures",
  "getrandom 0.4.3",
+ "hex",
  "rustix",
  "serde",
+ "snow",
  "thiserror",
  "tokio",
  "tokio-util",

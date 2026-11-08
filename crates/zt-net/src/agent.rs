@@ -4,7 +4,7 @@
 //! l'identità end-to-end del client contro il proprio elenco. Un relay compromesso non può
 //! quindi aprire sessioni SSH verso i nodi.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,13 +12,15 @@ use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout, timeout_at};
 use zt_crypto::Keyring;
-use zt_crypto::noise::{self, Channel};
+use zt_crypto::noise::{self, Channel, MAX_HANDSHAKE_PAYLOAD_LEN};
 use zt_domain::flow::Window;
+use zt_domain::limits::NOISE_MSG1_OVERHEAD;
 use zt_domain::{
-    AuthFailureReason, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
+    AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection, ClientCredential,
+    CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
 };
 
-use crate::relay::audit;
+use crate::relay::{CertFields, audit};
 use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
@@ -32,7 +34,7 @@ pub struct AgentConfig {
     /// Demone SSH locale.
     pub ssh_target: String,
     /// Client accettati end-to-end.
-    pub authorized_clients: crate::Revocable<HashSet<Fingerprint>>,
+    pub authorized_clients: crate::Revocable<AuthorizedClients>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
     /// Stream contemporanei, da 1 a [`MAX_STREAMS`].
@@ -251,6 +253,7 @@ fn on_relay_frame(
                 identity: Arc::clone(identity),
                 sessions: Arc::clone(slots),
                 authorized: config.authorized_clients.clone(),
+                node: config.node.clone(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
             };
@@ -316,9 +319,37 @@ struct StreamTask {
     identity: Arc<Keyring>,
     /// Sessioni verso sshd dell'agent intero (tutti i relay).
     sessions: Arc<Semaphore>,
-    authorized: crate::Revocable<HashSet<Fingerprint>>,
+    authorized: crate::Revocable<AuthorizedClients>,
+    /// Il nodo di questo agent: deve essere nell'ambito effettivo di un certificato.
+    node: NodeId,
     ssh_target: String,
     timeouts: Timeouts,
+}
+
+/// Passi 1–10 e 12 di PROTOCOL §15.4 sul canale end-to-end, con le CA, la denylist e
+/// l'orologio di questo agent (non quelli del relay).
+fn admit_client(
+    clients: &AuthorizedClients,
+    client: &Fingerprint,
+    payload: &[u8],
+    node: &NodeId,
+) -> Result<ClientCredential, (AuthFailureReason, Option<CertRef>)> {
+    let trust = clients.cert_trust();
+    if trust.is_key_revoked(client) {
+        return Err((AuthFailureReason::KeyRevoked, None));
+    }
+    // Un rifiuto prima della firma verificata non nomina mai CA e serie (PROTOCOL §15.11).
+    let certificate: Option<Arc<CertClaims>> = if payload.is_empty() {
+        None
+    } else {
+        let claims = zt_crypto::verify_certificate(payload, client, trust)
+            .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
+        Some(Arc::new(claims))
+    };
+    // Dopo la firma, il rifiuto porta il certificato (finding 0006-3).
+    clients
+        .admit(client, certificate.as_ref(), node, crate::unix_now())
+        .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))
 }
 
 impl StreamTask {
@@ -328,10 +359,23 @@ impl StreamTask {
             identity,
             sessions,
             authorized,
+            node,
             ssh_target,
             timeouts,
         } = self;
         let pending = match io.recv_message(&timeouts).await {
+            // Un messaggio 1 più lungo di quello con il certificato più grande non si
+            // interpreta nemmeno (PROTOCOL §15.3): è un certificato rifiutato, non un handshake
+            // da tentare.
+            Ok(msg1) if msg1.len() > MAX_MSG1_LEN => {
+                audit(&DomainEvent::AuthenticationFailed {
+                    peer: None,
+                    reason: AuthFailureReason::Certificate(CertRejection::Malformed),
+                    certificate: None,
+                });
+                io.close(CloseReason::Unauthorized).await;
+                return;
+            }
             Ok(msg1) => noise::respond_any(&identity, &msg1, Channel::EndToEnd),
             // Il client ha già chiuso: rispondere con un altro `Close` non serve (finding 0002-1).
             Err(NetError::StreamClosed(_)) => return,
@@ -345,19 +389,27 @@ impl StreamTask {
             audit(&DomainEvent::AuthenticationFailed {
                 peer: None,
                 reason: AuthFailureReason::HandshakeFailed,
+                certificate: None,
             });
             io.close(CloseReason::ProtocolViolation).await;
             return;
         };
         let client = pending.peer();
-        if !authorized.current().contains(&client) {
-            audit(&DomainEvent::AuthenticationFailed {
-                peer: Some(client),
-                reason: AuthFailureReason::UnknownPeer,
-            });
-            io.close(CloseReason::Unauthorized).await;
-            return;
-        }
+        // Prima del messaggio 2: un client rifiutato non completa l'handshake e non raggiunge
+        // sshd (come un client sconosciuto, PROTOCOL §8 punto 3).
+        let credential =
+            match admit_client(&authorized.current(), &client, pending.payload(), &node) {
+                Ok(credential) => credential,
+                Err((reason, certificate)) => {
+                    audit(&DomainEvent::AuthenticationFailed {
+                        peer: Some(client),
+                        reason,
+                        certificate,
+                    });
+                    io.close(CloseReason::Unauthorized).await;
+                    return;
+                }
+            };
         let Ok((msg2, mut transport)) = pending.accept() else {
             io.close(CloseReason::ProtocolViolation).await;
             return;
@@ -374,6 +426,7 @@ impl StreamTask {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(client),
                     reason: AuthFailureReason::HandshakeFailed,
+                    certificate: None,
                 });
                 io.close(CloseReason::ProtocolViolation).await;
                 return;
@@ -398,7 +451,58 @@ impl StreamTask {
             return;
         };
         let _ = ssh.set_nodelay(true);
-        bridge(io, transport, ssh, client, authorized, &timeouts).await;
+        let session = Session {
+            client,
+            credential,
+            node,
+        };
+        bridge(io, transport, ssh, session, authorized, &timeouts).await;
+    }
+}
+
+/// Il messaggio 1 end-to-end più lungo possibile: quello con il certificato più grande.
+const MAX_MSG1_LEN: usize = NOISE_MSG1_OVERHEAD.saturating_add(MAX_HANDSHAKE_PAYLOAD_LEN);
+
+/// Chi è il client di una sessione end-to-end e con quale credenziale è stato ammesso.
+struct Session {
+    client: Fingerprint,
+    credential: ClientCredential,
+    node: NodeId,
+}
+
+/// Al più ogni quanto si rilegge l'orologio di sistema per la scadenza di un certificato
+/// (PROTOCOL §15.7): un salto dell'orologio o una VM sospesa non allungano la sessione di più.
+const EXPIRY_RECHECK: Duration = Duration::from_secs(60);
+
+/// Perché una sessione deve finire prima che lo decidano le parti.
+enum Cut {
+    Revoked,
+    Expired,
+}
+
+/// Attende che la credenziale della sessione smetta di valere: a ogni cambio dei client
+/// autorizzati e, per un certificato, a `min(not_after, adesso + 60 s)`.
+async fn until_cut(session: &Session, authorized: &mut crate::Revocable<AuthorizedClients>) -> Cut {
+    loop {
+        let now = crate::unix_now();
+        let clients = authorized.current();
+        if !clients.still_admits(&session.client, &session.credential, &session.node, now) {
+            return match &session.credential {
+                ClientCredential::Certificate(claims) if now >= claims.not_after() => Cut::Expired,
+                _ => Cut::Revoked,
+            };
+        }
+        match &session.credential {
+            ClientCredential::Key => authorized.changed().await,
+            ClientCredential::Certificate(claims) => {
+                let left = claims.not_after().as_secs().saturating_sub(now.as_secs());
+                let wait = Duration::from_secs(left).min(EXPIRY_RECHECK);
+                tokio::select! {
+                    () = authorized.changed() => {}
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+        }
     }
 }
 
@@ -407,27 +511,34 @@ async fn bridge(
     io: StreamIo,
     transport: zt_crypto::noise::Transport,
     ssh: TcpStream,
-    client: Fingerprint,
-    mut authorized: crate::Revocable<HashSet<Fingerprint>>,
+    session: Session,
+    mut authorized: crate::Revocable<AuthorizedClients>,
     timeouts: &Timeouts,
 ) {
     let stream = io.id();
+    let client = session.client;
+    let certificate = match &session.credential {
+        ClientCredential::Key => None,
+        ClientCredential::Certificate(claims) => Some(claims.reference()),
+    };
+    let c = CertFields::of(certificate.as_ref());
     tracing::info!(
         target: "zt_audit",
         event_kind = "e2e_session_started",
         peer = %client,
         %stream,
+        credential = c.credential,
+        ca = c.ca.as_deref(),
+        serial = c.serial.as_deref(),
+        cert_name = c.cert_name.as_deref(),
+        not_after = c.not_after,
         "end-to-end session started"
     );
     let closer = io.closer();
-    // Revoca a caldo: se il client esce dall'elenco la sessione si chiude subito, senza
-    // aspettare il relay (che potrebbe non revocarlo mai). Si controlla il valore attuale
-    // prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
-    let revoked = async {
-        while authorized.current().contains(&client) {
-            authorized.changed().await;
-        }
-    };
+    // Revoca a caldo e scadenza: se la credenziale smette di valere la sessione si chiude
+    // subito, senza aspettare il relay (che potrebbe non farlo mai). Si controlla il valore
+    // attuale prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
+    let cut = until_cut(&session, &mut authorized);
     let outcome = tokio::select! {
         result = pump(io, transport, ssh, Some(timeouts.write)) => match result {
             Ok(()) => "closed",
@@ -436,10 +547,23 @@ async fn bridge(
                 "error"
             }
         },
-        () = revoked => {
-            audit(&DomainEvent::AccessRevoked { peer: client, target: None });
+        cut = cut => {
+            let outcome = match (cut, certificate) {
+                (Cut::Expired, Some(certificate)) => {
+                    audit(&DomainEvent::CertificateExpired { peer: client, certificate });
+                    "expired"
+                }
+                (_, certificate) => {
+                    audit(&DomainEvent::AccessRevoked {
+                        peer: client,
+                        target: None,
+                        certificate,
+                    });
+                    "revoked"
+                }
+            };
             closer.close(CloseReason::Unauthorized).await;
-            "revoked"
+            outcome
         }
     };
     tracing::info!(

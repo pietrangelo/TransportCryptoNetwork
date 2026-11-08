@@ -10,7 +10,6 @@
     clippy::cast_possible_truncation
 )]
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,9 +131,11 @@ impl Fleet {
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
-            authorized_clients: zt_net::Revocable::fixed(HashSet::from([self
-                .ansible
-                .fingerprint()])),
+            authorized_clients: zt_net::Revocable::fixed(
+                [self.ansible.fingerprint()]
+                    .into_iter()
+                    .collect::<zt_domain::AuthorizedClients>(),
+            ),
             timeouts: fast_timeouts(),
             max_streams: 16,
         };
@@ -166,6 +167,7 @@ impl Fleet {
             }],
             node: node(target),
             node_key: self.agent_id.public_key(),
+            certificate: None,
             timeouts: fast_timeouts(),
         }
     }
