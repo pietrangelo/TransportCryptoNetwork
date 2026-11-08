@@ -257,7 +257,7 @@ impl<S: SessionIds> RelayCore<S> {
             }
             Input::Disconnected { conn } => self.teardown(conn, &mut out),
             Input::Tick => self.on_tick(now, &mut out),
-            Input::PolicyUpdated { policy } => drop(policy),
+            Input::PolicyUpdated { policy } => self.on_policy(policy, &mut out),
         }
         out
     }
@@ -620,6 +620,69 @@ impl<S: SessionIds> RelayCore<S> {
             p.forget(peer_stream);
         }
         Some(route)
+    }
+
+    /// Applica una nuova policy alle connessioni aperte (revoca a caldo).
+    fn on_policy(&mut self, policy: Arc<AccessPolicy>, out: &mut Vec<Output>) {
+        self.policy = policy;
+        let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
+        ids.sort_unstable();
+        for conn in ids {
+            let Some(c) = self.conns.get(&conn) else {
+                continue;
+            };
+            let peer = c.peer;
+            let keeps_role = match (&c.role, self.policy.role(&peer)) {
+                (Role::Agent { node, .. }, Some(PeerRole::Agent { node: now })) => node == now,
+                (Role::Client, Some(PeerRole::Client { .. })) => true,
+                _ => false,
+            };
+            if !keeps_role {
+                out.push(Output::Audit(DomainEvent::AccessRevoked {
+                    peer,
+                    target: None,
+                }));
+                self.teardown(conn, out);
+                out.push(Output::Close { conn });
+                continue;
+            }
+            if !matches!(c.role, Role::Client) {
+                continue;
+            }
+            let lost: Vec<(StreamId, NodeId)> = c
+                .streams
+                .iter()
+                .filter_map(|s| self.routes.get(&(conn, *s)).map(|r| (*s, r.target.clone())))
+                .filter(|(_, target)| !self.policy.may_open(&peer, target))
+                .collect();
+            let mut targets = BTreeSet::new();
+            for (stream, target) in lost {
+                let Some(route) = self.remove_route(conn, stream) else {
+                    continue;
+                };
+                let (agent, agent_stream) = route.peer;
+                for (to, s) in [(conn, stream), (agent, agent_stream)] {
+                    out.push(Output::Send {
+                        conn: to,
+                        frame: Frame::Close {
+                            stream: s,
+                            reason: CloseReason::Unauthorized,
+                        },
+                    });
+                }
+                out.push(Output::Audit(DomainEvent::ConnectionDrained {
+                    session: route.session,
+                    reason: CloseReason::Unauthorized,
+                }));
+                targets.insert(target);
+            }
+            for target in targets {
+                out.push(Output::Audit(DomainEvent::AccessRevoked {
+                    peer,
+                    target: Some(target),
+                }));
+            }
+        }
     }
 
     fn violation(&mut self, conn: ConnId, rule: Violation, out: &mut Vec<Output>) {

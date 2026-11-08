@@ -166,6 +166,12 @@ impl AuthorizationPending {
 }
 
 /// Messaggi per direzione dopo i quali entrambe le parti eseguono il rekey di Noise.
+///
+/// Il rekey è implicito: nessun messaggio sul filo, entrambe le parti lo eseguono allo stesso
+/// contatore (TCP consegna in ordine e un messaggio rifiutato chiude il canale). Ogni periodo ha
+/// una chiave derivata a senso unico dalla precedente: chi legge la memoria del processo non
+/// decifra il traffico dei periodi passati. Con il keepalive a 30 s un canale inattivo cambia
+/// chiave ogni ~8,5 ore; con traffico SSH ogni 16 MiB circa.
 pub const REKEY_INTERVAL: usize = 1024;
 
 /// Canale cifrato e autenticato dopo l'handshake.
@@ -173,6 +179,8 @@ pub const REKEY_INTERVAL: usize = 1024;
 pub struct Transport {
     state: TransportState,
     peer: Fingerprint,
+    sent: usize,
+    received: usize,
 }
 
 impl Transport {
@@ -180,7 +188,12 @@ impl Transport {
         let state = state
             .into_transport_mode()
             .map_err(|_| CryptoError::Handshake)?;
-        Ok(Self { state, peer })
+        Ok(Self {
+            state,
+            peer,
+            sent: 0,
+            received: 0,
+        })
     }
 
     /// L'identità autenticata dell'altra parte.
@@ -192,13 +205,13 @@ impl Transport {
     /// Rekey eseguiti in invio.
     #[must_use]
     pub const fn send_epoch(&self) -> usize {
-        0
+        self.sent / REKEY_INTERVAL
     }
 
     /// Rekey eseguiti in ricezione.
     #[must_use]
     pub const fn recv_epoch(&self) -> usize {
-        0
+        self.received / REKEY_INTERVAL
     }
 
     /// Cifra un messaggio.
@@ -215,6 +228,10 @@ impl Transport {
             .write_message(plaintext, &mut out)
             .map_err(|_| CryptoError::Handshake)?;
         out.truncate(len);
+        self.sent = self.sent.wrapping_add(1);
+        if self.sent.is_multiple_of(REKEY_INTERVAL) {
+            self.state.rekey_outgoing();
+        }
         Ok(out)
     }
 
@@ -235,6 +252,11 @@ impl Transport {
             .read_message(ciphertext, &mut out)
             .map_err(|_| CryptoError::Decrypt)?;
         out.truncate(len);
+        // Solo i messaggi autentici contano: un falso non sposta il rekey.
+        self.received = self.received.wrapping_add(1);
+        if self.received.is_multiple_of(REKEY_INTERVAL) {
+            self.state.rekey_incoming();
+        }
         Ok(out)
     }
 }

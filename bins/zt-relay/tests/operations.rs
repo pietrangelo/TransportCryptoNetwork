@@ -5,7 +5,10 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::format_push_string,
+    clippy::arithmetic_side_effects,
+    clippy::assigning_clones
 )]
 
 use std::io::{BufRead, BufReader};

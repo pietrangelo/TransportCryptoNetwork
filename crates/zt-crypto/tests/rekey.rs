@@ -54,7 +54,7 @@ fn ciphertext_from_an_old_epoch_is_rejected() {
     let (mut a, mut b) = pair();
     let old = a.encrypt(b"old epoch").unwrap();
     assert_eq!(b.decrypt(&old).unwrap(), b"old epoch");
-    for _ in 1..REKEY_INTERVAL + 1 {
+    for _ in 1..=REKEY_INTERVAL {
         let ct = a.encrypt(b"x").unwrap();
         b.decrypt(&ct).unwrap();
     }

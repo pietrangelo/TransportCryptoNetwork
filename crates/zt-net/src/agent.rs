@@ -181,7 +181,7 @@ fn on_relay_frame(
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
-                authorized: config.authorized_clients.current(),
+                authorized: config.authorized_clients.clone(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
             };
@@ -229,7 +229,7 @@ fn on_relay_frame(
 struct StreamTask {
     io: StreamIo,
     identity: Arc<Identity>,
-    authorized: Arc<HashSet<Fingerprint>>,
+    authorized: crate::Revocable<HashSet<Fingerprint>>,
     ssh_target: String,
     timeouts: Timeouts,
 }
@@ -239,7 +239,7 @@ impl StreamTask {
         let Self {
             mut io,
             identity,
-            authorized,
+            mut authorized,
             ssh_target,
             timeouts,
         } = self;
@@ -262,7 +262,7 @@ impl StreamTask {
             return;
         };
         let client = pending.peer();
-        if !authorized.contains(&client) {
+        if !authorized.current().contains(&client) {
             audit(&DomainEvent::AuthenticationFailed {
                 peer: Some(client),
                 reason: AuthFailureReason::UnknownPeer,
@@ -304,8 +304,25 @@ impl StreamTask {
         };
         let _ = ssh.set_nodelay(true);
         tracing::info!(target: "zt_audit", %client, "end-to-end session started");
-        if let Err(err) = pump(io, transport, ssh, Some(timeouts.write)).await {
-            tracing::debug!(error = %err, "stream ended with error");
+        let closer = io.closer();
+        // Revoca a caldo: se il client esce dall'elenco la sessione si chiude subito, senza
+        // aspettare il relay (che potrebbe non revocarlo mai). Si controlla il valore attuale
+        // prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
+        let revoked = async {
+            while authorized.current().contains(&client) {
+                authorized.changed().await;
+            }
+        };
+        tokio::select! {
+            result = pump(io, transport, ssh, Some(timeouts.write)) => {
+                if let Err(err) = result {
+                    tracing::debug!(error = %err, "stream ended with error");
+                }
+            }
+            () = revoked => {
+                audit(&DomainEvent::AccessRevoked { peer: client, target: None });
+                closer.close(CloseReason::Unauthorized).await;
+            }
         }
         tracing::info!(target: "zt_audit", %client, "end-to-end session ended");
     }

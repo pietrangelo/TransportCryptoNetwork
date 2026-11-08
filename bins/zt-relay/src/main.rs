@@ -7,24 +7,27 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
-use zt_net::config;
+use zt_net::logging::{self, LogFormat};
 use zt_net::relay::{RelayConfig, RelayServer};
+use zt_net::reload::{self, ReloadEvents};
+use zt_net::{Revocable, config};
 
 /// Relay TCN.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
     /// Formato dei log su stderr.
-    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
-    log_format: LogFormat,
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    log_format: Format,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum LogFormat {
+enum Format {
+    /// Testo leggibile.
     Text,
+    /// Una riga JSON per evento (per SIEM e `jq`).
     Json,
 }
 
@@ -44,21 +47,20 @@ enum Command {
         /// Chiave segreta del relay.
         #[arg(long)]
         key: PathBuf,
-        /// Policy di accesso (TOML).
+        /// Policy di accesso (TOML). `SIGHUP` la ricarica e la applica anche alle connessioni
+        /// aperte; un file non valido lascia in vigore quella precedente.
         #[arg(long)]
         policy: PathBuf,
     },
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
     let cli = Cli::parse();
-    let _ = cli.log_format;
+    let format = match cli.log_format {
+        Format::Text => LogFormat::Text,
+        Format::Json => LogFormat::Json,
+    };
+    logging::init(format, "info");
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -86,12 +88,21 @@ fn run(command: Command) -> Result<(), String> {
             policy,
         } => {
             let identity = config::load_identity(&key).map_err(|e| e.to_string())?;
-            let policy = config::load_policy(&policy).map_err(|e| e.to_string())?;
+            let path = policy;
+            let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
             runtime.block_on(async {
+                let (policy, updater) = Revocable::new(policy);
+                let events = ReloadEvents {
+                    reloaded: "policy_reloaded",
+                    failed: "policy_reload_failed",
+                };
+                tokio::spawn(reload::on_sighup(updater, events, move || {
+                    config::load_policy(&path)
+                }));
                 let server = RelayServer::bind(listen, identity, policy, RelayConfig::default())
                     .await
                     .map_err(|e| e.to_string())?;

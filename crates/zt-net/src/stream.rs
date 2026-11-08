@@ -70,6 +70,14 @@ impl StreamIo {
         self.tx.send(frame).await.map_err(|_| NetError::Closed)
     }
 
+    /// Un handle che può chiudere lo stream anche dopo che `self` è passato al pump.
+    pub(crate) fn closer(&self) -> Closer {
+        Closer {
+            stream: self.stream,
+            tx: self.tx.clone(),
+        }
+    }
+
     pub(crate) async fn close(&self, reason: CloseReason) {
         // Best effort: se la connessione è già caduta non c'è nessuno da avvisare.
         let _ = self
@@ -335,5 +343,24 @@ impl Downlink<'_> {
                 Some(_) => return Err(NetError::Protocol("unexpected frame on stream")),
             }
         }
+    }
+}
+
+/// Chiude uno stream dall'esterno del pump (per esempio alla revoca del client).
+pub(crate) struct Closer {
+    stream: StreamId,
+    tx: mpsc::Sender<Frame>,
+}
+
+impl Closer {
+    /// Invia `Close` con il motivo dato. Best effort.
+    pub(crate) async fn close(&self, reason: CloseReason) {
+        let _ = self
+            .tx
+            .send(Frame::Close {
+                stream: self.stream,
+                reason,
+            })
+            .await;
     }
 }

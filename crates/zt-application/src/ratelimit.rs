@@ -206,19 +206,36 @@ mod tests {
     }
 }
 
-/// Chiave larga: prefisso /48 per IPv6, nessuna per IPv4.
+/// Chiave «larga» del rate limiter: il prefisso /48 per IPv6, nessuna per IPv4.
+///
+/// Un /48 è l'assegnazione tipica di un sito: chi lo controlla ha 65 536 prefissi /64 e con
+/// la sola chiave per /64 potrebbe riempire la tabella del limiter e bloccare gli indirizzi
+/// nuovi di tutti (residuo del finding 0002-5). Per IPv4 non serve: un attaccante con molti
+/// indirizzi IPv4 è già limitato dalla dimensione della tabella e dal costo degli indirizzi.
 #[must_use]
 pub fn wide_source_key(addr: IpAddr) -> Option<[u8; 7]> {
-    let _ = addr;
-    None
+    match addr.to_canonical() {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(v6) => {
+            let mut key = [6_u8; 7];
+            let (slot, prefix) = (key.get_mut(1..7)?, v6.octets().get(..6)?.to_owned());
+            slot.copy_from_slice(&prefix);
+            Some(key)
+        }
+    }
 }
 
-/// Cancello degli handshake del relay.
+/// Cancello degli handshake del relay: un bucket per indirizzo IPv4 o prefisso /64 IPv6 e, per
+/// IPv6, un secondo bucket per prefisso /48 controllato **prima**, così un /48 ostile non arriva
+/// nemmeno a occupare la tabella dei /64.
 #[derive(Debug)]
-pub struct HandshakeGate;
+pub struct HandshakeGate {
+    narrow: KeyedRateLimiter<[u8; 9]>,
+    wide: KeyedRateLimiter<[u8; 7]>,
+}
 
 impl HandshakeGate {
-    /// Nuovo cancello.
+    /// `burst`/`refill` per indirizzo o /64; `wide_burst`/`wide_refill` per /48.
     #[must_use]
     pub fn new(
         max_keys: usize,
@@ -228,20 +245,19 @@ impl HandshakeGate {
         wide_refill: Duration,
         max_wide_keys: usize,
     ) -> Self {
-        let _ = (
-            max_keys,
-            burst,
-            refill,
-            wide_burst,
-            wide_refill,
-            max_wide_keys,
-        );
-        Self
+        Self {
+            narrow: KeyedRateLimiter::new(max_keys, burst, refill),
+            wide: KeyedRateLimiter::new(max_wide_keys, wide_burst, wide_refill),
+        }
     }
 
-    /// `true` se l'handshake è ammesso.
+    /// `true` se l'handshake da `addr` è ammesso ora.
     pub fn admit(&mut self, addr: IpAddr, now: Instant) -> bool {
-        let _ = (addr, now);
-        true
+        if let Some(wide) = wide_source_key(addr)
+            && !self.wide.check(&wide, now)
+        {
+            return false;
+        }
+        self.narrow.check(&source_key(addr), now)
     }
 }
