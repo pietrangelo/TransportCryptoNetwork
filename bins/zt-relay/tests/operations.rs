@@ -172,8 +172,15 @@ async fn audit_events_are_json_with_a_stable_kind_and_no_secrets() {
     assert_eq!(event["fields"]["event_kind"], "authentication_failed");
     assert_eq!(event["level"], "WARN");
     assert!(event["timestamp"].is_string());
+    // Campi strutturati, non una stringa `Debug` da analizzare (finding 0004-4).
+    assert_eq!(
+        event["fields"]["peer"],
+        stranger.fingerprint().to_string(),
+        "{event}"
+    );
+    assert_eq!(event["fields"]["reason"], "UnknownPeer", "{event}");
+    assert!(event["fields"].get("event").is_none(), "{event}");
     let text = event.to_string();
-    assert!(text.contains(&stranger.fingerprint().to_string()), "{text}");
     assert!(!text.contains(relay.key.to_secret_hex().as_str()));
 }
 
@@ -231,4 +238,54 @@ async fn an_invalid_policy_on_reload_keeps_the_previous_one() {
         try_connect(&relay, &alice).await,
         Err(NetError::Rejected(_))
     ));
+}
+
+/// Finding 0004-2: con `Type=notify` systemd invia `reload` solo dopo `READY=1`. Da quel momento
+/// un `SIGHUP`, anche immediato, ricarica la policy e non termina il relay.
+#[test]
+fn ready_is_notified_only_once_sighup_is_handled() {
+    use std::os::unix::net::UnixDatagram;
+    let dir = std::env::temp_dir().join(format!("zt-relay-notify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    set_mode(&dir, 0o755);
+    let key = Identity::generate().unwrap();
+    std::fs::write(dir.join("relay.key"), key.to_secret_hex().as_str()).unwrap();
+    set_mode(&dir.join("relay.key"), 0o600);
+    std::fs::write(dir.join("policy.toml"), policy_text(&[])).unwrap();
+    set_mode(&dir.join("policy.toml"), 0o644);
+    let notify = UnixDatagram::bind(dir.join("notify.sock")).unwrap();
+    notify
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    for round in 0..10 {
+        let mut child = Command::new(BIN)
+            .args(["run", "--listen", "127.0.0.1:0", "--key"])
+            .arg(dir.join("relay.key"))
+            .arg("--policy")
+            .arg(dir.join("policy.toml"))
+            .env("NOTIFY_SOCKET", dir.join("notify.sock"))
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut buf = [0_u8; 64];
+        let n = notify.recv(&mut buf).expect("no READY=1 from the relay");
+        assert_eq!(&buf[..n], b"READY=1");
+        let ok = Command::new("kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        std::thread::sleep(Duration::from_millis(200));
+        let status = child.try_wait().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            status.is_none(),
+            "round {round}: SIGHUP after READY killed the relay"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -10,14 +10,17 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+# notify: READY=1 arriva solo quando SIGHUP è gestito (systemctl reload sicuro da subito).
+Type=notify
+NotifyAccess=main
 User=tcn
 Group=tcn
 # Per IPv6 dual-stack: --listen [::]:7443
 ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml
 # Ricarica la policy e revoca a caldo le connessioni non più ammesse.
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# always: anche un segnale (es. SIGHUP fuori tempo) conta come uscita pulita.
+Restart=always
 RestartSec=2s
 LimitNOFILE=16384
 Environment=RUST_LOG=info

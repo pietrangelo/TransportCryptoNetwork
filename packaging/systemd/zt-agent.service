@@ -12,7 +12,9 @@ After=network-online.target sshd.service
 Wants=network-online.target
 
 [Service]
-Type=exec
+# notify: READY=1 arriva solo quando SIGHUP è gestito (systemctl reload sicuro da subito).
+Type=notify
+NotifyAccess=main
 User=tcn
 Group=tcn
 EnvironmentFile=/etc/tcn/agent.env

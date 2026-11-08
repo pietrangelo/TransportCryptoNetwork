@@ -12,22 +12,55 @@ pub struct ReloadEvents {
     pub failed: &'static str,
 }
 
+/// I `SIGHUP` ricevuti da quando è stato creato. Va creato **prima** di leggere i file da
+/// ricaricare, così un segnale arrivato durante la lettura non va perso; da quel momento un
+/// `SIGHUP` non termina più il processo. Prima (durante l'avvio del processo) l'azione
+/// predefinita resta: per questo il servizio annuncia di essere pronto a systemd solo dopo
+/// ([`crate::systemd::notify_ready`], finding 0004-2).
+#[derive(Debug)]
+pub struct Hangups {
+    #[cfg(unix)]
+    signal: tokio::signal::unix::Signal,
+}
+
+impl Hangups {
+    /// Inizia a raccogliere i `SIGHUP`. Va chiamata dentro un runtime tokio.
+    ///
+    /// # Errors
+    /// Il gestore del segnale non può essere installato.
+    pub fn listen() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                signal: signal(SignalKind::hangup())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    async fn next(&mut self) -> Option<()> {
+        #[cfg(unix)]
+        {
+            self.signal.recv().await
+        }
+        #[cfg(not(unix))]
+        std::future::pending().await
+    }
+}
+
 /// A ogni `SIGHUP` richiama `load` e, se riesce, sostituisce il valore. Un file non valido (o
 /// diventato insicuro) non cambia nulla: meglio la policy di prima che nessuna policy.
-#[cfg(unix)]
-pub async fn on_sighup<T, F>(updater: Updater<T>, events: ReloadEvents, load: F)
-where
+pub async fn on_sighup<T, F>(
+    mut hangups: Hangups,
+    updater: Updater<T>,
+    events: ReloadEvents,
+    load: F,
+) where
     F: Fn() -> Result<T, ConfigError>,
 {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut hup = match signal(SignalKind::hangup()) {
-        Ok(hup) => hup,
-        Err(err) => {
-            tracing::error!(error = %err, "cannot install the SIGHUP handler: reload disabled");
-            return;
-        }
-    };
-    while hup.recv().await.is_some() {
+    while hangups.next().await.is_some() {
         match load() {
             Ok(value) => {
                 updater.replace(value);
@@ -43,14 +76,4 @@ where
             }
         }
     }
-}
-
-/// Su piattaforme senza segnali la ricarica non è disponibile.
-#[cfg(not(unix))]
-pub async fn on_sighup<T, F>(updater: Updater<T>, events: ReloadEvents, load: F)
-where
-    F: Fn() -> Result<T, ConfigError>,
-{
-    let _ = (updater, events, load);
-    std::future::pending::<()>().await;
 }

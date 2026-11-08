@@ -12,6 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.10"
 bytes = "1.12.1"
 zt-domain = { path = "../crates/zt-domain" }
+zt-application = { path = "../crates/zt-application" }
 zt-proto = { path = "../crates/zt-proto" }
 zt-crypto = { path = "../crates/zt-crypto" }
 zt-net = { path = "../crates/zt-net" }
@@ -40,6 +41,13 @@ bench = false
 [[bin]]
 name = "config_parsers"
 path = "fuzz_targets/config_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_core"
+path = "fuzz_targets/relay_core.rs"
 test = false
 doc = false
 bench = false

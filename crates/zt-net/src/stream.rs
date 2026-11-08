@@ -71,6 +71,11 @@ impl StreamIo {
     }
 
     /// Un handle che può chiudere lo stream anche dopo che `self` è passato al pump.
+    /// L'identificativo dello stream sulla connessione con il relay.
+    pub(crate) const fn id(&self) -> StreamId {
+        self.stream
+    }
+
     pub(crate) fn closer(&self) -> Closer {
         Closer {
             stream: self.stream,

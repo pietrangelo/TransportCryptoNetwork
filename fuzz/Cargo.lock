@@ -1205,6 +1205,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
+ "zt-application",
  "zt-crypto",
  "zt-domain",
  "zt-net",

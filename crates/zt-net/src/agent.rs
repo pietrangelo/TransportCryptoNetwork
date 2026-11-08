@@ -239,7 +239,7 @@ impl StreamTask {
         let Self {
             mut io,
             identity,
-            mut authorized,
+            authorized,
             ssh_target,
             timeouts,
         } = self;
@@ -303,27 +303,56 @@ impl StreamTask {
             return;
         };
         let _ = ssh.set_nodelay(true);
-        tracing::info!(target: "zt_audit", %client, "end-to-end session started");
-        let closer = io.closer();
-        // Revoca a caldo: se il client esce dall'elenco la sessione si chiude subito, senza
-        // aspettare il relay (che potrebbe non revocarlo mai). Si controlla il valore attuale
-        // prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
-        let revoked = async {
-            while authorized.current().contains(&client) {
-                authorized.changed().await;
-            }
-        };
-        tokio::select! {
-            result = pump(io, transport, ssh, Some(timeouts.write)) => {
-                if let Err(err) = result {
-                    tracing::debug!(error = %err, "stream ended with error");
-                }
-            }
-            () = revoked => {
-                audit(&DomainEvent::AccessRevoked { peer: client, target: None });
-                closer.close(CloseReason::Unauthorized).await;
-            }
-        }
-        tracing::info!(target: "zt_audit", %client, "end-to-end session ended");
+        bridge(io, transport, ssh, client, authorized, &timeouts).await;
     }
+}
+
+/// Collega la sessione end-to-end a sshd fino alla fine, o fino alla revoca del client.
+async fn bridge(
+    io: StreamIo,
+    transport: zt_crypto::noise::Transport,
+    ssh: TcpStream,
+    client: Fingerprint,
+    mut authorized: crate::Revocable<HashSet<Fingerprint>>,
+    timeouts: &Timeouts,
+) {
+    let stream = io.id();
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "e2e_session_started",
+        peer = %client,
+        %stream,
+        "end-to-end session started"
+    );
+    let closer = io.closer();
+    // Revoca a caldo: se il client esce dall'elenco la sessione si chiude subito, senza
+    // aspettare il relay (che potrebbe non revocarlo mai). Si controlla il valore attuale
+    // prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
+    let revoked = async {
+        while authorized.current().contains(&client) {
+            authorized.changed().await;
+        }
+    };
+    let outcome = tokio::select! {
+        result = pump(io, transport, ssh, Some(timeouts.write)) => match result {
+            Ok(()) => "closed",
+            Err(err) => {
+                tracing::debug!(error = %err, "stream ended with error");
+                "error"
+            }
+        },
+        () = revoked => {
+            audit(&DomainEvent::AccessRevoked { peer: client, target: None });
+            closer.close(CloseReason::Unauthorized).await;
+            "revoked"
+        }
+    };
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "e2e_session_ended",
+        peer = %client,
+        %stream,
+        outcome,
+        "end-to-end session ended"
+    );
 }

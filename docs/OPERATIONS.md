@@ -143,10 +143,12 @@ Gli eventi di sicurezza hanno target `zt_audit` e un nome stabile in `fields.eve
 | `access_denied` | WARN | un client ha chiesto un nodo che la policy non gli concede |
 | `protocol_violation` | WARN | un peer ha violato il protocollo ed è stato disconnesso |
 | `access_revoked` | WARN | una ricarica ha tolto a un peer il ruolo o l'accesso a un nodo |
+| `e2e_session_started`, `e2e_session_ended` | INFO | (agent) sessione verso sshd aperta / chiusa, con `outcome` `closed`, `error` o `revoked` |
 | `policy_reloaded`, `authorized_clients_reloaded` | INFO | ricarica riuscita |
 | `policy_reload_failed`, `authorized_clients_reload_failed` | ERROR | ricarica fallita: resta la configurazione precedente |
 
-Contengono fingerprint, nomi di nodo e session id, mai payload o segreti.
+I dati dell'evento sono campi separati: `peer` (fingerprint), `node`, `session` (hex),
+`stream`, `reason`, `rule`, secondo l'evento. Mai payload o segreti.
 
 ```bash
 journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
@@ -186,3 +188,7 @@ delle system call e indirizzi limitati a IPv4/IPv6/Unix (`systemd-analyze securi
 `tcn:tcn 0600`, file di trust e directory di proprietà di root o di `tcn` e non scrivibili da
 altri. Per l'agent, `/etc/tcn/agent.env` contiene `TCN_RELAY`, `TCN_RELAY_KEY` e `TCN_NODE`;
 se l'IP del relay è fisso, attiva `IPAddressDeny=any` / `IPAddressAllow=` nella unit.
+
+Le unit sono `Type=notify`: `systemctl start` ritorna quando il servizio ha caricato chiave e
+file di trust e gestisce già `SIGHUP`, quindi un `systemctl reload` subito dopo è sicuro. Il
+relay usa `Restart=always`, perché un segnale inatteso conta come uscita pulita.

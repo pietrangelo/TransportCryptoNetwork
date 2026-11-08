@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use zt_net::logging::{self, LogFormat};
 use zt_net::relay::{RelayConfig, RelayServer};
-use zt_net::reload::{self, ReloadEvents};
-use zt_net::{Revocable, config};
+use zt_net::reload::{self, Hangups, ReloadEvents};
+use zt_net::{Revocable, config, systemd};
 
 /// Relay TCN.
 #[derive(Debug, Parser)]
@@ -87,25 +87,28 @@ fn run(command: Command) -> Result<(), String> {
             key,
             policy,
         } => {
-            let identity = config::load_identity(&key).map_err(|e| e.to_string())?;
-            let path = policy;
-            let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
             runtime.block_on(async {
+                // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
+                let hangups = Hangups::listen().map_err(|e| e.to_string())?;
+                let identity = config::load_identity(&key).map_err(|e| e.to_string())?;
+                let path = policy;
+                let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
                 let events = ReloadEvents {
                     reloaded: "policy_reloaded",
                     failed: "policy_reload_failed",
                 };
-                tokio::spawn(reload::on_sighup(updater, events, move || {
+                tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
                     config::load_policy(&path)
                 }));
                 let server = RelayServer::bind(listen, identity, policy, RelayConfig::default())
                     .await
                     .map_err(|e| e.to_string())?;
+                systemd::notify_ready();
                 server.run().await.map_err(|e| e.to_string())
             })
         }

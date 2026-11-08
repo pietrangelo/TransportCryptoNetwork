@@ -13,8 +13,8 @@ use zt_domain::NodeId;
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
 use zt_net::logging::{self, LogFormat};
-use zt_net::reload::{self, ReloadEvents};
-use zt_net::{Revocable, config};
+use zt_net::reload::{self, Hangups, ReloadEvents};
+use zt_net::{Revocable, config, systemd};
 
 /// Agent TCN.
 #[derive(Debug, Parser)]
@@ -108,35 +108,39 @@ fn run(command: Command) -> Result<(), String> {
             ssh_target,
             max_streams,
         } => {
-            let identity = Arc::new(config::load_identity(&key).map_err(|e| e.to_string())?);
-            let path = authorized_clients;
-            let authorized = config::load_authorized_clients(&path).map_err(|e| e.to_string())?;
-            let (authorized_clients, updater) = Revocable::new(authorized);
-            let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
-            let config = AgentConfig {
-                relay,
-                relay_key,
-                node,
-                ssh_target,
-                authorized_clients,
-                timeouts: Timeouts::default(),
-                max_streams,
-            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
             runtime.block_on(async move {
+                // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
+                let hangups = Hangups::listen().map_err(|e| e.to_string())?;
+                let identity = Arc::new(config::load_identity(&key).map_err(|e| e.to_string())?);
+                let path = authorized_clients;
+                let authorized =
+                    config::load_authorized_clients(&path).map_err(|e| e.to_string())?;
+                let (authorized_clients, updater) = Revocable::new(authorized);
+                let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
+                let config = AgentConfig {
+                    relay,
+                    relay_key,
+                    node,
+                    ssh_target,
+                    authorized_clients,
+                    timeouts: Timeouts::default(),
+                    max_streams,
+                };
                 let events = ReloadEvents {
                     reloaded: "authorized_clients_reloaded",
                     failed: "authorized_clients_reload_failed",
                 };
-                tokio::spawn(reload::on_sighup(updater, events, move || {
+                tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
                     config::load_authorized_clients(&path)
                 }));
+                systemd::notify_ready();
                 agent::run(identity, config).await;
-            });
-            Ok(())
+                Ok(())
+            })
         }
     }
 }

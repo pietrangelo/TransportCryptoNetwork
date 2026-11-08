@@ -64,9 +64,10 @@ fn a_whole_slash48_cannot_lock_out_other_networks() {
     );
     let attacker = 0x2001_0db8_6666_u128 << 80;
     let mut admitted = 0;
-    for sub in 0..70_000_u128 {
+    // Ogni /64 del /48 compare una volta: il bucket /48 limita i /64 nuovi.
+    for sub in 0..65_536_u128 {
         if gate.admit(
-            IpAddr::V6(Ipv6Addr::from(attacker | ((sub & 0xffff) << 64) | sub)),
+            IpAddr::V6(Ipv6Addr::from(attacker | (sub << 64) | sub)),
             now,
         ) {
             admitted += 1;
@@ -100,4 +101,33 @@ fn the_wide_bucket_refills() {
     let addr = |sub: u128| IpAddr::V6(Ipv6Addr::from(net | (sub << 64)));
     assert_eq!((0..10).filter(|s| gate.admit(addr(*s), now)).count(), 4);
     assert!(gate.admit(addr(100), now + Duration::from_secs(1)));
+}
+
+/// Finding 0004-1: un solo host che si riconnette di continuo non deve esaurire il bucket del
+/// suo /48 e bloccare gli altri /64 dello stesso /48 (un /56 domestico vicino, una VPC cloud).
+#[test]
+fn one_busy_host_cannot_lock_out_its_slash48_neighbours() {
+    let t0 = Instant::now();
+    let mut gate = HandshakeGate::new(
+        65_536,
+        20,
+        Duration::from_secs(3),
+        64,
+        Duration::from_secs(1),
+        16_384,
+    );
+    let net = 0x2001_0db8_4242_u128 << 80;
+    let busy = IpAddr::V6(Ipv6Addr::from(net | (1 << 64) | 7));
+    // 2 handshake al secondo per 100 secondi.
+    for tick in 0..200_u64 {
+        let _ = gate.admit(busy, t0 + Duration::from_millis(tick * 500));
+    }
+    let later = t0 + Duration::from_secs(100);
+    for sub in 2..66_u128 {
+        let neighbour = IpAddr::V6(Ipv6Addr::from(net | (sub << 64) | 1));
+        assert!(
+            gate.admit(neighbour, later),
+            "neighbour /64 {sub} locked out"
+        );
+    }
 }

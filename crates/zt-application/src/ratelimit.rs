@@ -137,6 +137,12 @@ impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
         allowed
     }
 
+    /// `true` se `key` ha già un bucket.
+    #[must_use]
+    pub fn contains(&self, key: &K) -> bool {
+        self.buckets.contains_key(key)
+    }
+
     /// Numero di chiavi tracciate.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -226,8 +232,12 @@ pub fn wide_source_key(addr: IpAddr) -> Option<[u8; 7]> {
 }
 
 /// Cancello degli handshake del relay: un bucket per indirizzo IPv4 o prefisso /64 IPv6 e, per
-/// IPv6, un secondo bucket per prefisso /48 controllato **prima**, così un /48 ostile non arriva
-/// nemmeno a occupare la tabella dei /64.
+/// IPv6, un secondo bucket per prefisso /48 che limita la comparsa di /64 **nuovi**, così un /48
+/// ostile non può riempire la tabella dei /64.
+///
+/// Il bucket /48 si consuma solo per un /64 che il limiter non conosce già: un singolo host
+/// insistente è frenato dal proprio bucket e non può esaurire quello del /48, bloccando i vicini
+/// (finding 0004-1).
 #[derive(Debug)]
 pub struct HandshakeGate {
     narrow: KeyedRateLimiter<[u8; 9]>,
@@ -253,11 +263,13 @@ impl HandshakeGate {
 
     /// `true` se l'handshake da `addr` è ammesso ora.
     pub fn admit(&mut self, addr: IpAddr, now: Instant) -> bool {
-        if let Some(wide) = wide_source_key(addr)
+        let narrow = source_key(addr);
+        if !self.narrow.contains(&narrow)
+            && let Some(wide) = wide_source_key(addr)
             && !self.wide.check(&wide, now)
         {
             return false;
         }
-        self.narrow.check(&source_key(addr), now)
+        self.narrow.check(&narrow, now)
     }
 }

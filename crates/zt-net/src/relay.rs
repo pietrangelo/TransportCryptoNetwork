@@ -68,14 +68,64 @@ impl Default for RelayConfig {
 
 /// Registra un evento di audit. Gli eventi contengono solo identità e metadati.
 ///
-/// `event_kind` è il nome stabile dell'evento ([`DomainEvent::kind`]), su cui filtrare un SIEM.
+/// `event_kind` è il nome stabile dell'evento ([`DomainEvent::kind`]), su cui filtrare un SIEM;
+/// gli altri dati sono campi separati (`peer`, `node`, `session`, `reason`, `rule`), non una
+/// stringa `Debug` da analizzare (finding 0004-4).
 pub(crate) fn audit(event: &DomainEvent) {
     let kind = event.kind();
-    if event.is_security_alert() {
-        tracing::warn!(target: "zt_audit", event_kind = kind, ?event);
-    } else {
-        tracing::info!(target: "zt_audit", event_kind = kind, ?event);
+    let alert = event.is_security_alert();
+    macro_rules! emit {
+        ($($fields:tt)*) => {
+            if alert {
+                tracing::warn!(target: "zt_audit", event_kind = kind, $($fields)*);
+            } else {
+                tracing::info!(target: "zt_audit", event_kind = kind, $($fields)*);
+            }
+        };
     }
+    match event {
+        DomainEvent::AgentRegistered { node, fingerprint } => {
+            emit!(peer = %fingerprint, %node, "agent registered");
+        }
+        DomainEvent::SessionEstablished {
+            session,
+            client,
+            target,
+        } => {
+            emit!(session = %session_hex(session), peer = %client, node = %target, "session established");
+        }
+        DomainEvent::AuthenticationFailed { peer, reason } => match peer {
+            Some(peer) => emit!(%peer, ?reason, "authentication failed"),
+            None => emit!(?reason, "authentication failed"),
+        },
+        DomainEvent::AccessDenied { client, target } => {
+            emit!(peer = %client, node = %target, "access denied");
+        }
+        DomainEvent::ProtocolViolation { peer, rule } => {
+            emit!(%peer, rule = *rule, "protocol violation");
+        }
+        DomainEvent::ConnectionDrained { session, reason } => {
+            emit!(session = %session_hex(session), ?reason, "connection drained");
+        }
+        DomainEvent::AccessRevoked { peer, target } => match target {
+            Some(target) => emit!(%peer, node = %target, "access revoked"),
+            None => emit!(%peer, "access revoked"),
+        },
+        // `DomainEvent` è `non_exhaustive`: un evento nuovo resta almeno leggibile.
+        other => emit!(event = ?other, "audit event"),
+    }
+}
+
+/// Il session id in esadecimale, come compare nei log.
+pub(crate) fn session_hex(session: &SessionId) -> String {
+    session
+        .as_bytes()
+        .iter()
+        .fold(String::with_capacity(32), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// Session id dal CSPRNG del sistema.

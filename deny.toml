@@ -12,6 +12,9 @@ ignore = []
 [licenses]
 version = 2
 confidence-threshold = 0.9
+# libfuzzer-sys incorpora libFuzzer di LLVM (licenza NCSA). Serve solo ai target di fuzzing in
+# fuzz/, che non finiscono nei binari distribuiti.
+exceptions = [{ crate = "libfuzzer-sys", allow = ["NCSA"] }]
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

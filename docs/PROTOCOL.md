@@ -216,7 +216,7 @@ configurazione si applica anche a ciò che è già aperto:
 | Cambiamento | Effetto |
 | :- | :- |
 | chiave tolta dalla policy, o passata da client ad agent (o viceversa) | connessione chiusa; i peer delle sue sessioni ricevono `Close PeerGone` |
-| chiave di agent associata a un altro nodo | connessione chiusa; l'agent si riconnette e si registra con il nome nuovo |
+| chiave di agent associata a un altro nodo | connessione chiusa (`access_revoked`). L'agent continua a registrarsi con il proprio `--node` e viene rifiutato finché non lo si riconfigura (`TCN_NODE`) e riavvia: il nodo di un agent si cambia in entrambi i posti (finding 0004-3) |
 | client che perde l'accesso a un nodo | solo gli stream verso quel nodo si chiudono con `Close Unauthorized` da entrambi i lati |
 | client tolto dai client autorizzati di un agent | l'agent chiude le sue sessioni con `Close Unauthorized`, senza aspettare il relay |
 
