@@ -625,3 +625,73 @@ fn a_certificate_for_an_agent_key_is_refused_in_the_core() {
     );
     assert!(out.is_empty(), "{out:?}");
 }
+
+/// Finding 0006-4: l'operatore aggiunge alla whitelist la chiave di un client già connesso con
+/// certificato, con un `allow` più stretto (§15.5: la whitelist ha la precedenza). La
+/// connessione aperta passa alla credenziale `Key`: perde gli stream fuori dalla whitelist
+/// (`Close Unauthorized`, `access_revoked`), un nuovo `Open` fuori è negato, quelli dentro
+/// restano, e la scadenza del certificato non la chiude più.
+#[test]
+fn whitelisting_a_certified_connection_applies_the_whitelist_scope() {
+    let mut h = H::new();
+    let alice = claims(ALICE, &["web-01", "db-01"]);
+    h.connect(2, ALICE, Some(Arc::clone(&alice)));
+    let _ = h.open(2, 5, "web-01", 1);
+    let (db, _) = h.open(2, 7, "db-01", 3);
+    // Nuova policy: alice nella whitelist solo per web-01, CA invariata.
+    let base = policy(&Ca::default());
+    let mut p = AccessPolicy::new();
+    p.add_agent(fp(WEB_AGENT), node("web-01")).unwrap();
+    p.add_agent(fp(DB_AGENT), node("db-01")).unwrap();
+    p.add_client(
+        fp(ALICE),
+        ClientGrant {
+            name: node("alice"),
+            allowed: AllowedNodes::Only(nodes(&["web-01"])),
+        },
+    )
+    .unwrap();
+    p.set_cert_trust(base.cert_trust().clone()).unwrap();
+    let out = h.input(Input::PolicyUpdated {
+        policy: Arc::new(p),
+    });
+    assert_eq!(sent_to(&out, 2), [unauthorized(sid(7))], "{out:?}");
+    assert_eq!(sent_to(&out, 3), [unauthorized(db)]);
+    assert!(sent_to(&out, 1).is_empty(), "web-01 stays: {out:?}");
+    assert!(closed(&out).is_empty(), "the connection stays: {out:?}");
+    assert!(audits(&out).contains(&DomainEvent::AccessRevoked {
+        peer: fp(ALICE),
+        target: Some(node("db-01")),
+        certificate: Some(alice.reference()),
+    }));
+    // Un nuovo Open verso db-01 sulla stessa connessione è negato, verso web-01 no.
+    let out = h.recv(
+        2,
+        Frame::Open {
+            stream: sid(9),
+            target: node("db-01"),
+        },
+    );
+    assert!(sent_to(&out, 3).is_empty(), "{out:?}");
+    assert_eq!(
+        sent_to(&out, 2),
+        [Frame::Reject {
+            stream: sid(9),
+            reason: RejectReason::NotAuthorized
+        }]
+    );
+    let _ = h.open(2, 11, "web-01", 1);
+    // Come una connessione nuova con lo stesso certificato.
+    h.connect(4, ALICE, Some(Arc::clone(&alice)));
+    let out = h.recv(
+        4,
+        Frame::Open {
+            stream: sid(7),
+            target: node("db-01"),
+        },
+    );
+    assert!(sent_to(&out, 3).is_empty(), "{out:?}");
+    // La whitelist non scade in sessione (§15.5): la scadenza del certificato non la chiude.
+    let out = h.tick_at(NA + 10);
+    assert!(!closed(&out).contains(&2), "{out:?}");
+}

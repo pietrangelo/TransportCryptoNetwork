@@ -762,23 +762,33 @@ impl<S: SessionIds> RelayCore<S> {
                     ),
                     None,
                 ),
-                Role::Client { credential } => {
-                    let keeps = match credential {
-                        ClientCredential::Key => matches!(
+                Role::Client { credential } => match credential {
+                    ClientCredential::Key => (
+                        matches!(
                             self.policy.admit(&peer, None, now),
                             Ok(Admission::Client {
                                 credential: ClientCredential::Key
                             })
                         ),
-                        ClientCredential::Certificate(claims) => matches!(
-                            self.policy.admit(&peer, Some(claims), now),
-                            Ok(Admission::Client { .. })
-                        ),
-                    };
-                    (keeps, Some(credential.clone()))
-                }
+                        Some(ClientCredential::Key),
+                    ),
+                    // La whitelist ha la precedenza anche sulle connessioni aperte (PROTOCOL
+                    // §15.5, finding 0006-4): se la chiave è entrata nella whitelist la
+                    // connessione passa alla credenziale `Key` e ai suoi permessi, anche se più
+                    // stretti del certificato.
+                    ClientCredential::Certificate(claims) => {
+                        match self.policy.admit(&peer, Some(claims), now) {
+                            Ok(Admission::Client { credential }) => (true, Some(credential)),
+                            _ => (false, Some(credential.clone())),
+                        }
+                    }
+                },
             };
-            let certificate = credential.as_ref().and_then(cert_ref);
+            // I campi del certificato con cui la connessione è stata autorizzata finora.
+            let certificate = match &c.role {
+                Role::Client { credential } => cert_ref(credential),
+                Role::Agent { .. } => None,
+            };
             if !keeps {
                 out.push(Output::Audit(DomainEvent::AccessRevoked {
                     peer,
@@ -797,6 +807,14 @@ impl<S: SessionIds> RelayCore<S> {
             let Some(credential) = credential else {
                 continue;
             };
+            if let Some(Conn {
+                role: Role::Client { credential: held },
+                ..
+            }) = self.conns.get_mut(&conn)
+            {
+                // Una connessione passata alla whitelist non scade più con il certificato.
+                held.clone_from(&credential);
+            }
             let policy = Arc::clone(&self.policy);
             let targets = self.close_streams_where(
                 conn,

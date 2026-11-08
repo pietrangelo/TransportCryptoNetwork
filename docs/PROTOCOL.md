@@ -503,6 +503,12 @@ connessione cade una volta (§12) e si riapre con il certificato. Togliere la ch
 whitelist non basta per revocare un client che ha anche un certificato: si usa la denylist
 (§15.8).
 
+La precedenza vale anche per le connessioni aperte (finding 0006-4): se una ricarica aggiunge
+alla whitelist del relay la chiave di un client connesso con un certificato, la connessione
+passa alla credenziale della whitelist e ai suoi permessi, anche se più stretti; gli stream
+verso nodi non più concessi si chiudono con `Close Unauthorized` e `access_revoked`, come per
+ogni restringimento (§12), e da quel momento la connessione non scade più con il certificato.
+
 **Ambito effettivo** di un certificato firmato dalla CA `A`:
 
 ```
