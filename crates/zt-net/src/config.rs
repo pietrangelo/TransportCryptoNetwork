@@ -12,15 +12,23 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use thiserror::Error;
-use zt_crypto::{CaSigningKey, CryptoError, Identity, Keyring, PublicKey};
-use zt_domain::trust::Revocations;
+use zt_crypto::{
+    CaSigningKey, CryptoError, Identity, Keyring, PublicKey, decode_certificate_text,
+    trusted_ca_key,
+};
+use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
+use zt_domain::trust::{CertTrust, Revocations};
 use zt_domain::{
-    AccessPolicy, AllowedNodes, AuthorizedClients, CertBody, CertFormatError, ClientGrant,
-    DomainError, NodeId,
+    AccessPolicy, AllowedNodes, AuthorizedClients, CertBody, CertFormatError, CertSerial,
+    ClientGrant, DomainError, NodeId, decode_certificate,
 };
 
 /// Dimensione massima di un file di configurazione.
 const MAX_FILE_LEN: u64 = 1024 * 1024;
+
+/// Dimensione massima di un file di certificato: il certificato più grande in esadecimale sta
+/// ampiamente in 16 KiB.
+const MAX_CERT_FILE_LEN: u64 = 16 * 1024;
 
 /// Errore di configurazione. Non riporta mai il contenuto di un segreto.
 #[derive(Debug, Error)]
@@ -202,15 +210,19 @@ fn read_limited(path: &Path) -> Result<String, ConfigError> {
 }
 
 fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigError> {
+    read_file_bounded(file, path, MAX_FILE_LEN)
+}
+
+fn read_file_bounded(file: std::fs::File, path: &Path, max: u64) -> Result<String, ConfigError> {
     let display = path.display().to_string();
     let mut text = String::new();
-    file.take(MAX_FILE_LEN.saturating_add(1))
+    file.take(max.saturating_add(1))
         .read_to_string(&mut text)
         .map_err(|source| ConfigError::Io {
             path: display.clone(),
             source,
         })?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_FILE_LEN {
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > max {
         return Err(ConfigError::TooLarge(display));
     }
     Ok(text)
@@ -255,17 +267,25 @@ pub fn load_keyring(current: &Path, previous: Option<&Path>) -> Result<Keyring, 
 /// # Errors
 /// File già esistente, errore di I/O, RNG non disponibile.
 pub fn create_identity(path: &Path) -> Result<Identity, ConfigError> {
+    let identity = Identity::generate().map_err(|source| ConfigError::Key {
+        path: path.display().to_string(),
+        entry: "secret key".into(),
+        source,
+    })?;
+    let mut text = identity.to_secret_hex();
+    text.push('\n');
+    write_private_new(path, text.as_bytes())?;
+    Ok(identity)
+}
+
+/// Scrive `contents` in un file **nuovo** con permessi `0600` e lo sincronizza su disco.
+fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     use std::io::Write;
     let display = path.display().to_string();
     let io = |source| ConfigError::Io {
         path: display.clone(),
         source,
     };
-    let identity = Identity::generate().map_err(|source| ConfigError::Key {
-        path: display.clone(),
-        entry: "secret key".into(),
-        source,
-    })?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -274,11 +294,9 @@ pub fn create_identity(path: &Path) -> Result<Identity, ConfigError> {
         options.mode(0o600);
     }
     let mut file = options.open(path).map_err(io)?;
-    file.write_all(identity.to_secret_hex().as_bytes())
-        .map_err(io)?;
-    file.write_all(b"\n").map_err(io)?;
+    file.write_all(contents).map_err(io)?;
     file.sync_all().map_err(io)?;
-    Ok(identity)
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,8 +337,6 @@ struct NodeEntry {
 /// relay e nei `clients.toml` degli agent.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-// RED: i campi si leggono nel GREEN.
-#[allow(dead_code)]
 struct AuthorityEntry {
     name: String,
     #[serde(default)]
@@ -336,8 +352,6 @@ struct AuthorityEntry {
 /// `revoked.toml` (PROTOCOL §15.8).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-// RED: i campi si leggono nel GREEN.
-#[allow(dead_code)]
 struct RevocationsFile {
     #[serde(default)]
     serials: Vec<String>,
@@ -427,6 +441,33 @@ impl Ctx<'_> {
             source,
         })
     }
+    /// Una chiave che DEVE essere la codifica canonica di un punto valido e non debole: le
+    /// chiavi di CA e della denylist (il confronto byte per byte del passo 5 di PROTOCOL §15.4
+    /// presuppone pin canonici).
+    fn canonical_key(&self, entry: &str, text: &str) -> Result<PublicKey, ConfigError> {
+        let fail = |source| ConfigError::Key {
+            path: self.0.into(),
+            entry: entry.into(),
+            source,
+        };
+        // Esattamente 64 caratteri esadecimali, senza spazi (`FromStr` li toglierebbe).
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(fail(CryptoError::InvalidKey));
+        }
+        let parsed: PublicKey = text.parse().map_err(fail)?;
+        // `to_bytes` restituisce i 32 byte scritti, non la ricodifica del punto.
+        PublicKey::from_canonical_bytes(&parsed.to_bytes()).map_err(fail)
+    }
+    fn allowed(&self, entry: &str, allow: &[String]) -> Result<AllowedNodes, ConfigError> {
+        if allow.iter().any(|a| a == "*") {
+            return Ok(AllowedNodes::All);
+        }
+        let nodes = allow
+            .iter()
+            .map(|n| self.node(entry, n))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(AllowedNodes::Only(nodes))
+    }
     fn node(&self, entry: &str, text: &str) -> Result<NodeId, ConfigError> {
         NodeId::try_from(text).map_err(|source| self.domain(entry, source))
     }
@@ -457,9 +498,6 @@ impl Ctx<'_> {
 pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
-    if !file.authorities.is_empty() {
-        return Err(not_yet(origin, "[[authorities]]"));
-    }
     let mut policy = AccessPolicy::new();
     for entry in &file.agents {
         let node = ctx.node(&entry.node, &entry.node)?;
@@ -480,21 +518,46 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
     for entry in &file.clients {
         let name = ctx.node(&entry.name, &entry.name)?;
         let key = ctx.key(&entry.name, &entry.public_key)?;
-        let allowed = if entry.allow.iter().any(|a| a == "*") {
-            AllowedNodes::All
-        } else {
-            let nodes = entry
-                .allow
-                .iter()
-                .map(|n| ctx.node(&entry.name, n))
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            AllowedNodes::Only(nodes)
-        };
+        let allowed = ctx.allowed(&entry.name, &entry.allow)?;
         policy
             .add_client(key.fingerprint(), ClientGrant { name, allowed })
             .map_err(|e| ctx.domain(&entry.name, e))?;
     }
+    // Le CA per ultime: `set_cert_trust` rifiuta una chiave di CA uguale a quella di un peer.
+    let trust = parse_authorities(&ctx, &file.authorities)?;
+    policy
+        .set_cert_trust(trust)
+        .map_err(|e| ctx.domain("authorities", e))?;
     Ok(policy)
+}
+
+/// Le voci `[[authorities]]` (PROTOCOL §15.9), senza denylist.
+fn parse_authorities(ctx: &Ctx<'_>, entries: &[AuthorityEntry]) -> Result<CertTrust, ConfigError> {
+    let mut trust = CertTrust::new();
+    for entry in entries {
+        let name = ctx.node(&entry.name, &entry.name)?;
+        // `public_key` oppure `public_keys` (rotazione), mai entrambi né nessuno.
+        let texts: Vec<&str> = match (&entry.public_key, entry.public_keys.as_slice()) {
+            (Some(one), []) => vec![one.as_str()],
+            (None, many) if !many.is_empty() => many.iter().map(String::as_str).collect(),
+            _ => return Err(ctx.domain(&entry.name, DomainError::AuthorityKeys(name))),
+        };
+        let keys = texts
+            .into_iter()
+            .map(|t| {
+                ctx.canonical_key(&entry.name, t)
+                    .map(|k| trusted_ca_key(&k))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let allowed = ctx.allowed(&entry.name, &entry.allow)?;
+        let max_lifetime = entry
+            .max_lifetime
+            .unwrap_or(DEFAULT_AUTHORITY_LIFETIME_SECS);
+        trust
+            .add_authority(name, &keys, allowed, max_lifetime)
+            .map_err(|e| ctx.domain(&entry.name, e))?;
+    }
+    Ok(trust)
 }
 
 /// Interpreta l'elenco dei client che un agent accetta end-to-end (stesso formato della
@@ -508,21 +571,21 @@ pub fn parse_authorized_clients(
 ) -> Result<AuthorizedClients, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
-    if !file.authorities.is_empty() {
-        return Err(not_yet(origin, "[[authorities]]"));
+    let mut clients = AuthorizedClients::new();
+    for entry in &file.clients {
+        let key = ctx.key(&entry.name, &entry.public_key)?;
+        // Una chiave ripetuta non è un errore (era un insieme prima della Fase 6).
+        if !clients.contains_key(&key.fingerprint()) {
+            clients
+                .add_client(key.fingerprint())
+                .map_err(|e| ctx.domain(&entry.name, e))?;
+        }
     }
-    file.clients
-        .iter()
-        .map(|c| Ok(ctx.key(&c.name, &c.public_key)?.fingerprint()))
-        .collect()
-}
-
-/// RED: rifiuto di ciò che la Fase 6 non implementa ancora (fail closed).
-fn not_yet(origin: &str, what: &str) -> ConfigError {
-    ConfigError::Syntax {
-        path: origin.into(),
-        message: format!("{what}: client certificates are not supported yet"),
-    }
+    let trust = parse_authorities(&ctx, &file.authorities)?;
+    clients
+        .set_cert_trust(trust)
+        .map_err(|e| ctx.domain("authorities", e))?;
+    Ok(clients)
 }
 
 /// Interpreta la denylist `revoked.toml` (`serials`, `keys`; PROTOCOL §15.8).
@@ -531,9 +594,57 @@ fn not_yet(origin: &str, what: &str) -> ConfigError {
 /// Qualsiasi voce non valida, o oltre i limiti.
 pub fn parse_revocations(origin: &str, text: &str) -> Result<Revocations, ConfigError> {
     let ctx = Ctx(origin);
-    let _file: RevocationsFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
-    // RED: stub, rifiuta sempre.
-    Err(not_yet(origin, "revocations"))
+    let file: RevocationsFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    let serials = file
+        .serials
+        .iter()
+        .enumerate()
+        .map(|(i, text)| parse_serial(&ctx, i, text))
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys = file
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            ctx.canonical_key(&format!("keys[{i}]"), text)
+                .map(|k| k.fingerprint())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Revocations::new(serials, keys).map_err(|e| ctx.domain("revocations", e))
+}
+
+/// 32 caratteri esadecimali → 16 byte.
+fn decode_hex16(text: &str) -> Option<[u8; CertSerial::LEN]> {
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => c.checked_sub(b'0'),
+            b'a'..=b'f' => c.checked_sub(b'a' - 10),
+            b'A'..=b'F' => c.checked_sub(b'A' - 10),
+            _ => None,
+        }
+    }
+    let raw = text.as_bytes();
+    if raw.len() != CertSerial::LEN * 2 {
+        return None;
+    }
+    let mut out = [0_u8; CertSerial::LEN];
+    for (byte, pair) in out.iter_mut().zip(raw.chunks_exact(2)) {
+        let [hi, lo] = pair else { return None };
+        *byte = (nibble(*hi)? << 4) | nibble(*lo)?;
+    }
+    Some(out)
+}
+
+/// Un numero di serie: esattamente 32 caratteri esadecimali, mai tutto zero. L'errore non
+/// riporta il valore.
+fn parse_serial(ctx: &Ctx<'_>, index: usize, text: &str) -> Result<CertSerial, ConfigError> {
+    let fail = |message: &str| ConfigError::Syntax {
+        path: ctx.0.into(),
+        message: format!("serials[{index}]: {message}"),
+    };
+    let bytes =
+        decode_hex16(text).ok_or_else(|| fail("a serial must be 32 hexadecimal characters"))?;
+    CertSerial::try_from(bytes).map_err(|_| fail("a serial must not be all zeros"))
 }
 
 /// Un file di certificato letto e decodificato (la firma la verificano relay e agent).
@@ -550,11 +661,15 @@ pub struct CertificateFile {
 /// # Errors
 /// [`ConfigError::Certificate`] per un testo o un certificato non validi.
 pub fn parse_certificate_file(origin: &str, text: &str) -> Result<CertificateFile, ConfigError> {
-    // RED: stub, rifiuta sempre.
-    let _ = text;
-    Err(ConfigError::Certificate {
+    let fail = |source| ConfigError::Certificate {
         path: origin.into(),
-        source: CertFormatError::Magic,
+        source,
+    };
+    let bytes = decode_certificate_text(text).map_err(fail)?;
+    let body = decode_certificate(&bytes).map_err(fail)?.body;
+    Ok(CertificateFile {
+        bytes: bytes.into(),
+        body,
     })
 }
 
@@ -563,7 +678,8 @@ pub fn parse_certificate_file(origin: &str, text: &str) -> Result<CertificateFil
 /// # Errors
 /// Come [`parse_certificate_file`]; file insicuro, illeggibile o troppo grande.
 pub fn load_certificate(path: &Path) -> Result<CertificateFile, ConfigError> {
-    parse_certificate_file(&path.display().to_string(), &read_limited(path)?)
+    let text = read_file_bounded(open_trusted(path, false)?, path, MAX_CERT_FILE_LEN)?;
+    parse_certificate_file(&path.display().to_string(), &text)
 }
 
 /// Genera la chiave di una CA e la scrive in un file nuovo con permessi `0600`. Non
@@ -572,12 +688,13 @@ pub fn load_certificate(path: &Path) -> Result<CertificateFile, ConfigError> {
 /// # Errors
 /// File già esistente, errore di I/O, RNG non disponibile.
 pub fn create_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
-    // RED: stub, rifiuta sempre.
-    Err(ConfigError::Key {
+    let ca = CaSigningKey::generate().map_err(|source| ConfigError::Key {
         path: path.display().to_string(),
         entry: "ca secret key".into(),
-        source: CryptoError::Random,
-    })
+        source,
+    })?;
+    write_private_new(path, ca.to_secret_text().as_bytes())?;
+    Ok(ca)
 }
 
 /// Carica la chiave di una CA, con le regole delle chiavi segrete.
@@ -621,7 +738,7 @@ pub fn parse_known_nodes(
 /// # Errors
 /// Vedi [`parse_policy`]; [`ConfigError::RevocationsRequired`] con una CA.
 pub fn load_policy(path: &Path) -> Result<AccessPolicy, ConfigError> {
-    parse_policy(&path.display().to_string(), &read_limited(path)?)
+    load_relay_policy(path, None)
 }
 
 /// Legge la policy del relay e, se c'è, la denylist, in un solo passo: se uno dei due file non
@@ -634,11 +751,37 @@ pub fn load_relay_policy(
     policy: &Path,
     revocations: Option<&Path>,
 ) -> Result<AccessPolicy, ConfigError> {
-    match revocations {
-        None => load_policy(policy),
-        // RED: stub, la denylist non è ancora supportata.
-        Some(path) => Err(not_yet(&path.display().to_string(), "revocations")),
+    let origin = policy.display().to_string();
+    // Entrambi i file letti e validati prima di costruire il risultato: nessun effetto parziale.
+    let text = read_limited(policy)?;
+    let revoked = revocations.map(load_revocations).transpose()?;
+    let mut parsed = parse_policy(&origin, &text)?;
+    let trust = with_revocations(parsed.cert_trust(), revoked, &origin)?;
+    parsed
+        .set_cert_trust(trust)
+        .map_err(|e| Ctx(&origin).domain("authorities", e))?;
+    Ok(parsed)
+}
+
+/// Legge una denylist con le regole dei file di trust.
+fn load_revocations(path: &Path) -> Result<Revocations, ConfigError> {
+    parse_revocations(&path.display().to_string(), &read_limited(path)?)
+}
+
+/// Le CA di `trust` con la denylist; una CA senza denylist non è avviabile (PROTOCOL §15.8).
+fn with_revocations(
+    trust: &CertTrust,
+    revoked: Option<Revocations>,
+    origin: &str,
+) -> Result<CertTrust, ConfigError> {
+    let mut trust = trust.clone();
+    if let Some(revoked) = revoked {
+        trust.set_revocations(revoked);
     }
+    if trust.needs_revocations() {
+        return Err(ConfigError::RevocationsRequired(origin.into()));
+    }
+    Ok(trust)
 }
 
 /// Legge e interpreta i client autorizzati di un agent e, se c'è, la denylist.
@@ -649,11 +792,15 @@ pub fn load_authorized_clients(
     path: &Path,
     revocations: Option<&Path>,
 ) -> Result<AuthorizedClients, ConfigError> {
-    match revocations {
-        None => parse_authorized_clients(&path.display().to_string(), &read_limited(path)?),
-        // RED: stub, la denylist non è ancora supportata.
-        Some(path) => Err(not_yet(&path.display().to_string(), "revocations")),
-    }
+    let origin = path.display().to_string();
+    let text = read_limited(path)?;
+    let revoked = revocations.map(load_revocations).transpose()?;
+    let mut clients = parse_authorized_clients(&origin, &text)?;
+    let trust = with_revocations(clients.cert_trust(), revoked, &origin)?;
+    clients
+        .set_cert_trust(trust)
+        .map_err(|e| Ctx(&origin).domain("authorities", e))?;
+    Ok(clients)
 }
 
 /// Legge e interpreta i nodi noti a un client.
@@ -807,8 +954,11 @@ pub fn parse_client_settings(
         .map(|t| ctx.key("relay_key", t))
         .collect::<Result<Vec<_>, _>>()?;
     let relays = relay_endpoints(origin, &addresses, &relay_keys)?;
-    if file.certificate.is_some() {
-        return Err(not_yet(origin, "certificate"));
+    if file.certificate.as_deref() == Some("") {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "certificate must name the client certificate file".into(),
+        });
     }
     if file.key.is_empty() {
         return Err(ConfigError::Syntax {
@@ -834,7 +984,7 @@ pub fn parse_client_settings(
         relays,
         key: base.join(&file.key),
         nodes,
-        certificate: None,
+        certificate: file.certificate.as_ref().map(|c| base.join(c)),
     })
 }
 
