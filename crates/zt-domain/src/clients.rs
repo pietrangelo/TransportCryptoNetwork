@@ -1,13 +1,10 @@
 //! I client che un agent accetta end-to-end: whitelist per chiave e CA pinnate
 //! (PROTOCOL §15.4, §15.5).
-//!
-//! **Fase 6, RED**: la whitelist per chiave funziona come prima (era un
-//! `HashSet<Fingerprint>`); tutto ciò che riguarda i certificati è uno stub che rifiuta.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::cert::{CertClaims, UnixTime};
+use crate::cert::{CertClaims, CertRejection, UnixTime};
 use crate::crypto::Fingerprint;
 use crate::error::DomainError;
 use crate::events::AuthFailureReason;
@@ -32,9 +29,9 @@ impl AuthorizedClients {
     /// Aggiunge una chiave alla whitelist.
     ///
     /// # Errors
-    /// [`DomainError::DuplicatePeer`] se la chiave è già presente.
+    /// [`DomainError::DuplicatePeer`] se la chiave è già presente o è la chiave di una CA.
     pub fn add_client(&mut self, key: Fingerprint) -> Result<(), DomainError> {
-        if !self.keys.insert(key) {
+        if self.trust.ca_fingerprints().any(|ca| ca == key) || !self.keys.insert(key) {
             return Err(DomainError::DuplicatePeer(key));
         }
         Ok(())
@@ -45,9 +42,11 @@ impl AuthorizedClients {
     /// # Errors
     /// [`DomainError::DuplicatePeer`] se una chiave di CA è anche una chiave di client.
     pub fn set_cert_trust(&mut self, trust: CertTrust) -> Result<(), DomainError> {
-        // RED: stub, rifiuta sempre.
-        drop(trust);
-        Err(DomainError::TooManyAuthorities)
+        if let Some(ca) = trust.ca_fingerprints().find(|ca| self.keys.contains(ca)) {
+            return Err(DomainError::DuplicatePeer(ca));
+        }
+        self.trust = trust;
+        Ok(())
     }
 
     /// Le CA pinnate e la denylist.
@@ -73,9 +72,37 @@ impl AuthorizedClients {
         node: &NodeId,
         now: UnixTime,
     ) -> Result<ClientCredential, AuthFailureReason> {
-        // RED: stub, rifiuta sempre.
-        let _ = (peer, cert, node, now);
-        Err(AuthFailureReason::UnknownPeer)
+        // Passo 1.
+        if self.trust.is_key_revoked(peer) {
+            return Err(AuthFailureReason::KeyRevoked);
+        }
+        let Some(claims) = cert else {
+            // Passo 2: solo la whitelist decide.
+            return if self.keys.contains(peer) {
+                Ok(ClientCredential::Key)
+            } else {
+                Err(AuthFailureReason::UnknownPeer)
+            };
+        };
+        if claims.subject() != peer {
+            return Err(AuthFailureReason::Certificate(CertRejection::KeyMismatch));
+        }
+        // Passi 5 e 7–10, anche per una chiave della whitelist (fail closed).
+        let authority = self
+            .trust
+            .check(claims, now)
+            .map_err(AuthFailureReason::Certificate)?;
+        // La whitelist ha la precedenza: il certificato è solo verificato.
+        if self.keys.contains(peer) {
+            return Ok(ClientCredential::Key);
+        }
+        // Passo 12.
+        if !authority.permits(claims, node) {
+            return Err(AuthFailureReason::Certificate(
+                CertRejection::NodeOutOfScope,
+            ));
+        }
+        Ok(ClientCredential::Certificate(Arc::clone(claims)))
     }
 
     /// Per la revoca a caldo e la scadenza: la credenziale vale ancora?
@@ -87,9 +114,19 @@ impl AuthorizedClients {
         node: &NodeId,
         now: UnixTime,
     ) -> bool {
-        // RED: stub, fail closed.
-        let _ = (peer, credential, node, now);
-        false
+        if self.trust.is_key_revoked(peer) {
+            return false;
+        }
+        match credential {
+            ClientCredential::Key => self.keys.contains(peer),
+            ClientCredential::Certificate(claims) => {
+                claims.subject() == peer
+                    && self
+                        .trust
+                        .check(claims, now)
+                        .is_ok_and(|authority| authority.permits(claims, node))
+            }
+        }
     }
 }
 
