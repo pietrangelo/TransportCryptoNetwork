@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use zt_crypto::Keyring;
+use zt_domain::AccessPolicy;
 use zt_net::logging::{self, LogFormat};
 use zt_net::relay::{RelayConfig, RelayServer};
 use zt_net::reload::{self, Hangups, ReloadEvents};
@@ -80,6 +82,38 @@ fn main() -> ExitCode {
     }
 }
 
+/// I file che servono a ricaricare le chiavi del relay.
+struct KeyFiles {
+    key: PathBuf,
+    previous_key: Option<PathBuf>,
+    policy: PathBuf,
+    revocations: Option<PathBuf>,
+}
+
+/// Ricarica le chiavi del relay (`SIGHUP`, PROTOCOL §14) e rifiuta una chiave uguale a una CA
+/// (§15.9, finding 0006-2). Lo stesso `SIGHUP` ricarica policy e chiavi in due task, quindi la
+/// chiave nuova si confronta sia con la policy in vigore sia con quella sul disco: una rotazione
+/// della chiave e una CA nuova uguali, nella stessa ricarica, non entrano insieme. La policy si
+/// confronta solo con le chiavi in vigore: un file di chiave sbagliato non blocca una revoca
+/// urgente.
+fn reload_keys(
+    files: &KeyFiles,
+    policy_in_force: &Revocable<AccessPolicy>,
+) -> Result<Keyring, config::ConfigError> {
+    let keys = config::load_keyring(&files.key, files.previous_key.as_deref())?;
+    let forbidden = config::own_keys(&keys, "relay");
+    let origin = files.policy.display().to_string();
+    config::reject_infrastructure_keys_as_authority(
+        &origin,
+        policy_in_force.current().cert_trust(),
+        &forbidden,
+    )?;
+    if let Ok(next) = config::load_relay_policy(&files.policy, files.revocations.as_deref()) {
+        config::reject_infrastructure_keys_as_authority(&origin, next.cert_trust(), &forbidden)?;
+    }
+    Ok(keys)
+}
+
 fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Keygen { out } => {
@@ -118,16 +152,7 @@ fn run(command: Command) -> Result<(), String> {
                     zt_net::keys::ROTATION_REMINDER,
                 ));
                 let path = policy;
-                let origin = path.display().to_string();
-                // Lo stesso `SIGHUP` ricarica policy e chiavi in due task. La ricarica delle
-                // chiavi confronta la chiave nuova sia con la policy in vigore sia con quella sul
-                // disco: una rotazione della chiave e una CA nuova uguali, nella stessa ricarica,
-                // non entrano insieme (finding 0006-2). La policy si confronta solo con le chiavi
-                // in vigore: un file di chiave sbagliato non blocca una revoca urgente.
-                let (policy_file, revocations_file) = (path.clone(), revocations.clone());
-                let policy_on_disk = move || {
-                    config::load_relay_policy(&policy_file, revocations_file.as_deref()).ok()
-                };
+                let (path_for_keys, revocations_for_keys) = (path.clone(), revocations.clone());
                 // Policy e denylist in un solo passo; una CA uguale alla chiave del relay
                 // (corrente o precedente, quella in vigore al momento) è rifiutata (PROTOCOL
                 // §15.9), all'avvio e a ogni ricarica.
@@ -143,35 +168,23 @@ fn run(command: Command) -> Result<(), String> {
                 };
                 let policy = load().map_err(|e: config::ConfigError| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
-                // Lo stesso controllo nel verso opposto (finding 0006-2): una chiave del relay
-                // ricaricata uguale a una CA della policy in vigore è rifiutata, come all'avvio;
-                // restano le chiavi precedenti.
+                // Lo stesso controllo nel verso opposto (finding 0006-2), vedi `reload_keys`.
                 let key_events = ReloadEvents {
                     reloaded: "relay_keys_reloaded",
                     failed: "relay_keys_reload_failed",
+                };
+                let files = KeyFiles {
+                    key,
+                    previous_key,
+                    policy: path_for_keys,
+                    revocations: revocations_for_keys,
                 };
                 let policy_in_force = policy.clone();
                 tokio::spawn(reload::on_sighup(
                     key_hangups,
                     key_updater,
                     key_events,
-                    move || {
-                        let keys = config::load_keyring(&key, previous_key.as_deref())?;
-                        let forbidden = config::own_keys(&keys, "relay");
-                        config::reject_infrastructure_keys_as_authority(
-                            &origin,
-                            policy_in_force.current().cert_trust(),
-                            &forbidden,
-                        )?;
-                        if let Some(next) = policy_on_disk() {
-                            config::reject_infrastructure_keys_as_authority(
-                                &origin,
-                                next.cert_trust(),
-                                &forbidden,
-                            )?;
-                        }
-                        Ok(keys)
-                    },
+                    move || reload_keys(&files, &policy_in_force),
                 ));
                 // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
                 // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).

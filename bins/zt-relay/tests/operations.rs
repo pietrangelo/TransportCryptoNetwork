@@ -8,7 +8,8 @@
     clippy::missing_panics_doc,
     clippy::format_push_string,
     clippy::arithmetic_side_effects,
-    clippy::assigning_clones
+    clippy::assigning_clones,
+    clippy::too_many_lines
 )]
 
 use std::io::{BufRead, BufReader};

@@ -69,6 +69,43 @@ impl Default for RelayConfig {
     }
 }
 
+/// Una riga di audit (`target: "zt_audit"`), a livello WARN per un allarme e INFO altrimenti.
+macro_rules! audit_line {
+    ($alert:expr, $kind:expr, $($fields:tt)*) => {
+        if $alert {
+            tracing::warn!(target: "zt_audit", event_kind = $kind, $($fields)*);
+        } else {
+            tracing::info!(target: "zt_audit", event_kind = $kind, $($fields)*);
+        }
+    };
+}
+
+/// `authentication_failed`: i campi del certificato solo dopo la firma verificata (PROTOCOL
+/// §15.11, finding 0006-3); senza certificato sono vuoti e non compaiono.
+fn authentication_failed(
+    alert: bool,
+    kind: &'static str,
+    peer: Option<&Fingerprint>,
+    reason: AuthFailureReason,
+    certificate: Option<&CertRef>,
+) {
+    let (reason, cert_check) = failure_fields(reason);
+    let peer = peer.map(ToString::to_string);
+    let c = CertFields::of(certificate);
+    audit_line!(
+        alert,
+        kind,
+        peer = peer.as_deref(),
+        reason = reason.as_str(),
+        cert_check,
+        ca = c.ca.as_deref(),
+        serial = c.serial.as_deref(),
+        cert_name = c.cert_name.as_deref(),
+        not_after = c.not_after,
+        "authentication failed"
+    );
+}
+
 /// Registra un evento di audit. Gli eventi contengono solo identità e metadati.
 ///
 /// `event_kind` è il nome stabile dell'evento ([`DomainEvent::kind`]), su cui filtrare un SIEM;
@@ -78,13 +115,7 @@ pub(crate) fn audit(event: &DomainEvent) {
     let kind = event.kind();
     let alert = event.is_security_alert();
     macro_rules! emit {
-        ($($fields:tt)*) => {
-            if alert {
-                tracing::warn!(target: "zt_audit", event_kind = kind, $($fields)*);
-            } else {
-                tracing::info!(target: "zt_audit", event_kind = kind, $($fields)*);
-            }
-        };
+        ($($fields:tt)*) => { audit_line!(alert, kind, $($fields)*) };
     }
     match event {
         DomainEvent::AgentRegistered { node, fingerprint } => {
@@ -113,23 +144,7 @@ pub(crate) fn audit(event: &DomainEvent) {
             peer,
             reason,
             certificate,
-        } => {
-            let (reason, cert_check) = failure_fields(*reason);
-            let peer = peer.as_ref().map(ToString::to_string);
-            // Solo dopo la firma verificata (PROTOCOL §15.11, finding 0006-3).
-            let c = certificate.as_ref().map(|c| CertFields::of(Some(c)));
-            let c = c.as_ref();
-            emit!(
-                peer = peer.as_deref(),
-                reason = reason.as_str(),
-                cert_check,
-                ca = c.and_then(|c| c.ca.as_deref()),
-                serial = c.and_then(|c| c.serial.as_deref()),
-                cert_name = c.and_then(|c| c.cert_name.as_deref()),
-                not_after = c.and_then(|c| c.not_after),
-                "authentication failed"
-            );
-        }
+        } => authentication_failed(alert, kind, peer.as_ref(), *reason, certificate.as_ref()),
         DomainEvent::AccessDenied {
             client,
             target,

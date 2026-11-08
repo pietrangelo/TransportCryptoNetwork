@@ -360,7 +360,7 @@ fn a_ca_key_equal_to_a_pinned_relay_key_is_refused_at_start_and_on_reload() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1_000));
+    std::thread::sleep(std::time::Duration::from_secs(1));
     assert!(child.try_wait().unwrap().is_none(), "the agent exited");
     write(&dir, "clients.toml", &authority_text(&second));
     let hup = Command::new("kill")
@@ -368,7 +368,7 @@ fn a_ca_key_equal_to_a_pinned_relay_key_is_refused_at_start_and_on_reload() {
         .status()
         .unwrap();
     assert!(hup.success());
-    std::thread::sleep(std::time::Duration::from_millis(1_000));
+    std::thread::sleep(std::time::Duration::from_secs(1));
     let _ = child.kill();
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
