@@ -128,12 +128,61 @@ stesso host. Con `ControlPersist` le connessioni verso lo stesso host si riusano
 
 ## 6. Log e audit
 
-Log strutturati su stderr; livello con `RUST_LOG` (default `info` per relay e agent, `warn`
-per `zt-client`). Gli eventi di sicurezza
-hanno target `zt_audit`: registrazioni, sessioni aperte e chiuse, accessi negati,
-autenticazioni fallite, violazioni di protocollo. Contengono fingerprint, nomi di nodo e
-session id, mai payload o segreti.
+Log su stderr, livello con `RUST_LOG` (default `info` per relay e agent, `warn` per
+`zt-client`). Relay e agent accettano `--log-format json`: una riga JSON per evento, con
+`timestamp`, `level`, `target` e `fields`.
+
+Gli eventi di sicurezza hanno target `zt_audit` e un nome stabile in `fields.event_kind`:
+
+| `event_kind` | Livello | Significato |
+| :- | :- | :- |
+| `agent_registered` | INFO | un agent si è registrato per il suo nodo |
+| `session_established` | INFO | il relay ha aperto una sessione client → nodo |
+| `connection_drained` | INFO | una sessione è terminata (con il motivo) |
+| `authentication_failed` | WARN | handshake fallito, chiave sconosciuta, nome di nodo sbagliato |
+| `access_denied` | WARN | un client ha chiesto un nodo che la policy non gli concede |
+| `protocol_violation` | WARN | un peer ha violato il protocollo ed è stato disconnesso |
+| `access_revoked` | WARN | una ricarica ha tolto a un peer il ruolo o l'accesso a un nodo |
+| `policy_reloaded`, `authorized_clients_reloaded` | INFO | ricarica riuscita |
+| `policy_reload_failed`, `authorized_clients_reload_failed` | ERROR | ricarica fallita: resta la configurazione precedente |
+
+Contengono fingerprint, nomi di nodo e session id, mai payload o segreti.
 
 ```bash
-RUST_LOG=zt_audit=info,warn zt-relay run ...
+journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
 ```
+
+## 7. Revoca di una chiave
+
+1. Togli la chiave da `/etc/tcn/policy.toml` sul relay e, per un client, da
+   `/etc/tcn/clients.toml` sugli agent (difesa in profondità: basta uno dei due).
+2. `systemctl reload zt-relay` (e `zt-agent`). Le sessioni in corso della chiave revocata si
+   chiudono subito; la tabella completa è in `docs/PROTOCOL.md` §12.
+3. Controlla `access_revoked` nell'audit log. Se trovi `..._reload_failed`, il file non è
+   valido: la configurazione precedente è ancora in vigore.
+
+## 8. Installazione con systemd
+
+Le release (`.github/workflows/release.yml`) contengono binari statici (musl) per x86_64 e
+aarch64 con attestazione di provenienza: verificali prima dell'installazione.
+
+```bash
+gh attestation verify tcn-v0.1.0-x86_64-unknown-linux-musl.tar.gz -R pietrangelo/TransportCryptoNetwork
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+```bash
+install -m 0755 zt-relay zt-agent zt-client /usr/local/bin/
+install -m 0644 systemd/tcn.sysusers /usr/lib/sysusers.d/tcn.conf && systemd-sysusers
+install -d -m 0755 -o root -g root /etc/tcn
+zt-relay keygen --out /etc/tcn/relay.key && chown tcn:tcn /etc/tcn/relay.key   # o zt-agent / agent.key
+install -m 0644 systemd/zt-relay.service /etc/systemd/system/   # o zt-agent.service
+systemctl daemon-reload && systemctl enable --now zt-relay
+```
+
+Le unit girano come utente `tcn` senza capability, con file system in sola lettura, filtro
+delle system call e indirizzi limitati a IPv4/IPv6/Unix (`systemd-analyze security`: 1.2,
+«OK»). I permessi richiesti dai binari sono quelli di `StrictModes` di OpenSSH: chiave
+`tcn:tcn 0600`, file di trust e directory di proprietà di root o di `tcn` e non scrivibili da
+altri. Per l'agent, `/etc/tcn/agent.env` contiene `TCN_RELAY`, `TCN_RELAY_KEY` e `TCN_NODE`;
+se l'IP del relay è fisso, attiva `IPAddressDeny=any` / `IPAddressAllow=` nella unit.

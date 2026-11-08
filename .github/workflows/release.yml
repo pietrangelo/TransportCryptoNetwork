@@ -1,0 +1,69 @@
+name: release
+
+# Un tag vN.N.N produce binari statici (musl) per x86_64 e aarch64, firmati con attestazione
+# di provenienza SLSA (verificabile con `gh attestation verify`), e una release in bozza.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p zt-relay -p zt-agent -p zt-client
+      - name: package
+        run: |
+          name="tcn-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/zt-{relay,agent,client} "dist/$name/"
+          cp -r packaging/systemd LICENSE README.md docs/OPERATIONS.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcn-${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && cat *.sha256 > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft
+          --generate-notes dist/*.tar.gz dist/SHA256SUMS

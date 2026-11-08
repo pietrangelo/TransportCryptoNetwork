@@ -57,7 +57,9 @@ superficie, ipotesi d'attacco, esito (*mitigato da test X*, *accettato con motiv
 
 **Fuzzing continuo.** I test di proprietà (`proptest`) sono la versione automatica
 dell'avversario: generano input arbitrari e input strutturati che superano i primi filtri.
-Nella Fase 4 si aggiunge `cargo-fuzz` sullo stesso decoder.
+`cargo-fuzz` (in `fuzz/`) copre decoder, handshake, trasporto e parser di configurazione; la
+CI lo esegue a ogni pull request. Un crash diventa prima un test di regressione, poi una
+correzione.
 
 ## 3. Regole di codice
 
@@ -78,4 +80,5 @@ Nella Fase 4 si aggiunge `cargo-fuzz` sullo stesso decoder.
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` pulito
 - [ ] `cargo fmt --check` pulito
 - [ ] adversary review registrata in `docs/adversary/`
+- [ ] `cargo deny check` pulito (advisories, licenze, sorgenti)
 - [ ] documentazione del protocollo aggiornata se il formato cambia

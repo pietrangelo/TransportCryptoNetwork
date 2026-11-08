@@ -131,6 +131,16 @@ Sul canale end-to-end il primo messaggio di trasporto del client DEVE avere come
 `TCN/1 ready`. Il messaggio 1 di IK è rigiocabile da chi lo osserva (il relay): solo dopo
 questa conferma l'agent contatta sshd e registra la sessione.
 
+### 7.4 Rekey
+Su entrambi i canali, dopo ogni **1024** messaggi di trasporto autentici in una direzione,
+mittente e destinatario eseguono `Rekey()` di Noise sulla chiave di quella direzione. Il rekey
+è implicito: nessun frame sul filo, solo il contatore. Funziona perché TCP consegna in ordine
+e qualsiasi messaggio rifiutato chiude il canale; un messaggio falso non incrementa il
+contatore del destinatario. Ogni periodo ha una chiave derivata a senso unico dalla
+precedente, quindi una copia della memoria del processo non decifra il traffico registrato dei
+periodi passati. Con il keepalive di 30 s un canale inattivo cambia chiave ogni ~8,5 ore; una
+sessione SSH ogni ~16 MiB.
+
 ## 8. Ciclo di vita
 
 1. L'agent si connette, completa l'handshake e invia `Register` entro 10 s con il nome che la
@@ -198,7 +208,23 @@ collega stdin/stdout di OpenSSH al canale end-to-end.
 - **Nessun timeout di scrittura su stdout.** Un `ssh` sospeso smette di leggere: la finestra
   limita la memoria e la sessione riprende quando ssh torna a leggere.
 
-## 12. Fuori dall'ambito della Fase 3
+## 12. Revoca a caldo
 
-Rekey dei canali di lunga durata, revoca a caldo delle chiavi, `cargo-fuzz` e pacchetti
-(Fase 4).
+Relay e agent ricaricano i propri file di trust con `SIGHUP` (`systemctl reload`). La nuova
+configurazione si applica anche a ciò che è già aperto:
+
+| Cambiamento | Effetto |
+| :- | :- |
+| chiave tolta dalla policy, o passata da client ad agent (o viceversa) | connessione chiusa; i peer delle sue sessioni ricevono `Close PeerGone` |
+| chiave di agent associata a un altro nodo | connessione chiusa; l'agent si riconnette e si registra con il nome nuovo |
+| client che perde l'accesso a un nodo | solo gli stream verso quel nodo si chiudono con `Close Unauthorized` da entrambi i lati |
+| client tolto dai client autorizzati di un agent | l'agent chiude le sue sessioni con `Close Unauthorized`, senza aspettare il relay |
+
+Ogni revoca produce l'evento di audit `access_revoked`. Un file non valido o diventato
+insicuro non cambia nulla e produce `policy_reload_failed` (relay) o
+`authorized_clients_reload_failed` (agent), a livello `ERROR`.
+
+## 13. Fuori dall'ambito
+
+Ricarica a caldo della chiave del relay o dell'agent (oggi richiede un riavvio, che i peer
+assorbono con la riconnessione); rate limiting per prefissi IPv4 più ampi di un indirizzo.
