@@ -118,9 +118,16 @@ impl PublicKey {
     /// [`CryptoError::InvalidKey`] per un punto non valido o non canonico,
     /// [`CryptoError::WeakKey`] per un punto di ordine piccolo.
     pub fn from_canonical_bytes(bytes: &[u8; 32]) -> Result<Self, CryptoError> {
-        // RED: stub, rifiuta sempre.
-        let _ = bytes;
-        Err(CryptoError::InvalidKey)
+        let key = VerifyingKey::from_bytes(bytes).map_err(|_| CryptoError::InvalidKey)?;
+        // `from_bytes` accetta anche `y >= p` e un bit di segno su `x = 0`: la ricodifica del
+        // punto decompresso deve restituire gli stessi 32 byte.
+        if key.to_edwards().compress().to_bytes() != *bytes {
+            return Err(CryptoError::InvalidKey);
+        }
+        if key.is_weak() {
+            return Err(CryptoError::WeakKey);
+        }
+        Ok(Self { key })
     }
 
     /// I 32 byte Ed25519 della chiave.
@@ -131,6 +138,10 @@ impl PublicKey {
 
     pub(crate) const fn from_verifying_key(key: VerifyingKey) -> Self {
         Self { key }
+    }
+
+    pub(crate) const fn verifying_key(&self) -> &VerifyingKey {
+        &self.key
     }
 }
 
