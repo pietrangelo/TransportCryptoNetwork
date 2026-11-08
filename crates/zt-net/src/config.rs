@@ -35,6 +35,24 @@ pub enum ConfigError {
     /// Il file della chiave segreta è leggibile da altri utenti.
     #[error("{0}: secret key file must not be accessible by group or others (chmod 600)")]
     InsecurePermissions(String),
+    /// Un file di trust (pin delle chiavi, policy, client autorizzati) è scrivibile da gruppo
+    /// o altri: chi può scriverlo può sostituire una chiave.
+    #[error("{0}: trust file must not be writable by group or others (chmod go-w)")]
+    WritableByOthers(String),
+    /// Il file non è un file regolare (FIFO, dispositivo, directory).
+    #[error("{0}: not a regular file")]
+    NotRegular(String),
+    /// Il file appartiene a un utente diverso da quello corrente e da root.
+    #[error("{0}: must be owned by the current user or root")]
+    UntrustedOwner(String),
+    /// La directory che contiene il file è di un altro utente o scrivibile da gruppo o altri.
+    #[error(
+        "{0}: directory must be owned by the current user or root and not writable by group or others"
+    )]
+    InsecureDirectory(String),
+    /// Nodo senza chiave pinnata nella configurazione del client.
+    #[error("unknown node {0}: no pinned key in the client configuration")]
+    UnknownNode(String),
     /// TOML non valido.
     #[error("{path}: {message}")]
     Syntax {
@@ -65,12 +83,105 @@ pub enum ConfigError {
     },
 }
 
-fn read_limited(path: &Path) -> Result<String, ConfigError> {
-    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
-        path: path.display().to_string(),
+/// Apre un file di trust o una chiave segreta e verifica, sul file **già aperto** (nessuna
+/// finestra tra controllo e lettura), ciò che verifica OpenSSH con `StrictModes`
+/// (finding 0003-1): file regolare, proprietario l'utente corrente o root, nessun permesso di
+/// scrittura per gruppo e altri (per una chiave segreta: nessun permesso per gruppo e altri).
+/// La directory che lo contiene deve rispettare le stesse regole di proprietà e scrittura,
+/// perché chi può scriverci può sostituire il file.
+fn open_trusted(path: &Path, private: bool) -> Result<std::fs::File, ConfigError> {
+    let display = || path.display().to_string();
+    let io = |source| ConfigError::Io {
+        path: display(),
+        source,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // Un FIFO aperto senza O_NONBLOCK blocca finché qualcuno non lo apre in scrittura.
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
+    let file = options.open(path).map_err(io)?;
+    let meta = file.metadata().map_err(io)?;
+    let uid = current_uid();
+    check_trusted(&meta, uid, path, private)?;
+    check_directory(path, uid)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// Controllo puro sui metadati di un file di configurazione aperto: `uid` è l'utente per cui
+/// il file deve essere affidabile. `private` vale per le chiavi segrete.
+///
+/// # Errors
+/// [`ConfigError::NotRegular`], [`ConfigError::UntrustedOwner`],
+/// [`ConfigError::InsecurePermissions`] (solo `private`), [`ConfigError::WritableByOthers`].
+pub fn check_trusted(
+    meta: &std::fs::Metadata,
+    uid: u32,
+    path: &Path,
+    private: bool,
+) -> Result<(), ConfigError> {
+    let display = path.display().to_string();
+    if !meta.is_file() {
+        return Err(ConfigError::NotRegular(display));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(ConfigError::UntrustedOwner(display));
+        }
+        let mode = meta.mode();
+        if private && mode & 0o077 != 0 {
+            return Err(ConfigError::InsecurePermissions(display));
+        }
+        if mode & 0o022 != 0 {
+            return Err(ConfigError::WritableByOthers(display));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (uid, private);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_directory(path: &Path, uid: u32) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let display = dir.display().to_string();
+    let meta = std::fs::metadata(dir).map_err(|source| ConfigError::Io {
+        path: display.clone(),
         source,
     })?;
-    read_file_limited(file, path)
+    if (meta.uid() != uid && meta.uid() != 0) || meta.mode() & 0o022 != 0 {
+        return Err(ConfigError::InsecureDirectory(display));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_directory(_path: &Path, _uid: u32) -> Result<(), ConfigError> {
+    Ok(())
+}
+
+/// Legge un file di trust (vedi [`open_trusted`]).
+fn read_limited(path: &Path) -> Result<String, ConfigError> {
+    read_file_limited(open_trusted(path, false)?, path)
 }
 
 fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigError> {
@@ -88,36 +199,13 @@ fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigE
     Ok(text)
 }
 
-/// Verifica i permessi sul file **già aperto**: nessuna finestra tra controllo e lettura.
-#[cfg(unix)]
-fn check_private(file: &std::fs::File, path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::PermissionsExt;
-    let display = path.display().to_string();
-    let meta = file.metadata().map_err(|source| ConfigError::Io {
-        path: display.clone(),
-        source,
-    })?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(ConfigError::InsecurePermissions(display));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_private(_file: &std::fs::File, _path: &Path) -> Result<(), ConfigError> {
-    Ok(())
-}
-
-/// Carica un'identità da file, rifiutando permessi troppo larghi (come fa OpenSSH).
+/// Carica un'identità da file, con le stesse verifiche di OpenSSH sulle chiavi private.
 ///
 /// # Errors
-/// File illeggibile, permessi insicuri, contenuto non valido.
+/// File illeggibile, non regolare, di un altro utente, con permessi insicuri o in una
+/// directory insicura; contenuto non valido.
 pub fn load_identity(path: &Path) -> Result<Identity, ConfigError> {
-    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    check_private(&file, path)?;
+    let file = open_trusted(path, true)?;
     let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
     Identity::from_secret_hex(&text).map_err(|source| ConfigError::Key {
         path: path.display().to_string(),
@@ -193,6 +281,16 @@ struct PolicyFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NodesFile {
+    #[serde(default)]
+    nodes: Vec<NodeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientFile {
+    relay: String,
+    relay_key: String,
+    key: String,
     #[serde(default)]
     nodes: Vec<NodeEntry>,
 }
@@ -331,4 +429,127 @@ pub fn load_authorized_clients(path: &Path) -> Result<HashSet<Fingerprint>, Conf
 /// Vedi [`parse_known_nodes`].
 pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PublicKey>, ConfigError> {
     parse_known_nodes(&path.display().to_string(), &read_limited(path)?)
+}
+
+/// Lunghezza massima dell'indirizzo del relay (nome DNS completo più porta).
+const MAX_RELAY_LEN: usize = 261;
+
+/// Configurazione di `zt-client`.
+#[derive(Debug, Clone)]
+pub struct ClientSettings {
+    /// Indirizzo del relay (`host:porta`).
+    pub relay: String,
+    /// Chiave pubblica del relay, pinnata.
+    pub relay_key: PublicKey,
+    /// File della chiave segreta del client.
+    pub key: std::path::PathBuf,
+    /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent. Un nodo assente non
+    /// è raggiungibile: non esiste trust-on-first-use.
+    pub nodes: HashMap<NodeId, PublicKey>,
+}
+
+impl ClientSettings {
+    /// Configurazione di connessione verso `node`.
+    ///
+    /// # Errors
+    /// [`ConfigError::UnknownNode`] se il nodo non ha una chiave pinnata.
+    pub fn client_config(
+        &self,
+        node: &NodeId,
+        timeouts: crate::Timeouts,
+    ) -> Result<crate::client::ClientConfig, ConfigError> {
+        let node_key = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| ConfigError::UnknownNode(node.to_string()))?;
+        Ok(crate::client::ClientConfig {
+            relay: self.relay.clone(),
+            relay_key: self.relay_key,
+            node: node.clone(),
+            node_key: *node_key,
+            timeouts,
+        })
+    }
+}
+
+/// `host:porta` con porta numerica non nulla, senza spazi né caratteri di controllo.
+fn valid_relay(text: &str) -> bool {
+    if text.is_empty()
+        || text.len() > MAX_RELAY_LEN
+        || text.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    match text.rsplit_once(':') {
+        Some((host, port)) => {
+            !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0) && !port.starts_with('+')
+        }
+        None => false,
+    }
+}
+
+/// Interpreta la configurazione del client. `base` è la directory del file: un percorso
+/// relativo della chiave si risolve rispetto a essa.
+///
+/// ```toml
+/// relay = "relay.example.org:7443"
+/// relay_key = "<64 hex>"
+/// key = "client.key"
+///
+/// [[nodes]]
+/// node = "web-01"
+/// public_key = "<64 hex>"
+/// ```
+///
+/// # Errors
+/// Qualsiasi voce non valida, duplicata o in conflitto.
+pub fn parse_client_settings(
+    origin: &str,
+    base: &Path,
+    text: &str,
+) -> Result<ClientSettings, ConfigError> {
+    let ctx = Ctx(origin);
+    let file: ClientFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    if !valid_relay(&file.relay) {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "relay must be host:port".into(),
+        });
+    }
+    if file.key.is_empty() {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "key must name the client secret key file".into(),
+        });
+    }
+    let relay_key = ctx.key("relay_key", &file.relay_key)?;
+    let mut nodes = HashMap::new();
+    for entry in &file.nodes {
+        let node = ctx.node(&entry.node, &entry.node)?;
+        let key = ctx.key(&entry.node, &entry.public_key)?;
+        if key.fingerprint() == relay_key.fingerprint() {
+            return Err(ctx.domain(&entry.node, DomainError::DuplicatePeer(key.fingerprint())));
+        }
+        if nodes.insert(node.clone(), key).is_some() {
+            return Err(ctx.domain(&entry.node, DomainError::DuplicateNode(node)));
+        }
+    }
+    Ok(ClientSettings {
+        relay: file.relay,
+        relay_key,
+        key: base.join(&file.key),
+        nodes,
+    })
+}
+
+/// Legge e interpreta la configurazione del client.
+///
+/// # Errors
+/// Vedi [`parse_client_settings`]; inoltre file scrivibile da gruppo o altri.
+pub fn load_client_settings(path: &Path) -> Result<ClientSettings, ConfigError> {
+    let base = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    parse_client_settings(&path.display().to_string(), base, &read_limited(path)?)
 }

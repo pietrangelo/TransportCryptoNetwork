@@ -154,11 +154,15 @@ impl StreamIo {
 /// finché non può scrivere bloccherebbe entrambe (deadlock classico dei proxy). Il credito
 /// di invio è un semaforo in byte: la direzione in uscita lo consuma, i `WindowUpdate` della
 /// direzione in entrata lo ricaricano.
+///
+/// `local_write` limita il tempo di una scrittura verso `local`. L'agent lo usa verso sshd;
+/// il client no: un `ssh` sospeso (`~^Z`) smette di leggere e la sessione deve sopravvivere,
+/// mentre la memoria è comunque limitata dalla finestra (finding 0003-2).
 pub(crate) async fn pump<L>(
     io: StreamIo,
     transport: Transport,
     local: L,
-    timeouts: &Timeouts,
+    local_write: Option<std::time::Duration>,
 ) -> Result<(), NetError>
 where
     L: AsyncRead + AsyncWrite + Unpin,
@@ -186,10 +190,11 @@ where
     let up = uplink(stream, reader, &tx, &credit, &transport);
     let result = tokio::select! {
         r = up => r,
-        r = down.run(&mut writer, timeouts) => r,
+        r = down.run(&mut writer, local_write) => r,
     };
     let _ = writer.shutdown().await;
-    if result.is_err() {
+    // Uno stream già chiuso dal peer non si richiude.
+    if result.is_err() && !matches!(result, Err(NetError::StreamClosed(_))) {
         let _ = tx
             .send(Frame::Close {
                 stream,
@@ -271,19 +276,34 @@ impl Downlink<'_> {
     async fn run<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
-        timeouts: &Timeouts,
+        local_write: Option<std::time::Duration>,
     ) -> Result<(), NetError> {
         loop {
             match self.rx.recv().await {
-                None | Some(Frame::Close { .. }) => return Ok(()),
+                None
+                | Some(Frame::Close {
+                    reason: CloseReason::Normal,
+                    ..
+                }) => return Ok(()),
+                // Una chiusura per errore del peer è un errore anche qui (finding 0003-3).
+                Some(Frame::Close { reason, .. }) => return Err(NetError::StreamClosed(reason)),
                 Some(Frame::Data { payload, .. }) => {
                     self.recv
                         .consume(payload.len())
                         .map_err(NetError::Protocol)?;
                     let plaintext = lock(self.transport)?.decrypt(payload.as_bytes())?;
-                    timeout(timeouts.write, writer.write_all(&plaintext))
-                        .await
-                        .map_err(|_| NetError::Timeout("local write"))??;
+                    // Flush a ogni messaggio: lo stdout di `zt-client` è bufferizzato a righe e
+                    // SSH non manda righe (finding 0003-1).
+                    let write = async {
+                        writer.write_all(&plaintext).await?;
+                        writer.flush().await
+                    };
+                    match local_write {
+                        Some(limit) => timeout(limit, write)
+                            .await
+                            .map_err(|_| NetError::Timeout("local write"))??,
+                        None => write.await?,
+                    }
                     self.consumed = self.consumed.saturating_add(charge(payload.len()));
                     if self.consumed >= UPDATE_THRESHOLD {
                         let credit = Credit::try_from(self.consumed)

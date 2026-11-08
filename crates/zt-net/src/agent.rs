@@ -304,7 +304,7 @@ impl StreamTask {
         };
         let _ = ssh.set_nodelay(true);
         tracing::info!(target: "zt_audit", %client, "end-to-end session started");
-        if let Err(err) = pump(io, transport, ssh, &timeouts).await {
+        if let Err(err) = pump(io, transport, ssh, Some(timeouts.write)).await {
             tracing::debug!(error = %err, "stream ended with error");
         }
         tracing::info!(target: "zt_audit", %client, "end-to-end session ended");

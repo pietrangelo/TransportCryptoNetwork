@@ -6,7 +6,8 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::panic,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation
 )]
 
 use std::collections::HashSet;
@@ -193,6 +194,26 @@ async fn ssh_bytes_round_trip_through_the_relay() {
     assert!(result.is_ok(), "{result:?}");
 }
 
+/// Regressione 0003-1: lo stdout di `zt-client` è bufferizzato; senza flush i byte di SSH
+/// (che non terminano a fine riga) restano nel buffer e la sessione si blocca.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivered_bytes_are_flushed_to_a_buffered_local_writer() {
+    let fleet = Fleet::start(test_relay_config()).await;
+    fleet.start_agent().await;
+    let (mut app, local) = tokio::io::duplex(64 * 1024);
+    let local = tokio::io::BufWriter::with_capacity(8192, local);
+    let config = fleet.client_config("web-01");
+    let _session =
+        tokio::spawn(async move { client::connect(&fleet.ansible, &config, local).await });
+    app.write_all(b"no newline").await.unwrap();
+    let mut echoed = [0_u8; 10];
+    tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut echoed))
+        .await
+        .expect("bytes stuck in the local write buffer")
+        .unwrap();
+    assert_eq!(&echoed, b"no newline");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_transfer_is_flow_controlled_and_intact() {
     // 8 MiB: 32 volte la finestra iniziale, quindi servono molti WindowUpdate.
@@ -368,4 +389,37 @@ async fn handshake_floods_from_one_address_are_rate_limited() {
             .await
             .is_err()
     );
+}
+
+/// Regressione 0003-2: un `ssh` sospeso (`~^Z`, SIGSTOP) smette di leggere. La sessione deve
+/// sopravvivere: la memoria è già limitata dalla finestra, un timeout di scrittura locale
+/// non protegge nulla e uccide sessioni legittime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_local_reader_does_not_kill_the_session() {
+    let fleet = Fleet::start(test_relay_config()).await;
+    fleet.start_agent().await;
+    let (app, local) = tokio::io::duplex(16 * 1024);
+    let config = fleet.client_config("web-01");
+    let session =
+        tokio::spawn(async move { client::connect(&fleet.ansible, &config, local).await });
+    let (mut rd, mut wr) = tokio::io::split(app);
+    let data: Vec<u8> = (0..512 * 1024_u32).map(|i| (i % 251) as u8).collect();
+    let expected = data.clone();
+    let writer = tokio::spawn(async move {
+        wr.write_all(&data).await.unwrap();
+        wr
+    });
+    // Più del timeout di scrittura (5 s) senza leggere nulla.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(
+        !session.is_finished(),
+        "session died while the reader was stalled"
+    );
+    let mut got = vec![0_u8; expected.len()];
+    tokio::time::timeout(Duration::from_secs(20), rd.read_exact(&mut got))
+        .await
+        .expect("no data after resuming")
+        .unwrap();
+    assert!(got == expected, "data corrupted after the stall");
+    drop(writer.await.unwrap());
 }
