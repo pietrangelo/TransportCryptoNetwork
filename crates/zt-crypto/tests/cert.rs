@@ -624,7 +624,10 @@ fn node_and_ca_key_files_are_not_interchangeable() {
 fn ca_signing_key_debug_is_redacted() {
     let ca = CaSigningKey::from_secret_text(&ca_secret_text([0xab; 32])).unwrap();
     let rendered = format!("{ca:?}");
-    assert!(rendered.contains("redacted"), "{rendered}");
+    assert!(
+        rendered.contains("redacted"),
+        "the Debug output of a CA key is not redacted"
+    );
     let secret = ca.to_secret_text();
     let hex_part = secret.trim_end().strip_prefix("tcn-ca-secret-v1:").unwrap();
     assert_eq!(hex_part, "ab".repeat(32));

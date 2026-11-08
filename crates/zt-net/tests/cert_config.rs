@@ -495,7 +495,7 @@ fn certificate_files_reject_other_formats() {
     ] {
         assert!(
             parse_certificate_file("client.cert", &bad).is_err(),
-            "accepted {bad:?}"
+            "a malformed certificate file was accepted"
         );
     }
 }
@@ -611,12 +611,18 @@ fn a_ca_secret_pasted_into_a_trust_file_is_not_echoed() {
         ];
         assert!(
             errors.iter().all(Option::is_some),
-            "a pasted secret was accepted: {text}"
+            "a pasted secret was accepted"
         );
         for err in errors.into_iter().flatten() {
             let message = err.to_string();
-            assert!(!message.contains(&secret_hex), "{message}");
-            assert!(!message.contains("5c5c5c5c5c5c5c5c"), "{message}");
+            assert!(
+                !message.contains(&secret_hex),
+                "an error message echoed the pasted secret"
+            );
+            assert!(
+                !message.contains("5c5c5c5c5c5c5c5c"),
+                "an error message echoed the pasted secret"
+            );
         }
     }
 }
