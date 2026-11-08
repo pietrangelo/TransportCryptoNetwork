@@ -173,9 +173,20 @@ Gli eventi di sicurezza hanno target `zt_audit` e un nome stabile in `fields.eve
 | `keys_in_use` | INFO, WARN con una chiave precedente | (relay e agent) all'avvio e a ogni ricarica: `role`, `current_fingerprint`, `previous_fingerprint` (`none` se non c'è) |
 | `previous_key_still_accepted` | WARN | ogni ora, finché una chiave precedente è accettata: completa la rotazione (§8) |
 | `agent_rotation_pending` | WARN | (relay) all'avvio, a ogni ricarica e ogni ora, per ogni nodo con due chiavi di agent nella policy: `node`, `fingerprints`; completa la rotazione (§8) |
+| `certificate_expired` | INFO | (relay e agent) una sessione autorizzata da un certificato è stata chiusa alla sua scadenza: `peer`, `ca`, `serial` (§10) |
+| `authorities_in_use` | INFO, WARN con due chiavi | (relay e agent) all'avvio e a ogni ricarica, per ogni CA pinnata: `authority`, `fingerprints`, `max_lifetime` |
+| `ca_rotation_pending` | WARN | (relay e agent) all'avvio, a ogni ricarica e ogni ora, per ogni CA con due chiavi: completa la rotazione (§10.6) |
+| `revocations_in_use` | INFO | (relay e agent) all'avvio e a ogni ricarica: quante voci `serials` e `keys` ha la denylist |
 
 I dati dell'evento sono campi separati: `peer` (fingerprint), `node`, `session` (hex),
 `stream`, `reason`, `rule`, secondo l'evento. Mai payload o segreti.
+
+Con i certificati (§10) `session_established`, `e2e_session_started`, `access_denied` e
+`access_revoked` hanno anche `credential` (`key` o `certificate`) e, per un certificato, `ca`
+(fingerprint della CA), `serial`, `cert_name` e `not_after`. `authentication_failed` ha
+`reason = certificate` (o `key_revoked`) e `cert_check` con il controllo fallito (`malformed`,
+`key_mismatch`, `unknown_authority`, `bad_signature`, `serial_revoked`, `not_yet_valid`,
+`expired`, `lifetime_exceeds_authority`, `role_conflict`, `node_out_of_scope`; PROTOCOL §15.4).
 
 ```bash
 journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
@@ -192,6 +203,9 @@ journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
    da `clients.toml` sugli agent la blocca comunque, qualunque relay usi.
 3. Controlla `access_revoked` nell'audit log. Se trovi `..._reload_failed`, il file non è
    valido: la configurazione precedente è ancora in vigore.
+
+Un client con un certificato (§10) non si revoca togliendolo dai file: la sua chiave non c'è.
+Si usa la denylist (§10.5).
 
 ## 8. Più relay e rotazione delle chiavi
 
@@ -282,3 +296,198 @@ se l'IP del relay è fisso, attiva `IPAddressDeny=any` / `IPAddressAllow=` nella
 Le unit sono `Type=notify`: `systemctl start` ritorna quando il servizio ha caricato chiave e
 file di trust e gestisce già `SIGHUP`, quindi un `systemctl reload` subito dopo è sicuro. Il
 relay usa `Restart=always`, perché un segnale inatteso conta come uscita pulita.
+
+## 10. Certificati client e CA offline
+
+Con molti client, o con accessi che devono durare poche ore, invece di elencare ogni chiave in
+ogni policy e in ogni `clients.toml` si usa una **CA offline**: relay e agent pinnano la sua
+chiave pubblica, e ogni client riceve un certificato breve che lega la sua chiave a un nome, a
+un elenco di nodi e a una scadenza (PROTOCOL §15). La whitelist per chiave (§2, §3) continua a
+funzionare e ha la precedenza.
+
+Regole da tenere a mente:
+
+- la chiave segreta della CA non va **mai** su un relay, un agent o una workstation di uso
+  quotidiano: chi la possiede apre sessioni verso tutti i nodi che la CA può concedere;
+- un certificato scade anche **durante** le sessioni aperte (PROTOCOL §15.7): emettilo per la
+  durata del lavoro, entro il `max_lifetime` della CA;
+- la revoca prima della scadenza passa dalla denylist (§10.5), che deve arrivare a **tutti**
+  i relay e a **tutti** gli agent.
+
+### 10.1 Creare la CA (offline)
+
+Su una macchina dedicata, senza rete, con disco cifrato (o da un supporto rimovibile cifrato),
+con l'orologio impostato correttamente (i certificati prendono l'ora da qui):
+
+```bash
+date -u                                       # controlla l'ora UTC prima di ogni sessione di firma
+zt-ca keygen --out /media/ca/ops-ca.key
+# public_key  = "<chiave pubblica della CA>"
+# fingerprint = SHA256:...
+```
+
+Il file è nuovo, `0600`, e ha il formato `tcn-ca-secret-v1:<hex>`, diverso da quello delle
+chiavi di nodo: relay, agent e client non lo caricano, e `zt-ca` non firma con una chiave di
+nodo. Fanne una copia cifrata in un luogo diverso. Il binario `zt-ca` serve solo su questa
+macchina.
+
+Una CA per ambito: per esempio `ops-ca` per gli amministratori, `deploy-ca` per la pipeline di
+Ansible che tocca solo i server applicativi. L'ambito lo decide la configurazione di relay e
+agent (`allow`, §10.2), non la CA: una CA rubata non concede più di quanto le è stato assegnato.
+
+### 10.2 Pinnare la CA su relay e agent
+
+Nella policy di **ogni** relay (`/etc/tcn/policy.toml`):
+
+```toml
+[[authorities]]
+name = "ops-ca"                     # [a-z0-9-], 1..=63, distinto dalle altre CA
+public_key = "<chiave pubblica della CA>"
+allow = ["web-01", "web-02"]        # nodi che questa CA può concedere; ["*"] = tutti
+max_lifetime = 28800                # secondi, 60..=86400 (default 8 ore)
+```
+
+Negli `clients.toml` di **ogni** agent che deve accettare i client della CA, la stessa voce
+(l'agent controlla che il proprio nodo sia in `allow`; puoi distribuire lo stesso blocco
+ovunque).
+
+La denylist, inizialmente vuota, è lo **stesso file** su relay e agent
+(`/etc/tcn/revoked.toml`, `root:root 0644` o `tcn`, regole di §5 sui file di trust):
+
+```toml
+serials = []    # numeri di serie dei certificati revocati (32 caratteri esadecimali)
+keys = []       # chiavi pubbliche revocate, con qualsiasi credenziale
+```
+
+Avvio (o drop-in dell'unità systemd, `systemctl edit`):
+
+```bash
+zt-relay run ... --policy /etc/tcn/policy.toml --revocations /etc/tcn/revoked.toml
+zt-agent run ... --authorized-clients /etc/tcn/clients.toml --revocations /etc/tcn/revoked.toml
+```
+
+Con una `[[authorities]]` e senza `--revocations` il processo non parte (e una ricarica che
+aggiunge una CA fallisce): la denylist deve esistere prima che serva. Una chiave di CA non può
+essere anche la chiave di un agent o di un client nello stesso file, né quella del processo.
+
+Verifica: `authorities_in_use` nell'audit log di ogni relay e agent riporta nome e fingerprint
+della CA; `revocations_in_use` il numero di voci della denylist. Come per la policy, confronta
+`sha256sum /etc/tcn/policy.toml /etc/tcn/revoked.toml` su tutti i relay, e `revoked.toml` su
+tutti gli agent.
+
+### 10.3 Emettere un certificato
+
+1. Il client genera la propria chiave, se non l'ha già (`zt-client keygen`, §1), e manda
+   all'operatore della CA la **chiave pubblica**, mai il file della chiave. L'operatore
+   verifica la fingerprint con il richiedente su un canale diverso (per telefono, o in un
+   ticket firmato): chi sostituisce la chiave pubblica in transito ottiene il certificato.
+2. Sulla macchina della CA:
+
+   ```bash
+   zt-ca sign --ca /media/ca/ops-ca.key --log /media/ca/issued.tsv \
+       --subject <chiave pubblica del client> --name alice \
+       --nodes web-01,web-02 --validity 8h --out alice.cert
+   # serial      = 3f0c...       (32 hex)
+   # subject     = SHA256:...    (fingerprint del client)
+   # not_before  = 2026-11-08T09:00:00Z
+   # not_after   = 2026-11-08T17:00:00Z
+   ```
+
+   - `--nodes` (elenco, al massimo 64) oppure `--all-nodes` (tutti i nodi in `allow` della
+     CA). Preferisci l'elenco.
+   - `--validity` accetta `s`, `m`, `h` (per esempio `90m`), al massimo 24 ore e comunque non
+     oltre il `max_lifetime` della CA, altrimenti relay e agent lo rifiutano.
+   - `--not-before <secondi Unix>` emette un certificato per una finestra futura (manutenzione
+     programmata); di default parte da adesso.
+   - `--log` è obbligatorio: `zt-ca` aggiunge una riga per ogni certificato (serie,
+     fingerprint, nome, inizio, scadenza, ambito). Serve per revocare (§10.5) e per accorgersi di
+     certificati che la CA non ha emesso (PROTOCOL §15.11). Conservalo con la chiave della CA.
+   - `zt-ca` non sovrascrive mai `--out` e rifiuta chiavi deboli o non valide.
+3. Consegna `alice.cert` al client. Non è un segreto (da solo non serve a nulla senza la chiave
+   del client), ma un certificato sostituito in transito semplicemente non funziona.
+
+### 10.4 Usare il certificato su `zt-client`
+
+Accanto alla chiave, per esempio `~/.config/tcn/client.cert`, e in `client.toml`:
+
+```toml
+key = "client.key"
+certificate = "client.cert"         # relativo a questo file, oppure assoluto
+```
+
+Il file del certificato segue le regole dei file di trust (§5). `zt-client` lo legge a ogni
+invocazione e, prima di connettersi, controlla che sia per la propria chiave e non sia scaduto
+(secondo l'orologio locale): in quel caso esce con un messaggio chiaro invece di provare tutti
+i relay. Avvisa su stderr quando mancano meno di 15 minuti alla scadenza.
+
+```bash
+zt-client certificate     # nome, nodi, CA, numero di serie, validità del certificato configurato
+```
+
+**Rinnovo**: si ripete §10.3 e si sostituisce il file in modo atomico
+(`mv alice.cert.new ~/.config/tcn/client.cert`). Le nuove invocazioni usano il certificato
+nuovo; le sessioni aperte restano legate a quello con cui sono nate e si chiudono alla sua
+scadenza. Con `ControlPersist` il master SSH è una di queste: dopo il rinnovo chiudilo
+(`ssh -O exit web-01.tcn`) per non perderlo a metà di un lavoro.
+
+**Ansible**: un playbook che dura più del certificato viene interrotto alla scadenza. Emetti
+il certificato per la durata prevista (entro `max_lifetime`) o rinnovalo prima del lancio.
+
+Se il client è ancora anche nella whitelist (§2, §3), vale la whitelist e il certificato è solo
+verificato: un certificato non valido fa comunque rifiutare il client. Per passare del tutto ai
+certificati togli la sua voce da policy e `clients.toml` e ricarica: la sua connessione cade una
+volta e si riapre con il certificato.
+
+### 10.5 Revoca prima della scadenza
+
+Per un certificato (per esempio un portatile perso con chiave e certificato):
+
+1. Trova il numero di serie nel registro della CA (`issued.tsv`) o con
+   `zt-ca inspect --cert alice.cert`, che stampa anche la riga da incollare.
+2. Aggiungilo a `serials` in `/etc/tcn/revoked.toml`. Per revocare **tutto** ciò che una chiave
+   può fare (tutti i suoi certificati, di qualsiasi CA, e la sua eventuale voce nella
+   whitelist) aggiungi invece la sua chiave pubblica a `keys`: è la scelta giusta quando la
+   chiave è compromessa.
+3. Distribuisci il file a **tutti** i relay e a **tutti** gli agent e ricarica
+   (`systemctl reload zt-relay`, `systemctl reload zt-agent`). Le sessioni in corso del
+   certificato si chiudono subito (PROTOCOL §12).
+4. Controlla `access_revoked` e `revocations_in_use` con il nuovo numero di voci. Un
+   `policy_reload_failed` o `authorized_clients_reload_failed` vuol dire che la **revoca non è
+   in vigore** su quel nodo (resta la configurazione precedente): correggi il file e ricarica.
+
+Anche con un relay non aggiornato, gli agent aggiornati bloccano il certificato; viceversa un
+agent non aggiornato è protetto solo dai relay. Aggiornali tutti.
+
+**Potatura**: una voce di `serials` si può togliere quando il certificato è scaduto da più di
+qualche minuto (la scadenza chiude anche le sessioni, PROTOCOL §15.7); la data è nel registro
+della CA. Una voce di `keys` resta finché quella chiave non è sostituita ovunque.
+
+**Emergenza** (una CA da fermare subito, per esempio perché la denylist non basta o la chiave
+della CA è esposta): togli la voce `[[authorities]]` (o la sola chiave) da relay e agent e
+ricarica. Tutti i certificati di quella CA cadono, anche nelle sessioni aperte.
+
+### 10.6 Rotazione della CA
+
+Una rotazione programmata, senza interruzioni:
+
+1. `zt-ca keygen --out /media/ca/ops-ca.next.key` sulla macchina della CA.
+2. Su tutti i relay e gli agent: `public_keys = ["<nuova>", "<vecchia>"]` al posto di
+   `public_key` nella voce della CA, poi ricarica. `authorities_in_use` mostra le due
+   fingerprint, `ca_rotation_pending` lo ricorda ogni ora.
+3. Da qui firma solo con la nuova chiave.
+4. Quando è passato almeno `max_lifetime` dall'ultimo certificato firmato con la vecchia (vedi
+   il registro), nessun suo certificato è più valido: togli la vecchia (`public_key =
+   "<nuova>"`) ovunque e ricarica. Archivia o distruggi la chiave vecchia.
+
+**CA compromessa**: non si ruota. Togli subito la sua chiave da relay e agent (§10.5,
+emergenza), crea una CA nuova, pinnala, riemetti i certificati necessari. Poi confronta i numeri
+di serie negli audit log (`session_established`, `e2e_session_started`) con il registro della
+CA: una serie che non compare nel registro è un certificato forgiato.
+
+### 10.7 Orologi
+
+Relay e agent decidono validità e scadenza con il proprio orologio di sistema, con 2 minuti di
+tolleranza solo sull'inizio della validità. Tienili sincronizzati, preferibilmente con NTS
+(`chrony` con `nts`): chi sposta all'indietro l'orologio di un relay e di un agent rende di
+nuovo validi certificati scaduti. La macchina della CA, offline, va regolata a mano prima di
+ogni sessione di firma; `zt-ca sign` stampa le date in UTC proprio per controllarle.
