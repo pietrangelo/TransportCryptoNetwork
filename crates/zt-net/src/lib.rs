@@ -78,8 +78,10 @@ impl Default for Timeouts {
 /// certificato è ancora valido, PROTOCOL §15.6).
 #[must_use]
 pub fn unix_now() -> zt_domain::UnixTime {
-    // RED: stub, sempre 0.
-    zt_domain::UnixTime::from_secs(0)
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    zt_domain::UnixTime::from_secs(secs)
 }
 
 /// Scadenza a `after` da adesso. Una durata assurda che manderebbe in overflow l'orologio

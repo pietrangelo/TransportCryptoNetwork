@@ -24,7 +24,7 @@ use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
-    AccessPolicy, AuthFailureReason, CertClaims, CertRejection, DomainEvent, Fingerprint, Frame,
+    AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
     SessionId,
 };
 
@@ -94,16 +94,47 @@ pub(crate) fn audit(event: &DomainEvent) {
             session,
             client,
             target,
-            ..
+            certificate,
         } => {
-            emit!(session = %session_hex(session), peer = %client, node = %target, "session established");
+            let c = CertFields::of(certificate.as_ref());
+            emit!(
+                session = %session_hex(session),
+                peer = %client,
+                node = %target,
+                credential = c.credential,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "session established"
+            );
         }
-        DomainEvent::AuthenticationFailed { peer, reason } => match peer {
-            Some(peer) => emit!(%peer, ?reason, "authentication failed"),
-            None => emit!(?reason, "authentication failed"),
-        },
-        DomainEvent::AccessDenied { client, target, .. } => {
-            emit!(peer = %client, node = %target, "access denied");
+        DomainEvent::AuthenticationFailed { peer, reason } => {
+            let (reason, cert_check) = failure_fields(*reason);
+            let peer = peer.as_ref().map(ToString::to_string);
+            emit!(
+                peer = peer.as_deref(),
+                reason = reason.as_str(),
+                cert_check,
+                "authentication failed"
+            );
+        }
+        DomainEvent::AccessDenied {
+            client,
+            target,
+            certificate,
+        } => {
+            let c = CertFields::of(certificate.as_ref());
+            emit!(
+                peer = %client,
+                node = %target,
+                credential = c.credential,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "access denied"
+            );
         }
         DomainEvent::ProtocolViolation { peer, rule } => {
             emit!(%peer, rule = *rule, "protocol violation");
@@ -111,12 +142,79 @@ pub(crate) fn audit(event: &DomainEvent) {
         DomainEvent::ConnectionDrained { session, reason } => {
             emit!(session = %session_hex(session), ?reason, "connection drained");
         }
-        DomainEvent::AccessRevoked { peer, target, .. } => match target {
-            Some(target) => emit!(%peer, node = %target, "access revoked"),
-            None => emit!(%peer, "access revoked"),
-        },
+        DomainEvent::AccessRevoked {
+            peer,
+            target,
+            certificate,
+        } => {
+            let c = CertFields::of(certificate.as_ref());
+            let node = target.as_ref().map(ToString::to_string);
+            emit!(
+                %peer,
+                node = node.as_deref(),
+                credential = c.credential,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "access revoked"
+            );
+        }
+        DomainEvent::CertificateExpired { peer, certificate } => {
+            let c = CertFields::of(Some(certificate));
+            emit!(
+                %peer,
+                ca = c.ca.as_deref(),
+                serial = c.serial.as_deref(),
+                cert_name = c.cert_name.as_deref(),
+                not_after = c.not_after,
+                "certificate expired"
+            );
+        }
         // `DomainEvent` è `non_exhaustive`: un evento nuovo resta almeno leggibile.
         other => emit!(event = ?other, "audit event"),
+    }
+}
+
+/// I campi di audit di una credenziale (PROTOCOL §15.11): mai i byte del certificato, solo
+/// la CA, la serie, il nome e la scadenza.
+pub(crate) struct CertFields {
+    /// `key` o `certificate`.
+    pub(crate) credential: &'static str,
+    pub(crate) ca: Option<String>,
+    pub(crate) serial: Option<String>,
+    pub(crate) cert_name: Option<String>,
+    pub(crate) not_after: Option<u64>,
+}
+
+impl CertFields {
+    pub(crate) fn of(certificate: Option<&CertRef>) -> Self {
+        match certificate {
+            None => Self {
+                credential: "key",
+                ca: None,
+                serial: None,
+                cert_name: None,
+                not_after: None,
+            },
+            Some(c) => Self {
+                credential: "certificate",
+                ca: Some(c.ca.to_string()),
+                serial: Some(c.serial.to_string()),
+                cert_name: Some(c.name.to_string()),
+                not_after: Some(c.not_after.as_secs()),
+            },
+        }
+    }
+}
+
+/// `reason` e `cert_check` di un `authentication_failed`. I motivi precedenti alla Fase 6
+/// restano nella forma di sempre (`UnknownPeer`, ...), per non rompere i filtri esistenti.
+fn failure_fields(reason: AuthFailureReason) -> (String, Option<&'static str>) {
+    match reason {
+        AuthFailureReason::KeyRevoked => ("key_revoked".into(), None),
+        AuthFailureReason::Certificate(check) => ("certificate".into(), Some(check.as_str())),
+        other => (format!("{other:?}"), None),
     }
 }
 
@@ -310,22 +408,18 @@ impl Connection {
             }
         };
         let peer = pending.peer();
-        // RED: stub, un certificato nel messaggio 1 è rifiutato senza messaggio 2 (fail closed).
-        if !pending.payload().is_empty() {
-            audit(&DomainEvent::AuthenticationFailed {
-                peer: Some(peer),
-                reason: AuthFailureReason::Certificate(CertRejection::Malformed),
-            });
-            return;
-        }
-        // Una chiave sconosciuta non riceve nemmeno il secondo messaggio dell'handshake.
-        if self.policy.current().role(&peer).is_none() {
-            audit(&DomainEvent::AuthenticationFailed {
-                peer: Some(peer),
-                reason: AuthFailureReason::UnknownPeer,
-            });
-            return;
-        }
+        // PROTOCOL §15.4, prima del messaggio 2: un rifiuto equivale a una chiave sconosciuta,
+        // che non riceve nemmeno il secondo messaggio dell'handshake.
+        let certificate = match admit(&self.policy.current(), &peer, pending.payload()) {
+            Ok(certificate) => certificate,
+            Err(reason) => {
+                audit(&DomainEvent::AuthenticationFailed {
+                    peer: Some(peer),
+                    reason,
+                });
+                return;
+            }
+        };
         let Ok(mut ch) = pending.establish(&self.timeouts).await else {
             return;
         };
@@ -338,7 +432,7 @@ impl Connection {
             .send(HubEvent::Connected {
                 conn,
                 peer,
-                certificate: None,
+                certificate,
                 tx,
             })
             .await
@@ -380,6 +474,32 @@ impl Connection {
             .send(HubEvent::Core(Input::Disconnected { conn }))
             .await;
     }
+}
+
+/// Passi 1–11 di PROTOCOL §15.4 sul canale esterno: denylist della chiave, verifica del
+/// certificato (se il payload non è vuoto) e decisione della policy. Restituisce i dati
+/// verificati del certificato, che il core ricontrolla con la policy del momento.
+fn admit(
+    policy: &AccessPolicy,
+    peer: &Fingerprint,
+    payload: &[u8],
+) -> Result<Option<Arc<CertClaims>>, AuthFailureReason> {
+    let trust = policy.cert_trust();
+    // Passo 1, anche senza certificato.
+    if trust.is_key_revoked(peer) {
+        return Err(AuthFailureReason::KeyRevoked);
+    }
+    // Passi 3–6 (passo 2: payload vuoto, nessun certificato).
+    let certificate = if payload.is_empty() {
+        None
+    } else {
+        let claims = zt_crypto::verify_certificate(payload, peer, trust)
+            .map_err(AuthFailureReason::Certificate)?;
+        Some(Arc::new(claims))
+    };
+    // Passi 5 e 7–11 e la precedenza della whitelist.
+    policy.admit(peer, certificate.as_ref(), crate::unix_now())?;
+    Ok(certificate)
 }
 
 async fn hub(

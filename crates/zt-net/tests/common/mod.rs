@@ -521,6 +521,12 @@ impl Write for Captured {
 
 impl Captured {
     pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        // tracing-core, con un solo dispatcher registrato, calcola l'interesse dei callsite e il
+        // livello massimo globale dal dispatcher del thread che registra il callsite: un test
+        // parallelo senza subscriber (thread di un runtime multi-thread) spegne allora i log di
+        // questo test (`LevelFilter::OFF`). Un secondo dispatcher sempre vivo evita la scorciatoia.
+        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let writer = self.clone();
         let subscriber = tracing_subscriber::fmt()
             .json()

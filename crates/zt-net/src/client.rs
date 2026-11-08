@@ -51,17 +51,14 @@ where
             "the client needs between 1 and 8 relays",
         ));
     }
-    // RED: stub, i certificati non sono ancora supportati (fail closed).
-    if config.certificate.is_some() {
-        return Err(NetError::Protocol(
-            "client certificates are not supported yet",
-        ));
-    }
+    // Lo stesso certificato nel messaggio 1 di entrambi i canali (PROTOCOL §15.3): relay e
+    // agent lo verificano ciascuno con le proprie CA.
+    let certificate: &[u8] = config.certificate.as_deref().unwrap_or(&[]);
     let stream = StreamId::try_from(1).map_err(|_| NetError::Protocol("stream id"))?;
     let mut last = NetError::Closed;
     let mut opened = None;
     for (i, relay) in config.relays.iter().enumerate() {
-        match open(identity, relay, &config.node, stream, t).await {
+        match open(identity, relay, &config.node, stream, certificate, t).await {
             Ok(ch) => {
                 opened = Some(ch);
                 break;
@@ -84,7 +81,12 @@ where
     let relay_link = drive(ch, stream, to_stream, out_rx, t);
     let session = async {
         let mut io = StreamIo::new(stream, from_driver, out_tx);
-        let (msg1, waiting) = noise::initiate(identity, &config.node_key, Channel::EndToEnd)?;
+        let (msg1, waiting) = noise::initiate_with_payload(
+            identity,
+            &config.node_key,
+            Channel::EndToEnd,
+            certificate,
+        )?;
         io.send_data(msg1).await?;
         let msg2 = io.recv_message(t).await?;
         let mut transport = waiting.complete(&msg2)?;
@@ -101,13 +103,22 @@ async fn open(
     relay: &crate::RelayEndpoint,
     node: &NodeId,
     stream: StreamId,
+    certificate: &[u8],
     t: &Timeouts,
 ) -> Result<Established<TcpStream>, NetError> {
     let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
     let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect(tcp, identity, &relay.public_key, Channel::Outer, t).await?;
+    let mut ch = channel::connect_with_payload(
+        tcp,
+        identity,
+        &relay.public_key,
+        Channel::Outer,
+        certificate,
+        t,
+    )
+    .await?;
     ch.send(
         &Frame::Open {
             stream,
