@@ -763,6 +763,29 @@ pub fn load_relay_policy(
     Ok(parsed)
 }
 
+/// Rifiuta una CA la cui chiave è quella del processo stesso, corrente o precedente
+/// (PROTOCOL §15.9): un relay o un agent non è mai anche una CA della propria configurazione.
+///
+/// # Errors
+/// [`ConfigError::Domain`] con [`DomainError::DuplicatePeer`].
+pub fn reject_own_key_as_authority(
+    origin: &str,
+    trust: &CertTrust,
+    keys: &Keyring,
+) -> Result<(), ConfigError> {
+    let own = [
+        Some(keys.current().fingerprint()),
+        keys.previous().map(Identity::fingerprint),
+    ];
+    match trust
+        .ca_fingerprints()
+        .find(|ca| own.iter().flatten().any(|k| k == ca))
+    {
+        Some(ca) => Err(Ctx(origin).domain("authorities", DomainError::DuplicatePeer(ca))),
+        None => Ok(()),
+    }
+}
+
 /// Legge una denylist con le regole dei file di trust.
 fn load_revocations(path: &Path) -> Result<Revocations, ConfigError> {
     parse_revocations(&path.display().to_string(), &read_limited(path)?)

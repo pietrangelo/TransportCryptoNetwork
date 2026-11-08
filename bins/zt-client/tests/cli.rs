@@ -174,7 +174,11 @@ async fn certificate_subcommand_prints_status() {
         &me,
         &bait.addr.to_string(),
         &relay_key,
-        &[("web-01", relay_key)],
+        // Il nodo ha una chiave sua: una chiave di relay non può essere anche quella di un nodo.
+        &[(
+            "web-01",
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
     );
     let now = now_secs();
     let not_after = now + 3_600;
@@ -221,7 +225,10 @@ async fn a_certificate_expiring_soon_warns_on_stderr_only() {
             &me,
             &relay.to_string(),
             &relay_key,
-            &[("web-01", relay_key)],
+            &[(
+                "web-01",
+                zt_crypto::Identity::generate().unwrap().public_key(),
+            )],
         );
         let (cert, _, _) = issue(&me.public_key(), &["web-01"], nb, na);
         dir.add_certificate(&cert, 0o644);

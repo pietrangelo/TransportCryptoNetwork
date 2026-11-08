@@ -296,10 +296,16 @@ impl RelayServer {
         config: RelayConfig,
     ) -> Result<Self, NetError> {
         let policy = policy.into();
+        let keys = keys.into();
         let listener = TcpListener::bind(addr).await?;
+        // Il socket accetta già connessioni (in coda fino a `run`): lo si dichiara qui, così
+        // ciò che il processo registra dopo `bind` viene sempre dopo questa riga.
+        if let Ok(addr) = listener.local_addr() {
+            tracing::info!(%addr, relay = %keys.current().current().fingerprint(), "relay listening");
+        }
         Ok(Self {
             listener,
-            keys: keys.into(),
+            keys,
             policy,
             config,
         })
@@ -343,9 +349,6 @@ impl RelayServer {
         );
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
-        if let Ok(addr) = listener.local_addr() {
-            tracing::info!(%addr, relay = %keys.current().current().fingerprint(), "relay listening");
-        }
         loop {
             let (tcp, addr) = match listener.accept().await {
                 Ok(accepted) => accepted,

@@ -152,9 +152,25 @@ fn run(command: Command) -> Result<(), String> {
                     zt_net::keys::ROTATION_REMINDER,
                 ));
                 let path = authorized_clients;
-                let authorized = config::load_authorized_clients(&path, revocations.as_deref())
-                    .map_err(|e| e.to_string())?;
+                // Client autorizzati e denylist in un solo passo; una CA uguale alla chiave
+                // dell'agent (corrente o precedente) è rifiutata (PROTOCOL §15.9).
+                let agent_keys = Arc::clone(&keys);
+                let load = move || {
+                    let clients = config::load_authorized_clients(&path, revocations.as_deref())?;
+                    config::reject_own_key_as_authority(
+                        &path.display().to_string(),
+                        clients.cert_trust(),
+                        &agent_keys,
+                    )?;
+                    Ok(clients)
+                };
+                let authorized = load().map_err(|e: config::ConfigError| e.to_string())?;
                 let (authorized_clients, updater) = Revocable::new(authorized);
+                tokio::spawn(zt_net::keys::watch_authorities(
+                    "agent",
+                    authorized_clients.clone(),
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
                 let config = AgentConfig {
                     relays,
@@ -168,9 +184,7 @@ fn run(command: Command) -> Result<(), String> {
                     reloaded: "authorized_clients_reloaded",
                     failed: "authorized_clients_reload_failed",
                 };
-                tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
-                    config::load_authorized_clients(&path, revocations.as_deref())
-                }));
+                tokio::spawn(reload::on_sighup(hangups, updater, events, load));
                 systemd::notify_ready();
                 agent::run(keys, config).await;
                 Ok(())

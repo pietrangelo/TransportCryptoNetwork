@@ -674,6 +674,10 @@ async fn sighup_reloads_revocations_and_cuts_a_revoked_certificate() {
     let dir = CaDir::new("hup-revocations", &policy, Some(EMPTY_REVOCATIONS));
     let revocations = dir.revocations_arg();
     let relay = dir.start(&["--revocations", &revocations]);
+    // L'annuncio dell'avvio (denylist vuota) arriva dopo «relay listening»: va letto qui, o
+    // `wait_all` lo scambierebbe per quello della ricarica.
+    let startup = relay.wait_for(|v| v["fields"]["event_kind"] == "revocations_in_use");
+    assert_eq!(startup["fields"]["serials"], 0, "{startup}");
     assert!(certified(&relay, &alice, &cert).await);
 
     // Una connessione aperta con il certificato.

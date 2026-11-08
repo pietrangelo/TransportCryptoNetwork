@@ -128,8 +128,20 @@ fn run(command: Command) -> Result<(), String> {
                     move || config::load_keyring(&key, previous_key.as_deref()),
                 ));
                 let path = policy;
-                let policy = config::load_relay_policy(&path, revocations.as_deref())
-                    .map_err(|e| e.to_string())?;
+                // Policy e denylist in un solo passo; una CA uguale alla chiave del relay
+                // (corrente o precedente, quella in vigore al momento) è rifiutata (PROTOCOL
+                // §15.9), all'avvio e a ogni ricarica.
+                let relay_keys = keys.clone();
+                let load = move || {
+                    let policy = config::load_relay_policy(&path, revocations.as_deref())?;
+                    config::reject_own_key_as_authority(
+                        &path.display().to_string(),
+                        policy.cert_trust(),
+                        &relay_keys.current(),
+                    )?;
+                    Ok(policy)
+                };
+                let policy = load().map_err(|e: config::ConfigError| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
                 // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
                 // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
@@ -141,12 +153,18 @@ fn run(command: Command) -> Result<(), String> {
                     reloaded: "policy_reloaded",
                     failed: "policy_reload_failed",
                 };
-                tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
-                    config::load_relay_policy(&path, revocations.as_deref())
-                }));
+                tokio::spawn(reload::on_sighup(hangups, updater, events, load));
+                let authorities = policy.clone();
                 let server = RelayServer::bind(listen, keys, policy, RelayConfig::default())
                     .await
                     .map_err(|e| e.to_string())?;
+                // CA pinnate e denylist annunciate dopo «relay listening» e a ogni ricarica; le
+                // rotazioni di CA non completate ogni ora (PROTOCOL §15.11).
+                tokio::spawn(zt_net::keys::watch_authorities(
+                    "relay",
+                    authorities,
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 systemd::notify_ready();
                 server.run().await.map_err(|e| e.to_string())
             })
