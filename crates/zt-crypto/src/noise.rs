@@ -122,8 +122,13 @@ pub fn respond_any(
     msg1: &[u8],
     channel: Channel,
 ) -> Result<AuthorizationPending, CryptoError> {
-    // STUB (red): solo la chiave corrente.
-    respond(keys.current(), msg1, channel)
+    // Un tentativo fallito non lascia stato: ogni `respond` costruisce un handshake nuovo.
+    // Il tempo rivela quale chiave ha funzionato; non è un segreto (sono entrambe pubbliche).
+    match (respond(keys.current(), msg1, channel), keys.previous()) {
+        (Ok(pending), _) => Ok(pending),
+        (Err(_), Some(previous)) => respond(previous, msg1, channel),
+        (Err(err), None) => Err(err),
+    }
 }
 
 /// L'initiator ha inviato `msg1` e attende la risposta.

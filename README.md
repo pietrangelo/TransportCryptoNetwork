@@ -13,9 +13,10 @@ admin / Ansible                        relay pubblico                     server
        └──────────────── tunnel end-to-end client ↔ agent ───────────────────┘
 ```
 
-> **Stato:** Fase 4 (hardening). Revoca a caldo delle chiavi, rekey dei canali, audit log
-> JSON, fuzzing continuo, binari statici firmati e unit systemd blindate. Vedi
-> `docs/OPERATIONS.md`.
+> **Stato:** Fase 5 (alta disponibilità e rotazione delle chiavi). Più relay con failover,
+> rotazione delle chiavi di relay e agent senza ripinning simultaneo di tutta la flotta,
+> oltre a quanto fatto in Fase 4: revoca a caldo, rekey dei canali, audit log JSON, fuzzing
+> continuo, binari statici firmati e unit systemd blindate. Vedi `docs/OPERATIONS.md`.
 
 ## Struttura
 

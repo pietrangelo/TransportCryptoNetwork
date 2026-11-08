@@ -1,4 +1,4 @@
-# Relay TCN. Installazione: vedi docs/OPERATIONS.md §7.
+# Relay TCN. Installazione: vedi docs/OPERATIONS.md §9.
 # File attesi (controllati da zt-relay come StrictModes di OpenSSH):
 #   /etc/tcn            root:root 0755
 #   /etc/tcn/relay.key  tcn:tcn   0600
@@ -16,6 +16,8 @@ NotifyAccess=main
 User=tcn
 Group=tcn
 # Per IPv6 dual-stack: --listen [::]:7443
+# Durante una rotazione della chiave aggiungi --previous-key /etc/tcn/relay.prev.key
+# (OPERATIONS §8); systemctl reload ricarica poi entrambe le chiavi.
 ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml
 # Ricarica la policy e revoca a caldo le connessioni non più ammesse.
 ExecReload=/bin/kill -HUP $MAINPID

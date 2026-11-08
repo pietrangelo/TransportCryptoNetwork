@@ -392,7 +392,7 @@ impl Ctx<'_> {
 /// ```toml
 /// [[agents]]
 /// node = "web-01"
-/// public_key = "<64 hex>"
+/// public_key = "<64 hex>"    # in rotazione: public_keys = ["<nuova>", "<vecchia>"]
 ///
 /// [[clients]]
 /// name = "ansible"
@@ -408,10 +408,18 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
     let mut policy = AccessPolicy::new();
     for entry in &file.agents {
         let node = ctx.node(&entry.node, &entry.node)?;
-        // STUB (red): solo `public_key`.
-        let key = ctx.key(&entry.node, entry.public_key.as_deref().unwrap_or_default())?;
+        // `public_key` oppure `public_keys` (rotazione), mai entrambi né nessuno.
+        let texts: Vec<&str> = match (&entry.public_key, entry.public_keys.as_slice()) {
+            (Some(one), []) => vec![one.as_str()],
+            (None, many) if !many.is_empty() => many.iter().map(String::as_str).collect(),
+            _ => return Err(ctx.domain(&entry.node, DomainError::AgentKeys(node))),
+        };
+        let keys = texts
+            .into_iter()
+            .map(|t| ctx.key(&entry.node, t).map(|k| k.fingerprint()))
+            .collect::<Result<Vec<_>, _>>()?;
         policy
-            .add_agent(key.fingerprint(), node)
+            .add_agent_keys(node, &keys)
             .map_err(|e| ctx.domain(&entry.node, e))?;
     }
     for entry in &file.clients {
@@ -545,17 +553,33 @@ pub fn relay_endpoints(
     addresses: &[String],
     keys: &[PublicKey],
 ) -> Result<Vec<crate::RelayEndpoint>, ConfigError> {
-    // STUB (red): un solo relay.
-    match (addresses, keys) {
-        ([address], [key]) if valid_relay(address) => Ok(vec![crate::RelayEndpoint {
+    let fail = |message: &str| ConfigError::Syntax {
+        path: origin.into(),
+        message: message.into(),
+    };
+    if addresses.is_empty() || addresses.len() > crate::MAX_RELAYS {
+        return Err(fail("relay list must have between 1 and 8 relays"));
+    }
+    if addresses.len() != keys.len() {
+        return Err(fail("relay list: every relay needs exactly one relay key"));
+    }
+    let mut out: Vec<crate::RelayEndpoint> = Vec::with_capacity(addresses.len());
+    for (address, key) in addresses.iter().zip(keys) {
+        if !valid_relay(address) {
+            return Err(fail("relay list: each relay must be host:port"));
+        }
+        if out
+            .iter()
+            .any(|r| r.address == *address || r.public_key.fingerprint() == key.fingerprint())
+        {
+            return Err(fail("relay list: a relay address or relay key is repeated"));
+        }
+        out.push(crate::RelayEndpoint {
             address: address.clone(),
             public_key: *key,
-        }]),
-        _ => Err(ConfigError::Syntax {
-            path: origin.into(),
-            message: "invalid relay list".into(),
-        }),
+        });
     }
+    Ok(out)
 }
 
 /// `host:porta` con porta numerica non nulla, senza spazi né caratteri di controllo.
@@ -580,6 +604,10 @@ fn valid_relay(text: &str) -> bool {
 /// ```toml
 /// relay = "relay.example.org:7443"
 /// relay_key = "<64 hex>"
+/// # oppure, con più relay provati nell'ordine (PROTOCOL §13):
+/// # [[relays]]
+/// # address = "r1.example.org:7443"
+/// # public_key = "<64 hex>"
 /// key = "client.key"
 ///
 /// [[nodes]]
@@ -596,26 +624,40 @@ pub fn parse_client_settings(
 ) -> Result<ClientSettings, ConfigError> {
     let ctx = Ctx(origin);
     let file: ClientFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
-    // STUB (red): solo la forma con un relay.
-    let relay = file.relay.clone().unwrap_or_default();
-    if !valid_relay(&relay) {
-        return Err(ConfigError::Syntax {
-            path: origin.into(),
-            message: "relay must be host:port".into(),
-        });
-    }
+    // `relay` + `relay_key` oppure `[[relays]]`, mai entrambi.
+    let (addresses, key_texts): (Vec<String>, Vec<String>) =
+        match (&file.relay, &file.relay_key, file.relays.as_slice()) {
+            (Some(relay), Some(key), []) => (vec![relay.clone()], vec![key.clone()]),
+            (None, None, list) if !list.is_empty() => list
+                .iter()
+                .map(|r| (r.address.clone(), r.public_key.clone()))
+                .unzip(),
+            _ => {
+                return Err(ConfigError::Syntax {
+                    path: origin.into(),
+                    message: "give either relay and relay_key, or a [[relays]] list".into(),
+                });
+            }
+        };
+    let relay_keys = key_texts
+        .iter()
+        .map(|t| ctx.key("relay_key", t))
+        .collect::<Result<Vec<_>, _>>()?;
+    let relays = relay_endpoints(origin, &addresses, &relay_keys)?;
     if file.key.is_empty() {
         return Err(ConfigError::Syntax {
             path: origin.into(),
             message: "key must name the client secret key file".into(),
         });
     }
-    let relay_key = ctx.key("relay_key", file.relay_key.as_deref().unwrap_or_default())?;
     let mut nodes = HashMap::new();
     for entry in &file.nodes {
         let node = ctx.node(&entry.node, &entry.node)?;
         let key = ctx.key(&entry.node, &entry.public_key)?;
-        if key.fingerprint() == relay_key.fingerprint() {
+        if relays
+            .iter()
+            .any(|r| r.public_key.fingerprint() == key.fingerprint())
+        {
             return Err(ctx.domain(&entry.node, DomainError::DuplicatePeer(key.fingerprint())));
         }
         if nodes.insert(node.clone(), key).is_some() {
@@ -623,10 +665,7 @@ pub fn parse_client_settings(
         }
     }
     Ok(ClientSettings {
-        relays: vec![crate::RelayEndpoint {
-            address: relay,
-            public_key: relay_key,
-        }],
+        relays,
         key: base.join(&file.key),
         nodes,
     })

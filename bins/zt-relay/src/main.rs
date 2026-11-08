@@ -100,10 +100,22 @@ fn run(command: Command) -> Result<(), String> {
             runtime.block_on(async {
                 // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
                 let hangups = Hangups::listen().map_err(|e| e.to_string())?;
+                let key_hangups = Hangups::listen().map_err(|e| e.to_string())?;
                 let keys = config::load_keyring(&key, previous_key.as_deref())
                     .map_err(|e| e.to_string())?;
-                // STUB (red): le chiavi non si ricaricano.
-                let keys = Revocable::fixed(keys);
+                // Rotazione della chiave del relay senza riavvio (PROTOCOL §14): le chiavi nuove
+                // valgono per gli handshake successivi; le connessioni aperte restano.
+                let (keys, key_updater) = Revocable::new(keys);
+                let key_events = ReloadEvents {
+                    reloaded: "relay_keys_reloaded",
+                    failed: "relay_keys_reload_failed",
+                };
+                tokio::spawn(reload::on_sighup(
+                    key_hangups,
+                    key_updater,
+                    key_events,
+                    move || config::load_keyring(&key, previous_key.as_deref()),
+                ));
                 let path = policy;
                 let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);

@@ -102,11 +102,26 @@ impl AccessPolicy {
         node: NodeId,
         keys: &[Fingerprint],
     ) -> Result<(), DomainError> {
-        // STUB (red): una sola chiave.
-        match keys {
-            [one] => self.add_agent(*one, node),
-            _ => Err(DomainError::AgentKeys(node)),
+        let distinct = match keys {
+            [_] => true,
+            [a, b] => a != b,
+            _ => false,
+        };
+        if !distinct || keys.len() > MAX_AGENT_KEYS {
+            return Err(DomainError::AgentKeys(node));
         }
+        // Tutti i controlli prima di qualsiasi modifica: nessun effetto parziale.
+        for key in keys {
+            self.ensure_new_peer(key)?;
+        }
+        if self.nodes.contains(&node) {
+            return Err(DomainError::DuplicateNode(node));
+        }
+        self.nodes.insert(node.clone());
+        for key in keys {
+            self.agents.insert(*key, node.clone());
+        }
+        Ok(())
     }
 
     /// Autorizza la chiave `peer` come client con i permessi `grant`.

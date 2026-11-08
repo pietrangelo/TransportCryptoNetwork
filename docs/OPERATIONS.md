@@ -32,7 +32,12 @@ allow = ["web-01"]              # ["*"] = tutti i nodi della policy; [] = nessun
 ```
 
 Una chiave ha un solo ruolo, un nodo un solo agent; campi sconosciuti, chiavi deboli e nomi
-non validi fanno fallire l'avvio.
+non validi fanno fallire l'avvio. Durante la rotazione della chiave di un agent (§8) la voce
+elenca due chiavi: `public_keys = ["<nuova>", "<vecchia>"]` al posto di `public_key`.
+
+Con più relay (§8) ognuno ha la propria chiave ma **la stessa policy**: distribuiscila a tutti
+nello stesso passaggio. Il client non aggira un relay che lo rifiuta cercandone uno più
+permissivo, quindi una policy disallineata si vede come un accesso negato.
 
 ## 3. Client autorizzati sull'agent
 
@@ -53,6 +58,15 @@ L'agent non apre porte: si connette in uscita, si riconnette da solo con backoff
 esponenziale (1 s → 60 s, con jitter) e inoltra solo a `127.0.0.1:22`
 (`--ssh-target` per cambiarlo).
 
+Con più relay si ripetono `--relay` e `--relay-key` nello stesso ordine, o si separano con
+virgole (al massimo 8). L'agent resta connesso a tutti contemporaneamente; `--max-streams`
+vale per l'agent intero, non per relay:
+
+```bash
+zt-agent run --relay r1.example.org:7443,r2.example.org:7443 \
+    --relay-key <chiave di r1>,<chiave di r2> --node web-01 ...
+```
+
 ## 5. Client: `zt-client`
 
 `~/.config/tcn/client.toml`:
@@ -61,6 +75,13 @@ esponenziale (1 s → 60 s, con jitter) e inoltra solo a `127.0.0.1:22`
 relay = "relay.example.org:7443"
 relay_key = "<chiave pubblica del relay>"
 key = "client.key"                  # relativo a questo file, oppure assoluto
+# Con più relay, al posto di relay/relay_key (al massimo 8, provati in quest'ordine):
+# [[relays]]
+# address = "r1.example.org:7443"
+# public_key = "<chiave di r1>"
+# [[relays]]
+# address = "r2.example.org:7443"
+# public_key = "<chiave di r2>"
 
 [[nodes]]
 node = "web-01"
@@ -163,7 +184,40 @@ journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
 3. Controlla `access_revoked` nell'audit log. Se trovi `..._reload_failed`, il file non è
    valido: la configurazione precedente è ancora in vigore.
 
-## 8. Installazione con systemd
+## 8. Più relay e rotazione delle chiavi
+
+Più relay indipendenti (stessa policy, chiavi diverse) tolgono il single point of failure:
+gli agent sono connessi a tutti, e `zt-client` passa al relay successivo se il primo non
+risponde o non vede il nodo. Non passa oltre una risposta della policy né un errore
+end-to-end (PROTOCOL §13). Con almeno due relay, il riavvio di uno non interrompe nulla.
+
+**Chiave di un relay** (senza riavvio):
+
+1. `zt-relay keygen --out /etc/tcn/relay.key.new`, poi sposta la chiave attuale in
+   `/etc/tcn/relay.prev.key` e la nuova in `/etc/tcn/relay.key` (entrambe `tcn:tcn 0600`).
+2. Se il relay non ha ancora `--previous-key /etc/tcn/relay.prev.key`, aggiungilo
+   all'unità (un riavvio, la prima volta). Poi `systemctl reload zt-relay`: dall'evento
+   `relay_keys_reloaded` vale la chiave nuova e la vecchia resta accettata.
+3. Aggiorna `relay_key` (o `--relay-key`) su agent e client, quando conviene.
+4. Togli la precedente: un file non valido alla ricarica lascia le chiavi di prima
+   (`relay_keys_reload_failed`), quindi la si toglie riavviando senza `--previous-key`.
+
+**Chiave di un agent**:
+
+1. `zt-agent keygen --out /etc/tcn/agent.key.new` sul nodo.
+2. Nella policy di **ogni** relay: `public_keys = ["<nuova>", "<vecchia>"]` per il nodo, poi
+   `systemctl reload zt-relay`.
+3. Sul nodo: la vecchia chiave diventa `--previous-key`, la nuova `--key`; riavvia l'agent
+   (si interrompono le sessioni SSH di quel nodo). Verso i relay usa la nuova; i client che
+   pinnano la vecchia continuano a funzionare.
+4. Aggiorna il pin del nodo in `[[nodes]]` dei client.
+5. Togli la vecchia dalla policy e `--previous-key` dall'agent.
+
+Una chiave **compromessa** non si ruota: si revoca (§7) senza `--previous-key` e si
+aggiornano subito i pin, perché chi ha la chiave vecchia potrebbe impersonare il relay o
+l'agent verso chi la pinna ancora.
+
+## 9. Installazione con systemd
 
 Le release (`.github/workflows/release.yml`) contengono binari statici (musl) per x86_64 e
 aarch64 con attestazione di provenienza: verificali prima dell'installazione.

@@ -415,11 +415,13 @@ fn a_secret_pasted_into_a_trust_file_is_not_echoed_in_the_error() {
 // ======================= Fase 5: più relay e rotazione =======================
 
 fn relays_toml(entries: &[(&str, &str)], extra: &str) -> String {
+    use std::fmt::Write as _;
     let mut t = String::from("key = \"client.key\"\n");
     for (addr, k) in entries {
-        t.push_str(&format!(
+        let _ = write!(
+            t,
             "\n[[relays]]\naddress = \"{addr}\"\npublic_key = \"{k}\"\n"
-        ));
+        );
     }
     t.push_str(extra);
     t
@@ -462,10 +464,7 @@ fn a_relay_list_must_be_unambiguous_and_bounded() {
         "no relay at all"
     );
     assert!(
-        parse_client(&format!(
-            "relay = \"r.example.org:7443\"\nkey = \"client.key\"\n"
-        ))
-        .is_err(),
+        parse_client("relay = \"r.example.org:7443\"\nkey = \"client.key\"\n").is_err(),
         "relay without relay_key"
     );
     // Indirizzo o chiave ripetuti.

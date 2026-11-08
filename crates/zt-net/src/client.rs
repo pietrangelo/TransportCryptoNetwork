@@ -8,7 +8,7 @@ use tokio::time::{timeout, timeout_at};
 use zt_crypto::noise::{self, Channel};
 use zt_crypto::{Identity, PublicKey};
 use zt_domain::flow::Window;
-use zt_domain::{Frame, NodeId, StreamId};
+use zt_domain::{Frame, NodeId, RejectReason, StreamId};
 
 use crate::channel::Established;
 use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
@@ -29,9 +29,12 @@ pub struct ClientConfig {
 
 /// Si connette al nodo e inoltra `local` finché una delle due parti chiude.
 ///
+/// Prova i relay nell'ordine di `config.relays` e passa al successivo solo per i guasti che
+/// precedono l'`OpenAck` e non dicono nulla sul diritto d'accesso (PROTOCOL §13).
+///
 /// # Errors
 /// [`NetError::Rejected`] se il relay nega lo stream, [`NetError::StreamClosed`] se l'agent
-/// rifiuta il client, oltre agli errori di rete e di handshake.
+/// rifiuta il client, oltre agli errori di rete e di handshake (dell'ultimo relay provato).
 pub async fn connect<L>(
     identity: &Identity,
     config: &ClientConfig,
@@ -41,28 +44,32 @@ where
     L: AsyncRead + AsyncWrite + Unpin,
 {
     let t = &config.timeouts;
-    // STUB (red): solo il primo relay, nessun failover.
-    let relay = config
-        .relays
-        .first()
-        .ok_or(NetError::Protocol("no relay configured"))?;
-    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
-        .await
-        .map_err(|_| NetError::Timeout("connect"))??;
-    let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect(tcp, identity, &relay.public_key, Channel::Outer, t).await?;
+    if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
+        return Err(NetError::Protocol(
+            "the client needs between 1 and 8 relays",
+        ));
+    }
     let stream = StreamId::try_from(1).map_err(|_| NetError::Protocol("stream id"))?;
-    ch.send(
-        &Frame::Open {
-            stream,
-            target: config.node.clone(),
-        },
-        t,
-    )
-    .await?;
-    timeout(t.open, await_ack(&mut ch, stream))
-        .await
-        .map_err(|_| NetError::Timeout("open"))??;
+    let mut last = NetError::Closed;
+    let mut opened = None;
+    for (i, relay) in config.relays.iter().enumerate() {
+        match open(identity, relay, &config.node, stream, t).await {
+            Ok(ch) => {
+                opened = Some(ch);
+                break;
+            }
+            Err(err) if may_try_next_relay(&err) => {
+                if config.relays.get(i.saturating_add(1)).is_some() {
+                    tracing::warn!(relay = %relay.address, error = %err, "relay unavailable, trying the next one");
+                }
+                last = err;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let Some(ch) = opened else {
+        return Err(last);
+    };
 
     let (to_stream, from_driver) = mpsc::channel(STREAM_QUEUE);
     let (out_tx, out_rx) = mpsc::channel(1024);
@@ -78,6 +85,52 @@ where
     };
     let (link, session) = tokio::join!(relay_link, session);
     session.and(link)
+}
+
+/// Connessione, handshake esterno e apertura dello stream su un relay.
+async fn open(
+    identity: &Identity,
+    relay: &crate::RelayEndpoint,
+    node: &NodeId,
+    stream: StreamId,
+    t: &Timeouts,
+) -> Result<Established<TcpStream>, NetError> {
+    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
+        .await
+        .map_err(|_| NetError::Timeout("connect"))??;
+    let _ = tcp.set_nodelay(true);
+    let mut ch = channel::connect(tcp, identity, &relay.public_key, Channel::Outer, t).await?;
+    ch.send(
+        &Frame::Open {
+            stream,
+            target: node.clone(),
+        },
+        t,
+    )
+    .await?;
+    timeout(t.open, await_ack(&mut ch, stream))
+        .await
+        .map_err(|_| NetError::Timeout("open"))??;
+    Ok(ch)
+}
+
+/// `true` per un guasto, prima dell'`OpenAck`, che giustifica il relay successivo. Una
+/// risposta della policy è definitiva (fail closed): il client non cerca un relay più
+/// permissivo.
+const fn may_try_next_relay(err: &NetError) -> bool {
+    match err {
+        NetError::Rejected(reason) => matches!(
+            reason,
+            RejectReason::NodeOffline | RejectReason::RateLimited
+        ),
+        NetError::Io(_)
+        | NetError::Timeout(_)
+        | NetError::Crypto(_)
+        | NetError::Decode(_)
+        | NetError::Protocol(_)
+        | NetError::Closed => true,
+        _ => false,
+    }
 }
 
 async fn await_ack(ch: &mut Established<TcpStream>, stream: StreamId) -> Result<(), NetError> {

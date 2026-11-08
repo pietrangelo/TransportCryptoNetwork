@@ -267,7 +267,7 @@ con più relay, non interrompe nulla di nuovo: agent e client usano gli altri.
 
 **Una chiave compromessa non si ruota: si revoca.** Tenerla come precedente lascerebbe a chi
 la possiede la possibilità di impersonare il responder verso chi la pinna ancora. In quel
-caso si cambia la chiave senza `--previous-key` e si aggiornano subito i pin (OPERATIONS §7).
+caso si cambia la chiave senza `--previous-key` e si aggiornano subito i pin (OPERATIONS §7 e §8).
 
 ## 15. Fuori dall'ambito
 

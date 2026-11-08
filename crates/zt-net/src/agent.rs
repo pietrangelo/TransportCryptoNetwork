@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout, timeout_at};
 use zt_crypto::Keyring;
 use zt_crypto::noise::{self, Channel};
@@ -42,23 +42,44 @@ pub struct AgentConfig {
 /// Mantiene l'agent connesso a ogni relay dell'elenco per sempre, ciascuno con il proprio
 /// backoff esponenziale e jitter (PROTOCOL §13). Verso i relay usa la chiave corrente; sul
 /// canale end-to-end accetta anche quella precedente (PROTOCOL §14).
+///
+/// `max_streams` vale per l'agent intero, non per relay: con più relay un client non ottiene
+/// più sessioni contemporanee verso sshd.
 pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
-    // STUB (red): solo il primo relay.
-    let Some(relay) = config.relays.first().cloned() else {
-        tracing::error!("no relay configured");
+    if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
+        tracing::error!(
+            relays = config.relays.len(),
+            "the agent needs between 1 and 8 relays"
+        );
         return;
-    };
-    run_one(keys, relay, config).await;
+    }
+    let slots = Arc::new(Semaphore::new(config.max_streams));
+    let mut sessions = tokio::task::JoinSet::new();
+    for relay in config.relays.clone() {
+        sessions.spawn(run_one(
+            Arc::clone(&keys),
+            relay,
+            config.clone(),
+            Arc::clone(&slots),
+        ));
+    }
+    // I cicli non terminano mai; se uno andasse in panic gli altri continuano.
+    while sessions.join_next().await.is_some() {}
 }
 
-async fn run_one(identity: Arc<Keyring>, relay: crate::RelayEndpoint, config: AgentConfig) {
+async fn run_one(
+    identity: Arc<Keyring>,
+    relay: crate::RelayEndpoint,
+    config: AgentConfig,
+    slots: Arc<Semaphore>,
+) {
     const MAX_DELAY: Duration = Duration::from_secs(60);
     let mut delay = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        match run_session(&identity, &relay, &config).await {
-            Ok(()) => tracing::info!("relay closed the connection"),
-            Err(err) => tracing::warn!(error = %err, "relay session ended"),
+        match run_session(&identity, &relay, &config, &slots).await {
+            Ok(()) => tracing::info!(relay = %relay.address, "relay closed the connection"),
+            Err(err) => tracing::warn!(relay = %relay.address, error = %err, "relay session ended"),
         }
         if started.elapsed() > MAX_DELAY {
             delay = Duration::from_secs(1);
@@ -78,10 +99,11 @@ async fn run_one(identity: Arc<Keyring>, relay: crate::RelayEndpoint, config: Ag
 ///
 /// # Errors
 /// Qualsiasi errore di rete, handshake o protocollo del relay.
-pub async fn run_session(
+async fn run_session(
     identity: &Arc<Keyring>,
     relay: &crate::RelayEndpoint,
     config: &AgentConfig,
+    slots: &Arc<Semaphore>,
 ) -> Result<(), NetError> {
     let t = &config.timeouts;
     let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
@@ -117,7 +139,7 @@ pub async fn run_session(
             inbound = timeout_at(deadline, ch.recv()) => {
                 let frame = inbound.map_err(|_| NetError::Timeout("relay idle"))??.ok_or(NetError::Closed)?;
                 deadline = crate::deadline(t.idle);
-                if let Some(reply) = on_relay_frame(frame, identity, config, &mut streams, &out_tx, &done_tx)? {
+                if let Some(reply) = on_relay_frame(frame, identity, config, slots, &mut streams, &out_tx, &done_tx)? {
                     ch.send(&reply, t).await?;
                 }
             }
@@ -168,6 +190,7 @@ fn on_relay_frame(
     frame: Frame,
     identity: &Arc<Keyring>,
     config: &AgentConfig,
+    slots: &Arc<Semaphore>,
     streams: &mut Streams,
     out_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<StreamId>,
@@ -184,12 +207,13 @@ fn on_relay_frame(
                 return Err(NetError::Protocol("relay reused a stream id"));
             }
             streams.last = stream.get();
-            if streams.slots.len() >= config.max_streams {
+            // Il permesso resta al task dello stream fino alla sua fine.
+            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
                 return Ok(Some(Frame::Reject {
                     stream,
                     reason: RejectReason::ResourceExhausted,
                 }));
-            }
+            };
             let (tx, rx) = mpsc::channel(STREAM_QUEUE);
             streams.slots.insert(
                 stream,
@@ -208,6 +232,7 @@ fn on_relay_frame(
             let done = done_tx.clone();
             tokio::spawn(async move {
                 task.serve().await;
+                drop(permit);
                 let _ = done.send(stream).await;
             });
             Ok(Some(Frame::OpenAck { stream }))
