@@ -4,8 +4,6 @@
 //! certificato già verificato ([`CertClaims`]). Firma, canonicità dei punti e binding alla
 //! chiave Noise stanno in `zt-crypto`.
 //!
-//! **Fase 6, RED**: i tipi e le firme sono quelli del piano (`docs/phase6-plan.md` §3.1);
-//! i corpi che decidono qualcosa sono stub che rifiutano sempre (fail closed).
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -15,6 +13,9 @@ use thiserror::Error;
 use crate::crypto::Fingerprint;
 use crate::error::DomainError;
 use crate::ids::NodeId;
+use crate::limits::{
+    MAX_CERT_LEN, MAX_CERT_LIFETIME_SECS, MAX_CERT_NODES, MAX_NODE_ID_LEN, MIN_CERT_LEN,
+};
 
 /// I primi 4 byte di ogni certificato.
 pub const CERT_MAGIC: [u8; 4] = *b"TCNC";
@@ -96,9 +97,11 @@ impl TryFrom<[u8; 16]> for CertSerial {
 
     /// # Errors
     /// [`CertFormatError::SerialZero`] per il valore tutto a zero.
-    fn try_from(_bytes: [u8; 16]) -> Result<Self, Self::Error> {
-        // RED: stub, rifiuta sempre.
-        Err(CertFormatError::SerialZero)
+    fn try_from(bytes: [u8; 16]) -> Result<Self, Self::Error> {
+        if bytes.iter().all(|&b| b == 0) {
+            return Err(CertFormatError::SerialZero);
+        }
+        Ok(Self(bytes))
     }
 }
 
@@ -171,8 +174,18 @@ impl CertBody {
         name: NodeId,
         scope: CertScope,
     ) -> Result<Self, CertFormatError> {
-        // RED: stub, rifiuta sempre.
-        let _ = (
+        if ca_key == subject_key {
+            return Err(CertFormatError::SelfCertified);
+        }
+        check_validity(not_before, not_after)?;
+        if let CertScope::Only(nodes) = &scope
+            && (nodes.is_empty() || nodes.len() > MAX_CERT_NODES)
+        {
+            return Err(CertFormatError::NodeCount(
+                u8::try_from(nodes.len()).unwrap_or(u8::MAX),
+            ));
+        }
+        Ok(Self {
             ca_key,
             subject_key,
             serial,
@@ -180,15 +193,38 @@ impl CertBody {
             not_after,
             name,
             scope,
-        );
-        Err(CertFormatError::Validity)
+        })
     }
 
     /// I byte `[0, L-64)` del certificato (TBS, PROTOCOL §15.1).
     #[must_use]
     pub fn encode_tbs(&self) -> Vec<u8> {
-        // RED: stub, una codifica vuota che nessun decoder accetta.
-        Vec::new()
+        let mut out = Vec::with_capacity(MAX_CERT_LEN);
+        out.extend_from_slice(&CERT_MAGIC);
+        out.push(CERT_VERSION);
+        out.push(CERT_SIG_ED25519);
+        out.extend_from_slice(self.ca_key.as_bytes());
+        out.extend_from_slice(self.subject_key.as_bytes());
+        out.extend_from_slice(self.serial.as_bytes());
+        out.extend_from_slice(&self.not_before.as_secs().to_be_bytes());
+        out.extend_from_slice(&self.not_after.as_secs().to_be_bytes());
+        push_label(&mut out, &self.name);
+        match &self.scope {
+            CertScope::All => {
+                out.push(SCOPE_ALL);
+                out.push(0);
+            }
+            CertScope::Only(nodes) => {
+                out.push(SCOPE_LIST);
+                // 1..=MAX_CERT_NODES per costruzione.
+                out.push(u8::try_from(nodes.len()).unwrap_or(u8::MAX));
+                // `BTreeSet` di `NodeId` (stringhe ASCII): l'ordine è quello dei byte.
+                for node in nodes {
+                    push_label(&mut out, node);
+                }
+            }
+        }
+        out
     }
 
     /// Chiave della CA firmataria (non ancora confrontata con i pin).
@@ -236,8 +272,9 @@ impl CertBody {
     /// `not_after - not_before` in secondi.
     #[must_use]
     pub const fn lifetime_secs(&self) -> u64 {
-        // RED: stub, la durata più lunga possibile (nessuna CA la accetta).
-        u64::MAX
+        self.not_after
+            .as_secs()
+            .saturating_sub(self.not_before.as_secs())
     }
 }
 
@@ -257,8 +294,168 @@ pub struct ParsedCert<'a> {
 /// # Errors
 /// La prima regola violata. Gli errori riportano solo metadati, mai byte del certificato.
 pub fn decode_certificate(bytes: &[u8]) -> Result<ParsedCert<'_>, CertFormatError> {
-    // RED: stub, rifiuta sempre.
-    Err(CertFormatError::Length { len: bytes.len() })
+    // Regola 1: la lunghezza prima di qualsiasi campo.
+    let len = bytes.len();
+    if !(MIN_CERT_LEN..=MAX_CERT_LEN).contains(&len) {
+        return Err(CertFormatError::Length { len });
+    }
+    let mut r = Reader { bytes, pos: 0 };
+    // Regola 2.
+    if r.array::<4>()? != CERT_MAGIC {
+        return Err(CertFormatError::Magic);
+    }
+    let version = r.byte()?;
+    if version != CERT_VERSION {
+        return Err(CertFormatError::Version(version));
+    }
+    let sig_alg = r.byte()?;
+    if sig_alg != CERT_SIG_ED25519 {
+        return Err(CertFormatError::Algorithm(sig_alg));
+    }
+    // Regola 3.
+    let ca_key = CertKey::from_bytes(r.array::<32>()?);
+    let subject_key = CertKey::from_bytes(r.array::<32>()?);
+    let serial = CertSerial::try_from(r.array::<16>()?)?;
+    if ca_key == subject_key {
+        return Err(CertFormatError::SelfCertified);
+    }
+    // Regola 4.
+    let not_before = UnixTime::from_secs(u64::from_be_bytes(r.array::<8>()?));
+    let not_after = UnixTime::from_secs(u64::from_be_bytes(r.array::<8>()?));
+    check_validity(not_before, not_after)?;
+    // Regola 5.
+    let name = r.label()?;
+    // Regola 6.
+    let scope_code = r.byte()?;
+    let node_count = r.byte()?;
+    let scope = match scope_code {
+        SCOPE_LIST => {
+            if node_count == 0 || usize::from(node_count) > MAX_CERT_NODES {
+                return Err(CertFormatError::NodeCount(node_count));
+            }
+            let mut nodes = BTreeSet::new();
+            let mut previous: Option<NodeId> = None;
+            for index in 0..usize::from(node_count) {
+                let node = r.label()?;
+                if let Some(prev) = &previous
+                    && node.as_bytes() <= prev.as_bytes()
+                {
+                    return Err(CertFormatError::NodeOrder { index });
+                }
+                nodes.insert(node.clone());
+                previous = Some(node);
+            }
+            CertScope::Only(nodes)
+        }
+        SCOPE_ALL => {
+            if node_count != 0 {
+                return Err(CertFormatError::NodeCount(node_count));
+            }
+            CertScope::All
+        }
+        other => return Err(CertFormatError::Scope(other)),
+    };
+    // Regola 7: esattamente 64 byte di firma.
+    let tbs_len = r.pos;
+    let remaining = len.saturating_sub(tbs_len);
+    if remaining < CERT_SIGNATURE_LEN {
+        return Err(CertFormatError::Truncated { at: tbs_len });
+    }
+    if remaining > CERT_SIGNATURE_LEN {
+        return Err(CertFormatError::Trailing {
+            extra: remaining.saturating_sub(CERT_SIGNATURE_LEN),
+        });
+    }
+    let (tbs, sig) = bytes.split_at(tbs_len);
+    let signature: &[u8; CERT_SIGNATURE_LEN] = sig
+        .try_into()
+        .map_err(|_| CertFormatError::Truncated { at: tbs_len })?;
+    Ok(ParsedCert {
+        body: CertBody {
+            ca_key,
+            subject_key,
+            serial,
+            not_before,
+            not_after,
+            name,
+            scope,
+        },
+        tbs,
+        signature,
+    })
+}
+
+const SCOPE_LIST: u8 = 0x00;
+const SCOPE_ALL: u8 = 0x01;
+
+/// Regola 4 di PROTOCOL §15.1, con aritmetica controllata.
+fn check_validity(not_before: UnixTime, not_after: UnixTime) -> Result<(), CertFormatError> {
+    let Some(secs) = not_after.as_secs().checked_sub(not_before.as_secs()) else {
+        return Err(CertFormatError::Validity);
+    };
+    if secs == 0 {
+        return Err(CertFormatError::Validity);
+    }
+    if secs > MAX_CERT_LIFETIME_SECS {
+        return Err(CertFormatError::Lifetime { secs });
+    }
+    Ok(())
+}
+
+/// Scrive `len (u8) + byte` di un `NodeId` (1..=63 byte per costruzione).
+fn push_label(out: &mut Vec<u8>, id: &NodeId) {
+    out.push(u8::try_from(id.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(id.as_bytes());
+}
+
+/// Lettore sequenziale con controllo dei limiti: mai un indice fuori dal buffer.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], CertFormatError> {
+        let at = self.pos;
+        let end = at.checked_add(n).ok_or(CertFormatError::Truncated { at })?;
+        let slice = self
+            .bytes
+            .get(at..end)
+            .ok_or(CertFormatError::Truncated { at })?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn byte(&mut self) -> Result<u8, CertFormatError> {
+        let at = self.pos;
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or(CertFormatError::Truncated { at })
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], CertFormatError> {
+        let at = self.pos;
+        self.take(N)?
+            .try_into()
+            .map_err(|_| CertFormatError::Truncated { at })
+    }
+
+    /// `len (u8, 1..=63) + NodeId`. La lunghezza si controlla prima di leggere i byte.
+    fn label(&mut self) -> Result<NodeId, CertFormatError> {
+        let len = usize::from(self.byte()?);
+        if len == 0 {
+            return Err(CertFormatError::Name(DomainError::NodeIdEmpty));
+        }
+        if len > MAX_NODE_ID_LEN {
+            return Err(CertFormatError::Name(DomainError::NodeIdTooLong {
+                len,
+                max: MAX_NODE_ID_LEN,
+            }));
+        }
+        let raw = self.take(len)?;
+        NodeId::try_from(raw).map_err(CertFormatError::Name)
+    }
 }
 
 /// Perché un certificato non rispetta il formato. Solo metadati (campo, posizione,
