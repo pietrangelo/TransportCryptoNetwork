@@ -104,7 +104,7 @@ fn run(command: Command) -> Result<(), String> {
                 relay_key,
                 node,
                 ssh_target,
-                authorized_clients: Arc::new(authorized),
+                authorized_clients: authorized.into(),
                 timeouts: Timeouts::default(),
                 max_streams,
             };

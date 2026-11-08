@@ -15,8 +15,17 @@ use zt_net::relay::{RelayConfig, RelayServer};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Formato dei log su stderr.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -48,7 +57,9 @@ fn main() -> ExitCode {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    match run(Cli::parse().command) {
+    let cli = Cli::parse();
+    let _ = cli.log_format;
+    match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");

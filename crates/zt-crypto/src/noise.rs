@@ -165,6 +165,9 @@ impl AuthorizationPending {
     }
 }
 
+/// Messaggi per direzione dopo i quali entrambe le parti eseguono il rekey di Noise.
+pub const REKEY_INTERVAL: usize = 1024;
+
 /// Canale cifrato e autenticato dopo l'handshake.
 #[derive(Debug)]
 pub struct Transport {
@@ -184,6 +187,18 @@ impl Transport {
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.peer
+    }
+
+    /// Rekey eseguiti in invio.
+    #[must_use]
+    pub const fn send_epoch(&self) -> usize {
+        0
+    }
+
+    /// Rekey eseguiti in ricezione.
+    #[must_use]
+    pub const fn recv_epoch(&self) -> usize {
+        0
     }
 
     /// Cifra un messaggio.

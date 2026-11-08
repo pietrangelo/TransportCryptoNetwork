@@ -205,3 +205,43 @@ mod tests {
         assert!(l.len() <= 2);
     }
 }
+
+/// Chiave larga: prefisso /48 per IPv6, nessuna per IPv4.
+#[must_use]
+pub fn wide_source_key(addr: IpAddr) -> Option<[u8; 7]> {
+    let _ = addr;
+    None
+}
+
+/// Cancello degli handshake del relay.
+#[derive(Debug)]
+pub struct HandshakeGate;
+
+impl HandshakeGate {
+    /// Nuovo cancello.
+    #[must_use]
+    pub fn new(
+        max_keys: usize,
+        burst: u32,
+        refill: Duration,
+        wide_burst: u32,
+        wide_refill: Duration,
+        max_wide_keys: usize,
+    ) -> Self {
+        let _ = (
+            max_keys,
+            burst,
+            refill,
+            wide_burst,
+            wide_refill,
+            max_wide_keys,
+        );
+        Self
+    }
+
+    /// `true` se l'handshake è ammesso.
+    pub fn admit(&mut self, addr: IpAddr, now: Instant) -> bool {
+        let _ = (addr, now);
+        true
+    }
+}

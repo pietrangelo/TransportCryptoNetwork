@@ -34,7 +34,7 @@ pub struct AgentConfig {
     /// Demone SSH locale.
     pub ssh_target: String,
     /// Client accettati end-to-end.
-    pub authorized_clients: Arc<HashSet<Fingerprint>>,
+    pub authorized_clients: crate::Revocable<HashSet<Fingerprint>>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
     /// Stream contemporanei.
@@ -181,7 +181,7 @@ fn on_relay_frame(
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
-                authorized: Arc::clone(&config.authorized_clients),
+                authorized: config.authorized_clients.current(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
             };

@@ -164,7 +164,9 @@ impl Fleet {
             relay_key: self.relay_id.public_key(),
             node: node("web-01"),
             ssh_target: ssh.to_string(),
-            authorized_clients: Arc::new(HashSet::from([self.ansible.fingerprint()])),
+            authorized_clients: zt_net::Revocable::fixed(HashSet::from([self
+                .ansible
+                .fingerprint()])),
             timeouts: fast_timeouts(),
             max_streams: 16,
         };

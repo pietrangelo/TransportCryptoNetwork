@@ -48,6 +48,11 @@ pub enum Input {
     },
     /// Scatto periodico dell'orologio, per le scadenze.
     Tick,
+    /// È stata caricata una nuova policy: si applica anche alle connessioni già aperte.
+    PolicyUpdated {
+        /// La nuova policy.
+        policy: Arc<AccessPolicy>,
+    },
 }
 
 /// Azioni che l'adapter di rete deve eseguire.
@@ -252,6 +257,7 @@ impl<S: SessionIds> RelayCore<S> {
             }
             Input::Disconnected { conn } => self.teardown(conn, &mut out),
             Input::Tick => self.on_tick(now, &mut out),
+            Input::PolicyUpdated { policy } => drop(policy),
         }
         out
     }

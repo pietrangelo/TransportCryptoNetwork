@@ -130,14 +130,15 @@ impl RelayServer {
     pub async fn bind(
         addr: SocketAddr,
         identity: Identity,
-        policy: AccessPolicy,
+        policy: impl Into<crate::Revocable<AccessPolicy>>,
         config: RelayConfig,
     ) -> Result<Self, NetError> {
+        let policy = policy.into().current();
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
             identity: Arc::new(identity),
-            policy: Arc::new(policy),
+            policy,
             config,
         })
     }

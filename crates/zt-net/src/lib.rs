@@ -18,9 +18,11 @@ pub mod client;
 pub mod config;
 mod error;
 pub mod relay;
+mod revocable;
 mod stream;
 
 pub use error::NetError;
+pub use revocable::{Revocable, Updater};
 
 use std::time::Duration;
 
