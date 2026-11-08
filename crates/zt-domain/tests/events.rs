@@ -22,6 +22,7 @@ fn every_event_has_a_stable_snake_case_kind() {
                 session,
                 client: fp,
                 target: node.clone(),
+                certificate: None,
             },
             "session_established",
         ),
@@ -36,6 +37,7 @@ fn every_event_has_a_stable_snake_case_kind() {
             DomainEvent::AccessDenied {
                 client: fp,
                 target: node.clone(),
+                certificate: None,
             },
             "access_denied",
         ),
@@ -57,6 +59,7 @@ fn every_event_has_a_stable_snake_case_kind() {
             DomainEvent::AccessRevoked {
                 peer: fp,
                 target: Some(node),
+                certificate: None,
             },
             "access_revoked",
         ),
@@ -72,7 +75,8 @@ fn security_relevant_events_are_flagged() {
     assert!(
         DomainEvent::AccessRevoked {
             peer: fp,
-            target: None
+            target: None,
+            certificate: None,
         }
         .is_security_alert()
     );

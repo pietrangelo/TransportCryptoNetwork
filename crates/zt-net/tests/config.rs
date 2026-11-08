@@ -85,7 +85,7 @@ fn authorized_clients_and_known_nodes_parse() {
         ),
     )
     .unwrap();
-    assert!(clients.contains(&c.fingerprint()));
+    assert!(clients.contains_key(&c.fingerprint()));
     let k = key();
     let nodes = parse_known_nodes(
         "t",
@@ -259,7 +259,7 @@ fn trust_files_writable_by_others_are_refused() {
         match name {
             "client.toml" => zt_net::config::load_client_settings(&p).map(drop),
             "policy.toml" => zt_net::config::load_policy(&p).map(drop),
-            "clients.toml" => zt_net::config::load_authorized_clients(&p).map(drop),
+            "clients.toml" => zt_net::config::load_authorized_clients(&p, None).map(drop),
             _ => zt_net::config::load_known_nodes(&p).map(drop),
         }
     };

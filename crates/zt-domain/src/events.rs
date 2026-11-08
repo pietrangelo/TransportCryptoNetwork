@@ -1,3 +1,4 @@
+use crate::cert::{CertRef, CertRejection};
 use crate::crypto::Fingerprint;
 use crate::frame::CloseReason;
 use crate::ids::{NodeId, SessionId};
@@ -17,6 +18,10 @@ pub enum AuthFailureReason {
     NodeIdMismatch,
     /// Troppi tentativi dallo stesso indirizzo.
     RateLimited,
+    /// La chiave è nella denylist (`keys`, PROTOCOL §15.8), con qualsiasi credenziale.
+    KeyRevoked,
+    /// Il certificato presentato non è stato accettato (PROTOCOL §15.4).
+    Certificate(CertRejection),
 }
 
 /// Fatti significativi del dominio, emessi dai casi d'uso e consumati dagli adapter
@@ -42,6 +47,8 @@ pub enum DomainEvent {
         client: Fingerprint,
         /// Il nodo di destinazione.
         target: NodeId,
+        /// Il certificato che ha autorizzato il client, se non è la whitelist.
+        certificate: Option<CertRef>,
     },
     /// Un tentativo di autenticazione è fallito.
     AuthenticationFailed {
@@ -56,6 +63,8 @@ pub enum DomainEvent {
         client: Fingerprint,
         /// Il nodo richiesto.
         target: NodeId,
+        /// Il certificato del client, se non è la whitelist.
+        certificate: Option<CertRef>,
     },
     /// Un peer ha violato il protocollo e la sua connessione è stata chiusa.
     ProtocolViolation {
@@ -78,6 +87,16 @@ pub enum DomainEvent {
         peer: Fingerprint,
         /// Il nodo non più concesso; `None` se il peer ha perso il proprio ruolo.
         target: Option<NodeId>,
+        /// Il certificato del client, se non è la whitelist.
+        certificate: Option<CertRef>,
+    },
+    /// Una connessione autorizzata da un certificato è stata chiusa alla scadenza
+    /// (PROTOCOL §15.7).
+    CertificateExpired {
+        /// L'identità del client.
+        peer: Fingerprint,
+        /// Il certificato scaduto.
+        certificate: CertRef,
     },
 }
 
@@ -94,6 +113,7 @@ impl DomainEvent {
             Self::ProtocolViolation { .. } => "protocol_violation",
             Self::ConnectionDrained { .. } => "connection_drained",
             Self::AccessRevoked { .. } => "access_revoked",
+            Self::CertificateExpired { .. } => "certificate_expired",
         }
     }
 

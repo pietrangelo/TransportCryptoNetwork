@@ -5,14 +5,19 @@
 //! voce non valida fa fallire il caricamento (meglio non partire che partire con una policy
 //! diversa da quella scritta).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use thiserror::Error;
-use zt_crypto::{CryptoError, Identity, Keyring, PublicKey};
-use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant, DomainError, Fingerprint, NodeId};
+use zt_crypto::{CaSigningKey, CryptoError, Identity, Keyring, PublicKey};
+use zt_domain::trust::Revocations;
+use zt_domain::{
+    AccessPolicy, AllowedNodes, AuthorizedClients, CertBody, CertFormatError, ClientGrant,
+    DomainError, NodeId,
+};
 
 /// Dimensione massima di un file di configurazione.
 const MAX_FILE_LEN: u64 = 1024 * 1024;
@@ -80,6 +85,18 @@ pub enum ConfigError {
         entry: String,
         /// L'errore.
         source: DomainError,
+    },
+    /// La configurazione pinna almeno una CA ma non ha una denylist (`--revocations`,
+    /// PROTOCOL §15.8).
+    #[error("{0}: [[authorities]] require a revocation list (--revocations, may be empty)")]
+    RevocationsRequired(String),
+    /// File di certificato non valido.
+    #[error("{path}: {source}")]
+    Certificate {
+        /// Il file.
+        path: String,
+        /// L'errore di formato.
+        source: CertFormatError,
     },
 }
 
@@ -298,6 +315,36 @@ struct NodeEntry {
     public_key: String,
 }
 
+/// Una voce `[[authorities]]` (PROTOCOL §15.9, OPERATIONS §10.2), uguale nella policy del
+/// relay e nei `clients.toml` degli agent.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+// RED: i campi si leggono nel GREEN.
+#[allow(dead_code)]
+struct AuthorityEntry {
+    name: String,
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
+    public_keys: Vec<String>,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    max_lifetime: Option<u64>,
+}
+
+/// `revoked.toml` (PROTOCOL §15.8).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+// RED: i campi si leggono nel GREEN.
+#[allow(dead_code)]
+struct RevocationsFile {
+    #[serde(default)]
+    serials: Vec<String>,
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
@@ -305,6 +352,8 @@ struct PolicyFile {
     agents: Vec<AgentEntry>,
     #[serde(default)]
     clients: Vec<ClientEntry>,
+    #[serde(default)]
+    authorities: Vec<AuthorityEntry>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -326,6 +375,9 @@ struct ClientFile {
     #[serde(default)]
     relays: Vec<RelayEntry>,
     key: String,
+    /// File del certificato del client (PROTOCOL §15), relativo a questo file.
+    #[serde(default)]
+    certificate: Option<String>,
     #[serde(default)]
     nodes: Vec<NodeEntry>,
 }
@@ -405,6 +457,9 @@ impl Ctx<'_> {
 pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    if !file.authorities.is_empty() {
+        return Err(not_yet(origin, "[[authorities]]"));
+    }
     let mut policy = AccessPolicy::new();
     for entry in &file.agents {
         let node = ctx.node(&entry.node, &entry.node)?;
@@ -450,13 +505,93 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
 pub fn parse_authorized_clients(
     origin: &str,
     text: &str,
-) -> Result<HashSet<Fingerprint>, ConfigError> {
+) -> Result<AuthorizedClients, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    if !file.authorities.is_empty() {
+        return Err(not_yet(origin, "[[authorities]]"));
+    }
     file.clients
         .iter()
         .map(|c| Ok(ctx.key(&c.name, &c.public_key)?.fingerprint()))
         .collect()
+}
+
+/// RED: rifiuto di ciò che la Fase 6 non implementa ancora (fail closed).
+fn not_yet(origin: &str, what: &str) -> ConfigError {
+    ConfigError::Syntax {
+        path: origin.into(),
+        message: format!("{what}: client certificates are not supported yet"),
+    }
+}
+
+/// Interpreta la denylist `revoked.toml` (`serials`, `keys`; PROTOCOL §15.8).
+///
+/// # Errors
+/// Qualsiasi voce non valida, o oltre i limiti.
+pub fn parse_revocations(origin: &str, text: &str) -> Result<Revocations, ConfigError> {
+    let ctx = Ctx(origin);
+    let _file: RevocationsFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    // RED: stub, rifiuta sempre.
+    Err(not_yet(origin, "revocations"))
+}
+
+/// Un file di certificato letto e decodificato (la firma la verificano relay e agent).
+#[derive(Debug, Clone)]
+pub struct CertificateFile {
+    /// I byte del certificato, da inviare nel messaggio 1.
+    pub bytes: Arc<[u8]>,
+    /// Il corpo decodificato.
+    pub body: CertBody,
+}
+
+/// Interpreta un file di certificato (`tcn-client-cert-v1:<hex>`, PROTOCOL §15.1).
+///
+/// # Errors
+/// [`ConfigError::Certificate`] per un testo o un certificato non validi.
+pub fn parse_certificate_file(origin: &str, text: &str) -> Result<CertificateFile, ConfigError> {
+    // RED: stub, rifiuta sempre.
+    let _ = text;
+    Err(ConfigError::Certificate {
+        path: origin.into(),
+        source: CertFormatError::Magic,
+    })
+}
+
+/// Legge un file di certificato, con le regole dei file di trust.
+///
+/// # Errors
+/// Come [`parse_certificate_file`]; file insicuro, illeggibile o troppo grande.
+pub fn load_certificate(path: &Path) -> Result<CertificateFile, ConfigError> {
+    parse_certificate_file(&path.display().to_string(), &read_limited(path)?)
+}
+
+/// Genera la chiave di una CA e la scrive in un file nuovo con permessi `0600`. Non
+/// sovrascrive mai un file esistente.
+///
+/// # Errors
+/// File già esistente, errore di I/O, RNG non disponibile.
+pub fn create_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
+    // RED: stub, rifiuta sempre.
+    Err(ConfigError::Key {
+        path: path.display().to_string(),
+        entry: "ca secret key".into(),
+        source: CryptoError::Random,
+    })
+}
+
+/// Carica la chiave di una CA, con le regole delle chiavi segrete.
+///
+/// # Errors
+/// Come [`load_identity`]; un file di chiave di nodo è rifiutato.
+pub fn load_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
+    let file = open_trusted(path, true)?;
+    let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
+    CaSigningKey::from_secret_text(&text).map_err(|source| ConfigError::Key {
+        path: path.display().to_string(),
+        entry: "ca secret key".into(),
+        source,
+    })
 }
 
 /// Interpreta l'elenco dei nodi noti a un client (`[[nodes]] node, public_key`).
@@ -480,20 +615,45 @@ pub fn parse_known_nodes(
     Ok(nodes)
 }
 
-/// Legge e interpreta la policy del relay.
+/// Legge e interpreta la policy del relay. Una policy con `[[authorities]]` richiede
+/// [`load_relay_policy`] con una denylist.
 ///
 /// # Errors
-/// Vedi [`parse_policy`].
+/// Vedi [`parse_policy`]; [`ConfigError::RevocationsRequired`] con una CA.
 pub fn load_policy(path: &Path) -> Result<AccessPolicy, ConfigError> {
     parse_policy(&path.display().to_string(), &read_limited(path)?)
 }
 
-/// Legge e interpreta i client autorizzati di un agent.
+/// Legge la policy del relay e, se c'è, la denylist, in un solo passo: se uno dei due file non
+/// è valido non si carica nulla (PROTOCOL §15.8).
 ///
 /// # Errors
-/// Vedi [`parse_authorized_clients`].
-pub fn load_authorized_clients(path: &Path) -> Result<HashSet<Fingerprint>, ConfigError> {
-    parse_authorized_clients(&path.display().to_string(), &read_limited(path)?)
+/// Vedi [`parse_policy`] e [`parse_revocations`]; [`ConfigError::RevocationsRequired`] con una
+/// CA e senza denylist.
+pub fn load_relay_policy(
+    policy: &Path,
+    revocations: Option<&Path>,
+) -> Result<AccessPolicy, ConfigError> {
+    match revocations {
+        None => load_policy(policy),
+        // RED: stub, la denylist non è ancora supportata.
+        Some(path) => Err(not_yet(&path.display().to_string(), "revocations")),
+    }
+}
+
+/// Legge e interpreta i client autorizzati di un agent e, se c'è, la denylist.
+///
+/// # Errors
+/// Vedi [`parse_authorized_clients`] e [`load_relay_policy`].
+pub fn load_authorized_clients(
+    path: &Path,
+    revocations: Option<&Path>,
+) -> Result<AuthorizedClients, ConfigError> {
+    match revocations {
+        None => parse_authorized_clients(&path.display().to_string(), &read_limited(path)?),
+        // RED: stub, la denylist non è ancora supportata.
+        Some(path) => Err(not_yet(&path.display().to_string(), "revocations")),
+    }
 }
 
 /// Legge e interpreta i nodi noti a un client.
@@ -517,6 +677,8 @@ pub struct ClientSettings {
     /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent. Un nodo assente non
     /// è raggiungibile: non esiste trust-on-first-use.
     pub nodes: HashMap<NodeId, PublicKey>,
+    /// File del certificato del client, se configurato (PROTOCOL §15).
+    pub certificate: Option<std::path::PathBuf>,
 }
 
 impl ClientSettings {
@@ -537,6 +699,7 @@ impl ClientSettings {
             relays: self.relays.clone(),
             node: node.clone(),
             node_key: *node_key,
+            certificate: None,
             timeouts,
         })
     }
@@ -644,6 +807,9 @@ pub fn parse_client_settings(
         .map(|t| ctx.key("relay_key", t))
         .collect::<Result<Vec<_>, _>>()?;
     let relays = relay_endpoints(origin, &addresses, &relay_keys)?;
+    if file.certificate.is_some() {
+        return Err(not_yet(origin, "certificate"));
+    }
     if file.key.is_empty() {
         return Err(ConfigError::Syntax {
             path: origin.into(),
@@ -668,6 +834,7 @@ pub fn parse_client_settings(
         relays,
         key: base.join(&file.key),
         nodes,
+        certificate: None,
     })
 }
 

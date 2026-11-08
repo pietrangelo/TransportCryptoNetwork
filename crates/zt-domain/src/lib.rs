@@ -15,6 +15,8 @@
 //! La traduzione da/verso byte vive in `zt-proto` (adapter), non qui.
 #![forbid(unsafe_code)]
 
+pub mod cert;
+mod clients;
 mod crypto;
 mod error;
 mod events;
@@ -24,11 +26,20 @@ mod ids;
 pub mod limits;
 mod payload;
 mod policy;
+pub mod trust;
 
+pub use cert::{
+    CertBody, CertClaims, CertFormatError, CertKey, CertRef, CertRejection, CertScope, CertSerial,
+    ParsedCert, UnixTime, decode_certificate,
+};
+pub use clients::AuthorizedClients;
 pub use crypto::{AuthToken, Fingerprint};
 pub use error::DomainError;
 pub use events::{AuthFailureReason, DomainEvent};
 pub use frame::{CloseReason, Credit, Frame, FrameKind, RejectReason};
 pub use ids::{NodeId, SessionId, StreamId};
 pub use payload::FramePayload;
-pub use policy::{AccessPolicy, AllowedNodes, ClientGrant, MAX_AGENT_KEYS, PeerRole};
+pub use policy::{
+    AccessPolicy, Admission, AllowedNodes, ClientCredential, ClientGrant, MAX_AGENT_KEYS, PeerRole,
+};
+pub use trust::{Authority, CertTrust, Revocations, TrustedCaKey};

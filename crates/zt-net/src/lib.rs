@@ -74,6 +74,14 @@ impl Default for Timeouts {
     }
 }
 
+/// L'orologio di sistema in secondi Unix; prima del 1970 vale 0 (fail closed: nessun
+/// certificato è ancora valido, PROTOCOL §15.6).
+#[must_use]
+pub fn unix_now() -> zt_domain::UnixTime {
+    // RED: stub, sempre 0.
+    zt_domain::UnixTime::from_secs(0)
+}
+
 /// Scadenza a `after` da adesso. Una durata assurda che manderebbe in overflow l'orologio
 /// scade subito (fail closed) invece di non scadere mai.
 pub(crate) fn deadline(after: Duration) -> tokio::time::Instant {

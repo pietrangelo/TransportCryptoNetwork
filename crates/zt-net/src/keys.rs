@@ -11,7 +11,8 @@
 use std::time::Duration;
 
 use zt_crypto::Keyring;
-use zt_domain::AccessPolicy;
+use zt_domain::trust::CertTrust;
+use zt_domain::{AccessPolicy, AuthorizedClients};
 
 use crate::Revocable;
 
@@ -113,4 +114,47 @@ pub async fn watch_agent_rotations(mut policy: Revocable<AccessPolicy>, every: D
             () = reminders => {}
         }
     }
+}
+
+/// Una configurazione che pinna CA: la policy del relay o i client autorizzati di un agent.
+pub trait CertTrustSource {
+    /// Le CA pinnate e la denylist.
+    fn cert_trust(&self) -> &CertTrust;
+}
+
+impl CertTrustSource for CertTrust {
+    fn cert_trust(&self) -> &CertTrust {
+        self
+    }
+}
+
+impl CertTrustSource for AccessPolicy {
+    fn cert_trust(&self) -> &CertTrust {
+        AccessPolicy::cert_trust(self)
+    }
+}
+
+impl CertTrustSource for AuthorizedClients {
+    fn cert_trust(&self) -> &CertTrust {
+        AuthorizedClients::cert_trust(self)
+    }
+}
+
+/// Registra `authorities_in_use` per ogni CA e `revocations_in_use` con i conteggi della
+/// denylist (PROTOCOL §15.11).
+pub fn announce_authorities(role: &'static str, trust: &CertTrust) {
+    // RED: stub, non registra nulla.
+    let _ = (role, trust);
+}
+
+/// Annuncia CA e denylist all'avvio e a ogni sostituzione; finché una CA ha due chiavi
+/// registra `ca_rotation_pending` subito e ogni `every`. Non ritorna.
+pub async fn watch_authorities<T: CertTrustSource>(
+    role: &'static str,
+    config: Revocable<T>,
+    every: Duration,
+) {
+    // RED: stub, non registra nulla.
+    let _ = (role, config, every);
+    std::future::pending::<()>().await;
 }

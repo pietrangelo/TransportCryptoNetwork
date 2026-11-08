@@ -56,6 +56,11 @@ enum Command {
         /// aperte; un file non valido lascia in vigore quella precedente.
         #[arg(long)]
         policy: PathBuf,
+        /// Denylist di certificati e chiavi (`revoked.toml`, PROTOCOL §15.8). Obbligatoria se
+        /// la policy pinna una CA (`[[authorities]]`), anche vuota. `SIGHUP` la ricarica
+        /// insieme alla policy: se uno dei due file non è valido restano entrambi i precedenti.
+        #[arg(long)]
+        revocations: Option<PathBuf>,
     },
 }
 
@@ -92,6 +97,7 @@ fn run(command: Command) -> Result<(), String> {
             key,
             previous_key,
             policy,
+            revocations,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -122,7 +128,8 @@ fn run(command: Command) -> Result<(), String> {
                     move || config::load_keyring(&key, previous_key.as_deref()),
                 ));
                 let path = policy;
-                let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
+                let policy = config::load_relay_policy(&path, revocations.as_deref())
+                    .map_err(|e| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
                 // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
                 // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
@@ -135,7 +142,7 @@ fn run(command: Command) -> Result<(), String> {
                     failed: "policy_reload_failed",
                 };
                 tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
-                    config::load_policy(&path)
+                    config::load_relay_policy(&path, revocations.as_deref())
                 }));
                 let server = RelayServer::bind(listen, keys, policy, RelayConfig::default())
                     .await

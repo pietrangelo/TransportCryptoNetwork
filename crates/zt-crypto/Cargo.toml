@@ -19,6 +19,9 @@ getrandom.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+# Fase 6: test d'attacco (firme con -s, payload di msg2 scritti a mano). Crate già nel grafo.
+ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
+snow.workspace = true
 
 [lints]
 workspace = true

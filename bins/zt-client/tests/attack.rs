@@ -263,3 +263,69 @@ async fn options_after_the_node_name_are_never_parsed() {
     assert_eq!(good_relay.count(), 0);
     assert_eq!(evil_relay.count(), 0);
 }
+
+// ---------- Fase 6, passo 9: certificati (PROTOCOL §15.6, OPERATIONS §10.4) ----------
+
+/// Controllo positivo comune: lo stesso banco, con un certificato valido, contatta il relay.
+async fn a_valid_certificate_reaches_the_relay() {
+    let me = Identity::generate().unwrap();
+    let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
+    let now = common::now_secs();
+    let (cert, _, _) = common::issue(&me.public_key(), &["web-01"], now - 60, now + 3_600);
+    dir.add_certificate(&cert, 0o644);
+    assert!(
+        common::reaches(&bait, dir.spawn("web-01"), Duration::from_secs(10)).await,
+        "a valid certificate never reached the relay"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_certificate_fails_before_any_connection() {
+    a_valid_certificate_reaches_the_relay().await;
+    let me = Identity::generate().unwrap();
+    let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
+    let now = common::now_secs();
+    let (cert, _, _) = common::issue(&me.public_key(), &["web-01"], now - 3_600, now - 10);
+    dir.add_certificate(&cert, 0o644);
+    let out = finish(dir.spawn("web-01"), LIMIT).await;
+    assert!(!out.success);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.to_lowercase().contains("expired"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(bait.count(), 0);
+}
+
+#[tokio::test]
+async fn a_certificate_for_another_key_fails_before_any_connection() {
+    a_valid_certificate_reaches_the_relay().await;
+    let me = Identity::generate().unwrap();
+    let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
+    let now = common::now_secs();
+    let (cert, _, _) = common::issue(&some_key(), &["web-01"], now - 60, now + 3_600);
+    dir.add_certificate(&cert, 0o644);
+    let out = finish(dir.spawn("web-01"), LIMIT).await;
+    assert!(!out.success);
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+    assert_eq!(bait.count(), 0);
+}
+
+#[tokio::test]
+async fn an_insecure_certificate_file_is_refused() {
+    a_valid_certificate_reaches_the_relay().await;
+    for mode in [0o666, 0o646, 0o664] {
+        let me = Identity::generate().unwrap();
+        let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
+        let now = common::now_secs();
+        let (cert, _, _) = common::issue(&me.public_key(), &["web-01"], now - 60, now + 3_600);
+        dir.add_certificate(&cert, mode);
+        let out = finish(dir.spawn("web-01"), LIMIT).await;
+        assert!(!out.success, "mode {mode:o} accepted");
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.contains("client.cert"), "{}", out.stderr);
+        assert_eq!(bait.count(), 0, "mode {mode:o}");
+    }
+}

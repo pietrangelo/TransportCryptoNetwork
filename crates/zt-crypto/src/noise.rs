@@ -61,6 +61,9 @@ fn builder(
     Ok((builder, secret))
 }
 
+/// Payload massimo del messaggio 1: un certificato client (PROTOCOL §15.3).
+pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = zt_domain::limits::MAX_CERT_LEN;
+
 /// Initiator: produce il primo messaggio verso un responder di cui conosce la chiave.
 ///
 /// # Errors
@@ -70,6 +73,25 @@ pub fn initiate(
     remote: &PublicKey,
     channel: Channel,
 ) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    initiate_with_payload(local, remote, channel, &[])
+}
+
+/// Come [`initiate`], con `payload` cifrato nel messaggio 1 (il certificato del client,
+/// PROTOCOL §15.3).
+///
+/// # Errors
+/// [`CryptoError::MessageTooLarge`] oltre [`MAX_HANDSHAKE_PAYLOAD_LEN`],
+/// [`CryptoError::Handshake`] se lo stato Noise non può essere costruito.
+pub fn initiate_with_payload(
+    local: &Identity,
+    remote: &PublicKey,
+    channel: Channel,
+    payload: &[u8],
+) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    // RED: stub, un payload non vuoto non è ancora supportato.
+    if !payload.is_empty() {
+        return Err(CryptoError::Handshake);
+    }
     let (builder, secret) = builder(local, channel)?;
     let remote_static = remote.x25519();
     let mut state = builder
@@ -172,6 +194,14 @@ impl AuthorizationPending {
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.peer
+    }
+
+    /// Il payload del messaggio 1, autenticato da Noise (vuoto se l'initiator non ne ha
+    /// inviato uno).
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        // RED: stub, il payload non è conservato.
+        &[]
     }
 
     /// Accetta l'initiator: produce `msg2` e il canale di trasporto.

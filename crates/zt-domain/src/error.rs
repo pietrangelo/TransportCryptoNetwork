@@ -72,4 +72,25 @@ pub enum DomainError {
     /// Un nodo ha zero chiavi di agent, più di [`crate::MAX_AGENT_KEYS`], o chiavi ripetute.
     #[error("node {0} must have one or two distinct agent keys")]
     AgentKeys(crate::NodeId),
+    /// Una CA ha zero chiavi, più di [`crate::limits::MAX_AUTHORITY_KEYS`], o chiavi ripetute.
+    #[error("authority {0} must have one or two distinct keys")]
+    AuthorityKeys(crate::NodeId),
+    /// Due voci `[[authorities]]` con lo stesso nome.
+    #[error("authority {0} appears more than once")]
+    DuplicateAuthority(crate::NodeId),
+    /// `max_lifetime` di una CA fuori da `60..=86400` secondi.
+    #[error("authority max_lifetime is {secs} s, must be between 60 and 86400")]
+    AuthorityLifetime {
+        /// Il valore rifiutato.
+        secs: u64,
+    },
+    /// Più di [`crate::limits::MAX_AUTHORITIES`] CA.
+    #[error("too many authorities (maximum 16)")]
+    TooManyAuthorities,
+    /// Denylist oltre i limiti.
+    #[error("too many revoked {what}")]
+    TooManyRevocations {
+        /// `serials` o `keys`.
+        what: &'static str,
+    },
 }

@@ -55,6 +55,9 @@ enum Command {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         node: Vec<String>,
     },
+    /// Stampa nome, nodi, CA, numero di serie e validità del certificato configurato
+    /// (`certificate` in `client.toml`, PROTOCOL §15).
+    Certificate,
 }
 
 fn main() -> ExitCode {
@@ -73,6 +76,7 @@ fn main() -> ExitCode {
             [name] => connect(cli.config, strip_suffix.as_deref(), name),
             _ => Err("expected exactly one node name, and no option after it".into()),
         },
+        Command::Certificate => certificate(cli.config.as_deref()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -82,6 +86,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `zt-client certificate`.
+fn certificate(flag: Option<&Path>) -> Result<(), String> {
+    // RED: stub, rifiuta sempre.
+    let _ = flag;
+    Err("client certificates are not supported yet".into())
 }
 
 fn keygen(out: &Path) -> Result<(), String> {

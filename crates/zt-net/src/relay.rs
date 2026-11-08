@@ -19,11 +19,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout_at;
 use zt_application::ratelimit::HandshakeGate;
-use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
+use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
-use zt_domain::{AccessPolicy, AuthFailureReason, DomainEvent, Fingerprint, Frame, SessionId};
+use zt_domain::{
+    AccessPolicy, AuthFailureReason, CertClaims, CertRejection, DomainEvent, Fingerprint, Frame,
+    SessionId,
+};
 
 use crate::{NetError, Timeouts, channel};
 
@@ -91,6 +94,7 @@ pub(crate) fn audit(event: &DomainEvent) {
             session,
             client,
             target,
+            ..
         } => {
             emit!(session = %session_hex(session), peer = %client, node = %target, "session established");
         }
@@ -98,7 +102,7 @@ pub(crate) fn audit(event: &DomainEvent) {
             Some(peer) => emit!(%peer, ?reason, "authentication failed"),
             None => emit!(?reason, "authentication failed"),
         },
-        DomainEvent::AccessDenied { client, target } => {
+        DomainEvent::AccessDenied { client, target, .. } => {
             emit!(peer = %client, node = %target, "access denied");
         }
         DomainEvent::ProtocolViolation { peer, rule } => {
@@ -107,7 +111,7 @@ pub(crate) fn audit(event: &DomainEvent) {
         DomainEvent::ConnectionDrained { session, reason } => {
             emit!(session = %session_hex(session), ?reason, "connection drained");
         }
-        DomainEvent::AccessRevoked { peer, target } => match target {
+        DomainEvent::AccessRevoked { peer, target, .. } => match target {
             Some(target) => emit!(%peer, node = %target, "access revoked"),
             None => emit!(%peer, "access revoked"),
         },
@@ -157,6 +161,7 @@ enum HubEvent {
     Connected {
         conn: ConnId,
         peer: Fingerprint,
+        certificate: Option<Arc<CertClaims>>,
         tx: mpsc::Sender<Frame>,
     },
     Core(Input),
@@ -305,6 +310,14 @@ impl Connection {
             }
         };
         let peer = pending.peer();
+        // RED: stub, un certificato nel messaggio 1 è rifiutato senza messaggio 2 (fail closed).
+        if !pending.payload().is_empty() {
+            audit(&DomainEvent::AuthenticationFailed {
+                peer: Some(peer),
+                reason: AuthFailureReason::Certificate(CertRejection::Malformed),
+            });
+            return;
+        }
         // Una chiave sconosciuta non riceve nemmeno il secondo messaggio dell'handshake.
         if self.policy.current().role(&peer).is_none() {
             audit(&DomainEvent::AuthenticationFailed {
@@ -322,7 +335,12 @@ impl Connection {
         let conn = self.conn;
         if self
             .hub
-            .send(HubEvent::Connected { conn, peer, tx })
+            .send(HubEvent::Connected {
+                conn,
+                peer,
+                certificate: None,
+                tx,
+            })
             .await
             .is_err()
         {
@@ -379,9 +397,9 @@ async fn hub(
             () = policy.changed() => Input::PolicyUpdated { policy: policy.current() },
             event = events.recv() => match event {
                 None => return,
-                Some(HubEvent::Connected { conn, peer, tx }) => {
+                Some(HubEvent::Connected { conn, peer, certificate, tx }) => {
                     peers.insert(conn, tx);
-                    Input::Connected { conn, peer }
+                    Input::Connected { conn, peer, certificate }
                 }
                 Some(HubEvent::Core(input)) => {
                     if let Input::Disconnected { conn } = &input {
@@ -394,7 +412,11 @@ async fn hub(
         };
         let mut pending = vec![input];
         while let Some(input) = pending.pop() {
-            for output in core.handle(input, std::time::Instant::now()) {
+            let now = Now {
+                instant: std::time::Instant::now(),
+                unix: crate::unix_now(),
+            };
+            for output in core.handle(input, now) {
                 match output {
                     Output::Send { conn, frame } => {
                         let Some(tx) = peers.get(&conn) else { continue };

@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
+use crate::cert::{CertClaims, UnixTime};
 use crate::crypto::Fingerprint;
 use crate::error::DomainError;
+use crate::events::AuthFailureReason;
 use crate::ids::NodeId;
+use crate::trust::CertTrust;
 
 /// Nodi che un client può raggiungere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +52,30 @@ pub enum PeerRole<'a> {
     },
 }
 
+/// Con quale credenziale un client è stato ammesso (PROTOCOL §15.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientCredential {
+    /// La whitelist per chiave: nessuna scadenza in sessione.
+    Key,
+    /// Un certificato verificato: vale fino a `not_after`.
+    Certificate(Arc<CertClaims>),
+}
+
+/// Esito positivo di [`AccessPolicy::admit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission<'a> {
+    /// Un agent, che può registrarsi solo con questo nome.
+    Agent {
+        /// Il nome assegnato alla chiave.
+        node: &'a NodeId,
+    },
+    /// Un client, con la credenziale che lo ha ammesso.
+    Client {
+        /// La credenziale.
+        credential: ClientCredential,
+    },
+}
+
 /// Chiavi di agent ammesse per un nodo: la corrente e, durante una rotazione, la nuova.
 pub const MAX_AGENT_KEYS: usize = 2;
 
@@ -60,6 +88,7 @@ pub struct AccessPolicy {
     agents: HashMap<Fingerprint, NodeId>,
     nodes: BTreeSet<NodeId>,
     clients: HashMap<Fingerprint, ClientGrant>,
+    cert_trust: CertTrust,
 }
 
 impl AccessPolicy {
@@ -155,6 +184,51 @@ impl AccessPolicy {
             by_node.entry(node).or_default().push(*key);
         }
         by_node
+    }
+
+    /// Imposta le CA pinnate e la denylist (PROTOCOL §15.8, §15.9).
+    ///
+    /// # Errors
+    /// [`DomainError::DuplicatePeer`] se una chiave di CA è anche la chiave di un peer.
+    pub fn set_cert_trust(&mut self, trust: CertTrust) -> Result<(), DomainError> {
+        // RED: stub, rifiuta sempre.
+        drop(trust);
+        Err(DomainError::TooManyAuthorities)
+    }
+
+    /// Le CA pinnate e la denylist.
+    #[must_use]
+    pub const fn cert_trust(&self) -> &CertTrust {
+        &self.cert_trust
+    }
+
+    /// Passi 1, 2, 5, 7–11 di PROTOCOL §15.4 e la tabella di §15.5.
+    ///
+    /// # Errors
+    /// Il motivo del rifiuto, per l'audit.
+    pub fn admit(
+        &self,
+        peer: &Fingerprint,
+        cert: Option<&Arc<CertClaims>>,
+        now: UnixTime,
+    ) -> Result<Admission<'_>, AuthFailureReason> {
+        // RED: stub, rifiuta sempre.
+        let _ = (peer, cert, now);
+        Err(AuthFailureReason::UnknownPeer)
+    }
+
+    /// [`Self::may_open`] generalizzato: nodi della policy ∩ ambito effettivo della credenziale.
+    #[must_use]
+    pub fn may_open_with(
+        &self,
+        peer: &Fingerprint,
+        credential: &ClientCredential,
+        target: &NodeId,
+        now: UnixTime,
+    ) -> bool {
+        // RED: stub, non concede nulla.
+        let _ = (peer, credential, target, now);
+        false
     }
 
     /// `true` se il client `peer` può aprire uno stream verso `target`.

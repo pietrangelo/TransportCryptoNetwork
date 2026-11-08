@@ -54,9 +54,27 @@ pub async fn connect<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    connect_with_payload(io, local, remote, channel, &[], timeouts).await
+}
+
+/// Come [`connect`], con `payload` nel messaggio 1 (il certificato del client, PROTOCOL §15.3).
+///
+/// # Errors
+/// Come [`connect`]; [`NetError::Crypto`] per un payload oltre il massimo.
+pub async fn connect_with_payload<IO>(
+    io: IO,
+    local: &Identity,
+    remote: &PublicKey,
+    channel: Channel,
+    payload: &[u8],
+    timeouts: &Timeouts,
+) -> Result<Established<IO>, NetError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
     let mut framed = Framed::new(io, codec());
     let handshake = async {
-        let (msg1, waiting) = noise::initiate(local, remote, channel)?;
+        let (msg1, waiting) = noise::initiate_with_payload(local, remote, channel, payload)?;
         framed.send(Bytes::from(msg1)).await?;
         let msg2 = read_message(&mut framed).await?;
         Ok::<_, NetError>(waiting.complete(&msg2)?)
@@ -106,6 +124,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.pending.peer()
+    }
+
+    /// Il payload del messaggio 1 (vuoto senza certificato).
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        self.pending.payload()
     }
 
     /// Accetta il peer e completa l'handshake.

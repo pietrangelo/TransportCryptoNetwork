@@ -159,3 +159,82 @@ async fn falls_back_to_the_next_relay_when_the_first_is_down() {
     let out = finish(child, Duration::from_secs(10)).await;
     assert!(out.success, "stderr: {}", out.stderr);
 }
+
+// ---------- Fase 6, passo 9: certificati (OPERATIONS §10.4, PROTOCOL §15.6) ----------
+
+/// Spec: `zt-client certificate` stampa nome, nodi, CA, serie e validità del certificato
+/// configurato, senza toccare la rete.
+#[tokio::test]
+async fn certificate_subcommand_prints_status() {
+    use common::{ClientDir, issue, now_secs, utc_date};
+    let me = zt_crypto::Identity::generate().unwrap();
+    let bait = Counting::start(false).await;
+    let relay_key = zt_crypto::Identity::generate().unwrap().public_key();
+    let dir = ClientDir::new(
+        &me,
+        &bait.addr.to_string(),
+        &relay_key,
+        &[("web-01", relay_key)],
+    );
+    let now = now_secs();
+    let not_after = now + 3_600;
+    let (cert, ca, serial) = issue(&me.public_key(), &["web-01", "db-01"], now - 60, not_after);
+    dir.add_certificate(&cert, 0o644);
+    let out = finish(
+        spawn_with(
+            &["--config", dir.config().to_str().unwrap(), "certificate"],
+            &[],
+        ),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(out.success, "stderr: {}", out.stderr);
+    let text = String::from_utf8(out.stdout).unwrap();
+    for needle in [
+        "alice".to_owned(),
+        "web-01".to_owned(),
+        "db-01".to_owned(),
+        ca.fingerprint().to_string(),
+        serial.to_string(),
+        utc_date(not_after),
+    ] {
+        assert!(text.contains(&needle), "missing {needle}: {text}");
+    }
+    assert_eq!(bait.count(), 0);
+}
+
+/// Spec: un certificato che scade entro 15 minuti, o non ancora valido, provoca un avviso su
+/// stderr; stdout (il canale SSH) resta vuoto. Un certificato lontano dalla scadenza no.
+#[tokio::test]
+async fn a_certificate_expiring_soon_warns_on_stderr_only() {
+    use common::{ClientDir, closed_port, issue, now_secs};
+    let now = now_secs();
+    let relay = closed_port().await;
+    for (what, nb, na, warns) in [
+        ("expiring soon", now - 3_000, now + 600, "expire"),
+        ("not yet valid", now + 60, now + 3_600, "not yet valid"),
+        ("fine", now - 60, now + 3_600, ""),
+    ] {
+        let me = zt_crypto::Identity::generate().unwrap();
+        let relay_key = zt_crypto::Identity::generate().unwrap().public_key();
+        let dir = ClientDir::new(
+            &me,
+            &relay.to_string(),
+            &relay_key,
+            &[("web-01", relay_key)],
+        );
+        let (cert, _, _) = issue(&me.public_key(), &["web-01"], nb, na);
+        dir.add_certificate(&cert, 0o644);
+        let out = finish(dir.spawn("web-01"), Duration::from_secs(15)).await;
+        assert!(out.stdout.is_empty(), "{what}: stdout must stay empty");
+        let stderr = out.stderr.to_lowercase();
+        if warns.is_empty() {
+            assert!(!stderr.contains("expire"), "{what}: {stderr}");
+            assert!(!stderr.contains("not yet valid"), "{what}: {stderr}");
+        } else {
+            assert!(stderr.contains(warns), "{what}: {stderr}");
+        }
+        // Il problema è la rete (porta chiusa), non il certificato: l'avviso non è un errore.
+        assert!(!stderr.contains("not supported"), "{what}: {stderr}");
+    }
+}

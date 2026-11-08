@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
+use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_domain::flow::{INITIAL_WINDOW, MAX_WINDOW, MIN_CHARGE};
 use zt_domain::{
     AccessPolicy, AllowedNodes, AuthFailureReason, ClientGrant, CloseReason, Credit, DomainEvent,
@@ -87,12 +87,19 @@ impl Harness {
     }
 
     fn input(&mut self, input: Input) -> Vec<Output> {
-        self.core.handle(input, self.now)
+        self.core.handle(
+            input,
+            Now {
+                instant: self.now,
+                unix: zt_domain::UnixTime::from_secs(1_800_000_000),
+            },
+        )
     }
     fn connect(&mut self, conn: u64, peer: u8) -> Vec<Output> {
         self.input(Input::Connected {
             conn: ConnId(conn),
             peer: fp(peer),
+            certificate: None,
         })
     }
     fn recv(&mut self, conn: u64, frame: Frame) -> Vec<Output> {
@@ -231,6 +238,7 @@ fn full_session_lifecycle_is_routed_and_audited() {
                 session,
                 client,
                 target,
+                certificate: None,
             },
         ] => {
             assert_eq!(client, &fp(ANSIBLE));

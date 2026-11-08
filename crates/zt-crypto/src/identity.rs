@@ -110,6 +110,28 @@ impl PublicKey {
     pub fn fingerprint(&self) -> Fingerprint {
         fingerprint_of_x25519(&self.x25519())
     }
+
+    /// Una chiave da 32 byte Ed25519 che DEVONO essere la codifica canonica di un punto valido
+    /// e non di ordine piccolo (PROTOCOL §15.1 regola 8).
+    ///
+    /// # Errors
+    /// [`CryptoError::InvalidKey`] per un punto non valido o non canonico,
+    /// [`CryptoError::WeakKey`] per un punto di ordine piccolo.
+    pub fn from_canonical_bytes(bytes: &[u8; 32]) -> Result<Self, CryptoError> {
+        // RED: stub, rifiuta sempre.
+        let _ = bytes;
+        Err(CryptoError::InvalidKey)
+    }
+
+    /// I 32 byte Ed25519 della chiave.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
+
+    pub(crate) const fn from_verifying_key(key: VerifyingKey) -> Self {
+        Self { key }
+    }
 }
 
 impl FromStr for PublicKey {

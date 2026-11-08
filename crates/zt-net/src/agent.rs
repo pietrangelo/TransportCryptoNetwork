@@ -4,7 +4,7 @@
 //! l'identità end-to-end del client contro il proprio elenco. Un relay compromesso non può
 //! quindi aprire sessioni SSH verso i nodi.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +15,8 @@ use zt_crypto::Keyring;
 use zt_crypto::noise::{self, Channel};
 use zt_domain::flow::Window;
 use zt_domain::{
-    AuthFailureReason, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
+    AuthFailureReason, AuthorizedClients, CertRejection, CloseReason, DomainEvent, Fingerprint,
+    Frame, NodeId, RejectReason, StreamId,
 };
 
 use crate::relay::audit;
@@ -32,7 +33,7 @@ pub struct AgentConfig {
     /// Demone SSH locale.
     pub ssh_target: String,
     /// Client accettati end-to-end.
-    pub authorized_clients: crate::Revocable<HashSet<Fingerprint>>,
+    pub authorized_clients: crate::Revocable<AuthorizedClients>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
     /// Stream contemporanei, da 1 a [`MAX_STREAMS`].
@@ -316,7 +317,7 @@ struct StreamTask {
     identity: Arc<Keyring>,
     /// Sessioni verso sshd dell'agent intero (tutti i relay).
     sessions: Arc<Semaphore>,
-    authorized: crate::Revocable<HashSet<Fingerprint>>,
+    authorized: crate::Revocable<AuthorizedClients>,
     ssh_target: String,
     timeouts: Timeouts,
 }
@@ -350,7 +351,16 @@ impl StreamTask {
             return;
         };
         let client = pending.peer();
-        if !authorized.current().contains(&client) {
+        // RED: stub, un certificato nel messaggio 1 è rifiutato (fail closed).
+        if !pending.payload().is_empty() {
+            audit(&DomainEvent::AuthenticationFailed {
+                peer: Some(client),
+                reason: AuthFailureReason::Certificate(CertRejection::Malformed),
+            });
+            io.close(CloseReason::Unauthorized).await;
+            return;
+        }
+        if !authorized.current().contains_key(&client) {
             audit(&DomainEvent::AuthenticationFailed {
                 peer: Some(client),
                 reason: AuthFailureReason::UnknownPeer,
@@ -408,7 +418,7 @@ async fn bridge(
     transport: zt_crypto::noise::Transport,
     ssh: TcpStream,
     client: Fingerprint,
-    mut authorized: crate::Revocable<HashSet<Fingerprint>>,
+    mut authorized: crate::Revocable<AuthorizedClients>,
     timeouts: &Timeouts,
 ) {
     let stream = io.id();
@@ -424,7 +434,7 @@ async fn bridge(
     // aspettare il relay (che potrebbe non revocarlo mai). Si controlla il valore attuale
     // prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
     let revoked = async {
-        while authorized.current().contains(&client) {
+        while authorized.current().contains_key(&client) {
             authorized.changed().await;
         }
     };
@@ -437,7 +447,11 @@ async fn bridge(
             }
         },
         () = revoked => {
-            audit(&DomainEvent::AccessRevoked { peer: client, target: None });
+            audit(&DomainEvent::AccessRevoked {
+                peer: client,
+                target: None,
+                certificate: None,
+            });
             closer.close(CloseReason::Unauthorized).await;
             "revoked"
         }

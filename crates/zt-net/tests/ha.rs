@@ -8,7 +8,6 @@
     clippy::missing_panics_doc
 )]
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -174,7 +173,11 @@ async fn start_agent_with(
         relays,
         node: node("web-01"),
         ssh_target: ssh.to_string(),
-        authorized_clients: Revocable::fixed(HashSet::from([ansible.fingerprint()])),
+        authorized_clients: Revocable::fixed(
+            [ansible.fingerprint()]
+                .into_iter()
+                .collect::<zt_domain::AuthorizedClients>(),
+        ),
         timeouts: timeouts(),
         max_streams,
     };
@@ -186,6 +189,7 @@ fn client_config(relays: Vec<RelayEndpoint>, node_key: &PublicKey) -> ClientConf
         relays,
         node: node("web-01"),
         node_key: *node_key,
+        certificate: None,
         timeouts: timeouts(),
     }
 }
@@ -863,7 +867,7 @@ async fn an_out_of_range_max_streams_is_refused_without_panic() {
             )],
             node: node("web-01"),
             ssh_target: "127.0.0.1:9".into(),
-            authorized_clients: Revocable::fixed(HashSet::new()),
+            authorized_clients: Revocable::fixed(zt_domain::AuthorizedClients::new()),
             timeouts: timeouts(),
             max_streams: max,
         };

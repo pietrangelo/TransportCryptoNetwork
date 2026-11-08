@@ -23,6 +23,8 @@ pub struct ClientConfig {
     pub node: NodeId,
     /// Chiave pubblica dell'agent del nodo, pinnata per il canale end-to-end.
     pub node_key: PublicKey,
+    /// Certificato del client (PROTOCOL §15), inviato nel messaggio 1 di entrambi i canali.
+    pub certificate: Option<std::sync::Arc<[u8]>>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
 }
@@ -47,6 +49,12 @@ where
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         return Err(NetError::Protocol(
             "the client needs between 1 and 8 relays",
+        ));
+    }
+    // RED: stub, i certificati non sono ancora supportati (fail closed).
+    if config.certificate.is_some() {
+        return Err(NetError::Protocol(
+            "client certificates are not supported yet",
         ));
     }
     let stream = StreamId::try_from(1).map_err(|_| NetError::Protocol("stream id"))?;

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
+use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_domain::{
     AccessPolicy, AllowedNodes, AuthFailureReason, ClientGrant, CloseReason, DomainEvent,
     Fingerprint, Frame, FramePayload, NodeId, SessionId, StreamId,
@@ -116,12 +116,19 @@ impl H {
         (h, s)
     }
     fn input(&mut self, i: Input) -> Vec<Output> {
-        self.core.handle(i, self.now)
+        self.core.handle(
+            i,
+            Now {
+                instant: self.now,
+                unix: zt_domain::UnixTime::from_secs(1_800_000_000),
+            },
+        )
     }
     fn connect(&mut self, conn: u64, peer: u8) -> Vec<Output> {
         self.input(Input::Connected {
             conn: ConnId(conn),
             peer: fp(peer),
+            certificate: None,
         })
     }
     fn recv(&mut self, conn: u64, frame: Frame) -> Vec<Output> {
@@ -183,7 +190,7 @@ fn closed(out: &[Output]) -> Vec<u64> {
 fn revoked(out: &[Output]) -> Vec<(Fingerprint, Option<NodeId>)> {
     out.iter()
         .filter_map(|o| match o {
-            Output::Audit(DomainEvent::AccessRevoked { peer, target }) => {
+            Output::Audit(DomainEvent::AccessRevoked { peer, target, .. }) => {
                 Some((*peer, target.clone()))
             }
             _ => None,

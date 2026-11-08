@@ -68,6 +68,11 @@ enum Command {
         /// chiude subito le sessioni dei client rimossi.
         #[arg(long)]
         authorized_clients: PathBuf,
+        /// Denylist di certificati e chiavi (`revoked.toml`, PROTOCOL §15.8). Obbligatoria se
+        /// i client autorizzati pinnano una CA (`[[authorities]]`), anche vuota. `SIGHUP` la
+        /// ricarica insieme ai client autorizzati.
+        #[arg(long)]
+        revocations: Option<PathBuf>,
         /// Demone SSH locale.
         #[arg(long, default_value = "127.0.0.1:22")]
         ssh_target: String,
@@ -123,6 +128,7 @@ fn run(command: Command) -> Result<(), String> {
             key,
             previous_key,
             authorized_clients,
+            revocations,
             ssh_target,
             max_streams,
         } => {
@@ -146,8 +152,8 @@ fn run(command: Command) -> Result<(), String> {
                     zt_net::keys::ROTATION_REMINDER,
                 ));
                 let path = authorized_clients;
-                let authorized =
-                    config::load_authorized_clients(&path).map_err(|e| e.to_string())?;
+                let authorized = config::load_authorized_clients(&path, revocations.as_deref())
+                    .map_err(|e| e.to_string())?;
                 let (authorized_clients, updater) = Revocable::new(authorized);
                 let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
                 let config = AgentConfig {
@@ -163,7 +169,7 @@ fn run(command: Command) -> Result<(), String> {
                     failed: "authorized_clients_reload_failed",
                 };
                 tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
-                    config::load_authorized_clients(&path)
+                    config::load_authorized_clients(&path, revocations.as_deref())
                 }));
                 systemd::notify_ready();
                 agent::run(keys, config).await;

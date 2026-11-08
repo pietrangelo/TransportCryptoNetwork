@@ -234,3 +234,93 @@ fn max_streams_out_of_range_is_refused_without_panic() {
         );
     }
 }
+
+// ---------- Fase 6, passo 9: CA pinnate e denylist (PROTOCOL §15.8, §15.9) ----------
+
+fn authority_text(ca: &str) -> String {
+    format!("[[authorities]]\nname = \"ops-ca\"\npublic_key = \"{ca}\"\nallow = [\"web-01\"]\n")
+}
+
+fn write(dir: &Dir, name: &str, text: &str) -> String {
+    let p = dir.0.join(name);
+    std::fs::write(&p, text).unwrap();
+    set_mode(&p, 0o644);
+    p.to_str().unwrap().to_owned()
+}
+
+fn public_of(file: &std::path::Path) -> String {
+    Identity::from_secret_hex(std::fs::read_to_string(file).unwrap().trim())
+        .unwrap()
+        .public_key()
+        .to_string()
+}
+
+/// Un agent valido resta in esecuzione: `run` lo ferma (nessun codice d'uscita) o è uscito
+/// con successo.
+fn keeps_running(out: &Output) {
+    assert!(
+        out.status.code().is_none() || out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn authorities_without_revocations_refuse_to_start() {
+    let dir = setup("ca-no-revocations");
+    let relay = key();
+    write(&dir, "clients.toml", &authority_text(&key()));
+    let out = run(&dir, &["--relay", "127.0.0.1:9", "--relay-key", &relay]);
+    fails_with(&out, "revocations");
+    // Controllo positivo: con la denylist (vuota) l'agent parte e annuncia la CA.
+    let revoked = write(&dir, "revoked.toml", "serials = []\nkeys = []\n");
+    let out = run(
+        &dir,
+        &[
+            "--relay",
+            "127.0.0.1:9",
+            "--relay-key",
+            &relay,
+            "--revocations",
+            &revoked,
+        ],
+    );
+    keeps_running(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("authorities_in_use"), "{stderr}");
+}
+
+#[test]
+fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
+    let dir = setup("ca-is-me");
+    let relay = key();
+    let revoked = write(&dir, "revoked.toml", "serials = []\nkeys = []\n");
+    let (current, old) = (dir.0.join("agent.key"), dir.0.join("old.key"));
+    let base = [
+        "--relay",
+        "127.0.0.1:9",
+        "--relay-key",
+        relay.as_str(),
+        "--revocations",
+        revoked.as_str(),
+    ];
+    // La CA è la chiave dell'agent.
+    write(&dir, "clients.toml", &authority_text(&public_of(&current)));
+    let out = run(&dir, &base);
+    assert!(
+        out.status.code().is_some_and(|c| c != 0),
+        "the agent started"
+    );
+    // La CA è la chiave precedente dell'agent.
+    write(&dir, "clients.toml", &authority_text(&public_of(&old)));
+    let mut with_previous = base.to_vec();
+    with_previous.extend(["--previous-key", old.to_str().unwrap()]);
+    let out = run(&dir, &with_previous);
+    assert!(
+        out.status.code().is_some_and(|c| c != 0),
+        "the agent started"
+    );
+    // Controllo positivo: un'altra CA va bene.
+    write(&dir, "clients.toml", &authority_text(&key()));
+    keeps_running(&run(&dir, &with_previous));
+}
