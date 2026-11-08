@@ -13,9 +13,9 @@ admin / Ansible                        relay pubblico                     server
        └──────────────── tunnel end-to-end client ↔ agent ───────────────────┘
 ```
 
-> **Stato:** Fase 3. Relay, agent e `zt-client` sono funzionanti; `ssh`, `scp` e
-> `ansible-playbook` passano attraverso TCN (verificato in CI con OpenSSH e Ansible veri).
-> L'hardening (fuzzing, rekey, revoca a caldo, pacchetti) è la Fase 4. Vedi `docs/OPERATIONS.md`.
+> **Stato:** Fase 4 (hardening). Revoca a caldo delle chiavi, rekey dei canali, audit log
+> JSON, fuzzing continuo, binari statici firmati e unit systemd blindate. Vedi
+> `docs/OPERATIONS.md`.
 
 ## Struttura
 
@@ -33,6 +33,8 @@ admin / Ansible                        relay pubblico                     server
 | `docs/OPERATIONS.md` | chiavi, policy, avvio di relay e agent, OpenSSH e Ansible |
 | `docs/METHODOLOGY.md` | DDD esagonale, Adversarial TDD, regole di codice |
 | `docs/adversary/` | registro delle adversary review |
+| `fuzz/` | target di `cargo-fuzz` (nightly) |
+| `packaging/systemd/` | unit systemd e utente di servizio |
 
 ## Sviluppo
 

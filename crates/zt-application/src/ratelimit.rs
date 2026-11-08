@@ -137,6 +137,12 @@ impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
         allowed
     }
 
+    /// `true` se `key` ha già un bucket.
+    #[must_use]
+    pub fn contains(&self, key: &K) -> bool {
+        self.buckets.contains_key(key)
+    }
+
     /// Numero di chiavi tracciate.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -203,5 +209,67 @@ mod tests {
         // Dopo il refill i bucket pieni vengono eliminati e c'è di nuovo spazio.
         assert!(l.check(&3, t0 + Duration::from_secs(60)));
         assert!(l.len() <= 2);
+    }
+}
+
+/// Chiave «larga» del rate limiter: il prefisso /48 per IPv6, nessuna per IPv4.
+///
+/// Un /48 è l'assegnazione tipica di un sito: chi lo controlla ha 65 536 prefissi /64 e con
+/// la sola chiave per /64 potrebbe riempire la tabella del limiter e bloccare gli indirizzi
+/// nuovi di tutti (residuo del finding 0002-5). Per IPv4 non serve: un attaccante con molti
+/// indirizzi IPv4 è già limitato dalla dimensione della tabella e dal costo degli indirizzi.
+#[must_use]
+pub fn wide_source_key(addr: IpAddr) -> Option<[u8; 7]> {
+    match addr.to_canonical() {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(v6) => {
+            let mut key = [6_u8; 7];
+            let (slot, prefix) = (key.get_mut(1..7)?, v6.octets().get(..6)?.to_owned());
+            slot.copy_from_slice(&prefix);
+            Some(key)
+        }
+    }
+}
+
+/// Cancello degli handshake del relay: un bucket per indirizzo IPv4 o prefisso /64 IPv6 e, per
+/// IPv6, un secondo bucket per prefisso /48 che limita la comparsa di /64 **nuovi**, così un /48
+/// ostile non può riempire la tabella dei /64.
+///
+/// Il bucket /48 si consuma solo per un /64 che il limiter non conosce già: un singolo host
+/// insistente è frenato dal proprio bucket e non può esaurire quello del /48, bloccando i vicini
+/// (finding 0004-1).
+#[derive(Debug)]
+pub struct HandshakeGate {
+    narrow: KeyedRateLimiter<[u8; 9]>,
+    wide: KeyedRateLimiter<[u8; 7]>,
+}
+
+impl HandshakeGate {
+    /// `burst`/`refill` per indirizzo o /64; `wide_burst`/`wide_refill` per /48.
+    #[must_use]
+    pub fn new(
+        max_keys: usize,
+        burst: u32,
+        refill: Duration,
+        wide_burst: u32,
+        wide_refill: Duration,
+        max_wide_keys: usize,
+    ) -> Self {
+        Self {
+            narrow: KeyedRateLimiter::new(max_keys, burst, refill),
+            wide: KeyedRateLimiter::new(max_wide_keys, wide_burst, wide_refill),
+        }
+    }
+
+    /// `true` se l'handshake da `addr` è ammesso ora.
+    pub fn admit(&mut self, addr: IpAddr, now: Instant) -> bool {
+        let narrow = source_key(addr);
+        if !self.narrow.contains(&narrow)
+            && let Some(wide) = wide_source_key(addr)
+            && !self.wide.check(&wide, now)
+        {
+            return false;
+        }
+        self.narrow.check(&narrow, now)
     }
 }

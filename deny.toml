@@ -1,0 +1,37 @@
+# cargo-deny: controlli di supply chain, eseguiti in CI (job `deny`).
+
+[graph]
+all-features = true
+
+[advisories]
+# Ogni advisory RustSec (vulnerabilità, crate non mantenuti, yank) fa fallire la build.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# libfuzzer-sys incorpora libFuzzer di LLVM (licenza NCSA). Serve solo ai target di fuzzing in
+# fuzz/, che non finiscono nei binari distribuiti.
+exceptions = [{ crate = "libfuzzer-sys", allow = ["NCSA"] }]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# I crate interni usano `path`: non sono wildcard.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

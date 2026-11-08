@@ -17,10 +17,15 @@ pub mod channel;
 pub mod client;
 pub mod config;
 mod error;
+pub mod logging;
 pub mod relay;
+pub mod reload;
+mod revocable;
 mod stream;
+pub mod systemd;
 
 pub use error::NetError;
+pub use revocable::{Revocable, Updater};
 
 use std::time::Duration;
 

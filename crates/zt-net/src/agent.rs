@@ -34,7 +34,7 @@ pub struct AgentConfig {
     /// Demone SSH locale.
     pub ssh_target: String,
     /// Client accettati end-to-end.
-    pub authorized_clients: Arc<HashSet<Fingerprint>>,
+    pub authorized_clients: crate::Revocable<HashSet<Fingerprint>>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
     /// Stream contemporanei.
@@ -181,7 +181,7 @@ fn on_relay_frame(
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
-                authorized: Arc::clone(&config.authorized_clients),
+                authorized: config.authorized_clients.clone(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
             };
@@ -229,7 +229,7 @@ fn on_relay_frame(
 struct StreamTask {
     io: StreamIo,
     identity: Arc<Identity>,
-    authorized: Arc<HashSet<Fingerprint>>,
+    authorized: crate::Revocable<HashSet<Fingerprint>>,
     ssh_target: String,
     timeouts: Timeouts,
 }
@@ -262,7 +262,7 @@ impl StreamTask {
             return;
         };
         let client = pending.peer();
-        if !authorized.contains(&client) {
+        if !authorized.current().contains(&client) {
             audit(&DomainEvent::AuthenticationFailed {
                 peer: Some(client),
                 reason: AuthFailureReason::UnknownPeer,
@@ -303,10 +303,56 @@ impl StreamTask {
             return;
         };
         let _ = ssh.set_nodelay(true);
-        tracing::info!(target: "zt_audit", %client, "end-to-end session started");
-        if let Err(err) = pump(io, transport, ssh, Some(timeouts.write)).await {
-            tracing::debug!(error = %err, "stream ended with error");
-        }
-        tracing::info!(target: "zt_audit", %client, "end-to-end session ended");
+        bridge(io, transport, ssh, client, authorized, &timeouts).await;
     }
+}
+
+/// Collega la sessione end-to-end a sshd fino alla fine, o fino alla revoca del client.
+async fn bridge(
+    io: StreamIo,
+    transport: zt_crypto::noise::Transport,
+    ssh: TcpStream,
+    client: Fingerprint,
+    mut authorized: crate::Revocable<HashSet<Fingerprint>>,
+    timeouts: &Timeouts,
+) {
+    let stream = io.id();
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "e2e_session_started",
+        peer = %client,
+        %stream,
+        "end-to-end session started"
+    );
+    let closer = io.closer();
+    // Revoca a caldo: se il client esce dall'elenco la sessione si chiude subito, senza
+    // aspettare il relay (che potrebbe non revocarlo mai). Si controlla il valore attuale
+    // prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
+    let revoked = async {
+        while authorized.current().contains(&client) {
+            authorized.changed().await;
+        }
+    };
+    let outcome = tokio::select! {
+        result = pump(io, transport, ssh, Some(timeouts.write)) => match result {
+            Ok(()) => "closed",
+            Err(err) => {
+                tracing::debug!(error = %err, "stream ended with error");
+                "error"
+            }
+        },
+        () = revoked => {
+            audit(&DomainEvent::AccessRevoked { peer: client, target: None });
+            closer.close(CloseReason::Unauthorized).await;
+            "revoked"
+        }
+    };
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "e2e_session_ended",
+        peer = %client,
+        %stream,
+        outcome,
+        "end-to-end session ended"
+    );
 }

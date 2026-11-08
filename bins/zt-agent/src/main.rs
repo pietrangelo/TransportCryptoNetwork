@@ -8,19 +8,31 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 use zt_crypto::PublicKey;
 use zt_domain::NodeId;
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
-use zt_net::config;
+use zt_net::logging::{self, LogFormat};
+use zt_net::reload::{self, Hangups, ReloadEvents};
+use zt_net::{Revocable, config, systemd};
 
 /// Agent TCN.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Formato dei log su stderr.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    log_format: Format,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Format {
+    /// Testo leggibile.
+    Text,
+    /// Una riga JSON per evento (per SIEM e `jq`).
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -46,7 +58,8 @@ enum Command {
         /// Chiave segreta dell'agent.
         #[arg(long)]
         key: PathBuf,
-        /// Client accettati end-to-end (TOML, sezioni `[[clients]]`).
+        /// Client accettati end-to-end (TOML, sezioni `[[clients]]`). `SIGHUP` lo ricarica e
+        /// chiude subito le sessioni dei client rimossi.
         #[arg(long)]
         authorized_clients: PathBuf,
         /// Demone SSH locale.
@@ -59,13 +72,13 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-    match run(Cli::parse().command) {
+    let cli = Cli::parse();
+    let format = match cli.log_format {
+        Format::Text => LogFormat::Text,
+        Format::Json => LogFormat::Json,
+    };
+    logging::init(format, "info");
+    match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");
@@ -95,25 +108,39 @@ fn run(command: Command) -> Result<(), String> {
             ssh_target,
             max_streams,
         } => {
-            let identity = Arc::new(config::load_identity(&key).map_err(|e| e.to_string())?);
-            let authorized =
-                config::load_authorized_clients(&authorized_clients).map_err(|e| e.to_string())?;
-            let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
-            let config = AgentConfig {
-                relay,
-                relay_key,
-                node,
-                ssh_target,
-                authorized_clients: Arc::new(authorized),
-                timeouts: Timeouts::default(),
-                max_streams,
-            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
-            runtime.block_on(agent::run(identity, config));
-            Ok(())
+            runtime.block_on(async move {
+                // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
+                let hangups = Hangups::listen().map_err(|e| e.to_string())?;
+                let identity = Arc::new(config::load_identity(&key).map_err(|e| e.to_string())?);
+                let path = authorized_clients;
+                let authorized =
+                    config::load_authorized_clients(&path).map_err(|e| e.to_string())?;
+                let (authorized_clients, updater) = Revocable::new(authorized);
+                let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
+                let config = AgentConfig {
+                    relay,
+                    relay_key,
+                    node,
+                    ssh_target,
+                    authorized_clients,
+                    timeouts: Timeouts::default(),
+                    max_streams,
+                };
+                let events = ReloadEvents {
+                    reloaded: "authorized_clients_reloaded",
+                    failed: "authorized_clients_reload_failed",
+                };
+                tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
+                    config::load_authorized_clients(&path)
+                }));
+                systemd::notify_ready();
+                agent::run(identity, config).await;
+                Ok(())
+            })
         }
     }
 }

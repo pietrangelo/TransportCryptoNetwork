@@ -383,3 +383,30 @@ fn trust_files_in_a_directory_writable_by_others_are_refused() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Finding 0004-6 (dal fuzzer `config_parsers`): una chiave privata incollata per errore in un
+/// file di trust non deve finire nel messaggio d'errore, e quindi nel journal.
+#[test]
+fn a_secret_pasted_into_a_trust_file_is_not_echoed_in_the_error() {
+    let secret = Identity::generate().unwrap().to_secret_hex();
+    let secret = secret.as_str();
+    for text in [
+        format!("{secret}\n"),
+        format!("{secret} = 1\n"),
+        format!(
+            "[[clients]]\nname = \"x\"\npublic_key = \"k\"\nallow = [\"*\"]\n{secret} = \"\"\n"
+        ),
+    ] {
+        for err in [
+            parse_policy("policy.toml", &text).err(),
+            parse_authorized_clients("clients.toml", &text).err(),
+            parse_known_nodes("nodes.toml", &text).err(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let message = err.to_string();
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+}

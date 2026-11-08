@@ -1515,7 +1515,6 @@ dependencies = [
  "clap",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "zt-crypto",
  "zt-domain",
  "zt-net",
@@ -1581,6 +1580,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
  "zt-application",
  "zt-crypto",
@@ -1607,9 +1607,9 @@ name = "zt-relay"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "zt-crypto",
  "zt-domain",
  "zt-net",

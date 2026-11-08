@@ -1,0 +1,62 @@
+# Agent TCN sui server target: nessuna porta in ascolto, solo connessioni in uscita verso il
+# relay e verso sshd su 127.0.0.1:22. Installazione: vedi docs/OPERATIONS.md §7.
+# File attesi:
+#   /etc/tcn               root:root 0755
+#   /etc/tcn/agent.key     tcn:tcn   0600
+#   /etc/tcn/clients.toml  root:root 0644   (systemctl reload zt-agent dopo una modifica)
+#   /etc/tcn/agent.env     root:root 0644   con TCN_RELAY, TCN_RELAY_KEY, TCN_NODE
+[Unit]
+Description=TCN agent (zt-agent)
+Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
+After=network-online.target sshd.service
+Wants=network-online.target
+
+[Service]
+# notify: READY=1 arriva solo quando SIGHUP è gestito (systemctl reload sicuro da subito).
+Type=notify
+NotifyAccess=main
+User=tcn
+Group=tcn
+EnvironmentFile=/etc/tcn/agent.env
+ExecStart=/usr/local/bin/zt-agent --log-format json run --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
+# Ricarica i client autorizzati e chiude subito le sessioni di quelli rimossi.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2s
+Environment=RUST_LOG=info
+
+# --- sandbox ---
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+ReadOnlyPaths=/etc/tcn
+# Facoltativo, se l'IP del relay è fisso: l'agent può parlare solo con il relay e con sshd.
+#IPAddressDeny=any
+#IPAddressAllow=localhost <IP del relay>
+
+[Install]
+WantedBy=multi-user.target

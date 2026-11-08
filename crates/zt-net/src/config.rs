@@ -295,13 +295,42 @@ struct ClientFile {
     nodes: Vec<NodeEntry>,
 }
 
+/// Sostituisce le sequenze esadecimali lunghe (32 caratteri o più) di un messaggio del parser.
+///
+/// serde riporta nomi di campo e valori sbagliati: una chiave privata incollata per errore in un
+/// file di trust finirebbe nel messaggio, e da lì nel journal (finding 0004-6, trovato dal
+/// fuzzer `config_parsers`).
+fn redact_hex(message: &str) -> String {
+    const MIN: usize = 32;
+    let mut out = String::with_capacity(message.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= MIN {
+            out.push_str("<redacted>");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in message.chars() {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 struct Ctx<'a>(&'a str);
 
 impl Ctx<'_> {
     fn syntax(&self, err: &toml::de::Error) -> ConfigError {
         ConfigError::Syntax {
             path: self.0.into(),
-            message: err.message().into(),
+            message: redact_hex(err.message()),
         }
     }
     fn key(&self, entry: &str, text: &str) -> Result<PublicKey, ConfigError> {

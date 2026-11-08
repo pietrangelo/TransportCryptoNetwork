@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout_at;
-use zt_application::ratelimit::{KeyedRateLimiter, source_key};
+use zt_application::ratelimit::HandshakeGate;
 use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Identity;
 use zt_crypto::noise::Channel;
@@ -42,6 +42,12 @@ pub struct RelayConfig {
     pub handshake_refill: Duration,
     /// Indirizzi IP tracciati dal rate limiter.
     pub max_tracked_ips: usize,
+    /// Handshake ammessi a raffica per prefisso IPv6 /48.
+    pub wide_handshake_burst: u32,
+    /// Un handshake in più per /48 ogni `wide_handshake_refill`.
+    pub wide_handshake_refill: Duration,
+    /// Prefissi /48 tracciati.
+    pub max_tracked_wide: usize,
 }
 
 impl Default for RelayConfig {
@@ -53,20 +59,73 @@ impl Default for RelayConfig {
             handshake_burst: 20,
             handshake_refill: Duration::from_secs(3),
             max_tracked_ips: 65_536,
+            wide_handshake_burst: 64,
+            wide_handshake_refill: Duration::from_secs(1),
+            max_tracked_wide: 16_384,
         }
     }
 }
 
 /// Registra un evento di audit. Gli eventi contengono solo identità e metadati.
+///
+/// `event_kind` è il nome stabile dell'evento ([`DomainEvent::kind`]), su cui filtrare un SIEM;
+/// gli altri dati sono campi separati (`peer`, `node`, `session`, `reason`, `rule`), non una
+/// stringa `Debug` da analizzare (finding 0004-4).
 pub(crate) fn audit(event: &DomainEvent) {
-    match event {
-        DomainEvent::AuthenticationFailed { .. }
-        | DomainEvent::ProtocolViolation { .. }
-        | DomainEvent::AccessDenied { .. } => {
-            tracing::warn!(target: "zt_audit", ?event);
-        }
-        _ => tracing::info!(target: "zt_audit", ?event),
+    let kind = event.kind();
+    let alert = event.is_security_alert();
+    macro_rules! emit {
+        ($($fields:tt)*) => {
+            if alert {
+                tracing::warn!(target: "zt_audit", event_kind = kind, $($fields)*);
+            } else {
+                tracing::info!(target: "zt_audit", event_kind = kind, $($fields)*);
+            }
+        };
     }
+    match event {
+        DomainEvent::AgentRegistered { node, fingerprint } => {
+            emit!(peer = %fingerprint, %node, "agent registered");
+        }
+        DomainEvent::SessionEstablished {
+            session,
+            client,
+            target,
+        } => {
+            emit!(session = %session_hex(session), peer = %client, node = %target, "session established");
+        }
+        DomainEvent::AuthenticationFailed { peer, reason } => match peer {
+            Some(peer) => emit!(%peer, ?reason, "authentication failed"),
+            None => emit!(?reason, "authentication failed"),
+        },
+        DomainEvent::AccessDenied { client, target } => {
+            emit!(peer = %client, node = %target, "access denied");
+        }
+        DomainEvent::ProtocolViolation { peer, rule } => {
+            emit!(%peer, rule = *rule, "protocol violation");
+        }
+        DomainEvent::ConnectionDrained { session, reason } => {
+            emit!(session = %session_hex(session), ?reason, "connection drained");
+        }
+        DomainEvent::AccessRevoked { peer, target } => match target {
+            Some(target) => emit!(%peer, node = %target, "access revoked"),
+            None => emit!(%peer, "access revoked"),
+        },
+        // `DomainEvent` è `non_exhaustive`: un evento nuovo resta almeno leggibile.
+        other => emit!(event = ?other, "audit event"),
+    }
+}
+
+/// Il session id in esadecimale, come compare nei log.
+pub(crate) fn session_hex(session: &SessionId) -> String {
+    session
+        .as_bytes()
+        .iter()
+        .fold(String::with_capacity(32), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// Session id dal CSPRNG del sistema.
@@ -118,7 +177,7 @@ fn outbound_capacity(limits: &RelayLimits) -> usize {
 pub struct RelayServer {
     listener: TcpListener,
     identity: Arc<Identity>,
-    policy: Arc<AccessPolicy>,
+    policy: crate::Revocable<AccessPolicy>,
     config: RelayConfig,
 }
 
@@ -130,14 +189,15 @@ impl RelayServer {
     pub async fn bind(
         addr: SocketAddr,
         identity: Identity,
-        policy: AccessPolicy,
+        policy: impl Into<crate::Revocable<AccessPolicy>>,
         config: RelayConfig,
     ) -> Result<Self, NetError> {
+        let policy = policy.into();
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
             identity: Arc::new(identity),
-            policy: Arc::new(policy),
+            policy,
             config,
         })
     }
@@ -163,21 +223,26 @@ impl RelayServer {
         } = self;
         let (hub_tx, hub_rx) = mpsc::channel(4096);
         let core = RelayCore::new(
-            Arc::clone(&policy),
+            policy.current(),
             config.limits.clone(),
             RandomIds { fallback: 0 },
         );
-        tokio::spawn(hub(core, hub_rx));
+        tokio::spawn(hub(core, hub_rx, policy.clone()));
 
         let slots = Arc::new(Semaphore::new(config.max_connections));
-        let mut limiter: KeyedRateLimiter<[u8; 9]> = KeyedRateLimiter::new(
+        let mut gate = HandshakeGate::new(
             config.max_tracked_ips,
             config.handshake_burst,
             config.handshake_refill,
+            config.wide_handshake_burst,
+            config.wide_handshake_refill,
+            config.max_tracked_wide,
         );
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
-        tracing::info!(addr = ?listener.local_addr().ok(), relay = %identity.fingerprint(), "relay listening");
+        if let Ok(addr) = listener.local_addr() {
+            tracing::info!(%addr, relay = %identity.fingerprint(), "relay listening");
+        }
         loop {
             let (tcp, addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -192,7 +257,7 @@ impl RelayServer {
                 tracing::warn!(%addr, "connection limit reached");
                 continue;
             };
-            if !limiter.check(&source_key(addr.ip()), std::time::Instant::now()) {
+            if !gate.admit(addr.ip(), std::time::Instant::now()) {
                 tracing::warn!(%addr, "handshake rate limit");
                 continue;
             }
@@ -202,7 +267,7 @@ impl RelayServer {
             let task = Connection {
                 conn,
                 identity: Arc::clone(&identity),
-                policy: Arc::clone(&policy),
+                policy: policy.clone(),
                 hub: hub_tx.clone(),
                 timeouts: config.timeouts.clone(),
                 capacity,
@@ -218,7 +283,7 @@ impl RelayServer {
 struct Connection {
     conn: ConnId,
     identity: Arc<Identity>,
-    policy: Arc<AccessPolicy>,
+    policy: crate::Revocable<AccessPolicy>,
     hub: mpsc::Sender<HubEvent>,
     timeouts: Timeouts,
     capacity: usize,
@@ -240,7 +305,7 @@ impl Connection {
             };
         let peer = pending.peer();
         // Una chiave sconosciuta non riceve nemmeno il secondo messaggio dell'handshake.
-        if self.policy.role(&peer).is_none() {
+        if self.policy.current().role(&peer).is_none() {
             audit(&DomainEvent::AuthenticationFailed {
                 peer: Some(peer),
                 reason: AuthFailureReason::UnknownPeer,
@@ -298,11 +363,19 @@ impl Connection {
     }
 }
 
-async fn hub(mut core: RelayCore<RandomIds>, mut events: mpsc::Receiver<HubEvent>) {
+async fn hub(
+    mut core: RelayCore<RandomIds>,
+    mut events: mpsc::Receiver<HubEvent>,
+    mut policy: crate::Revocable<AccessPolicy>,
+) {
     let mut peers: HashMap<ConnId, mpsc::Sender<Frame>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let input = tokio::select! {
+            // Prima la policy: una connessione autenticata con la policy nuova non deve
+            // arrivare al core prima della policy stessa.
+            biased;
+            () = policy.changed() => Input::PolicyUpdated { policy: policy.current() },
             event = events.recv() => match event {
                 None => return,
                 Some(HubEvent::Connected { conn, peer, tx }) => {

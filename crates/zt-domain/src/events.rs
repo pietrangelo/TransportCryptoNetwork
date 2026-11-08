@@ -71,4 +71,41 @@ pub enum DomainEvent {
         /// Il motivo.
         reason: CloseReason,
     },
+    /// Una nuova policy ha tolto a un peer il ruolo o l'accesso a un nodo: le sue sessioni
+    /// (tutte, o solo quelle verso `target`) sono state chiuse.
+    AccessRevoked {
+        /// L'identità revocata.
+        peer: Fingerprint,
+        /// Il nodo non più concesso; `None` se il peer ha perso il proprio ruolo.
+        target: Option<NodeId>,
+    },
+}
+
+impl DomainEvent {
+    /// Nome stabile dell'evento, in `snake_case`: è il campo `event_kind` dell'audit log e non
+    /// dipende dal formato `Debug`.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::AgentRegistered { .. } => "agent_registered",
+            Self::SessionEstablished { .. } => "session_established",
+            Self::AuthenticationFailed { .. } => "authentication_failed",
+            Self::AccessDenied { .. } => "access_denied",
+            Self::ProtocolViolation { .. } => "protocol_violation",
+            Self::ConnectionDrained { .. } => "connection_drained",
+            Self::AccessRevoked { .. } => "access_revoked",
+        }
+    }
+
+    /// `true` per gli eventi che meritano attenzione (livello `WARN` nell'audit log).
+    #[must_use]
+    pub const fn is_security_alert(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthenticationFailed { .. }
+                | Self::AccessDenied { .. }
+                | Self::ProtocolViolation { .. }
+                | Self::AccessRevoked { .. }
+        )
+    }
 }
