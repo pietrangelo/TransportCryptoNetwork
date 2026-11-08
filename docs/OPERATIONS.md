@@ -390,6 +390,12 @@ tutti gli agent.
    all'operatore della CA la **chiave pubblica**, mai il file della chiave. L'operatore
    verifica la fingerprint con il richiedente su un canale diverso (per telefono, o in un
    ticket firmato): chi sostituisce la chiave pubblica in transito ottiene il certificato.
+   Attenzione: il file della chiave di `zt-client` contiene 64 caratteri esadecimali, come una
+   chiave pubblica, e `zt-ca` non li distingue. `--subject` è la riga `public_key` stampata da
+   `zt-client keygen`, non il contenuto di `client.key`. Se il segreto finisce per errore in un
+   certificato, `zt-client` lo rifiuta («secret key leaked into a certificate: regenerate the
+   client key»): il segreto è ormai nel certificato e nel registro, quindi si rigenera la
+   chiave del client, si revoca il certificato (§10.5) e se ne emette uno nuovo.
 2. Sulla macchina della CA:
 
    ```bash
@@ -418,6 +424,13 @@ tutti gli agent.
    del client), ma un certificato sostituito in transito semplicemente non funziona.
 
 ### 10.4 Usare il certificato su `zt-client`
+
+**Prima di consegnare un certificato, pinna la CA su tutti i relay e tutti gli agent** che il
+client deve raggiungere (§10.2) e controlla `authorities_in_use` su ognuno. Un certificato
+presentato si verifica sempre, anche da un client ancora nella whitelist (PROTOCOL §15.5): un
+relay o un agent che non conosce la CA lo rifiuta (`unknown_authority`, fail closed) e il
+client, finora ammesso per chiave, resta fuori da quel nodo finché la CA non è pinnata o il
+certificato non è tolto da `client.toml`.
 
 Accanto alla chiave, per esempio `~/.config/tcn/client.cert`, e in `client.toml`:
 

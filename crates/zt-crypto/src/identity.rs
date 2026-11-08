@@ -59,6 +59,20 @@ impl Identity {
         })
     }
 
+    /// `true` se `bytes` sono il seme segreto di questa identità (confronto senza uscite
+    /// anticipate). Serve a riconoscere un segreto finito per errore dove va una chiave
+    /// pubblica, per esempio come `subject_key` di un certificato (finding 0006-6).
+    #[must_use]
+    pub fn is_own_secret(&self, bytes: &[u8; 32]) -> bool {
+        let diff = self
+            .key
+            .as_bytes()
+            .iter()
+            .zip(bytes)
+            .fold(0_u8, |acc, (a, b)| acc | (a ^ b));
+        std::hint::black_box(diff) == 0
+    }
+
     /// La forma esadecimale del segreto, da scrivere su un file con permessi `0600`.
     #[must_use]
     pub fn to_secret_hex(&self) -> Zeroizing<String> {

@@ -102,6 +102,8 @@ fn certificate(flag: Option<&Path>) -> Result<(), String> {
     };
     let cert = config::load_certificate(cert_path).map_err(|e| e.to_string())?;
     let body = &cert.body;
+    let identity = config::load_identity(&settings.key).map_err(|e| e.to_string())?;
+    reject_leaked_secret(cert_path, body, &identity)?;
     let mut out = String::new();
     let _ = writeln!(out, "file        = {}", cert_path.display());
     let _ = writeln!(out, "name        = {}", body.name());
@@ -174,6 +176,7 @@ fn load_own_certificate(
     identity: &Identity,
 ) -> Result<config::CertificateFile, String> {
     let cert = config::load_certificate(path).map_err(|e| e.to_string())?;
+    reject_leaked_secret(path, &cert.body, identity)?;
     if *cert.body.subject_key() != cert_key(&identity.public_key()) {
         return Err(format!(
             "{}: the certificate is for another key (subject {}), not for this client's key {}",
@@ -205,6 +208,21 @@ fn load_own_certificate(
         Validity::Valid => {}
     }
     Ok(cert)
+}
+
+/// Un certificato il cui `subject_key` è il **segreto** del client (`--subject` di `zt-ca` con
+/// il contenuto del file della chiave, 64 caratteri esadecimali come una chiave pubblica):
+/// il segreto è ormai in un file pubblico e nel registro della CA, quindi la chiave va
+/// rigenerata (finding 0006-6). Il messaggio non riporta mai il segreto.
+fn reject_leaked_secret(path: &Path, body: &CertBody, identity: &Identity) -> Result<(), String> {
+    if identity.is_own_secret(body.subject_key().as_bytes()) {
+        return Err(format!(
+            "{}: secret key leaked into a certificate: regenerate the client key \
+             (zt-client keygen), send the CA the public key, and revoke this certificate",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn warn(message: &str) {

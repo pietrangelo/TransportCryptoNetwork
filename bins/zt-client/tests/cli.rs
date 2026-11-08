@@ -245,3 +245,65 @@ async fn a_certificate_expiring_soon_warns_on_stderr_only() {
         assert!(!stderr.contains("not supported"), "{what}: {stderr}");
     }
 }
+
+/// Finding 0006-6: un certificato il cui `subject_key` è il **segreto** del client (`--subject`
+/// di `zt-ca` con il contenuto del file della chiave) è rifiutato da `zt-client certificate` e
+/// prima di qualsiasi connessione, con un messaggio che dice di rigenerare la chiave e non
+/// riporta il segreto.
+#[tokio::test]
+async fn a_certificate_carrying_the_client_secret_is_refused() {
+    use common::{ClientDir, issue, now_secs};
+    // Un client il cui seme (32 byte) è anche una chiave pubblica valida, come serve a zt-ca.
+    let (me, leaked) = loop {
+        let id = zt_crypto::Identity::generate().unwrap();
+        let secret = id.to_secret_hex();
+        if let Ok(pk) = secret.parse::<zt_crypto::PublicKey>() {
+            break (id, pk);
+        }
+    };
+    let secret = me.to_secret_hex().to_string();
+    let bait = Counting::start(false).await;
+    let relay_key = zt_crypto::Identity::generate().unwrap().public_key();
+    let dir = ClientDir::new(
+        &me,
+        &bait.addr.to_string(),
+        &relay_key,
+        &[(
+            "web-01",
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let now = now_secs();
+    let (cert, _, _) = issue(&leaked, &["web-01"], now - 60, now + 3_600);
+    dir.add_certificate(&cert, 0o644);
+    let config = dir.config();
+    for child in [
+        spawn_with(&["--config", config.to_str().unwrap(), "certificate"], &[]),
+        dir.spawn("web-01"),
+    ] {
+        let out = finish(child, Duration::from_secs(10)).await;
+        assert!(!out.success, "stderr: {}", out.stderr);
+        assert!(out.stdout.is_empty());
+        assert!(
+            out.stderr
+                .contains("secret key leaked into a certificate: regenerate the client key"),
+            "{}",
+            out.stderr
+        );
+        assert!(!out.stderr.contains(&secret), "the secret was echoed");
+    }
+    assert_eq!(bait.count(), 0, "a connection was attempted");
+    // Controllo positivo: lo stesso client con un certificato per la sua chiave pubblica.
+    let (cert, _, _) = issue(&me.public_key(), &["web-01"], now - 60, now + 3_600);
+    std::fs::write(
+        dir.config().with_file_name("client.cert"),
+        zt_crypto::encode_certificate_text(&cert),
+    )
+    .unwrap();
+    let out = finish(
+        spawn_with(&["--config", config.to_str().unwrap(), "certificate"], &[]),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(out.success, "stderr: {}", out.stderr);
+}
