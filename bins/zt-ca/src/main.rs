@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -204,7 +204,7 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     );
     // Prima il registro, sincronizzato; poi il certificato. Un certificato senza riga nel
     // registro non deve esistere (OPERATIONS §10.3).
-    append_log(args.log, line.as_bytes())?;
+    append_log(args.log, args.ca, line.as_bytes())?;
     write_public_new(args.out, text.as_bytes())?;
 
     let mut out = String::new();
@@ -465,33 +465,80 @@ fn random_serial() -> Result<CertSerial, String> {
 
 /// Aggiunge una riga al registro: file regolare, creato `0600`, mai accessibile da gruppo o
 /// altri; scritto con una sola `write` e sincronizzato prima di tornare.
-fn append_log(path: &Path, line: &[u8]) -> Result<(), String> {
+///
+/// Il registro non è mai il file della chiave della CA (finding 0006-5): un `--log` uguale a
+/// `--ca` aggiungerebbe una riga alla chiave e la renderebbe illeggibile. Si rifiutano quindi un
+/// collegamento simbolico (`O_NOFOLLOW`), lo stesso file di `--ca` (stesso dispositivo e
+/// inode, anche con un hard link) e un file che inizia come una chiave di CA (una copia).
+fn append_log(path: &Path, ca: &Path, line: &[u8]) -> Result<(), String> {
     let io = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut options = std::fs::OpenOptions::new();
-    options.append(true).create(true);
+    options.read(true).append(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
     }
-    let mut file = options.open(path).map_err(io)?;
+    let mut file = options.open(path).map_err(|e| {
+        if is_symlink_refusal(&e) {
+            format!(
+                "{}: the issuance log must not be a symbolic link",
+                path.display()
+            )
+        } else {
+            io(e)
+        }
+    })?;
     let meta = file.metadata().map_err(io)?;
     if !meta.is_file() {
         return Err(format!("{}: not a regular file", path.display()));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if meta.permissions().mode() & 0o077 != 0 {
             return Err(format!(
                 "{}: the issuance log must not be accessible by group or others (chmod 600)",
                 path.display()
             ));
         }
+        let ca_meta = std::fs::metadata(ca).map_err(|e| format!("{}: {e}", ca.display()))?;
+        if ca_meta.dev() == meta.dev() && ca_meta.ino() == meta.ino() {
+            return Err(format!(
+                "{}: the issuance log is the CA key file (--ca): use a separate file",
+                path.display()
+            ));
+        }
+    }
+    // Il file è aperto in lettura dall'inizio: i primi byte dicono se è una chiave di CA.
+    let prefix = CaSigningKey::FILE_PREFIX.as_bytes();
+    let mut head = Vec::with_capacity(prefix.len());
+    (&mut file)
+        .take(u64::try_from(prefix.len()).unwrap_or(u64::MAX))
+        .read_to_end(&mut head)
+        .map_err(io)?;
+    if head == prefix {
+        return Err(format!(
+            "{}: the issuance log looks like a CA key file: use a separate file",
+            path.display()
+        ));
     }
     file.write_all(line).map_err(io)?;
     file.sync_all().map_err(io)?;
     Ok(())
+}
+
+/// `true` se `open` ha rifiutato un collegamento simbolico (`O_NOFOLLOW`).
+#[cfg(unix)]
+fn is_symlink_refusal(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+}
+
+#[cfg(not(unix))]
+const fn is_symlink_refusal(_: &std::io::Error) -> bool {
+    false
 }
 
 /// Crea il file del certificato (`0644`, mai sovrascritto).

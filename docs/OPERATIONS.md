@@ -410,7 +410,9 @@ tutti gli agent.
      programmata); di default parte da adesso.
    - `--log` è obbligatorio: `zt-ca` aggiunge una riga per ogni certificato (serie,
      fingerprint, nome, inizio, scadenza, ambito). Serve per revocare (§10.5) e per accorgersi di
-     certificati che la CA non ha emesso (PROTOCOL §15.11). Conservalo con la chiave della CA.
+     certificati che la CA non ha emesso (PROTOCOL §15.11). Conservalo con la chiave della CA,
+     ma in un file separato: `zt-ca` rifiuta un registro che è il file della chiave (stesso
+     file, hard link o copia) o un collegamento simbolico.
    - `zt-ca` non sovrascrive mai `--out` e rifiuta chiavi deboli o non valide.
 3. Consegna `alice.cert` al client. Non è un segreto (da solo non serve a nulla senza la chiave
    del client), ma un certificato sostituito in transito semplicemente non funziona.

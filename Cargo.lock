@@ -1539,6 +1539,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "hex",
+ "rustix",
  "zt-crypto",
  "zt-domain",
  "zt-net",

@@ -506,3 +506,45 @@ fn errors_never_print_secret_material() {
     }
     assert!(!Path::new(&dir.path("a.cert")).exists());
 }
+
+/// Finding 0006-5: `--log` uguale a `--ca`, un collegamento simbolico o un hard link al file
+/// della chiave, o una copia della chiave, è rifiutato senza toccare la chiave né creare il
+/// certificato. Controllo positivo: un registro separato funziona e la CA firma ancora.
+#[test]
+fn an_issuance_log_that_is_the_ca_key_is_refused() {
+    let dir = Dir::new();
+    keygen(&dir);
+    let before = std::fs::read(dir.path("ca.key")).unwrap();
+    std::os::unix::fs::symlink(dir.path("ca.key"), dir.path("link.tsv")).unwrap();
+    std::fs::hard_link(dir.path("ca.key"), dir.path("hard.tsv")).unwrap();
+    std::fs::copy(dir.path("ca.key"), dir.path("copy.tsv")).unwrap();
+    std::fs::set_permissions(dir.path("copy.tsv"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let copy_before = std::fs::read(dir.path("copy.tsv")).unwrap();
+    // Anche un collegamento simbolico verso un registro vero: il registro non segue link.
+    std::fs::write(dir.path("real.tsv"), "").unwrap();
+    std::fs::set_permissions(dir.path("real.tsv"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(dir.path("real.tsv"), dir.path("to-real.tsv")).unwrap();
+    for (log, needle) in [
+        ("ca.key", "CA key file"),
+        ("link.tsv", "symbolic link"),
+        ("hard.tsv", "CA key file"),
+        ("copy.tsv", "looks like a CA key file"),
+        ("to-real.tsv", "symbolic link"),
+    ] {
+        let out = sign(&dir, "a.cert", &[("--log", Some(&dir.arg(log)))]);
+        assert!(!out.status.success(), "{log}: {}", all(&out));
+        assert!(stderr(&out).contains(needle), "{log}: {}", all(&out));
+        assert!(!dir.path("a.cert").exists(), "{log}");
+    }
+    assert_eq!(std::fs::read(dir.path("ca.key")).unwrap(), before);
+    assert_eq!(std::fs::read(dir.path("copy.tsv")).unwrap(), copy_before);
+    assert!(std::fs::read(dir.path("real.tsv")).unwrap().is_empty());
+    let out = sign(&dir, "a.cert", &[]);
+    assert!(out.status.success(), "{}", all(&out));
+    let out = sign(&dir, "b.cert", &[]);
+    assert!(
+        out.status.success(),
+        "the CA key still loads: {}",
+        all(&out)
+    );
+}

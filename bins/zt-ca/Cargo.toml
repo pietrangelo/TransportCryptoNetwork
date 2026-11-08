@@ -13,6 +13,7 @@ zt-crypto.workspace = true
 zt-net.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
