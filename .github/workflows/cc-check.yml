@@ -2,13 +2,18 @@ name: Encrypted Claude configuration
 
 on: [push, pull_request]
 
+# Il controllo legge soltanto i file del commit.
 permissions:
   contents: read
 
 jobs:
   check:
+    name: cc-check
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Check that the Claude configuration is encrypted
         run: .claude/cc/cc check

@@ -5,8 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+# Solo lettura: nessun job di CI scrive sul repository. I job eseguono codice delle dipendenze
+# (build script, proc macro) e non devono avere un token capace di modificare nulla.
 permissions:
   contents: read
+
+# Un nuovo push sulla stessa PR annulla la run precedente.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +21,9 @@ env:
 
 jobs:
   check:
+    name: build-test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -33,7 +42,9 @@ jobs:
 
   e2e-openssh:
     # ssh, scp e ansible-playbook veri attraverso relay, agent e zt-client (ProxyCommand).
+    name: e2e-openssh
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -48,7 +59,9 @@ jobs:
 
   fuzz:
     # Fuzzing breve a ogni PR: 60 s per target. Le campagne lunghe si lanciano a mano.
+    name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -64,8 +77,10 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
-      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=1024
+      - run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=60 -rss_limit_mb=1024
         working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -74,7 +89,9 @@ jobs:
 
   deny:
     # Supply chain: advisories RustSec, licenze ammesse, sorgenti solo da crates.io.
+    name: deny
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -84,3 +101,18 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: fuzz/Cargo.toml
+
+  zizmor:
+    # Analisi statica dei workflow: injection nei template, permessi eccessivi, credenziali
+    # persistite, action non fissate a un commit. Fallisce la PR su ogni finding.
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          version: "1.32.0"
+          advanced-security: false
