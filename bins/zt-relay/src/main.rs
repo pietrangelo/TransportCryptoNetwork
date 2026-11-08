@@ -119,6 +119,15 @@ fn run(command: Command) -> Result<(), String> {
                 ));
                 let path = policy;
                 let origin = path.display().to_string();
+                // Lo stesso `SIGHUP` ricarica policy e chiavi in due task. La ricarica delle
+                // chiavi confronta la chiave nuova sia con la policy in vigore sia con quella sul
+                // disco: una rotazione della chiave e una CA nuova uguali, nella stessa ricarica,
+                // non entrano insieme (finding 0006-2). La policy si confronta solo con le chiavi
+                // in vigore: un file di chiave sbagliato non blocca una revoca urgente.
+                let (policy_file, revocations_file) = (path.clone(), revocations.clone());
+                let policy_on_disk = move || {
+                    config::load_relay_policy(&policy_file, revocations_file.as_deref()).ok()
+                };
                 // Policy e denylist in un solo passo; una CA uguale alla chiave del relay
                 // (corrente o precedente, quella in vigore al momento) è rifiutata (PROTOCOL
                 // §15.9), all'avvio e a ogni ricarica.
@@ -148,11 +157,19 @@ fn run(command: Command) -> Result<(), String> {
                     key_events,
                     move || {
                         let keys = config::load_keyring(&key, previous_key.as_deref())?;
+                        let forbidden = config::own_keys(&keys, "relay");
                         config::reject_infrastructure_keys_as_authority(
                             &origin,
                             policy_in_force.current().cert_trust(),
-                            &config::own_keys(&keys, "relay"),
+                            &forbidden,
                         )?;
+                        if let Some(next) = policy_on_disk() {
+                            config::reject_infrastructure_keys_as_authority(
+                                &origin,
+                                next.cert_trust(),
+                                &forbidden,
+                            )?;
+                        }
                         Ok(keys)
                     },
                 ));

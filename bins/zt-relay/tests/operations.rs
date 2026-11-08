@@ -839,6 +839,68 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
             || v["fields"]["event_kind"] == "relay_keys_reload_failed"
     });
     assert_eq!(ok["fields"]["event_kind"], "relay_keys_reloaded", "{ok}");
+    // Nella stessa ricarica, una CA nuova e una chiave del relay uguale: la policy entra (la CA
+    // non è la chiave in vigore), la chiave no (è la CA della policy sul disco).
+    let other = zt_crypto::CaSigningKey::generate().unwrap();
+    let policy_file = relay.dir.join("policy.toml");
+    std::fs::write(
+        &policy_file,
+        format!(
+            "{}\n{}",
+            policy_text(&[]),
+            authority_text(&other.public_key())
+        ),
+    )
+    .unwrap();
+    set_mode(&policy_file, 0o644);
+    let secret = other.to_secret_text();
+    let seed = secret
+        .trim_end()
+        .strip_prefix(zt_crypto::CaSigningKey::FILE_PREFIX)
+        .unwrap()
+        .to_owned();
+    std::fs::write(&key_file, format!("{seed}\n")).unwrap();
+    set_mode(&key_file, 0o600);
+    relay.hup();
+    let (mut policy_event, mut keys_event) = (None, None);
+    while policy_event.is_none() || keys_event.is_none() {
+        let v = relay.wait_for(|_| true);
+        let kind = v["fields"]["event_kind"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if kind.starts_with("policy_reload") {
+            policy_event = Some(v);
+        } else if kind.starts_with("relay_keys_reload") {
+            keys_event = Some(v);
+        }
+    }
+    let (policy_event, keys_event) = (policy_event.unwrap(), keys_event.unwrap());
+    assert_eq!(policy_event["fields"]["event_kind"], "policy_reloaded");
+    assert_eq!(
+        keys_event["fields"]["event_kind"], "relay_keys_reload_failed",
+        "{keys_event}"
+    );
+    assert!(
+        keys_event["fields"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("authority key equals the relay key"),
+        "{keys_event}"
+    );
+    // Il relay risponde ancora con la chiave di prima e ammette un certificato della CA nuova.
+    let (other_cert, _) = issue(&other, &alice);
+    let mut config = relay.config();
+    config.relays[0].public_key = fresh.public_key();
+    config.certificate = Some(std::sync::Arc::from(other_cert.as_slice()));
+    let (_app, local) = tokio::io::duplex(1024);
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        client::connect(&alice, &config, local),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(r, Err(NetError::Rejected(_))), "{r:?}");
 }
 
 /// Finding 0006-3: `authentication_failed` per un certificato firmato da una CA pinnata ma
