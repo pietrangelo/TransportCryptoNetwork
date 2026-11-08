@@ -117,32 +117,45 @@ fn run(command: Command) -> Result<(), String> {
                     keys.clone(),
                     zt_net::keys::ROTATION_REMINDER,
                 ));
-                let key_events = ReloadEvents {
-                    reloaded: "relay_keys_reloaded",
-                    failed: "relay_keys_reload_failed",
-                };
-                tokio::spawn(reload::on_sighup(
-                    key_hangups,
-                    key_updater,
-                    key_events,
-                    move || config::load_keyring(&key, previous_key.as_deref()),
-                ));
                 let path = policy;
+                let origin = path.display().to_string();
                 // Policy e denylist in un solo passo; una CA uguale alla chiave del relay
                 // (corrente o precedente, quella in vigore al momento) è rifiutata (PROTOCOL
                 // §15.9), all'avvio e a ogni ricarica.
                 let relay_keys = keys.clone();
                 let load = move || {
                     let policy = config::load_relay_policy(&path, revocations.as_deref())?;
-                    config::reject_own_key_as_authority(
+                    config::reject_infrastructure_keys_as_authority(
                         &path.display().to_string(),
                         policy.cert_trust(),
-                        &relay_keys.current(),
+                        &config::own_keys(&relay_keys.current(), "relay"),
                     )?;
                     Ok(policy)
                 };
                 let policy = load().map_err(|e: config::ConfigError| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
+                // Lo stesso controllo nel verso opposto (finding 0006-2): una chiave del relay
+                // ricaricata uguale a una CA della policy in vigore è rifiutata, come all'avvio;
+                // restano le chiavi precedenti.
+                let key_events = ReloadEvents {
+                    reloaded: "relay_keys_reloaded",
+                    failed: "relay_keys_reload_failed",
+                };
+                let policy_in_force = policy.clone();
+                tokio::spawn(reload::on_sighup(
+                    key_hangups,
+                    key_updater,
+                    key_events,
+                    move || {
+                        let keys = config::load_keyring(&key, previous_key.as_deref())?;
+                        config::reject_infrastructure_keys_as_authority(
+                            &origin,
+                            policy_in_force.current().cert_trust(),
+                            &config::own_keys(&keys, "relay"),
+                        )?;
+                        Ok(keys)
+                    },
+                ));
                 // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
                 // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
                 tokio::spawn(zt_net::keys::watch_agent_rotations(

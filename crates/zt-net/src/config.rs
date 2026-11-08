@@ -98,6 +98,16 @@ pub enum ConfigError {
     /// PROTOCOL §15.8).
     #[error("{0}: [[authorities]] require a revocation list (--revocations, may be empty)")]
     RevocationsRequired(String),
+    /// Una CA ha la chiave del processo o di un relay pinnato (PROTOCOL §15.9).
+    #[error("{path}: authority {ca}: authority key equals the {role} key")]
+    AuthorityIsInfrastructureKey {
+        /// Il file (o l'opzione) che pinna la CA.
+        path: String,
+        /// L'impronta della CA.
+        ca: zt_domain::Fingerprint,
+        /// Il ruolo della chiave uguale: `relay` o `agent`.
+        role: &'static str,
+    },
     /// File di certificato non valido.
     #[error("{path}: {source}")]
     Certificate {
@@ -763,27 +773,52 @@ pub fn load_relay_policy(
     Ok(parsed)
 }
 
-/// Rifiuta una CA la cui chiave è quella del processo stesso, corrente o precedente
-/// (PROTOCOL §15.9): un relay o un agent non è mai anche una CA della propria configurazione.
+/// Le chiavi di un keyring (corrente e precedente) come chiavi vietate alle CA, con il ruolo
+/// da riportare nell'errore (es. `"relay"`, `"agent"`).
+#[must_use]
+pub fn own_keys(keys: &Keyring, role: &'static str) -> Vec<ForbiddenKey> {
+    std::iter::once(keys.current())
+        .chain(keys.previous())
+        .map(|k| ForbiddenKey {
+            fingerprint: k.fingerprint(),
+            role,
+        })
+        .collect()
+}
+
+/// Una chiave che nessuna CA della configurazione può avere (PROTOCOL §15.9): la chiave del
+/// processo o quella di un relay pinnato.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForbiddenKey {
+    /// L'impronta della chiave.
+    pub fingerprint: zt_domain::Fingerprint,
+    /// Il ruolo della chiave, per il messaggio d'errore.
+    pub role: &'static str,
+}
+
+/// Rifiuta una CA la cui chiave è una di `forbidden` (PROTOCOL §15.9, finding 0006-1): un
+/// relay o un agent non è mai anche una CA della propria configurazione (chiave corrente o
+/// precedente, [`own_keys`]) e un agent non accetta come CA nessun `--relay-key`. Un relay
+/// compromesso non deve poter firmare certificati che l'agent ammette con il proprio seme di
+/// nodo.
 ///
 /// # Errors
-/// [`ConfigError::Domain`] con [`DomainError::DuplicatePeer`].
-pub fn reject_own_key_as_authority(
+/// [`ConfigError::AuthorityIsInfrastructureKey`] per la prima CA vietata.
+pub fn reject_infrastructure_keys_as_authority(
     origin: &str,
     trust: &CertTrust,
-    keys: &Keyring,
+    forbidden: &[ForbiddenKey],
 ) -> Result<(), ConfigError> {
-    let own = [
-        Some(keys.current().fingerprint()),
-        keys.previous().map(Identity::fingerprint),
-    ];
-    match trust
-        .ca_fingerprints()
-        .find(|ca| own.iter().flatten().any(|k| k == ca))
-    {
-        Some(ca) => Err(Ctx(origin).domain("authorities", DomainError::DuplicatePeer(ca))),
-        None => Ok(()),
+    for ca in trust.ca_fingerprints() {
+        if let Some(key) = forbidden.iter().find(|k| k.fingerprint == ca) {
+            return Err(ConfigError::AuthorityIsInfrastructureKey {
+                path: origin.into(),
+                ca,
+                role: key.role,
+            });
+        }
     }
+    Ok(())
 }
 
 /// Legge una denylist con le regole dei file di trust.

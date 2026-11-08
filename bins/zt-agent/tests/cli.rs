@@ -324,3 +324,58 @@ fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
     write(&dir, "clients.toml", &authority_text(&key()));
     keeps_running(&run(&dir, &with_previous));
 }
+
+/// Finding 0006-1: una CA uguale a un `--relay-key` pinnato è rifiutata all'avvio e a ogni
+/// `SIGHUP`. Altrimenti un relay compromesso, con il proprio seme di nodo trasformato in file di
+/// CA, firmerebbe certificati che l'agent ammette.
+#[test]
+fn a_ca_key_equal_to_a_pinned_relay_key_is_refused_at_start_and_on_reload() {
+    let dir = setup("ca-is-relay");
+    let (first, second) = (key(), key());
+    let revoked = write(&dir, "revoked.toml", "serials = []\nkeys = []\n");
+    let relays = format!("{first},{second}");
+    let base = [
+        "--relay",
+        "127.0.0.1:9,127.0.0.1:10",
+        "--relay-key",
+        relays.as_str(),
+        "--revocations",
+        revoked.as_str(),
+    ];
+    // All'avvio: la CA è uno qualsiasi dei relay pinnati.
+    for relay in [&first, &second] {
+        write(&dir, "clients.toml", &authority_text(relay));
+        fails_with(&run(&dir, &base), "authority key equals the relay key");
+    }
+    // Alla ricarica: l'agent parte con un'altra CA, poi `clients.toml` pinna la chiave di un relay.
+    write(&dir, "clients.toml", &authority_text(&key()));
+    let mut child = Command::new(BIN)
+        .args(["run", "--node", "web-01", "--key"])
+        .arg(dir.0.join("agent.key"))
+        .arg("--authorized-clients")
+        .arg(dir.0.join("clients.toml"))
+        .args(base)
+        .env_remove("RUST_LOG")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1_000));
+    assert!(child.try_wait().unwrap().is_none(), "the agent exited");
+    write(&dir, "clients.toml", &authority_text(&second));
+    let hup = Command::new("kill")
+        .args(["-HUP", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(hup.success());
+    std::thread::sleep(std::time::Duration::from_millis(1_000));
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("authorized_clients_reload_failed")
+            && stderr.contains("authority key equals the relay key"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("authorized_clients_reloaded"), "{stderr}");
+}

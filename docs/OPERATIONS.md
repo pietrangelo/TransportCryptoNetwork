@@ -368,7 +368,13 @@ zt-agent run ... --authorized-clients /etc/tcn/clients.toml --revocations /etc/t
 
 Con una `[[authorities]]` e senza `--revocations` il processo non parte (e una ricarica che
 aggiunge una CA fallisce): la denylist deve esistere prima che serva. Una chiave di CA non può
-essere anche la chiave di un agent o di un client nello stesso file, né quella del processo.
+essere anche la chiave di un agent o di un client nello stesso file, né quella del processo
+(corrente o precedente), né, in `clients.toml`, la chiave di un relay passata all'agent con
+`--relay-key`: chi controlla un relay non deve poter firmare certificati per gli agent
+(PROTOCOL §15.9). L'errore dice «authority key equals the relay key» (o `agent`). Lo stesso
+vale alla rotazione della chiave del relay con `SIGHUP`: una chiave nuova uguale a una CA della
+policy è rifiutata con `relay_keys_reload_failed` e restano le chiavi precedenti. Ogni CA è una
+chiave generata con `zt-ca keygen` e usata solo per firmare.
 
 Verifica: `authorities_in_use` nell'audit log di ogni relay e agent riporta nome e fingerprint
 della CA; `revocations_in_use` il numero di voci della denylist. Come per la policy, confronta

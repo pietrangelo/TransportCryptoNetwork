@@ -773,3 +773,67 @@ async fn a_bad_revocation_file_on_reload_keeps_both_previous_files() {
         "the new denylist entered"
     );
 }
+
+/// Finding 0006-2: una rotazione con `SIGHUP` verso una chiave del relay uguale a una CA della
+/// policy in vigore è rifiutata come all'avvio (`relay_keys_reload_failed`, messaggio esplicito)
+/// e restano le chiavi precedenti; la policy si ricarica ancora. Controllo positivo: una chiave
+/// nuova qualsiasi entra.
+#[tokio::test]
+async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
+    let ca = zt_crypto::CaSigningKey::generate().unwrap();
+    let alice = Identity::generate().unwrap();
+    let (cert, _) = issue(&ca, &alice);
+    let policy = format!("{}\n{}", policy_text(&[]), authority_text(&ca.public_key()));
+    let dir = CaDir::new("rotate-to-ca", &policy, Some(EMPTY_REVOCATIONS));
+    let revocations = dir.revocations_arg();
+    let relay = dir.start(&["--revocations", &revocations]);
+    let secret = ca.to_secret_text();
+    let seed = secret
+        .trim_end()
+        .strip_prefix(zt_crypto::CaSigningKey::FILE_PREFIX)
+        .unwrap()
+        .to_owned();
+    let key_file = relay.dir.join("relay.key");
+    std::fs::write(&key_file, format!("{seed}\n")).unwrap();
+    set_mode(&key_file, 0o600);
+    relay.hup();
+    let failed = relay.wait_for(|v| {
+        v["fields"]["event_kind"] == "relay_keys_reloaded"
+            || v["fields"]["event_kind"] == "relay_keys_reload_failed"
+    });
+    assert_eq!(failed["fields"]["event_kind"], "relay_keys_reload_failed");
+    let error = failed["fields"]["error"].as_str().unwrap();
+    assert!(
+        error.contains("authority key equals the relay key")
+            && error.contains(&ca.public_key().fingerprint().to_string()),
+        "{failed}"
+    );
+    // Le chiavi precedenti restano: il relay risponde ancora con la sua chiave e ammette il
+    // certificato.
+    assert!(certified(&relay, &alice, &cert).await);
+    // La policy si ricarica ancora (prima della correzione falliva da qui in poi); lo stesso
+    // `SIGHUP` rifiuta di nuovo la chiave. Si attendono entrambi prima di cambiare il file.
+    relay.hup();
+    let (mut policy_event, mut keys_event) = (None, None);
+    while policy_event.is_none() || keys_event.is_none() {
+        let v = relay.wait_for(|_| true);
+        let kind = v["fields"]["event_kind"].as_str().unwrap_or_default().to_owned();
+        if kind.starts_with("policy_reload") {
+            policy_event = Some(kind);
+        } else if kind.starts_with("relay_keys_reload") {
+            keys_event = Some(kind);
+        }
+    }
+    assert_eq!(policy_event.unwrap(), "policy_reloaded");
+    assert_eq!(keys_event.unwrap(), "relay_keys_reload_failed");
+    // Controllo positivo: una chiave nuova che non è una CA entra.
+    let fresh = Identity::generate().unwrap();
+    std::fs::write(&key_file, fresh.to_secret_hex().as_str()).unwrap();
+    set_mode(&key_file, 0o600);
+    relay.hup();
+    let ok = relay.wait_for(|v| {
+        v["fields"]["event_kind"] == "relay_keys_reloaded"
+            || v["fields"]["event_kind"] == "relay_keys_reload_failed"
+    });
+    assert_eq!(ok["fields"]["event_kind"], "relay_keys_reloaded", "{ok}");
+}

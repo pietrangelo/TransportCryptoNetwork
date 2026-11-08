@@ -644,3 +644,53 @@ fn an_invalid_revocation_file_fails_the_whole_load() {
     // Una denylist che manca è un errore, non una denylist vuota.
     assert!(load_relay_policy(&policy, Some(&dir.0.join("missing.toml"))).is_err());
 }
+
+/// Finding 0006-1: una CA con la chiave di un relay pinnato (o dell'agent, corrente o
+/// precedente) è rifiutata; il messaggio dice quale ruolo ha la chiave. Controllo positivo:
+/// un'altra CA passa.
+#[test]
+fn an_authority_equal_to_a_relay_or_own_key_is_refused() {
+    use zt_net::config::{ForbiddenKey, own_keys, reject_infrastructure_keys_as_authority};
+    let relay = Identity::generate().unwrap();
+    let (agent, old) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let (agent_pk, old_pk) = (agent.public_key(), old.public_key());
+    let keyring = zt_crypto::Keyring::rotating(agent, old).unwrap();
+    let mut forbidden = own_keys(&keyring, "agent");
+    forbidden.push(ForbiddenKey {
+        fingerprint: relay.fingerprint(),
+        role: "relay",
+    });
+    for (ca, role) in [
+        (relay.public_key(), "relay"),
+        (agent_pk, "agent"),
+        (old_pk, "agent"),
+    ] {
+        let block = authority("ops-ca", &[&ca.to_string()], "[\"*\"]", "");
+        let clients = parse_authorized_clients("clients.toml", &clients_text(&block)).unwrap();
+        let err = reject_infrastructure_keys_as_authority(
+            "clients.toml",
+            clients.cert_trust(),
+            &forbidden,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::AuthorityIsInfrastructureKey { ref ca, .. } if *ca == ca_fp(&block)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("authority key equals the {role} key")),
+            "{err}"
+        );
+    }
+    let block = authority("ops-ca", &[&key()], "[\"*\"]", "");
+    let clients = parse_authorized_clients("clients.toml", &clients_text(&block)).unwrap();
+    reject_infrastructure_keys_as_authority("clients.toml", clients.cert_trust(), &forbidden)
+        .unwrap();
+}
+
+/// L'impronta dell'unica CA di un blocco `[[authorities]]`.
+fn ca_fp(block: &str) -> zt_domain::Fingerprint {
+    let clients = parse_authorized_clients("clients.toml", &clients_text(block)).unwrap();
+    clients.cert_trust().ca_fingerprints().next().unwrap()
+}

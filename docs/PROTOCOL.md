@@ -634,8 +634,14 @@ d'emergenza) e si riemettono i certificati con una CA nuova.
 Vincoli di caricamento, tutti fatali: al massimo `MAX_AUTHORITIES` (16) voci; una o due chiavi
 per voce, distinte; una chiave di CA compare in una sola voce; una chiave di CA non è mai la
 chiave di un peer della stessa configurazione (agent o client della whitelist), né la chiave
-del processo stesso (relay o agent, corrente o precedente); i nomi delle CA sono `NodeId`
-distinti fra loro; chiavi canonicali e non deboli.
+del processo stesso (relay o agent, corrente o precedente), né per un agent la chiave di un
+relay pinnato (`--relay-key`): un relay compromesso, con il proprio seme di nodo trasformato in
+file di CA, firmerebbe altrimenti certificati che l'agent ammette (finding 0006-1); i nomi delle
+CA sono `NodeId` distinti fra loro; chiavi canonicali e non deboli. Il controllo vale all'avvio
+e a ogni ricarica, nei due versi: una ricarica della policy rifiuta una CA uguale alle chiavi del
+relay in vigore, e una ricarica delle chiavi del relay (§14) rifiuta una chiave uguale a una CA
+della policy in vigore (`relay_keys_reload_failed`, «authority key equals the relay key»;
+finding 0006-2).
 
 ### 15.10 Più relay
 

@@ -153,14 +153,20 @@ fn run(command: Command) -> Result<(), String> {
                 ));
                 let path = authorized_clients;
                 // Client autorizzati e denylist in un solo passo; una CA uguale alla chiave
-                // dell'agent (corrente o precedente) è rifiutata (PROTOCOL §15.9).
-                let agent_keys = Arc::clone(&keys);
+                // dell'agent (corrente o precedente) o a un `--relay-key` è rifiutata, all'avvio
+                // e a ogni ricarica (PROTOCOL §15.9, finding 0006-1): un relay compromesso non
+                // firma certificati che l'agent ammette.
+                let mut forbidden = config::own_keys(&keys, "agent");
+                forbidden.extend(relays.iter().map(|r| config::ForbiddenKey {
+                    fingerprint: r.public_key.fingerprint(),
+                    role: "relay",
+                }));
                 let load = move || {
                     let clients = config::load_authorized_clients(&path, revocations.as_deref())?;
-                    config::reject_own_key_as_authority(
+                    config::reject_infrastructure_keys_as_authority(
                         &path.display().to_string(),
                         clients.cert_trust(),
-                        &agent_keys,
+                        &forbidden,
                     )?;
                     Ok(clients)
                 };
