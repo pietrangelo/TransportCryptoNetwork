@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use zt_domain::decode_certificate;
+use zt_domain::{CertFormatError, decode_certificate};
 use zt_domain::limits::{MAX_CERT_LEN, MIN_CERT_LEN};
 
 /// Le sequenze esadecimali di almeno 16 caratteri.
@@ -37,7 +37,12 @@ fuzz_target!(|data: &[u8]| {
             assert_ne!(parsed.body.ca_key(), parsed.body.subject_key());
         }
         Err(e) => {
-            let message = format!("{e} {e:?}");
+            let mut message = format!("{e} {e:?}");
+            // La durata è un metadato ammesso (piano §2, `Lifetime{secs}`) e può avere 20 cifre
+            // decimali: si toglie solo quel numero, il resto del messaggio resta controllato.
+            if let CertFormatError::Lifetime { secs } = e {
+                message = message.replace(&secs.to_string(), "<secs>");
+            }
             assert!(
                 hex_runs(&message).next().is_none(),
                 "error carries input bytes: {message}"
