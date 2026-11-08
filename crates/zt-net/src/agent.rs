@@ -11,8 +11,8 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout, timeout_at};
+use zt_crypto::Keyring;
 use zt_crypto::noise::{self, Channel};
-use zt_crypto::{Identity, PublicKey};
 use zt_domain::flow::Window;
 use zt_domain::{
     AuthFailureReason, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
@@ -25,10 +25,8 @@ use crate::{NetError, Timeouts, channel};
 /// Configurazione dell'agent.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Indirizzo del relay (`host:porta`).
-    pub relay: String,
-    /// Chiave pubblica del relay, pinnata.
-    pub relay_key: PublicKey,
+    /// Relay a cui restare connessi, tutti insieme (al massimo [`crate::MAX_RELAYS`]).
+    pub relays: Vec<crate::RelayEndpoint>,
     /// Nome di questo nodo.
     pub node: NodeId,
     /// Demone SSH locale.
@@ -41,13 +39,24 @@ pub struct AgentConfig {
     pub max_streams: usize,
 }
 
-/// Mantiene l'agent connesso al relay per sempre, con backoff esponenziale e jitter.
-pub async fn run(identity: Arc<Identity>, config: AgentConfig) {
+/// Mantiene l'agent connesso a ogni relay dell'elenco per sempre, ciascuno con il proprio
+/// backoff esponenziale e jitter (PROTOCOL §13). Verso i relay usa la chiave corrente; sul
+/// canale end-to-end accetta anche quella precedente (PROTOCOL §14).
+pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
+    // STUB (red): solo il primo relay.
+    let Some(relay) = config.relays.first().cloned() else {
+        tracing::error!("no relay configured");
+        return;
+    };
+    run_one(keys, relay, config).await;
+}
+
+async fn run_one(identity: Arc<Keyring>, relay: crate::RelayEndpoint, config: AgentConfig) {
     const MAX_DELAY: Duration = Duration::from_secs(60);
     let mut delay = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        match run_session(&identity, &config).await {
+        match run_session(&identity, &relay, &config).await {
             Ok(()) => tracing::info!("relay closed the connection"),
             Err(err) => tracing::warn!(error = %err, "relay session ended"),
         }
@@ -69,13 +78,24 @@ pub async fn run(identity: Arc<Identity>, config: AgentConfig) {
 ///
 /// # Errors
 /// Qualsiasi errore di rete, handshake o protocollo del relay.
-pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Result<(), NetError> {
+pub async fn run_session(
+    identity: &Arc<Keyring>,
+    relay: &crate::RelayEndpoint,
+    config: &AgentConfig,
+) -> Result<(), NetError> {
     let t = &config.timeouts;
-    let tcp = timeout(t.handshake, TcpStream::connect(&config.relay))
+    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
     let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect(tcp, identity, &config.relay_key, Channel::Outer, t).await?;
+    let mut ch = channel::connect(
+        tcp,
+        identity.current(),
+        &relay.public_key,
+        Channel::Outer,
+        t,
+    )
+    .await?;
     ch.send(
         &Frame::Register {
             node: config.node.clone(),
@@ -83,7 +103,7 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
         t,
     )
     .await?;
-    tracing::info!(node = %config.node, relay = %config.relay, "registered with relay");
+    tracing::info!(node = %config.node, relay = %relay.address, "registered with relay");
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(1024);
     let (done_tx, mut done_rx) = mpsc::channel::<StreamId>(config.max_streams.saturating_add(1));
@@ -146,7 +166,7 @@ impl Streams {
 
 fn on_relay_frame(
     frame: Frame,
-    identity: &Arc<Identity>,
+    identity: &Arc<Keyring>,
     config: &AgentConfig,
     streams: &mut Streams,
     out_tx: &mpsc::Sender<Frame>,
@@ -228,7 +248,7 @@ fn on_relay_frame(
 
 struct StreamTask {
     io: StreamIo,
-    identity: Arc<Identity>,
+    identity: Arc<Keyring>,
     authorized: crate::Revocable<HashSet<Fingerprint>>,
     ssh_target: String,
     timeouts: Timeouts,
@@ -244,7 +264,7 @@ impl StreamTask {
             timeouts,
         } = self;
         let pending = match io.recv_message(&timeouts).await {
-            Ok(msg1) => noise::respond(&identity, &msg1, Channel::EndToEnd),
+            Ok(msg1) => noise::respond_any(&identity, &msg1, Channel::EndToEnd),
             // Il client ha già chiuso: rispondere con un altro `Close` non serve (finding 0002-1).
             Err(NetError::StreamClosed(_)) => return,
             Err(err) => {

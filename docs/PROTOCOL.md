@@ -224,7 +224,53 @@ Ogni revoca produce l'evento di audit `access_revoked`. Un file non valido o div
 insicuro non cambia nulla e produce `policy_reload_failed` (relay) o
 `authorized_clients_reload_failed` (agent), a livello `ERROR`.
 
-## 13. Fuori dall'ambito
+## 13. Più relay (alta disponibilità)
 
-Ricarica a caldo della chiave del relay o dell'agent (oggi richiede un riavvio, che i peer
-assorbono con la riconnessione); rate limiting per prefissi IPv4 più ampi di un indirizzo.
+I relay sono indipendenti: nessuno stato condiviso e nessun protocollo fra di loro. Ognuno ha
+la propria chiave e una copia della stessa policy, che l'operatore distribuisce (per esempio
+con Ansible). Nulla cambia sul filo.
+
+- **Agent**: ha un elenco di relay (al massimo 8, ciascuno con la propria chiave pinnata) e
+  mantiene una sessione verso **ognuno**, in parallelo e con backoff indipendenti. Un relay
+  irraggiungibile o lento non tocca le sessioni verso gli altri.
+- **Client**: ha un elenco ordinato di relay (al massimo 8) e li prova nell'ordine dato.
+  Passa al successivo **solo** per errori che si verificano prima dell'`OpenAck` e che non
+  dicono nulla sul diritto d'accesso:
+
+  | Errore sul relay *i* | Il client |
+  | :- | :- |
+  | TCP rifiutato, timeout, handshake esterno fallito (anche chiave del relay sbagliata), connessione chiusa | prova il relay successivo |
+  | `Reject NodeOffline`, `Reject RateLimited` | prova il relay successivo |
+  | `Reject NotAuthorized`, `Reject UnknownNode` | si ferma: la policy ha risposto (fail closed) |
+  | qualsiasi errore dopo l'`OpenAck` (handshake end-to-end, `Close` dell'agent, dati) | si ferma |
+
+  Dopo l'`OpenAck` il client ha già parlato con l'agent: ripetere su un altro relay
+  mascherebbe un agent impostore (chiave end-to-end sbagliata) o una revoca, e potrebbe
+  duplicare una sessione già iniziata. Policy diverse fra i relay sono un errore di
+  configurazione: il client non le «aggira» cercando un relay più permissivo.
+
+## 14. Rotazione delle chiavi
+
+Un responder (il relay sul canale esterno, l'agent su quello end-to-end) può avere, oltre alla
+chiave corrente, una **chiave precedente**: accetta un `msg1` cifrato verso l'una o l'altra
+(prova la corrente, poi la precedente) e risponde con quella che corrisponde. Come initiator
+usa sempre la chiave corrente. Così i pin dei peer si aggiornano un po' alla volta, senza un
+cambio contemporaneo in tutta la flotta.
+
+| Rotazione | Passi |
+| :- | :- |
+| chiave del relay | 1. nuova chiave; 2. il relay la carica come corrente e tiene la vecchia come precedente (`--previous-key`), con `SIGHUP`, senza riavvio; 3. si aggiornano i pin su agent e client; 4. si toglie la precedente |
+| chiave di un agent | 1. nuova chiave; 2. la policy del relay elenca entrambe le chiavi per il nodo (`public_keys`, al massimo 2) e si ricarica; 3. l'agent si riavvia con la nuova chiave e la vecchia come precedente: la sessione esterna usa la nuova, il canale end-to-end accetta anche la vecchia; 4. si aggiornano i pin dei client; 5. si tolgono la vecchia chiave dalla policy e la precedente dall'agent |
+
+Il riavvio di un agent interrompe solo le sessioni SSH di quel nodo. Il riavvio di un relay,
+con più relay, non interrompe nulla di nuovo: agent e client usano gli altri.
+
+**Una chiave compromessa non si ruota: si revoca.** Tenerla come precedente lascerebbe a chi
+la possiede la possibilità di impersonare il responder verso chi la pinna ancora. In quel
+caso si cambia la chiave senza `--previous-key` e si aggiornano subito i pin (OPERATIONS §7).
+
+## 15. Fuori dall'ambito
+
+Ricarica a caldo della chiave di un agent (richiede il riavvio di quell'agent); policy
+condivisa o sincronizzata fra relay; rate limiting per prefissi IPv4 più ampi di un
+indirizzo.

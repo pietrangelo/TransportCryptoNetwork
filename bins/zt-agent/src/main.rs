@@ -46,18 +46,24 @@ enum Command {
     },
     /// Avvia l'agent.
     Run {
-        /// Indirizzo del relay (`host:porta`).
-        #[arg(long)]
-        relay: String,
-        /// Chiave pubblica del relay (64 caratteri esadecimali).
-        #[arg(long)]
-        relay_key: PublicKey,
+        /// Relay (`host:porta`). Ripetibile, o separati da virgole: l'agent resta connesso a
+        /// tutti (al massimo 8).
+        #[arg(long, required = true, value_delimiter = ',')]
+        relay: Vec<String>,
+        /// Chiave pubblica di ogni relay (64 caratteri esadecimali), nello stesso ordine di
+        /// `--relay`.
+        #[arg(long, required = true, value_delimiter = ',')]
+        relay_key: Vec<PublicKey>,
         /// Nome di questo nodo, come nella policy del relay.
         #[arg(long)]
         node: String,
         /// Chiave segreta dell'agent.
         #[arg(long)]
         key: PathBuf,
+        /// Chiave segreta precedente, durante una rotazione: il canale end-to-end la accetta
+        /// ancora, così i client si aggiornano un po' alla volta (PROTOCOL §14).
+        #[arg(long)]
+        previous_key: Option<PathBuf>,
         /// Client accettati end-to-end (TOML, sezioni `[[clients]]`). `SIGHUP` lo ricarica e
         /// chiude subito le sessioni dei client rimossi.
         #[arg(long)]
@@ -104,6 +110,7 @@ fn run(command: Command) -> Result<(), String> {
             relay_key,
             node,
             key,
+            previous_key,
             authorized_clients,
             ssh_target,
             max_streams,
@@ -115,15 +122,19 @@ fn run(command: Command) -> Result<(), String> {
             runtime.block_on(async move {
                 // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
                 let hangups = Hangups::listen().map_err(|e| e.to_string())?;
-                let identity = Arc::new(config::load_identity(&key).map_err(|e| e.to_string())?);
+                let relays = config::relay_endpoints("--relay", &relay, &relay_key)
+                    .map_err(|e| e.to_string())?;
+                let keys = Arc::new(
+                    config::load_keyring(&key, previous_key.as_deref())
+                        .map_err(|e| e.to_string())?,
+                );
                 let path = authorized_clients;
                 let authorized =
                     config::load_authorized_clients(&path).map_err(|e| e.to_string())?;
                 let (authorized_clients, updater) = Revocable::new(authorized);
                 let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
                 let config = AgentConfig {
-                    relay,
-                    relay_key,
+                    relays,
                     node,
                     ssh_target,
                     authorized_clients,
@@ -138,7 +149,7 @@ fn run(command: Command) -> Result<(), String> {
                     config::load_authorized_clients(&path)
                 }));
                 systemd::notify_ready();
-                agent::run(identity, config).await;
+                agent::run(keys, config).await;
                 Ok(())
             })
         }

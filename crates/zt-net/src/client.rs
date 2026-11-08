@@ -17,10 +17,8 @@ use crate::{NetError, Timeouts, channel};
 /// Configurazione di una connessione client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Indirizzo del relay (`host:porta`).
-    pub relay: String,
-    /// Chiave pubblica del relay, pinnata.
-    pub relay_key: PublicKey,
+    /// Relay da provare, nell'ordine (al massimo [`crate::MAX_RELAYS`], PROTOCOL §13).
+    pub relays: Vec<crate::RelayEndpoint>,
     /// Nodo di destinazione.
     pub node: NodeId,
     /// Chiave pubblica dell'agent del nodo, pinnata per il canale end-to-end.
@@ -43,11 +41,16 @@ where
     L: AsyncRead + AsyncWrite + Unpin,
 {
     let t = &config.timeouts;
-    let tcp = timeout(t.handshake, TcpStream::connect(&config.relay))
+    // STUB (red): solo il primo relay, nessun failover.
+    let relay = config
+        .relays
+        .first()
+        .ok_or(NetError::Protocol("no relay configured"))?;
+    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
     let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect(tcp, identity, &config.relay_key, Channel::Outer, t).await?;
+    let mut ch = channel::connect(tcp, identity, &relay.public_key, Channel::Outer, t).await?;
     let stream = StreamId::try_from(1).map_err(|_| NetError::Protocol("stream id"))?;
     ch.send(
         &Frame::Open {

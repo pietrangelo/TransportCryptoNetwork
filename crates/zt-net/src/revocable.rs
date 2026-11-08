@@ -17,6 +17,12 @@ pub struct Updater<T> {
     tx: watch::Sender<Arc<T>>,
 }
 
+impl From<zt_crypto::Identity> for Revocable<zt_crypto::Keyring> {
+    fn from(identity: zt_crypto::Identity) -> Self {
+        Self::fixed(zt_crypto::Keyring::single(identity))
+    }
+}
+
 impl<T> Revocable<T> {
     /// Un valore sostituibile e il suo [`Updater`].
     #[must_use]

@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout_at;
 use zt_application::ratelimit::HandshakeGate;
 use zt_application::relay::{ConnId, Input, Output, RelayCore, RelayLimits, SessionIds};
-use zt_crypto::Identity;
+use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{AccessPolicy, AuthFailureReason, DomainEvent, Fingerprint, Frame, SessionId};
@@ -176,7 +176,7 @@ fn outbound_capacity(limits: &RelayLimits) -> usize {
 /// Il relay, pronto ad accettare connessioni.
 pub struct RelayServer {
     listener: TcpListener,
-    identity: Arc<Identity>,
+    keys: crate::Revocable<Keyring>,
     policy: crate::Revocable<AccessPolicy>,
     config: RelayConfig,
 }
@@ -188,7 +188,7 @@ impl RelayServer {
     /// Errore di bind.
     pub async fn bind(
         addr: SocketAddr,
-        identity: Identity,
+        keys: impl Into<crate::Revocable<Keyring>>,
         policy: impl Into<crate::Revocable<AccessPolicy>>,
         config: RelayConfig,
     ) -> Result<Self, NetError> {
@@ -196,7 +196,7 @@ impl RelayServer {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
-            identity: Arc::new(identity),
+            keys: keys.into(),
             policy,
             config,
         })
@@ -217,7 +217,7 @@ impl RelayServer {
     pub async fn run(self) -> Result<(), NetError> {
         let Self {
             listener,
-            identity,
+            keys,
             policy,
             config,
         } = self;
@@ -241,7 +241,7 @@ impl RelayServer {
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
         if let Ok(addr) = listener.local_addr() {
-            tracing::info!(%addr, relay = %identity.fingerprint(), "relay listening");
+            tracing::info!(%addr, relay = %keys.current().current().fingerprint(), "relay listening");
         }
         loop {
             let (tcp, addr) = match listener.accept().await {
@@ -266,7 +266,9 @@ impl RelayServer {
             let conn = ConnId(next_conn);
             let task = Connection {
                 conn,
-                identity: Arc::clone(&identity),
+                // Le chiavi in vigore al momento dell'accept: una ricarica vale per le
+                // connessioni successive.
+                keys: keys.current(),
                 policy: policy.clone(),
                 hub: hub_tx.clone(),
                 timeouts: config.timeouts.clone(),
@@ -282,7 +284,7 @@ impl RelayServer {
 
 struct Connection {
     conn: ConnId,
-    identity: Arc<Identity>,
+    keys: Arc<Keyring>,
     policy: crate::Revocable<AccessPolicy>,
     hub: mpsc::Sender<HubEvent>,
     timeouts: Timeouts,
@@ -291,18 +293,17 @@ struct Connection {
 
 impl Connection {
     async fn serve(self, tcp: TcpStream, addr: SocketAddr) {
-        let pending =
-            match channel::accept(tcp, &self.identity, Channel::Outer, &self.timeouts).await {
-                Ok(pending) => pending,
-                Err(err) => {
-                    audit(&DomainEvent::AuthenticationFailed {
-                        peer: None,
-                        reason: AuthFailureReason::HandshakeFailed,
-                    });
-                    tracing::debug!(%addr, error = %err, "handshake failed");
-                    return;
-                }
-            };
+        let pending = match channel::accept(tcp, &self.keys, Channel::Outer, &self.timeouts).await {
+            Ok(pending) => pending,
+            Err(err) => {
+                audit(&DomainEvent::AuthenticationFailed {
+                    peer: None,
+                    reason: AuthFailureReason::HandshakeFailed,
+                });
+                tracing::debug!(%addr, error = %err, "handshake failed");
+                return;
+            }
+        };
         let peer = pending.peer();
         // Una chiave sconosciuta non riceve nemmeno il secondo messaggio dell'handshake.
         if self.policy.current().role(&peer).is_none() {

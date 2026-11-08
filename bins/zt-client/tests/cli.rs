@@ -132,3 +132,30 @@ async fn parallel_sessions_are_independent() {
     }
     assert_eq!(ssh.count(), 8);
 }
+
+/// Fase 5 (PROTOCOL §13): con più relay in `client.toml`, se il primo è giù `ssh` passa dal
+/// successivo senza che l'utente se ne accorga.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn falls_back_to_the_next_relay_when_the_first_is_down() {
+    let fleet = Fleet::start().await;
+    let ssh = Counting::start(true).await;
+    fleet.start_agent(ssh.addr).await;
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let other = zt_crypto::Identity::generate().unwrap().public_key();
+    let dir = common::ClientDir::with_relays(
+        &fleet.ansible,
+        &[
+            (dead.to_string(), other),
+            (fleet.relay.to_string(), fleet.relay_id.public_key()),
+        ],
+        &[("web-01", fleet.agent_id.public_key())],
+    );
+    let mut child = dir.spawn("web-01");
+    let data = pattern(4096);
+    assert_eq!(echo_through(&mut child, &data).await, data);
+    let out = finish(child, Duration::from_secs(10)).await;
+    assert!(out.success, "stderr: {}", out.stderr);
+}

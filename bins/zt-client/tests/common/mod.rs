@@ -160,8 +160,10 @@ impl Fleet {
     /// Avvia l'agent di `web-01` verso `ssh` e attende che sia registrato.
     pub async fn start_agent(&self, ssh: SocketAddr) {
         let config = AgentConfig {
-            relay: self.relay.to_string(),
-            relay_key: self.relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: self.relay.to_string(),
+                public_key: self.relay_id.public_key(),
+            }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
             authorized_clients: zt_net::Revocable::fixed(HashSet::from([self
@@ -170,7 +172,12 @@ impl Fleet {
             timeouts: fast_timeouts(),
             max_streams: 16,
         };
-        tokio::spawn(agent::run(Arc::clone(&self.agent_id), config));
+        tokio::spawn(agent::run(
+            Arc::new(zt_crypto::Keyring::single(
+                zt_crypto::Identity::from_secret_hex(&self.agent_id.to_secret_hex()).unwrap(),
+            )),
+            config,
+        ));
         // La registrazione è asincrona: lascia il tempo all'agent di completarla.
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -219,6 +226,30 @@ impl ClientDir {
         std::fs::write(dir.join("client.toml"), toml).unwrap();
         set_mode(&dir.join("client.toml"), 0o644);
         Self { dir }
+    }
+
+    /// Come [`Self::new`], con un elenco `[[relays]]` (Fase 5).
+    pub fn with_relays(
+        who: &Identity,
+        relays: &[(String, PublicKey)],
+        nodes: &[(&str, PublicKey)],
+    ) -> Self {
+        let first = relays.first().unwrap();
+        let this = Self::new(who, &first.0, &first.1, nodes);
+        let mut toml = String::from("key = \"client.key\"\n");
+        for (addr, k) in relays {
+            toml.push_str(&format!(
+                "\n[[relays]]\naddress = \"{addr}\"\npublic_key = \"{k}\"\n"
+            ));
+        }
+        for (name, k) in nodes {
+            toml.push_str(&format!(
+                "\n[[nodes]]\nnode = \"{name}\"\npublic_key = \"{k}\"\n"
+            ));
+        }
+        std::fs::write(this.dir.join("client.toml"), toml).unwrap();
+        set_mode(&this.dir.join("client.toml"), 0o644);
+        this
     }
 
     pub fn config(&self) -> PathBuf {

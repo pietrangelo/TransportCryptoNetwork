@@ -131,8 +131,10 @@ impl Relay {
 
     fn config(&self) -> ClientConfig {
         ClientConfig {
-            relay: self.addr.clone(),
-            relay_key: self.key.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: self.addr.clone(),
+                public_key: self.key.public_key(),
+            }],
             node: NodeId::try_from("web-01").unwrap(),
             node_key: Identity::generate().unwrap().public_key(),
             timeouts: Timeouts {
@@ -288,4 +290,108 @@ fn ready_is_notified_only_once_sighup_is_handled() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fase 5 (PROTOCOL §14): la chiave del relay ruota con `SIGHUP`, senza riavvio. Dopo la
+/// ricarica valgono la chiave nuova e la precedente; quella ancora più vecchia no.
+#[tokio::test]
+async fn sighup_rotates_the_relay_key_without_a_restart() {
+    let client = Identity::generate().unwrap();
+    let dir = std::env::temp_dir().join(format!("zt-relay-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    set_mode(&dir, 0o755);
+    let (oldest, old, new) = (
+        Identity::generate().unwrap(),
+        Identity::generate().unwrap(),
+        Identity::generate().unwrap(),
+    );
+    let write_key = |name: &str, id: &Identity| {
+        let p = dir.join(name);
+        std::fs::write(&p, id.to_secret_hex().as_str()).unwrap();
+        set_mode(&p, 0o600);
+    };
+    write_key("cur.key", &old);
+    write_key("prev.key", &oldest);
+    std::fs::write(dir.join("policy.toml"), policy_text(&[&client])).unwrap();
+    set_mode(&dir.join("policy.toml"), 0o644);
+    let mut child = Command::new(BIN)
+        .args([
+            "--log-format",
+            "json",
+            "run",
+            "--listen",
+            "127.0.0.1:0",
+            "--key",
+        ])
+        .arg(dir.join("cur.key"))
+        .arg("--previous-key")
+        .arg(dir.join("prev.key"))
+        .arg("--policy")
+        .arg(dir.join("policy.toml"))
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { return };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if tx.send(v).is_err() {
+                return;
+            }
+        }
+    });
+    let mut relay = Relay {
+        child,
+        lines,
+        addr: String::new(),
+        key: Identity::from_secret_hex(&old.to_secret_hex()).unwrap(),
+        dir: dir.clone(),
+    };
+    let listening = relay.wait_for(|v| v["fields"]["message"] == "relay listening");
+    relay.addr = listening["fields"]["addr"].as_str().unwrap().to_owned();
+
+    let reaches = |relay: &Relay, pin: &Identity| {
+        let mut config = relay.config();
+        config.relays[0].public_key = pin.public_key();
+        let who = Identity::from_secret_hex(&client.to_secret_hex()).unwrap();
+        async move {
+            let (_app, local) = tokio::io::duplex(1024);
+            let r = tokio::time::timeout(
+                Duration::from_secs(5),
+                client::connect(&who, &config, local),
+            )
+            .await
+            .expect("connect hung");
+            // Autenticato: il relay risponde che il nodo è offline.
+            matches!(r, Err(NetError::Rejected(_)))
+        }
+    };
+    assert!(reaches(&relay, &old).await);
+    assert!(reaches(&relay, &oldest).await);
+    assert!(!reaches(&relay, &new).await);
+
+    // Rotazione: nuova chiave corrente, la vecchia diventa precedente.
+    write_key("cur.key", &new);
+    write_key("prev.key", &old);
+    relay.hup();
+    relay.wait_for(|v| v["fields"]["event_kind"] == "relay_keys_reloaded");
+    assert!(reaches(&relay, &new).await, "new key after SIGHUP");
+    assert!(reaches(&relay, &old).await, "previous key after SIGHUP");
+    assert!(
+        !reaches(&relay, &oldest).await,
+        "the retired key must stop working"
+    );
+
+    // Un file non valido lascia in vigore le chiavi di prima.
+    std::fs::write(dir.join("cur.key"), "not a key").unwrap();
+    relay.hup();
+    relay.wait_for(|v| v["fields"]["event_kind"] == "relay_keys_reload_failed");
+    assert!(reaches(&relay, &new).await);
 }

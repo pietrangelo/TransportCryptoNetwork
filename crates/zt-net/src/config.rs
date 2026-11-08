@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use thiserror::Error;
-use zt_crypto::{CryptoError, Identity, PublicKey};
+use zt_crypto::{CryptoError, Identity, Keyring, PublicKey};
 use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant, DomainError, Fingerprint, NodeId};
 
 /// Dimensione massima di un file di configurazione.
@@ -214,6 +214,24 @@ pub fn load_identity(path: &Path) -> Result<Identity, ConfigError> {
     })
 }
 
+/// Carica la chiave corrente e, durante una rotazione, quella precedente (PROTOCOL §14).
+///
+/// # Errors
+/// Come [`load_identity`] per ciascun file; [`ConfigError::Key`] se le due chiavi coincidono.
+pub fn load_keyring(current: &Path, previous: Option<&Path>) -> Result<Keyring, ConfigError> {
+    let key = load_identity(current)?;
+    match previous {
+        None => Ok(Keyring::single(key)),
+        Some(path) => {
+            Keyring::rotating(key, load_identity(path)?).map_err(|source| ConfigError::Key {
+                path: path.display().to_string(),
+                entry: "previous key (same as the current key)".into(),
+                source,
+            })
+        }
+    }
+}
+
 /// Genera una nuova identità e la scrive in un file nuovo con permessi `0600`.
 /// Non sovrascrive mai un file esistente.
 ///
@@ -250,6 +268,17 @@ pub fn create_identity(path: &Path) -> Result<Identity, ConfigError> {
 #[serde(deny_unknown_fields)]
 struct AgentEntry {
     node: String,
+    /// Una chiave; durante una rotazione si usa `public_keys` (PROTOCOL §14).
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
+    public_keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayEntry {
+    address: String,
     public_key: String,
 }
 
@@ -288,8 +317,14 @@ struct NodesFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientFile {
-    relay: String,
-    relay_key: String,
+    /// Forma con un solo relay.
+    #[serde(default)]
+    relay: Option<String>,
+    #[serde(default)]
+    relay_key: Option<String>,
+    /// Forma con più relay, in ordine di preferenza (PROTOCOL §13).
+    #[serde(default)]
+    relays: Vec<RelayEntry>,
     key: String,
     #[serde(default)]
     nodes: Vec<NodeEntry>,
@@ -373,7 +408,8 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
     let mut policy = AccessPolicy::new();
     for entry in &file.agents {
         let node = ctx.node(&entry.node, &entry.node)?;
-        let key = ctx.key(&entry.node, &entry.public_key)?;
+        // STUB (red): solo `public_key`.
+        let key = ctx.key(&entry.node, entry.public_key.as_deref().unwrap_or_default())?;
         policy
             .add_agent(key.fingerprint(), node)
             .map_err(|e| ctx.domain(&entry.node, e))?;
@@ -466,10 +502,8 @@ const MAX_RELAY_LEN: usize = 261;
 /// Configurazione di `zt-client`.
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
-    /// Indirizzo del relay (`host:porta`).
-    pub relay: String,
-    /// Chiave pubblica del relay, pinnata.
-    pub relay_key: PublicKey,
+    /// Relay da provare nell'ordine, ciascuno con la chiave pinnata (PROTOCOL §13).
+    pub relays: Vec<crate::RelayEndpoint>,
     /// File della chiave segreta del client.
     pub key: std::path::PathBuf,
     /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent. Un nodo assente non
@@ -492,12 +526,35 @@ impl ClientSettings {
             .get(node)
             .ok_or_else(|| ConfigError::UnknownNode(node.to_string()))?;
         Ok(crate::client::ClientConfig {
-            relay: self.relay.clone(),
-            relay_key: self.relay_key,
+            relays: self.relays.clone(),
             node: node.clone(),
             node_key: *node_key,
             timeouts,
         })
+    }
+}
+
+/// Elenco dei relay da indirizzi e chiavi appaiati per posizione (opzioni ripetute di
+/// `zt-agent`, o voci `[[relays]]` del client). Da 1 a [`crate::MAX_RELAYS`] voci, stesso
+/// numero di indirizzi e di chiavi, nessun indirizzo e nessuna chiave ripetuti.
+///
+/// # Errors
+/// [`ConfigError::Syntax`] per un elenco che non rispetta le regole.
+pub fn relay_endpoints(
+    origin: &str,
+    addresses: &[String],
+    keys: &[PublicKey],
+) -> Result<Vec<crate::RelayEndpoint>, ConfigError> {
+    // STUB (red): un solo relay.
+    match (addresses, keys) {
+        ([address], [key]) if valid_relay(address) => Ok(vec![crate::RelayEndpoint {
+            address: address.clone(),
+            public_key: *key,
+        }]),
+        _ => Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "invalid relay list".into(),
+        }),
     }
 }
 
@@ -539,7 +596,9 @@ pub fn parse_client_settings(
 ) -> Result<ClientSettings, ConfigError> {
     let ctx = Ctx(origin);
     let file: ClientFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
-    if !valid_relay(&file.relay) {
+    // STUB (red): solo la forma con un relay.
+    let relay = file.relay.clone().unwrap_or_default();
+    if !valid_relay(&relay) {
         return Err(ConfigError::Syntax {
             path: origin.into(),
             message: "relay must be host:port".into(),
@@ -551,7 +610,7 @@ pub fn parse_client_settings(
             message: "key must name the client secret key file".into(),
         });
     }
-    let relay_key = ctx.key("relay_key", &file.relay_key)?;
+    let relay_key = ctx.key("relay_key", file.relay_key.as_deref().unwrap_or_default())?;
     let mut nodes = HashMap::new();
     for entry in &file.nodes {
         let node = ctx.node(&entry.node, &entry.node)?;
@@ -564,8 +623,10 @@ pub fn parse_client_settings(
         }
     }
     Ok(ClientSettings {
-        relay: file.relay,
-        relay_key,
+        relays: vec![crate::RelayEndpoint {
+            address: relay,
+            public_key: relay_key,
+        }],
         key: base.join(&file.key),
         nodes,
     })

@@ -69,4 +69,7 @@ pub enum DomainError {
     /// Due agent dichiarano lo stesso nome di nodo.
     #[error("node {0} is assigned to more than one agent key")]
     DuplicateNode(crate::NodeId),
+    /// Un nodo ha zero chiavi di agent, più di [`crate::MAX_AGENT_KEYS`], o chiavi ripetute.
+    #[error("node {0} must have one or two distinct agent keys")]
+    AgentKeys(crate::NodeId),
 }

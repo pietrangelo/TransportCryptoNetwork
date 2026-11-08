@@ -29,6 +29,20 @@ pub use revocable::{Revocable, Updater};
 
 use std::time::Duration;
 
+use zt_crypto::PublicKey;
+
+/// Relay al massimo in un elenco di un agent o di un client (PROTOCOL §13).
+pub const MAX_RELAYS: usize = 8;
+
+/// Un relay: indirizzo e chiave pinnata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayEndpoint {
+    /// Indirizzo (`host:porta`).
+    pub address: String,
+    /// Chiave pubblica del relay, pinnata.
+    pub public_key: PublicKey,
+}
+
 /// Timeout di tutte le operazioni di rete.
 #[derive(Debug, Clone)]
 pub struct Timeouts {

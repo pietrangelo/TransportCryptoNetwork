@@ -126,8 +126,10 @@ impl Fleet {
     async fn start_agent(&self) {
         let ssh = echo_server().await;
         let config = AgentConfig {
-            relay: self.relay.to_string(),
-            relay_key: self.relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: self.relay.to_string(),
+                public_key: self.relay_id.public_key(),
+            }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
             authorized_clients: zt_net::Revocable::fixed(HashSet::from([self
@@ -136,7 +138,12 @@ impl Fleet {
             timeouts: fast_timeouts(),
             max_streams: 16,
         };
-        tokio::spawn(agent::run(Arc::clone(&self.agent_id), config));
+        tokio::spawn(agent::run(
+            Arc::new(zt_crypto::Keyring::single(
+                zt_crypto::Identity::from_secret_hex(&self.agent_id.to_secret_hex()).unwrap(),
+            )),
+            config,
+        ));
         // Attende la registrazione: finché il nodo risulta offline si riprova.
         for _ in 0..100 {
             let (app, local) = tokio::io::duplex(1024);
@@ -153,8 +160,10 @@ impl Fleet {
 
     fn client_config(&self, target: &str) -> ClientConfig {
         ClientConfig {
-            relay: self.relay.to_string(),
-            relay_key: self.relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: self.relay.to_string(),
+                public_key: self.relay_id.public_key(),
+            }],
             node: node(target),
             node_key: self.agent_id.public_key(),
             timeouts: fast_timeouts(),
@@ -275,7 +284,7 @@ async fn unknown_client_key_gets_no_answer() {
 async fn client_detects_a_relay_impostor() {
     let fleet = Fleet::start(test_relay_config()).await;
     let mut config = fleet.client_config("web-01");
-    config.relay_key = fleet.stranger.public_key();
+    config.relays[0].public_key = fleet.stranger.public_key();
     let (_app, local) = tokio::io::duplex(1024);
     let err = client::connect(&fleet.ansible, &config, local)
         .await

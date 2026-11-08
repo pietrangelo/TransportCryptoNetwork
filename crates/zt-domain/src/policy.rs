@@ -48,6 +48,9 @@ pub enum PeerRole<'a> {
     },
 }
 
+/// Chiavi di agent ammesse per un nodo: la corrente e, durante una rotazione, la nuova.
+pub const MAX_AGENT_KEYS: usize = 2;
+
 /// Whitelist del relay: chi può connettersi, con quale ruolo, e verso quali nodi.
 ///
 /// Principio del minimo privilegio: una chiave ha **un solo** ruolo, un agent ha **un solo**
@@ -85,6 +88,25 @@ impl AccessPolicy {
         }
         self.agents.insert(peer, node);
         Ok(())
+    }
+
+    /// Autorizza come agent del nodo `node` una o due chiavi: due durante la rotazione della
+    /// chiave dell'agent (PROTOCOL §14). Vale l'ultima che si registra.
+    ///
+    /// # Errors
+    /// [`DomainError::AgentKeys`] se le chiavi sono zero, più di [`MAX_AGENT_KEYS`] o
+    /// ripetute; [`DomainError::DuplicatePeer`] e [`DomainError::DuplicateNode`] come
+    /// [`Self::add_agent`]. In caso d'errore la policy non cambia.
+    pub fn add_agent_keys(
+        &mut self,
+        node: NodeId,
+        keys: &[Fingerprint],
+    ) -> Result<(), DomainError> {
+        // STUB (red): una sola chiave.
+        match keys {
+            [one] => self.add_agent(*one, node),
+            _ => Err(DomainError::AgentKeys(node)),
+        }
     }
 
     /// Autorizza la chiave `peer` come client con i permessi `grant`.

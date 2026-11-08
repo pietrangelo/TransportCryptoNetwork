@@ -31,4 +31,4 @@ pub use events::{AuthFailureReason, DomainEvent};
 pub use frame::{CloseReason, Credit, Frame, FrameKind, RejectReason};
 pub use ids::{NodeId, SessionId, StreamId};
 pub use payload::FramePayload;
-pub use policy::{AccessPolicy, AllowedNodes, ClientGrant, PeerRole};
+pub use policy::{AccessPolicy, AllowedNodes, ClientGrant, MAX_AGENT_KEYS, PeerRole};

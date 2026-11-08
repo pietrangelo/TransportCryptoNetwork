@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use zt_crypto::noise::{self, Channel, MAX_MESSAGE_LEN};
-use zt_crypto::{Identity, PublicKey};
+use zt_crypto::{Identity, Keyring, PublicKey};
 use zt_domain::{Fingerprint, Frame};
 use zt_proto::FrameDecoder;
 
@@ -77,7 +77,7 @@ where
 /// [`NetError::Timeout`] oltre `timeouts.handshake`, [`NetError::Crypto`] su messaggi non validi.
 pub async fn accept<IO>(
     io: IO,
-    local: &Identity,
+    local: &Keyring,
     channel: Channel,
     timeouts: &Timeouts,
 ) -> Result<Pending<IO>, NetError>
@@ -88,7 +88,7 @@ where
     let msg1 = timeout(timeouts.handshake, read_message(&mut framed))
         .await
         .map_err(|_| NetError::Timeout("handshake"))??;
-    let pending = noise::respond(local, &msg1, channel)?;
+    let pending = noise::respond_any(local, &msg1, channel)?;
     Ok(Pending { framed, pending })
 }
 
