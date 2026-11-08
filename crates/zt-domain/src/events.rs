@@ -1,4 +1,4 @@
-use crate::cert::{CertRef, CertRejection};
+use crate::cert::{CertClaims, CertRef, CertRejection};
 use crate::crypto::Fingerprint;
 use crate::frame::CloseReason;
 use crate::ids::{NodeId, SessionId};
@@ -22,6 +22,23 @@ pub enum AuthFailureReason {
     KeyRevoked,
     /// Il certificato presentato non è stato accettato (PROTOCOL §15.4).
     Certificate(CertRejection),
+}
+
+impl AuthFailureReason {
+    /// Il certificato da riportare in un `authentication_failed` (PROTOCOL §15.11, finding
+    /// 0006-3): solo se la firma è stata verificata (`verified` viene da `zt-crypto`) e il
+    /// rifiuto viene da un controllo successivo (passi 7–12 di §15.4). Prima della firma i campi
+    /// del certificato non sono di nessuno: un evento che nomina una serie riguarda sempre un
+    /// certificato davvero firmato da una CA pinnata.
+    #[must_use]
+    pub fn certificate_ref(self, verified: Option<&CertClaims>) -> Option<CertRef> {
+        match self {
+            Self::Certificate(check) if check.after_signature() => {
+                verified.map(CertClaims::reference)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Fatti significativi del dominio, emessi dai casi d'uso e consumati dagli adapter
@@ -56,6 +73,9 @@ pub enum DomainEvent {
         peer: Option<Fingerprint>,
         /// Il motivo.
         reason: AuthFailureReason,
+        /// Il certificato rifiutato, solo dopo la verifica della firma
+        /// ([`AuthFailureReason::certificate_ref`]).
+        certificate: Option<CertRef>,
     },
     /// Un client autenticato ha chiesto un nodo che la policy non gli concede.
     AccessDenied {

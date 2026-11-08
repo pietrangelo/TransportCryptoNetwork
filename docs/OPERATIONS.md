@@ -187,6 +187,9 @@ Con i certificati (§10) `session_established`, `e2e_session_started`, `access_d
 `reason = certificate` (o `key_revoked`) e `cert_check` con il controllo fallito (`malformed`,
 `key_mismatch`, `unknown_authority`, `bad_signature`, `serial_revoked`, `not_yet_valid`,
 `expired`, `lifetime_exceeds_authority`, `role_conflict`, `node_out_of_scope`; PROTOCOL §15.4).
+Dopo la verifica della firma (da `serial_revoked` in poi) riporta anche `ca`, `serial`,
+`cert_name` e `not_after` del certificato rifiutato; prima (`malformed` … `bad_signature`) mai,
+perché quei dati non sono firmati da nessuno.
 
 ```bash
 journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'

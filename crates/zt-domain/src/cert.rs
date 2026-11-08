@@ -566,6 +566,23 @@ impl CertRejection {
             Self::NodeOutOfScope => "node_out_of_scope",
         }
     }
+
+    /// `true` per i controlli successivi alla verifica della firma (passi 7–12 di PROTOCOL
+    /// §15.4): solo per questi l'audit riporta CA e numero di serie (§15.11).
+    #[must_use]
+    pub const fn after_signature(self) -> bool {
+        match self {
+            Self::Malformed | Self::KeyMismatch | Self::UnknownAuthority | Self::BadSignature => {
+                false
+            }
+            Self::SerialRevoked
+            | Self::NotYetValid
+            | Self::Expired
+            | Self::LifetimeExceedsAuthority
+            | Self::RoleConflict
+            | Self::NodeOutOfScope => true,
+        }
+    }
 }
 
 /// I dati di un certificato la cui firma è già stata verificata da `zt-crypto` con una chiave

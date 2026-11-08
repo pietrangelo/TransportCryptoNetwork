@@ -541,3 +541,100 @@ async fn a_relay_without_revocations_for_its_authorities_does_not_start() {
     let (cert, _) = ca.issue(&alice.public_key(), scope(&["web-01"]));
     let (_app, _task) = lab.session(&alice, Some(&cert)).await.unwrap();
 }
+
+/// Finding 0006-3: un rifiuto dopo la verifica della firma (qui `serial_revoked` sul relay,
+/// `serial_revoked` e `node_out_of_scope` sull'agent) riporta `ca` e `serial` (§15.11); un
+/// rifiuto prima della firma (`bad_signature`) mai.
+#[tokio::test]
+async fn authentication_failed_after_the_signature_names_ca_and_serial() {
+    let log = Captured::default();
+    let _guard = log.install();
+    let ca = Ca::new();
+    let (alice_seed, alice) = seeded(0x31);
+    let (bob_seed, bob) = seeded(0x32);
+    let (carol_seed, carol) = seeded(0x33);
+    let (revoked, revoked_serial) = ca.issue(&alice.public_key(), scope(&["web-01"]));
+    let (elsewhere, elsewhere_serial) = ca.issue(&bob.public_key(), scope(&["db-01"]));
+    let (good, good_serial) = ca.issue(&carol.public_key(), scope(&["web-01"]));
+    let mut forged = good.to_vec();
+    *forged.last_mut().unwrap() ^= 0x01;
+    let ca_fp = ca.key.public_key().fingerprint().to_string();
+    let line_for = |peer: &Identity| {
+        log.events("authentication_failed")
+            .into_iter()
+            .find(|l| field(l, "peer") == Some(peer.fingerprint().to_string()))
+            .unwrap_or_else(|| panic!("no authentication_failed for {peer:?}: {}", log.text()))
+    };
+    let names_certificate = |line: &str, check: &str, serial: &zt_domain::CertSerial| {
+        assert_eq!(field(line, "cert_check").as_deref(), Some(check), "{line}");
+        assert_eq!(field(line, "ca"), Some(ca_fp.clone()), "{line}");
+        assert_eq!(field(line, "serial"), Some(serial.to_string()), "{line}");
+    };
+    let names_nothing = |line: &str| {
+        assert_eq!(
+            field(line, "cert_check").as_deref(),
+            Some("bad_signature"),
+            "{line}"
+        );
+        assert!(field(line, "ca").is_none(), "{line}");
+        assert!(field(line, "serial").is_none(), "{line}");
+        assert!(!line.contains(&good_serial.to_string()), "{line}");
+    };
+
+    // Relay.
+    let relay = start_relay(relay_policy(
+        &some_agent(),
+        &[],
+        trust(&[(&ca, AllowedNodes::All)], &[revoked_serial], &[]),
+    ))
+    .await;
+    let msg1 = raw_msg1(alice_seed, &relay.key, Channel::Outer, &revoked);
+    assert!(probe_relay(relay.addr, &msg1).await.is_none());
+    names_certificate(&line_for(&alice), "serial_revoked", &revoked_serial);
+    let msg1 = raw_msg1(carol_seed, &relay.key, Channel::Outer, &forged);
+    assert!(probe_relay(relay.addr, &msg1).await.is_none());
+    names_nothing(&line_for(&carol));
+    // Controllo positivo: il certificato integro passa.
+    let msg1 = raw_msg1(carol_seed, &relay.key, Channel::Outer, &good);
+    assert!(probe_relay(relay.addr, &msg1).await.is_some());
+
+    // Agent: si ricomincia con un log pulito.
+    log.clear();
+    let mut fake = FakeRelay::start(agent_clients(
+        &[],
+        trust(&[(&ca, AllowedNodes::All)], &[revoked_serial], &[]),
+    ))
+    .await;
+    let agent_key = fake.agent.public_key();
+    let offers = [
+        (
+            1,
+            raw_msg1(alice_seed, &agent_key, Channel::EndToEnd, &revoked),
+        ),
+        (
+            3,
+            raw_msg1(bob_seed, &agent_key, Channel::EndToEnd, &elsewhere),
+        ),
+        (
+            5,
+            raw_msg1(carol_seed, &agent_key, Channel::EndToEnd, &forged),
+        ),
+    ];
+    for (stream, msg1) in offers {
+        assert_eq!(
+            fake.offer(stream, msg1).await,
+            AgentAnswer::Closed(CloseReason::Unauthorized)
+        );
+    }
+    names_certificate(&line_for(&alice), "serial_revoked", &revoked_serial);
+    names_certificate(&line_for(&bob), "node_out_of_scope", &elsewhere_serial);
+    names_nothing(&line_for(&carol));
+    assert_eq!(
+        fake.offer(
+            7,
+            raw_msg1(carol_seed, &agent_key, Channel::EndToEnd, &good)
+        )
+        .await,
+        AgentAnswer::Msg2
+    );
+}

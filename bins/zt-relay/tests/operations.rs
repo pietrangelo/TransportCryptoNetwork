@@ -817,7 +817,10 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
     let (mut policy_event, mut keys_event) = (None, None);
     while policy_event.is_none() || keys_event.is_none() {
         let v = relay.wait_for(|_| true);
-        let kind = v["fields"]["event_kind"].as_str().unwrap_or_default().to_owned();
+        let kind = v["fields"]["event_kind"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         if kind.starts_with("policy_reload") {
             policy_event = Some(kind);
         } else if kind.starts_with("relay_keys_reload") {
@@ -836,4 +839,31 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
             || v["fields"]["event_kind"] == "relay_keys_reload_failed"
     });
     assert_eq!(ok["fields"]["event_kind"], "relay_keys_reloaded", "{ok}");
+}
+
+/// Finding 0006-3: `authentication_failed` per un certificato firmato da una CA pinnata ma
+/// rifiutato dopo la firma (qui `serial_revoked`) riporta `ca` e `serial` (PROTOCOL §15.11).
+#[tokio::test]
+async fn authentication_failed_after_the_signature_names_ca_and_serial_in_json() {
+    let ca = zt_crypto::CaSigningKey::generate().unwrap();
+    let alice = Identity::generate().unwrap();
+    let (cert, serial) = issue(&ca, &alice);
+    let policy = format!("{}\n{}", policy_text(&[]), authority_text(&ca.public_key()));
+    let dir = CaDir::new(
+        "failed-serial",
+        &policy,
+        Some(&format!("serials = [\"{serial}\"]\nkeys = []\n")),
+    );
+    let revocations = dir.revocations_arg();
+    let relay = dir.start(&["--revocations", &revocations]);
+    assert!(!certified(&relay, &alice, &cert).await);
+    let failed = relay.wait_for(|v| v["fields"]["event_kind"] == "authentication_failed");
+    assert_eq!(failed["fields"]["cert_check"], "serial_revoked", "{failed}");
+    assert_eq!(failed["fields"]["serial"], serial.to_string(), "{failed}");
+    assert_eq!(
+        failed["fields"]["ca"],
+        ca.public_key().fingerprint().to_string(),
+        "{failed}"
+    );
+    assert_eq!(failed["fields"]["cert_name"], "alice", "{failed}");
 }

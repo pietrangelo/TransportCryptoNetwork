@@ -243,11 +243,19 @@ fn unauthorized(stream: StreamId) -> Frame {
     }
 }
 fn refused_with(out: &[Output], peer: u8, rejection: CertRejection) {
+    // Finding 0006-3: un rifiuto dopo la firma (passi 7–12) riporta il certificato, uno
+    // precedente mai.
     assert!(
-        audits(out).contains(&DomainEvent::AuthenticationFailed {
-            peer: Some(fp(peer)),
-            reason: AuthFailureReason::Certificate(rejection),
-        }),
+        audits(out).iter().any(|e| matches!(
+            e,
+            DomainEvent::AuthenticationFailed {
+                peer: Some(p),
+                reason: AuthFailureReason::Certificate(r),
+                certificate,
+            } if *p == fp(peer)
+                && *r == rejection
+                && certificate.is_some() == rejection.after_signature()
+        )),
         "expected {rejection:?}: {out:?}"
     );
     assert_eq!(closed(out), [7], "{out:?}");
@@ -502,6 +510,7 @@ fn revoking_a_key_on_reload_cuts_static_and_certified_clients() {
     assert!(audits(&out).contains(&DomainEvent::AuthenticationFailed {
         peer: Some(fp(ANSIBLE)),
         reason: AuthFailureReason::KeyRevoked,
+        certificate: None,
     }));
     assert_eq!(closed(&out), [9]);
 }

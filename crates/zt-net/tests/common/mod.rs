@@ -538,6 +538,10 @@ impl Captured {
     pub fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
+    /// Dimentica le righe catturate finora.
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
     /// Le righe con `"event_kind":"<kind>"`.
     pub fn events(&self, kind: &str) -> Vec<String> {
         let needle = format!("\"event_kind\":\"{kind}\"");

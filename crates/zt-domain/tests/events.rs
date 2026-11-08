@@ -30,6 +30,7 @@ fn every_event_has_a_stable_snake_case_kind() {
             DomainEvent::AuthenticationFailed {
                 peer: None,
                 reason: AuthFailureReason::HandshakeFailed,
+                certificate: None,
             },
             "authentication_failed",
         ),

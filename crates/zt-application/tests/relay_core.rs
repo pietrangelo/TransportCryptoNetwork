@@ -460,7 +460,8 @@ fn unknown_key_is_dropped_and_audited() {
         audits(&out),
         vec![DomainEvent::AuthenticationFailed {
             peer: Some(fp(STRANGER)),
-            reason: AuthFailureReason::UnknownPeer
+            reason: AuthFailureReason::UnknownPeer,
+            certificate: None,
         }]
     );
 }

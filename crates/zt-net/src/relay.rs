@@ -109,13 +109,24 @@ pub(crate) fn audit(event: &DomainEvent) {
                 "session established"
             );
         }
-        DomainEvent::AuthenticationFailed { peer, reason } => {
+        DomainEvent::AuthenticationFailed {
+            peer,
+            reason,
+            certificate,
+        } => {
             let (reason, cert_check) = failure_fields(*reason);
             let peer = peer.as_ref().map(ToString::to_string);
+            // Solo dopo la firma verificata (PROTOCOL §15.11, finding 0006-3).
+            let c = certificate.as_ref().map(|c| CertFields::of(Some(c)));
+            let c = c.as_ref();
             emit!(
                 peer = peer.as_deref(),
                 reason = reason.as_str(),
                 cert_check,
+                ca = c.and_then(|c| c.ca.as_deref()),
+                serial = c.and_then(|c| c.serial.as_deref()),
+                cert_name = c.and_then(|c| c.cert_name.as_deref()),
+                not_after = c.and_then(|c| c.not_after),
                 "authentication failed"
             );
         }
@@ -405,6 +416,7 @@ impl Connection {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: None,
                     reason: AuthFailureReason::HandshakeFailed,
+                    certificate: None,
                 });
                 tracing::debug!(%addr, error = %err, "handshake failed");
                 return;
@@ -415,10 +427,11 @@ impl Connection {
         // che non riceve nemmeno il secondo messaggio dell'handshake.
         let certificate = match admit(&self.policy.current(), &peer, pending.payload()) {
             Ok(certificate) => certificate,
-            Err(reason) => {
+            Err((reason, certificate)) => {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(peer),
                     reason,
+                    certificate,
                 });
                 return;
             }
@@ -482,26 +495,33 @@ impl Connection {
 /// Passi 1–11 di PROTOCOL §15.4 sul canale esterno: denylist della chiave, verifica del
 /// certificato (se il payload non è vuoto) e decisione della policy. Restituisce i dati
 /// verificati del certificato, che il core ricontrolla con la policy del momento.
+/// Il rifiuto di [`admit`]: il motivo e, dopo la verifica della firma, il certificato
+/// (PROTOCOL §15.11).
+type Refusal = (AuthFailureReason, Option<CertRef>);
+
 fn admit(
     policy: &AccessPolicy,
     peer: &Fingerprint,
     payload: &[u8],
-) -> Result<Option<Arc<CertClaims>>, AuthFailureReason> {
+) -> Result<Option<Arc<CertClaims>>, Refusal> {
     let trust = policy.cert_trust();
     // Passo 1, anche senza certificato.
     if trust.is_key_revoked(peer) {
-        return Err(AuthFailureReason::KeyRevoked);
+        return Err((AuthFailureReason::KeyRevoked, None));
     }
-    // Passi 3–6 (passo 2: payload vuoto, nessun certificato).
+    // Passi 3–6 (passo 2: payload vuoto, nessun certificato). Un rifiuto qui non nomina mai
+    // CA e serie: la firma non è verificata.
     let certificate = if payload.is_empty() {
         None
     } else {
         let claims = zt_crypto::verify_certificate(payload, peer, trust)
-            .map_err(AuthFailureReason::Certificate)?;
+            .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
         Some(Arc::new(claims))
     };
     // Passi 5 e 7–11 e la precedenza della whitelist.
-    policy.admit(peer, certificate.as_ref(), crate::unix_now())?;
+    policy
+        .admit(peer, certificate.as_ref(), crate::unix_now())
+        .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))?;
     Ok(certificate)
 }
 

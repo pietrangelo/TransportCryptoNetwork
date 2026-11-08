@@ -659,7 +659,7 @@ numero di serie (esadecimale), fingerprint della CA e del client, nome e scadenz
 
 | `event_kind` | Livello | Quando, e campi aggiunti |
 | :- | :- | :- |
-| `authentication_failed` | WARN | un controllo del §15.4 fallisce: `reason` (`key_revoked` o `certificate`), `cert_check`; `ca` e `serial` solo dopo il passo 6 (firma verificata) |
+| `authentication_failed` | WARN | un controllo del §15.4 fallisce: `reason` (`key_revoked` o `certificate`), `cert_check`; `ca`, `serial`, `cert_name` e `not_after` solo dopo il passo 6 (firma verificata), su relay e agent |
 | `session_established` (relay), `e2e_session_started` (agent) | INFO | `credential` = `key` o `certificate`; per un certificato anche `ca`, `serial`, `cert_name`, `not_after`. Si registrano solo dopo un messaggio autentico del client (§15.3) |
 | `access_denied` | WARN | come oggi, con gli stessi campi del certificato |
 | `access_revoked` | WARN | come oggi, con gli stessi campi del certificato |

@@ -311,6 +311,8 @@ impl<S: SessionIds> RelayCore<S> {
                 out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                     peer: Some(peer),
                     reason,
+                    // Le claims vengono dalla verifica della firma in `zt-crypto`.
+                    certificate: reason.certificate_ref(certificate.map(AsRef::as_ref)),
                 }));
                 out.push(Output::Close { conn });
                 return;
@@ -551,6 +553,7 @@ impl<S: SessionIds> RelayCore<S> {
             out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                 peer: Some(peer),
                 reason: AuthFailureReason::NodeIdMismatch,
+                certificate: None,
             }));
             self.teardown(conn, out);
             out.push(Output::Close { conn });

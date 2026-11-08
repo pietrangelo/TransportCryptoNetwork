@@ -16,8 +16,8 @@ use zt_crypto::noise::{self, Channel, MAX_HANDSHAKE_PAYLOAD_LEN};
 use zt_domain::flow::Window;
 use zt_domain::limits::NOISE_MSG1_OVERHEAD;
 use zt_domain::{
-    AuthFailureReason, AuthorizedClients, CertClaims, CertRejection, ClientCredential, CloseReason,
-    DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
+    AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection, ClientCredential,
+    CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
 };
 
 use crate::relay::{CertFields, audit};
@@ -333,19 +333,23 @@ fn admit_client(
     client: &Fingerprint,
     payload: &[u8],
     node: &NodeId,
-) -> Result<ClientCredential, AuthFailureReason> {
+) -> Result<ClientCredential, (AuthFailureReason, Option<CertRef>)> {
     let trust = clients.cert_trust();
     if trust.is_key_revoked(client) {
-        return Err(AuthFailureReason::KeyRevoked);
+        return Err((AuthFailureReason::KeyRevoked, None));
     }
+    // Un rifiuto prima della firma verificata non nomina mai CA e serie (PROTOCOL §15.11).
     let certificate: Option<Arc<CertClaims>> = if payload.is_empty() {
         None
     } else {
         let claims = zt_crypto::verify_certificate(payload, client, trust)
-            .map_err(AuthFailureReason::Certificate)?;
+            .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
         Some(Arc::new(claims))
     };
-    clients.admit(client, certificate.as_ref(), node, crate::unix_now())
+    // Dopo la firma, il rifiuto porta il certificato (finding 0006-3).
+    clients
+        .admit(client, certificate.as_ref(), node, crate::unix_now())
+        .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))
 }
 
 impl StreamTask {
@@ -367,6 +371,7 @@ impl StreamTask {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: None,
                     reason: AuthFailureReason::Certificate(CertRejection::Malformed),
+                    certificate: None,
                 });
                 io.close(CloseReason::Unauthorized).await;
                 return;
@@ -384,6 +389,7 @@ impl StreamTask {
             audit(&DomainEvent::AuthenticationFailed {
                 peer: None,
                 reason: AuthFailureReason::HandshakeFailed,
+                certificate: None,
             });
             io.close(CloseReason::ProtocolViolation).await;
             return;
@@ -394,10 +400,11 @@ impl StreamTask {
         let credential =
             match admit_client(&authorized.current(), &client, pending.payload(), &node) {
                 Ok(credential) => credential,
-                Err(reason) => {
+                Err((reason, certificate)) => {
                     audit(&DomainEvent::AuthenticationFailed {
                         peer: Some(client),
                         reason,
+                        certificate,
                     });
                     io.close(CloseReason::Unauthorized).await;
                     return;
@@ -419,6 +426,7 @@ impl StreamTask {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(client),
                     reason: AuthFailureReason::HandshakeFailed,
+                    certificate: None,
                 });
                 io.close(CloseReason::ProtocolViolation).await;
                 return;
