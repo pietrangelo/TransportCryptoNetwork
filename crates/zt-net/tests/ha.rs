@@ -160,6 +160,15 @@ fn endpoint(addr: SocketAddr, key: &PublicKey) -> RelayEndpoint {
 
 /// Avvia l'agent di web-01 verso `relays`; accetta end-to-end solo `ansible`.
 async fn start_agent(keys: Keyring, relays: Vec<RelayEndpoint>, ansible: &Identity) {
+    start_agent_with(keys, relays, ansible, 16).await;
+}
+
+async fn start_agent_with(
+    keys: Keyring,
+    relays: Vec<RelayEndpoint>,
+    ansible: &Identity,
+    max_streams: usize,
+) {
     let ssh = echo_server().await;
     let config = AgentConfig {
         relays,
@@ -167,7 +176,7 @@ async fn start_agent(keys: Keyring, relays: Vec<RelayEndpoint>, ansible: &Identi
         ssh_target: ssh.to_string(),
         authorized_clients: Revocable::fixed(HashSet::from([ansible.fingerprint()])),
         timeouts: timeouts(),
-        max_streams: 16,
+        max_streams,
     };
     tokio::spawn(agent::run(Arc::new(keys), config));
 }
@@ -545,4 +554,118 @@ async fn an_agent_never_uses_its_previous_key_towards_the_relay() {
         matches!(result, Err(NetError::Rejected(RejectReason::NodeOffline))),
         "{result:?}"
     );
+}
+
+// ======================= adversary 0005 =======================
+
+/// Finding 0005-1: un relay compromesso (uno di due) apre stream senza mai mandare `msg1`.
+/// Prima occupava tutti i posti dell'agent e i client onesti, anche attraverso l'altro relay,
+/// ricevevano `ResourceExhausted`. Ora esaurisce solo la propria quota.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compromised_relay_cannot_starve_sessions_through_the_others() {
+    use zt_crypto::noise::Channel;
+    use zt_domain::{Frame, StreamId};
+    let k = Keys::new();
+    let (evil_id, good_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let evil = listener.local_addr().unwrap();
+    let good = relay(copy(&good_id).into(), k.policy(&[&k.agent])).await;
+    start_agent(
+        copy(&k.agent).into(),
+        vec![
+            endpoint(evil, &evil_id.public_key()),
+            endpoint(good, &good_id.public_key()),
+        ],
+        &k.ansible,
+    )
+    .await;
+    let (tcp, _) = listener.accept().await.unwrap();
+    let keys: Keyring = copy(&evil_id).into();
+    let mut ch = zt_net::channel::accept(tcp, &keys, Channel::Outer, &timeouts())
+        .await
+        .unwrap()
+        .establish(&timeouts())
+        .await
+        .unwrap();
+    assert!(matches!(
+        ch.recv().await.unwrap(),
+        Some(Frame::Register { .. })
+    ));
+    // Più stream di quanti l'agent ne ammetta, nessuno mai confermato.
+    for n in 1..=24_u32 {
+        ch.send(
+            &Frame::Open {
+                stream: StreamId::try_from(n).unwrap(),
+                target: node("web-01"),
+            },
+            &timeouts(),
+        )
+        .await
+        .unwrap();
+    }
+    let mut rejected = 0;
+    while let Ok(Ok(Some(frame))) =
+        tokio::time::timeout(Duration::from_millis(300), ch.recv()).await
+    {
+        if matches!(frame, Frame::Reject { .. }) {
+            rejected += 1;
+        }
+    }
+    assert!(
+        rejected > 0,
+        "the compromised relay is still bounded by its own quota"
+    );
+    let cfg = client_config(
+        vec![endpoint(good, &good_id.public_key())],
+        &k.agent.public_key(),
+    );
+    for attempt in 0..5 {
+        echo(&k.ansible, &cfg)
+            .await
+            .unwrap_or_else(|e| panic!("attempt {attempt} through the honest relay: {e:?}"));
+    }
+    drop(ch);
+}
+
+/// Il limite delle sessioni verso sshd vale per l'agent intero: due relay non lo raddoppiano.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_limit_holds_for_the_whole_agent() {
+    let k = Keys::new();
+    let (r1_id, r2_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let r1 = relay(copy(&r1_id).into(), k.policy(&[&k.agent])).await;
+    let r2 = relay(copy(&r2_id).into(), k.policy(&[&k.agent])).await;
+    start_agent_with(
+        copy(&k.agent).into(),
+        vec![
+            endpoint(r1, &r1_id.public_key()),
+            endpoint(r2, &r2_id.public_key()),
+        ],
+        &k.ansible,
+        1,
+    )
+    .await;
+    let via = |r: SocketAddr, id: &Identity| {
+        client_config(vec![endpoint(r, &id.public_key())], &k.agent.public_key())
+    };
+    // Attende che l'agent sia registrato su entrambi.
+    echo(&k.ansible, &via(r1, &r1_id)).await.unwrap();
+    echo(&k.ansible, &via(r2, &r2_id)).await.unwrap();
+    // Una sessione aperta attraverso r1 occupa l'unico posto.
+    let (mut held, local) = tokio::io::duplex(1024);
+    let cfg = via(r1, &r1_id);
+    let who = copy(&k.ansible);
+    let first = tokio::spawn(async move { client::connect(&who, &cfg, local).await });
+    held.write_all(b"x").await.unwrap();
+    let mut b = [0_u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), held.read_exact(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = echo(&k.ansible, &via(r2, &r2_id)).await;
+    assert!(
+        matches!(second, Err(NetError::StreamClosed(CloseReason::Drained))),
+        "{second:?}"
+    );
+    drop(held);
+    let _ = tokio::time::timeout(Duration::from_secs(5), first).await;
 }

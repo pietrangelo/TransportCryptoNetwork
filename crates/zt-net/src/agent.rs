@@ -43,8 +43,11 @@ pub struct AgentConfig {
 /// backoff esponenziale e jitter (PROTOCOL §13). Verso i relay usa la chiave corrente; sul
 /// canale end-to-end accetta anche quella precedente (PROTOCOL §14).
 ///
-/// `max_streams` vale per l'agent intero, non per relay: con più relay un client non ottiene
-/// più sessioni contemporanee verso sshd.
+/// `max_streams` limita due cose: gli stream di **ciascun** relay (anche quelli che non hanno
+/// ancora completato l'handshake end-to-end) e le sessioni verso sshd dell'agent **intero**.
+/// Il permesso globale si prende solo dopo la conferma del client, che un relay non sa
+/// falsificare: un relay compromesso esaurisce solo la propria quota e non blocca le
+/// sessioni che passano dagli altri (finding 0005-1).
 pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         tracing::error!(
@@ -207,13 +210,13 @@ fn on_relay_frame(
                 return Err(NetError::Protocol("relay reused a stream id"));
             }
             streams.last = stream.get();
-            // Il permesso resta al task dello stream fino alla sua fine.
-            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+            // Quota per relay: conta anche gli stream non ancora confermati.
+            if streams.slots.len() >= config.max_streams {
                 return Ok(Some(Frame::Reject {
                     stream,
                     reason: RejectReason::ResourceExhausted,
                 }));
-            };
+            }
             let (tx, rx) = mpsc::channel(STREAM_QUEUE);
             streams.slots.insert(
                 stream,
@@ -225,6 +228,7 @@ fn on_relay_frame(
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
+                sessions: Arc::clone(slots),
                 authorized: config.authorized_clients.clone(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
@@ -232,7 +236,6 @@ fn on_relay_frame(
             let done = done_tx.clone();
             tokio::spawn(async move {
                 task.serve().await;
-                drop(permit);
                 let _ = done.send(stream).await;
             });
             Ok(Some(Frame::OpenAck { stream }))
@@ -274,6 +277,8 @@ fn on_relay_frame(
 struct StreamTask {
     io: StreamIo,
     identity: Arc<Keyring>,
+    /// Sessioni verso sshd dell'agent intero (tutti i relay).
+    sessions: Arc<Semaphore>,
     authorized: crate::Revocable<HashSet<Fingerprint>>,
     ssh_target: String,
     timeouts: Timeouts,
@@ -284,6 +289,7 @@ impl StreamTask {
         let Self {
             mut io,
             identity,
+            sessions,
             authorized,
             ssh_target,
             timeouts,
@@ -341,6 +347,13 @@ impl StreamTask {
                 return;
             }
         }
+        // Solo ora, con un client vero, si occupa uno dei `max_streams` posti globali; resta
+        // occupato fino alla fine di questa funzione.
+        let Ok(_session) = sessions.try_acquire_owned() else {
+            tracing::warn!(peer = %client, "too many sessions on this agent");
+            io.close(CloseReason::Drained).await;
+            return;
+        };
         let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, TcpStream::connect(&ssh_target)).await
         else {
             tracing::warn!(target = %ssh_target, "cannot reach local ssh daemon");
