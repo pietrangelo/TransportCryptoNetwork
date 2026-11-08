@@ -53,3 +53,24 @@ di `the_session_limit_holds_for_the_whole_agent`.
 | 21 | Chiave di un relay uguale a quella di un nodo | **Mitigato.** `no_relay_key_may_double_as_a_node_key`. |
 | 22 | Segreti nei log | **Mitigato.** `Identity` si stampa come `<redacted>`; gli errori di caricamento riportano solo il percorso; i nuovi eventi riportano solo fingerprint. |
 | 23 | Policy diverse fra relay usate per cercare un relay più permissivo con `NotAuthorized` | **Mitigato.** `a_policy_denial_is_final_and_never_retried_elsewhere`. Per la chiave rimossa del tutto vedi il finding 2. |
+
+## Seconda review (0005b, effort elevato)
+
+Una seconda review indipendente, fatta con più profondità prima del merge, ha verificato le
+correzioni della prima e cercato ciò che le era sfuggito. Ha trovato un difetto di gravità
+media proprio nella correzione del finding 1. Tutti i finding sono corretti in questa PR.
+
+| # | Ipotesi d'attacco | Gravità | Correzione | Regressione |
+| :-: | :- | :-: | :- | :- |
+| 5b-1 | **La correzione del finding 1 non reggeva.** La quota per relay contava gli slot, ma un `Close` del relay toglieva lo slot subito, mentre il task dello stream era ancora vivo. Un relay compromesso che ripete in ciclo `Open`, `msg1` spazzatura e `Close` non incontrava mai la quota: task e memoria crescevano con la durata dell'attacco (`zt-agent` release, 600 000 stream: RSS da 4,8 MB a 219 MB in 26 s). Lo stesso succedeva nel ramo «credito superato». | media | Lo slot vive quanto il task: un `Close` (o una violazione del credito) stacca solo la coda verso il task, e lo slot lo toglie il canale `done` quando il task è finito. I frame successivi per quell'id si scartano. `done` non può togliere lo slot di uno stream più nuovo: gli id crescono e un id ripetuto chiude la sessione. | `a_relay_close_does_not_free_the_quota_before_the_stream_task_ends` |
+| 5b-2 | Una seconda chiave di agent lasciata nella policy (`public_keys = [nuova, vecchia]`) non veniva mai segnalata: chi ha la chiave vecchia può ancora registrarsi come il nodo. | bassa | Evento WARN `agent_rotation_pending` (`node`, `fingerprints`) all'avvio, a ogni ricarica e ogni ora, per ogni nodo con due chiavi. | `an_agent_rotation_left_in_the_policy_is_reported_until_it_is_completed`, `a_pending_agent_rotation_in_the_policy_is_reported`, `agent_keys_lists_both_keys_of_a_node_in_rotation` |
+| 5b-3 | Lo stesso relay elencato due volte dall'agent, una volta con la chiave vecchia e una con la nuova (per esempio `127.0.0.1:p` e `localhost:p`), supera la validazione. Le due sessioni si scavalcano e fanno cadere le sessioni SSH. | bassa (operatore) | OPERATIONS §8 e PROTOCOL §14: il pin si **sostituisce**, non si aggiunge una seconda voce. Non si risolvono i nomi all'avvio (gli indirizzi possono cambiare). | — |
+| 5b-4 | Un `--max-streams` enorme mandava in panic l'agent all'avvio (il semaforo di tokio ha un massimo). | bassa | `--max-streams` accetta 1..=4096 (`agent::MAX_STREAMS`). `agent::run` rifiuta i valori fuori intervallo senza panic. | `max_streams_out_of_range_is_refused_without_panic`, `an_out_of_range_max_streams_is_refused_without_panic` |
+| 5b-5 | Ogni `SIGHUP` ricarica sia la policy sia le chiavi del relay. Seguendo il runbook come era scritto (prima spostare i file, poi aggiungere `--previous-key` e riavviare), una ricarica della policy fra i due passi attivava la chiave nuova senza la precedente. | bassa (docs) | Runbook di OPERATIONS §8 riscritto: lo scambio avviene in un solo passo (un drop-in con `--key` nuova e `--previous-key` vecchia, poi un riavvio). In ogni stato intermedio una ricarica o non cambia nulla o fallisce in modo sicuro. PROTOCOL §14 e l'unità systemd dicono lo stesso. | — |
+
+Smentite o accettate dalla seconda review:
+- il canale `done` che toglie lo slot di uno stream più nuovo (smentita: gli id non si riusano);
+- più relay in combutta che esauriscono il limite globale (smentita: il permesso si prende dopo `CONFIRM`, che un relay non sa produrre; restano k quote di stream non confermati, ciascuno con una finestra limitata: accettata);
+- lo scarto dei frame verso un task finito che lascia il client appeso (smentita: ogni uscita del task manda `Close`, che precede `done`);
+- segreti nei log durante la rotazione (smentita: solo fingerprint);
+- le connessioni aperte prima di un `SIGHUP` tengono il vecchio keyring (accettata).

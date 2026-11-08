@@ -124,6 +124,12 @@ fn run(command: Command) -> Result<(), String> {
                 let path = policy;
                 let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
+                // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
+                // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
+                tokio::spawn(zt_net::keys::watch_agent_rotations(
+                    policy.clone(),
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 let events = ReloadEvents {
                     reloaded: "policy_reloaded",
                     failed: "policy_reload_failed",

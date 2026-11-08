@@ -426,3 +426,34 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
     relay.wait_for(|v| v["fields"]["event_kind"] == "relay_keys_reload_failed");
     assert!(reaches(&relay, &new).await);
 }
+
+/// Finding 0005b-2: due chiavi di agent per un nodo nella policy (rotazione dell'agent non
+/// completata) sono segnalate alla ricarica con `agent_rotation_pending`.
+#[test]
+fn a_pending_agent_rotation_in_the_policy_is_reported() {
+    let relay = Relay::start("agent-rotation", &[]);
+    let (new, old) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    std::fs::write(
+        relay.dir.join("policy.toml"),
+        format!(
+            "[[agents]]\nnode = \"web-01\"\npublic_keys = [\"{}\", \"{}\"]\n",
+            new.public_key(),
+            old.public_key()
+        ),
+    )
+    .unwrap();
+    relay.hup();
+    let event = relay.wait_for(|v| v["fields"]["event_kind"] == "agent_rotation_pending");
+    assert_eq!(event["target"], "zt_audit");
+    assert_eq!(event["level"], "WARN");
+    assert_eq!(event["fields"]["node"], "web-01");
+    let fingerprints = event["fields"]["fingerprints"].as_str().unwrap();
+    assert!(
+        fingerprints.contains(&new.fingerprint().to_string()),
+        "{event}"
+    );
+    assert!(
+        fingerprints.contains(&old.fingerprint().to_string()),
+        "{event}"
+    );
+}

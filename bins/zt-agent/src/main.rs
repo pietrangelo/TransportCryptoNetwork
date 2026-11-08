@@ -71,10 +71,21 @@ enum Command {
         /// Demone SSH locale.
         #[arg(long, default_value = "127.0.0.1:22")]
         ssh_target: String,
-        /// Sessioni contemporanee.
-        #[arg(long, default_value_t = 16)]
+        /// Sessioni contemporanee (da 1 a 4096).
+        #[arg(long, default_value_t = 16, value_parser = parse_max_streams)]
         max_streams: usize,
     },
+}
+
+/// `--max-streams` entro i limiti dell'agent (finding 0005b-4: oltre il massimo del semaforo
+/// di tokio l'agent andava in panic all'avvio).
+fn parse_max_streams(value: &str) -> Result<usize, String> {
+    let n: usize = value.parse().map_err(|e| format!("{e}"))?;
+    if (1..=agent::MAX_STREAMS).contains(&n) {
+        Ok(n)
+    } else {
+        Err(format!("must be between 1 and {}", agent::MAX_STREAMS))
+    }
 }
 
 fn main() -> ExitCode {

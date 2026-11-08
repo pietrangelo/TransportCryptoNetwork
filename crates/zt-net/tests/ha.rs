@@ -683,3 +683,193 @@ async fn the_session_limit_holds_for_the_whole_agent() {
     drop(held);
     let _ = tokio::time::timeout(Duration::from_secs(5), first).await;
 }
+
+// ======================= adversary 0005b =======================
+
+/// Relay finto: accetta l'agent e restituisce il canale dopo `Register`.
+async fn evil_session(
+    listener: &TcpListener,
+    evil_id: &Identity,
+) -> zt_net::channel::Established<tokio::net::TcpStream> {
+    use zt_crypto::noise::Channel;
+    use zt_domain::Frame;
+    let (tcp, _) = listener.accept().await.unwrap();
+    let keys: Keyring = copy(evil_id).into();
+    let mut ch = zt_net::channel::accept(tcp, &keys, Channel::Outer, &timeouts())
+        .await
+        .unwrap()
+        .establish(&timeouts())
+        .await
+        .unwrap();
+    assert!(matches!(
+        ch.recv().await.unwrap(),
+        Some(Frame::Register { .. })
+    ));
+    ch
+}
+
+/// Sonda: il massimo dei task vivi nel runtime finché `stop` non diventa `true`.
+fn peak_alive_tasks(stop: Arc<std::sync::atomic::AtomicBool>) -> tokio::task::JoinHandle<usize> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::spawn(async move {
+        let mut peak = 0;
+        while !stop.load(Ordering::SeqCst) {
+            peak = peak.max(runtime.metrics().num_alive_tasks());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        peak
+    })
+}
+
+/// Il relay compromesso apre gli stream `ids`, ciascuno con un `msg1` spazzatura subito
+/// seguito da `Close`; restituisce quanti `Reject` riceve.
+async fn open_junk_close(
+    ch: &mut zt_net::channel::Established<tokio::net::TcpStream>,
+    ids: std::ops::RangeInclusive<u32>,
+) -> usize {
+    use zt_domain::{Frame, FramePayload, StreamId};
+    let t = timeouts();
+    let mut rejected = 0;
+    let mut count = |frame: Frame| {
+        if matches!(frame, Frame::Reject { .. }) {
+            rejected += 1;
+        }
+    };
+    for i in ids {
+        let stream = StreamId::try_from(i).unwrap();
+        let junk = FramePayload::try_from(vec![0x42_u8; 96]).unwrap();
+        for frame in [
+            Frame::Open {
+                stream,
+                target: node("web-01"),
+            },
+            Frame::Data {
+                stream,
+                payload: junk,
+            },
+            Frame::Close {
+                stream,
+                reason: CloseReason::Normal,
+            },
+        ] {
+            ch.send(&frame, &t).await.unwrap();
+        }
+        // Si svuota ogni tanto la direzione opposta, così nessuno dei due resta bloccato.
+        if i % 256 == 0 {
+            while let Ok(Ok(Some(f))) =
+                tokio::time::timeout(Duration::from_micros(200), ch.recv()).await
+            {
+                count(f);
+            }
+        }
+    }
+    while let Ok(Ok(Some(f))) = tokio::time::timeout(Duration::from_millis(300), ch.recv()).await {
+        count(f);
+    }
+    rejected
+}
+
+/// Finding 0005b-1: il `Close` del relay toglieva lo slot dello stream subito, mentre il suo
+/// task era ancora vivo. Un relay compromesso che alterna `Open`, `msg1` spazzatura e `Close`
+/// non riceveva mai `ResourceExhausted` e accumulava task senza limite. Ora lo slot resta
+/// finché il task non finisce: la quota per relay vale, e torna libera quando i task finiscono.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_close_does_not_free_the_quota_before_the_stream_task_ends() {
+    use zt_domain::{Frame, FramePayload, StreamId};
+    const MAX: usize = 1;
+    const FLOOD: u32 = 2_000;
+    let k = Keys::new();
+    let evil_id = Identity::generate().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let evil = listener.local_addr().unwrap();
+    // Con la chiave precedente ogni `msg1` spazzatura costa due DH: i task durano di più.
+    let keys = Keyring::rotating(copy(&k.agent), copy(&k.agent_new)).unwrap();
+    start_agent_with(
+        keys,
+        vec![endpoint(evil, &evil_id.public_key())],
+        &k.ansible,
+        MAX,
+    )
+    .await;
+    let mut ch = evil_session(&listener, &evil_id).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let base = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = peak_alive_tasks(Arc::clone(&stop));
+    let rejected = open_junk_close(&mut ch, 1..=FLOOD).await;
+    stop.store(true, Ordering::SeqCst);
+    let peak = probe.await.unwrap();
+    // Prima della correzione: zero rifiuti, sempre (lo slot spariva insieme al `Close`).
+    assert!(
+        rejected > 0,
+        "the relay's Close bypassed the per-relay quota"
+    );
+    // Task di stream vivi al massimo `MAX`; il resto è la sonda e un margine.
+    assert!(
+        peak <= base + 1 + MAX + 2,
+        "peak alive tasks {peak} with base {base}: more stream tasks than max_streams"
+    );
+
+    // Frame per uno stream già chiuso dal relay: si scartano, la sessione resta.
+    let t = timeouts();
+    let old = StreamId::try_from(FLOOD).unwrap();
+    for frame in [
+        Frame::Data {
+            stream: old,
+            payload: FramePayload::try_from(vec![1_u8; 8]).unwrap(),
+        },
+        Frame::Close {
+            stream: old,
+            reason: CloseReason::Normal,
+        },
+    ] {
+        ch.send(&frame, &t).await.unwrap();
+    }
+    // Finiti i task, la quota torna libera: un nuovo `Open` è accettato.
+    let fresh = StreamId::try_from(FLOOD + 1).unwrap();
+    ch.send(
+        &Frame::Open {
+            stream: fresh,
+            target: node("web-01"),
+        },
+        &t,
+    )
+    .await
+    .unwrap();
+    let reply = loop {
+        match tokio::time::timeout(Duration::from_secs(3), ch.recv()).await {
+            Ok(Ok(Some(Frame::OpenAck { stream }))) if stream == fresh => break Ok(()),
+            Ok(Ok(Some(Frame::Reject { stream, reason }))) if stream == fresh => {
+                break Err(reason);
+            }
+            Ok(Ok(Some(_))) => {}
+            other => panic!("relay session ended: {other:?}"),
+        }
+    };
+    assert_eq!(reply, Ok(()), "the quota must come back once the tasks end");
+}
+
+/// Finding 0005b-4: `max_streams` oltre il limite del semaforo di tokio faceva andare in panic
+/// l'agent. Ora `run` rifiuta il valore e ritorna.
+#[tokio::test]
+async fn an_out_of_range_max_streams_is_refused_without_panic() {
+    for max in [0, agent::MAX_STREAMS + 1, usize::MAX] {
+        let config = AgentConfig {
+            relays: vec![endpoint(
+                dead_address().await,
+                &Identity::generate().unwrap().public_key(),
+            )],
+            node: node("web-01"),
+            ssh_target: "127.0.0.1:9".into(),
+            authorized_clients: Revocable::fixed(HashSet::new()),
+            timeouts: timeouts(),
+            max_streams: max,
+        };
+        let keys: Keyring = Identity::generate().unwrap().into();
+        tokio::time::timeout(Duration::from_secs(2), agent::run(Arc::new(keys), config))
+            .await
+            .unwrap_or_else(|_| panic!("max_streams {max} was not refused"));
+    }
+}

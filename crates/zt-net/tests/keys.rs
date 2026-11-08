@@ -109,3 +109,59 @@ async fn a_single_key_is_announced_once_and_never_reminded() {
     assert!(log.text().contains("\"previous_fingerprint\":\"none\""));
     task.abort();
 }
+
+/// Finding 0005b-2: un nodo con due chiavi di agent nella policy del relay (rotazione non
+/// completata) è segnalato al caricamento, a ogni ricarica e ogni `every` finché resta.
+#[tokio::test(start_paused = true)]
+async fn an_agent_rotation_left_in_the_policy_is_reported_until_it_is_completed() {
+    use zt_domain::{AccessPolicy, NodeId};
+    use zt_net::keys::watch_agent_rotations;
+    let log = Captured::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let node = |n: &str| NodeId::try_from(n).unwrap();
+    let (new, old, db) = (id(), id(), id());
+    let policy = |rotating: bool| {
+        let mut p = AccessPolicy::new();
+        let keys: Vec<_> = if rotating {
+            vec![new.fingerprint(), old.fingerprint()]
+        } else {
+            vec![new.fingerprint()]
+        };
+        p.add_agent_keys(node("web-01"), &keys).unwrap();
+        p.add_agent(db.fingerprint(), node("db-01")).unwrap();
+        p
+    };
+    let (current, updater) = Revocable::new(policy(true));
+    let task = tokio::spawn(watch_agent_rotations(current, Duration::from_secs(60)));
+
+    // Al caricamento: solo il nodo con due chiavi, con entrambe le fingerprint.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(log.kinds(), ["agent_rotation_pending"]);
+    let text = log.text();
+    assert!(text.contains("\"node\":\"web-01\""), "{text}");
+    assert!(!text.contains("db-01"), "{text}");
+    assert!(text.contains(&new.fingerprint().to_string()), "{text}");
+    assert!(text.contains(&old.fingerprint().to_string()), "{text}");
+    assert!(text.contains("\"level\":\"WARN\""), "{text}");
+
+    // Promemoria periodico.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(log.kinds().len(), 3);
+
+    // Ricarica ancora in rotazione: subito un altro avviso.
+    updater.replace(policy(true));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(log.kinds().len(), 4);
+
+    // Rotazione completata: niente più avvisi.
+    updater.replace(policy(false));
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(log.kinds().len(), 4, "{:?}", log.kinds());
+    task.abort();
+}

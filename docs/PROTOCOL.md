@@ -271,12 +271,20 @@ cambio contemporaneo in tutta la flotta.
 
 | Rotazione | Passi |
 | :- | :- |
-| chiave del relay | 1. nuova chiave; 2. il relay la carica come corrente e tiene la vecchia come precedente: con `SIGHUP`, senza riavvio, se è già avviato con `--previous-key` (altrimenti serve un riavvio per aggiungere l'opzione); 3. si aggiornano i pin su agent e client; 4. si toglie la precedente (un riavvio senza `--previous-key`) |
+| chiave del relay | 1. nuova chiave; 2. il relay la carica come corrente e tiene la vecchia come precedente, in un solo passo: un riavvio con i nuovi argomenti (o un `SIGHUP`, se è già avviato con `--previous-key` e i file sono stati sistemati in un ordine sicuro, OPERATIONS §8); 3. si sostituiscono i pin su agent e client (mai due voci per lo stesso relay); 4. si toglie la precedente (un riavvio senza `--previous-key`) |
 | chiave di un agent | 1. nuova chiave; 2. la policy del relay elenca entrambe le chiavi per il nodo (`public_keys`, al massimo 2) e si ricarica; 3. l'agent si riavvia con la nuova chiave e la vecchia come precedente: la sessione esterna usa la nuova, il canale end-to-end accetta anche la vecchia; 4. si aggiornano i pin dei client; 5. si tolgono la vecchia chiave dalla policy e la precedente dall'agent |
 
 Relay e agent dichiarano nell'audit log, all'avvio e a ogni ricarica, le fingerprint delle
 chiavi che accettano (`keys_in_use`), e finché una precedente è accettata lo ricordano ogni ora
-(`previous_key_still_accepted`): una rotazione lasciata a metà non resta invisibile.
+(`previous_key_still_accepted`): una rotazione lasciata a metà non resta invisibile. Allo
+stesso modo il relay segnala, all'avvio, a ogni ricarica e ogni ora, i nodi che hanno ancora
+due chiavi di agent nella policy (`agent_rotation_pending`).
+
+Il relay rilegge le proprie chiavi a **ogni** `SIGHUP`, anche quando la ricarica serve per la
+policy: lo scambio tra chiave corrente e precedente deve quindi essere un unico passo, mai una
+sequenza di spostamenti di file sotto un relay avviato senza `--previous-key`. Una precedente
+uguale alla corrente, o un file non valido, fa fallire la ricarica e lascia in vigore le chiavi
+di prima.
 
 Il riavvio di un agent interrompe solo le sessioni SSH di quel nodo. Il riavvio di un relay,
 con più relay, non interrompe nulla di nuovo: agent e client usano gli altri.

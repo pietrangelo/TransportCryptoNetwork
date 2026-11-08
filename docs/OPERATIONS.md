@@ -172,6 +172,7 @@ Gli eventi di sicurezza hanno target `zt_audit` e un nome stabile in `fields.eve
 | `policy_reload_failed`, `authorized_clients_reload_failed`, `relay_keys_reload_failed` | ERROR | ricarica fallita: resta la configurazione precedente |
 | `keys_in_use` | INFO, WARN con una chiave precedente | (relay e agent) all'avvio e a ogni ricarica: `role`, `current_fingerprint`, `previous_fingerprint` (`none` se non c'è) |
 | `previous_key_still_accepted` | WARN | ogni ora, finché una chiave precedente è accettata: completa la rotazione (§8) |
+| `agent_rotation_pending` | WARN | (relay) all'avvio, a ogni ricarica e ogni ora, per ogni nodo con due chiavi di agent nella policy: `node`, `fingerprints`; completa la rotazione (§8) |
 
 I dati dell'evento sono campi separati: `peer` (fingerprint), `node`, `session` (hex),
 `stream`, `reason`, `rule`, secondo l'evento. Mai payload o segreti.
@@ -199,18 +200,41 @@ gli agent sono connessi a tutti, e `zt-client` passa al relay successivo se il p
 risponde o non vede il nodo. Non passa oltre una risposta della policy né un errore
 end-to-end (PROTOCOL §13). Con almeno due relay, il riavvio di uno non interrompe nulla.
 
-**Chiave di un relay** (senza riavvio):
+**Chiave di un relay** (due riavvii; con almeno due relay non interrompono nulla):
 
-1. `zt-relay keygen --out /etc/tcn/relay.key.new`, poi sposta la chiave attuale in
-   `/etc/tcn/relay.prev.key` e la nuova in `/etc/tcn/relay.key` (entrambe `tcn:tcn 0600`).
-2. Se il relay non ha ancora `--previous-key /etc/tcn/relay.prev.key`, aggiungilo
-   all'unità (un riavvio, la prima volta). Poi `systemctl reload zt-relay`: dall'evento
-   `relay_keys_reloaded` vale la chiave nuova e la vecchia resta accettata.
-3. Aggiorna `relay_key` (o `--relay-key`) su agent e client, quando conviene.
-4. Togli la precedente: un file non valido alla ricarica lascia le chiavi di prima
-   (`relay_keys_reload_failed`), quindi la si toglie riavviando senza `--previous-key`.
-   L'evento `keys_in_use` all'avvio deve riportare `previous_fingerprint` `none`; finché non
-   è così, `previous_key_still_accepted` lo ricorda ogni ora.
+Ogni `SIGHUP` (`systemctl reload zt-relay`, anche quando serve solo per la policy) rilegge
+**sia** la policy **sia** le chiavi, dai percorsi con cui il relay è stato avviato. Non spostare
+quindi i file delle chiavi sotto un relay avviato senza `--previous-key`: una ricarica qualsiasi
+tra lo spostamento e il riavvio attiverebbe la chiave nuova senza la vecchia, e i peer che
+pinnano la vecchia verrebbero rifiutati. Lo scambio avviene in un solo passo, al riavvio, negli
+argomenti dell'unità. Una ricarica che trova una chiave precedente uguale alla corrente, o un
+file mancante o non valido, fallisce (`relay_keys_reload_failed`) e lascia le chiavi di prima:
+negli stati intermedi qui sotto è sempre così.
+
+1. `zt-relay keygen --out /etc/tcn/relay.next.key` (poi `chown tcn:tcn`, `0600`). Il relay
+   non lo legge: nulla cambia.
+2. In un drop-in dell'unità (`systemctl edit zt-relay`: una riga `ExecStart=` vuota, poi
+   l'`ExecStart=` completo) avvia il relay con
+   `--key /etc/tcn/relay.next.key --previous-key /etc/tcn/relay.key`, poi
+   `systemctl restart zt-relay`. `keys_in_use` deve riportare come `current_fingerprint` la
+   chiave nuova e come `previous_fingerprint` la vecchia; da qui le ricariche rileggono
+   entrambe.
+3. Aggiorna `relay_key` (o `--relay-key`) su agent e client, quando conviene. **Sostituisci**
+   il pin: non aggiungere una seconda voce per lo stesso relay con l'altra chiave (per esempio
+   `127.0.0.1:7443` con la vecchia e `localhost:7443` con la nuova). L'agent aprirebbe due
+   sessioni verso lo stesso relay, che si scavalcano a vicenda (vale l'ultima registrazione) e
+   fanno cadere le sessioni SSH del nodo.
+4. Togli la precedente: `cp -p /etc/tcn/relay.next.key /etc/tcn/relay.key` (una ricarica in
+   questo momento fallisce, perché le due chiavi coincidono, e lascia quelle di prima), togli
+   il drop-in, `systemctl daemon-reload && systemctl restart zt-relay`, poi cancella
+   `relay.next.key`. L'evento `keys_in_use` all'avvio deve riportare `previous_fingerprint`
+   `none`; finché non è così, `previous_key_still_accepted` lo ricorda ogni ora.
+
+Se un relay gira già con `--previous-key /etc/tcn/relay.prev.key`, la rotazione si fa anche
+senza riavvio, ma in quest'ordine: prima `cp -p /etc/tcn/relay.key /etc/tcn/relay.prev.key`
+(chiavi uguali: una ricarica fallisce e lascia quelle di prima), poi
+`mv /etc/tcn/relay.next.key /etc/tcn/relay.key` (una rinomina è atomica), poi
+`systemctl reload zt-relay` e controlla `relay_keys_reloaded` e `keys_in_use`.
 
 **Chiave di un agent**:
 
@@ -221,7 +245,9 @@ end-to-end (PROTOCOL §13). Con almeno due relay, il riavvio di uno non interrom
    (si interrompono le sessioni SSH di quel nodo). Verso i relay usa la nuova; i client che
    pinnano la vecchia continuano a funzionare.
 4. Aggiorna il pin del nodo in `[[nodes]]` dei client.
-5. Togli la vecchia dalla policy e `--previous-key` dall'agent.
+5. Togli la vecchia dalla policy e `--previous-key` dall'agent. Finché un nodo ha due chiavi
+   nella policy, il relay lo segnala con `agent_rotation_pending` all'avvio, a ogni ricarica e
+   ogni ora: la chiave vecchia può ancora registrarsi come quel nodo.
 
 Una chiave **compromessa** non si ruota: si revoca (§7) senza `--previous-key` e si
 aggiornano subito i pin, perché chi ha la chiave vecchia potrebbe impersonare il relay o

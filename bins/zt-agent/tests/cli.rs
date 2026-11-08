@@ -190,3 +190,47 @@ fn the_previous_key_cannot_be_the_current_key() {
     assert!(stderr.contains("keys_in_use"), "{stderr}");
     assert!(stderr.contains(&old_fp), "{stderr}");
 }
+
+/// Finding 0005b-4: un `--max-streams` enorme faceva andare in panic l'agent (semaforo di
+/// tokio); ora è rifiutato dalla CLI, come lo zero.
+#[test]
+fn max_streams_out_of_range_is_refused_without_panic() {
+    let dir = setup("maxstreams");
+    let a = key();
+    let huge = usize::MAX.to_string();
+    for bad in ["0", "4097", huge.as_str()] {
+        let out = run(
+            &dir,
+            &[
+                "--relay",
+                "127.0.0.1:9",
+                "--relay-key",
+                &a,
+                "--max-streams",
+                bad,
+            ],
+        );
+        fails_with(&out, "max-streams");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+    // I limiti sono accettati.
+    for ok in ["1", "4096"] {
+        let out = run(
+            &dir,
+            &[
+                "--relay",
+                "127.0.0.1:9",
+                "--relay-key",
+                &a,
+                "--max-streams",
+                ok,
+            ],
+        );
+        assert!(
+            out.status.code().is_none() || out.status.success(),
+            "--max-streams {ok} refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

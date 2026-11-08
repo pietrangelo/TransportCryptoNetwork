@@ -35,9 +35,13 @@ pub struct AgentConfig {
     pub authorized_clients: crate::Revocable<HashSet<Fingerprint>>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
-    /// Stream contemporanei.
+    /// Stream contemporanei, da 1 a [`MAX_STREAMS`].
     pub max_streams: usize,
 }
+
+/// Massimo di `max_streams`: ben sotto il limite del semaforo di tokio, che oltre il suo
+/// massimo va in panic (finding 0005b-4).
+pub const MAX_STREAMS: usize = 4096;
 
 /// Mantiene l'agent connesso a ogni relay dell'elenco per sempre, ciascuno con il proprio
 /// backoff esponenziale e jitter (PROTOCOL §13). Verso i relay usa la chiave corrente; sul
@@ -53,6 +57,14 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
         tracing::error!(
             relays = config.relays.len(),
             "the agent needs between 1 and 8 relays"
+        );
+        return;
+    }
+    // La CLI lo valida già; qui si difende chi usa la libreria, senza panic.
+    if config.max_streams == 0 || config.max_streams > MAX_STREAMS {
+        tracing::error!(
+            max_streams = config.max_streams,
+            "the agent needs between 1 and 4096 concurrent streams"
         );
         return;
     }
@@ -151,6 +163,8 @@ async fn run_session(
                 ch.send(&frame, t).await?;
             }
             Some(stream) = done_rx.recv() => {
+                // Gli id crescono e non si riusano (un id ripetuto chiude la sessione), e
+                // `done` è di questa sessione: non può togliere lo slot di uno stream più nuovo.
                 streams.slots.remove(&stream);
             }
             _ = keepalive.tick() => {
@@ -162,8 +176,15 @@ async fn run_session(
 }
 
 /// Coda e credito in ingresso di uno stream.
+///
+/// Lo slot vive quanto il task dello stream, non quanto lo stream sul filo: lo toglie solo il
+/// canale `done`, alla fine del task. Così la quota per relay conta i task davvero vivi e un
+/// relay compromesso che alterna `Open`, `msg1` spazzatura e `Close` non può accumulare task
+/// oltre `max_streams` (finding 0005b-1).
 struct Slot {
-    tx: mpsc::Sender<Frame>,
+    /// `None` dopo il `Close` del relay (o una sua violazione): il task ha già ricevuto tutto
+    /// quello che doveva e i frame successivi per questo id si scartano.
+    tx: Option<mpsc::Sender<Frame>>,
     /// Credito che il relay ha verso questo stream: si applica **prima** di accodare, così un
     /// relay compromesso non può riempire la coda oltre la finestra (finding 0002-14).
     recv: Window,
@@ -221,7 +242,7 @@ fn on_relay_frame(
             streams.slots.insert(
                 stream,
                 Slot {
-                    tx,
+                    tx: Some(tx),
                     recv: Window::initial(),
                 },
             );
@@ -244,8 +265,12 @@ fn on_relay_frame(
         | Frame::WindowUpdate { stream, .. }
         | Frame::Close { stream, .. } => {
             let closing = matches!(frame, Frame::Close { .. });
+            // Stream già chiuso da questa parte (slot tolto da `done`) o già chiuso dal relay
+            // (coda staccata): frame in volo o ripetuto, si scarta.
             let Some(slot) = streams.slots.get_mut(&stream) else {
-                // Stream già chiuso da questa parte: frame in volo, si scarta.
+                return Ok(None);
+            };
+            let Some(tx) = &slot.tx else {
                 return Ok(None);
             };
             let within_credit = match &frame {
@@ -253,7 +278,7 @@ fn on_relay_frame(
                 _ => true,
             };
             let queued = within_credit
-                && match slot.tx.try_send(frame) {
+                && match tx.try_send(frame) {
                     Ok(()) => true,
                     // Il task dello stream ha già finito e il suo `Close` è in viaggio: il
                     // frame era in volo, si scarta. Rispondere `ProtocolViolation` qui poteva
@@ -263,15 +288,18 @@ fn on_relay_frame(
                     Err(mpsc::error::TrySendError::Full(_)) => false,
                 };
             if !queued {
-                // Solo un relay che non applica il credito può arrivare qui.
-                streams.slots.remove(&stream);
+                // Solo un relay che non applica il credito può arrivare qui. Staccare la coda
+                // fa finire il task; lo slot resta (e conta nella quota) finché non finisce.
+                slot.tx = None;
                 return Ok(Some(Frame::Close {
                     stream,
                     reason: CloseReason::ProtocolViolation,
                 }));
             }
             if closing {
-                streams.slots.remove(&stream);
+                // Il `Close` è già in coda: il task lo legge, poi vede la coda chiusa. Lo slot
+                // lo toglie solo `done`, quando il task è davvero finito (finding 0005b-1).
+                slot.tx = None;
             }
             Ok(None)
         }

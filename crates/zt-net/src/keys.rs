@@ -3,10 +3,15 @@
 //! Una chiave precedente lasciata attiva per errore allunga la vita di una chiave che si voleva
 //! ritirare: per questo il processo dichiara all'avvio (e a ogni ricarica) quali fingerprint
 //! accetta, e ricorda periodicamente finché una precedente è ancora accettata.
+//!
+//! Lo stesso vale per le chiavi di agent nella policy del relay: un nodo con due chiavi
+//! (`public_keys = [nuova, vecchia]`) ha una rotazione non completata, e la chiave vecchia
+//! resta valida per registrarsi come quel nodo (finding 0005b-2).
 
 use std::time::Duration;
 
 use zt_crypto::Keyring;
+use zt_domain::AccessPolicy;
 
 use crate::Revocable;
 
@@ -61,6 +66,50 @@ pub async fn watch(role: &'static str, mut keys: Revocable<Keyring>, every: Dura
         };
         tokio::select! {
             () = keys.changed() => {}
+            () = reminders => {}
+        }
+    }
+}
+
+/// Registra un `agent_rotation_pending` per ogni nodo della policy con due chiavi di agent.
+/// Restituisce quanti sono.
+pub fn announce_agent_rotations(policy: &AccessPolicy) -> usize {
+    let mut pending: usize = 0;
+    for (node, keys) in policy.agent_keys() {
+        if keys.len() < 2 {
+            continue;
+        }
+        // Ordine stabile nei log: le fingerprint non hanno un ordine proprio.
+        let mut fingerprints: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        fingerprints.sort_unstable();
+        tracing::warn!(
+            target: "zt_audit",
+            event_kind = "agent_rotation_pending",
+            %node,
+            fingerprints = %fingerprints.join(","),
+            "an agent key rotation is not complete: remove the old key from the policy"
+        );
+        pending = pending.saturating_add(1);
+    }
+    pending
+}
+
+/// Segnala le rotazioni di agent non completate nella policy all'avvio e a ogni ricarica;
+/// finché ne resta una, le ripete ogni `every`. Non ritorna.
+pub async fn watch_agent_rotations(mut policy: Revocable<AccessPolicy>, every: Duration) {
+    loop {
+        let current = policy.current();
+        let reminders = async {
+            if announce_agent_rotations(&current) == 0 {
+                return std::future::pending::<()>().await;
+            }
+            loop {
+                tokio::time::sleep(every).await;
+                announce_agent_rotations(&current);
+            }
+        };
+        tokio::select! {
+            () = policy.changed() => {}
             () = reminders => {}
         }
     }
