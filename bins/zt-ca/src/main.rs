@@ -289,36 +289,45 @@ fn inspect(cert: &Path, ca_key: Option<&str>) -> Result<(), String> {
     let Some(expected_ca) = expected_ca else {
         return emit(&out);
     };
+    let verdict = verify_signature(&file.bytes, subject, &expected_ca);
+    if verdict.is_ok() {
+        let _ = writeln!(
+            out,
+            "signature   = verified with {}",
+            expected_ca.fingerprint()
+        );
+    }
+    emit(&out)?;
+    verdict
+}
+
+/// Verifica la firma con `ca` come unica CA pinnata (passi 3–6 di PROTOCOL §15.4).
+fn verify_signature(
+    bytes: &[u8],
+    subject: Option<PublicKey>,
+    ca: &PublicKey,
+) -> Result<(), String> {
     let subject = subject.ok_or("signature: the certificate's subject key is not valid")?;
     let name = NodeId::try_from("inspect").map_err(|_| "internal error")?;
     let mut trust = CertTrust::new();
     trust
         .add_authority(
             name,
-            &[trusted_ca_key(&expected_ca)],
+            &[trusted_ca_key(ca)],
             AllowedNodes::All,
             MAX_CERT_LIFETIME_SECS,
         )
         .map_err(|_| "--ca-key: not usable as a CA key")?;
     let empty = Revocations::new([], []).map_err(|_| "internal error")?;
     trust.set_revocations(empty);
-    match verify_certificate(&file.bytes, &subject.fingerprint(), &trust) {
-        Ok(_) => {
-            let _ = writeln!(
-                out,
-                "signature   = verified with {}",
-                expected_ca.fingerprint()
-            );
-            emit(&out)
-        }
-        Err(rejection) => {
-            emit(&out)?;
-            Err(format!(
+    verify_certificate(bytes, &subject.fingerprint(), &trust)
+        .map(|_| ())
+        .map_err(|rejection| {
+            format!(
                 "signature: not verified with this CA key ({})",
                 rejection.as_str()
-            ))
-        }
-    }
+            )
+        })
 }
 
 /// Scrive l'output di un comando su stdout, in una volta.
