@@ -60,6 +60,12 @@ ansible-playbook -i inventory.ini site.yml   # inventario con web-01.tcn, db-01.
 
 Il relay e le chiavi pinnate stanno in `~/.config/tcn/client.toml` (vedi `docs/OPERATIONS.md`).
 
+## Sicurezza
+
+Per segnalare una vulnerabilità usa la segnalazione privata di GitHub: vedi
+[`SECURITY.md`](SECURITY.md). Le difese del repository e del processo di rilascio sono in
+[`docs/REPOSITORY_SECURITY.md`](docs/REPOSITORY_SECURITY.md).
+
 ## Licenza
 
 Apache-2.0

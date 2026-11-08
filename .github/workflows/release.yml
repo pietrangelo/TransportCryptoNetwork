@@ -6,8 +6,14 @@ on:
   push:
     tags: ["v*"]
 
+# Default senza permessi di scrittura; ogni job dichiara i propri.
 permissions:
   contents: read
+
+# Una sola release per tag alla volta; una run in corso non viene annullata a metà.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,8 +21,41 @@ env:
 # Le action sono fissate a un commit (il tag fra commenti è solo un promemoria). Compilazione e
 # test, che eseguono codice delle dipendenze (build script), girano senza permessi; il token
 # OIDC per l'attestazione esiste solo nel job `attest`, che non compila nulla (finding 0004-5).
+#
+# `attest` e `release` girano nell'environment protetto `release` (revisore obbligatorio, solo
+# tag v*): firma e pubblicazione partono solo dopo un'approvazione esplicita. Vedi
+# docs/REPOSITORY_SECURITY.md.
 jobs:
+  verify-tag:
+    # Si rilascia solo codice già revisionato: il commit del tag deve stare su main.
+    name: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: tag commit is reachable from main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::il tag $GITHUB_REF_NAME punta a $GITHUB_SHA, che non è su main"
+            exit 1
+          fi
+      - name: tag name is a semantic version
+        run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::nome di tag non valido: $GITHUB_REF_NAME"
+            exit 1
+          fi
+
   build:
+    name: build (${{ matrix.target }})
+    needs: verify-tag
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -37,12 +76,16 @@ jobs:
           targets: ${{ matrix.target }}
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - run: cargo test --workspace --locked
-      - run: cargo build --release --locked --target ${{ matrix.target }} -p zt-relay -p zt-agent -p zt-client
+      - run: cargo build --release --locked --target "$TARGET" -p zt-relay -p zt-agent -p zt-client
+        env:
+          TARGET: ${{ matrix.target }}
       - name: package
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          name="tcn-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="tcn-${GITHUB_REF_NAME}-${TARGET}"
           mkdir -p "dist/$name"
-          cp target/${{ matrix.target }}/release/zt-{relay,agent,client} "dist/$name/"
+          cp "target/${TARGET}/release/"zt-{relay,agent,client} "dist/$name/"
           cp -r packaging/systemd LICENSE README.md docs/OPERATIONS.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
@@ -52,12 +95,15 @@ jobs:
           path: dist/*.tar.gz*
 
   attest:
+    name: attest
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+      id-token: write # token OIDC per il certificato Sigstore dell'attestazione
+      attestations: write # salva l'attestazione SLSA nel repository
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -69,10 +115,13 @@ jobs:
           subject-path: dist/*.tar.gz
 
   release:
+    name: release
     needs: attest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
     permissions:
-      contents: write
+      contents: write # crea la release in bozza e carica gli archivi
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

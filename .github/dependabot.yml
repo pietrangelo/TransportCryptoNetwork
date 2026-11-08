@@ -1,0 +1,36 @@
+# Aggiornamenti automatici delle dipendenze. Ogni PR di Dependabot passa dalla stessa CI di
+# tutte le altre (test, fuzzing, cargo-deny, zizmor) e richiede una revisione umana.
+#
+# `cooldown` aspetta qualche giorno prima di proporre una versione appena pubblicata: una
+# release malevola di una dipendenza di solito viene scoperta e ritirata in quella finestra.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories: ["/", "/fuzz"]
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

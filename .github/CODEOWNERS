@@ -1,0 +1,21 @@
+# Ogni modifica richiede la revisione del maintainer. Le righe più specifiche, in fondo,
+# segnano le aree in cui un errore diventa una vulnerabilità o compromette la supply chain.
+*                       @pietrangelo
+
+# Supply chain e rilascio: workflow, regole del repository, dipendenze, packaging.
+/.github/               @pietrangelo
+/deny.toml              @pietrangelo
+/Cargo.lock             @pietrangelo
+/fuzz/Cargo.lock        @pietrangelo
+/rust-toolchain.toml    @pietrangelo
+/packaging/             @pietrangelo
+
+# Configurazione di Claude cifrata con cc: filtro git e hook.
+/.gitattributes         @pietrangelo
+/.claude/               @pietrangelo
+/CLAUDE.md              @pietrangelo
+
+# Protocollo, crittografia e documenti di sicurezza.
+/crates/                @pietrangelo
+/docs/PROTOCOL.md       @pietrangelo
+/SECURITY.md            @pietrangelo
