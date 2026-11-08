@@ -17,6 +17,7 @@ use zt_domain::Fingerprint;
 
 use crate::error::CryptoError;
 use crate::identity::{Identity, PublicKey, fingerprint_of_x25519};
+use crate::keyring::Keyring;
 
 const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
@@ -109,6 +110,25 @@ pub fn respond(
         .map_err(|_| CryptoError::Handshake)?;
     let peer = remote_fingerprint(&state)?;
     Ok(AuthorizationPending { state, peer })
+}
+
+/// Responder con un [`Keyring`]: accetta un `msg1` cifrato verso la chiave corrente o verso
+/// quella precedente (PROTOCOL §14).
+///
+/// # Errors
+/// [`CryptoError::Handshake`] se `msg1` non è valido per nessuna delle due chiavi.
+pub fn respond_any(
+    keys: &Keyring,
+    msg1: &[u8],
+    channel: Channel,
+) -> Result<AuthorizationPending, CryptoError> {
+    // Un tentativo fallito non lascia stato: ogni `respond` costruisce un handshake nuovo.
+    // Il tempo rivela quale chiave ha funzionato; non è un segreto (sono entrambe pubbliche).
+    match (respond(keys.current(), msg1, channel), keys.previous()) {
+        (Ok(pending), _) => Ok(pending),
+        (Err(_), Some(previous)) => respond(previous, msg1, channel),
+        (Err(err), None) => Err(err),
+    }
 }
 
 /// L'initiator ha inviato `msg1` e attende la risposta.

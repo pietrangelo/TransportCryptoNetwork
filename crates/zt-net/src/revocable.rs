@@ -6,15 +6,30 @@ use tokio::sync::watch;
 
 /// Lato di lettura di un valore che può essere sostituito mentre il processo gira (policy del
 /// relay, client autorizzati di un agent). Clonabile; ogni copia vede l'ultimo valore.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Revocable<T> {
     rx: watch::Receiver<Arc<T>>,
+}
+
+// A mano: la copia condivide il valore, quindi `T` non deve essere `Clone` (es. `Keyring`).
+impl<T> Clone for Revocable<T> {
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.clone(),
+        }
+    }
 }
 
 /// Lato di scrittura: sostituisce il valore e sveglia chi lo osserva.
 #[derive(Debug)]
 pub struct Updater<T> {
     tx: watch::Sender<Arc<T>>,
+}
+
+impl From<zt_crypto::Identity> for Revocable<zt_crypto::Keyring> {
+    fn from(identity: zt_crypto::Identity) -> Self {
+        Self::fixed(zt_crypto::Keyring::single(identity))
+    }
 }
 
 impl<T> Revocable<T> {
@@ -29,6 +44,13 @@ impl<T> Revocable<T> {
     #[must_use]
     pub fn fixed(value: T) -> Self {
         Self::new(value).0
+    }
+
+    /// Un valore già condiviso che non cambierà mai.
+    #[must_use]
+    pub fn fixed_shared(value: Arc<T>) -> Self {
+        let (_tx, rx) = watch::channel(value);
+        Self { rx }
     }
 
     /// Il valore attuale.

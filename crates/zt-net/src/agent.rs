@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout, timeout_at};
+use zt_crypto::Keyring;
 use zt_crypto::noise::{self, Channel};
-use zt_crypto::{Identity, PublicKey};
 use zt_domain::flow::Window;
 use zt_domain::{
     AuthFailureReason, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
@@ -25,10 +25,8 @@ use crate::{NetError, Timeouts, channel};
 /// Configurazione dell'agent.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Indirizzo del relay (`host:porta`).
-    pub relay: String,
-    /// Chiave pubblica del relay, pinnata.
-    pub relay_key: PublicKey,
+    /// Relay a cui restare connessi, tutti insieme (al massimo [`crate::MAX_RELAYS`]).
+    pub relays: Vec<crate::RelayEndpoint>,
     /// Nome di questo nodo.
     pub node: NodeId,
     /// Demone SSH locale.
@@ -37,19 +35,66 @@ pub struct AgentConfig {
     pub authorized_clients: crate::Revocable<HashSet<Fingerprint>>,
     /// Timeout di rete.
     pub timeouts: Timeouts,
-    /// Stream contemporanei.
+    /// Stream contemporanei, da 1 a [`MAX_STREAMS`].
     pub max_streams: usize,
 }
 
-/// Mantiene l'agent connesso al relay per sempre, con backoff esponenziale e jitter.
-pub async fn run(identity: Arc<Identity>, config: AgentConfig) {
+/// Massimo di `max_streams`: ben sotto il limite del semaforo di tokio, che oltre il suo
+/// massimo va in panic (finding 0005b-4).
+pub const MAX_STREAMS: usize = 4096;
+
+/// Mantiene l'agent connesso a ogni relay dell'elenco per sempre, ciascuno con il proprio
+/// backoff esponenziale e jitter (PROTOCOL §13). Verso i relay usa la chiave corrente; sul
+/// canale end-to-end accetta anche quella precedente (PROTOCOL §14).
+///
+/// `max_streams` limita due cose: gli stream di **ciascun** relay (anche quelli che non hanno
+/// ancora completato l'handshake end-to-end) e le sessioni verso sshd dell'agent **intero**.
+/// Il permesso globale si prende solo dopo la conferma del client, che un relay non sa
+/// falsificare: un relay compromesso esaurisce solo la propria quota e non blocca le
+/// sessioni che passano dagli altri (finding 0005-1).
+pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
+    if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
+        tracing::error!(
+            relays = config.relays.len(),
+            "the agent needs between 1 and 8 relays"
+        );
+        return;
+    }
+    // La CLI lo valida già; qui si difende chi usa la libreria, senza panic.
+    if config.max_streams == 0 || config.max_streams > MAX_STREAMS {
+        tracing::error!(
+            max_streams = config.max_streams,
+            "the agent needs between 1 and 4096 concurrent streams"
+        );
+        return;
+    }
+    let slots = Arc::new(Semaphore::new(config.max_streams));
+    let mut sessions = tokio::task::JoinSet::new();
+    for relay in config.relays.clone() {
+        sessions.spawn(run_one(
+            Arc::clone(&keys),
+            relay,
+            config.clone(),
+            Arc::clone(&slots),
+        ));
+    }
+    // I cicli non terminano mai; se uno andasse in panic gli altri continuano.
+    while sessions.join_next().await.is_some() {}
+}
+
+async fn run_one(
+    identity: Arc<Keyring>,
+    relay: crate::RelayEndpoint,
+    config: AgentConfig,
+    slots: Arc<Semaphore>,
+) {
     const MAX_DELAY: Duration = Duration::from_secs(60);
     let mut delay = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        match run_session(&identity, &config).await {
-            Ok(()) => tracing::info!("relay closed the connection"),
-            Err(err) => tracing::warn!(error = %err, "relay session ended"),
+        match run_session(&identity, &relay, &config, &slots).await {
+            Ok(()) => tracing::info!(relay = %relay.address, "relay closed the connection"),
+            Err(err) => tracing::warn!(relay = %relay.address, error = %err, "relay session ended"),
         }
         if started.elapsed() > MAX_DELAY {
             delay = Duration::from_secs(1);
@@ -69,13 +114,25 @@ pub async fn run(identity: Arc<Identity>, config: AgentConfig) {
 ///
 /// # Errors
 /// Qualsiasi errore di rete, handshake o protocollo del relay.
-pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Result<(), NetError> {
+async fn run_session(
+    identity: &Arc<Keyring>,
+    relay: &crate::RelayEndpoint,
+    config: &AgentConfig,
+    slots: &Arc<Semaphore>,
+) -> Result<(), NetError> {
     let t = &config.timeouts;
-    let tcp = timeout(t.handshake, TcpStream::connect(&config.relay))
+    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
     let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect(tcp, identity, &config.relay_key, Channel::Outer, t).await?;
+    let mut ch = channel::connect(
+        tcp,
+        identity.current(),
+        &relay.public_key,
+        Channel::Outer,
+        t,
+    )
+    .await?;
     ch.send(
         &Frame::Register {
             node: config.node.clone(),
@@ -83,7 +140,7 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
         t,
     )
     .await?;
-    tracing::info!(node = %config.node, relay = %config.relay, "registered with relay");
+    tracing::info!(node = %config.node, relay = %relay.address, "registered with relay");
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(1024);
     let (done_tx, mut done_rx) = mpsc::channel::<StreamId>(config.max_streams.saturating_add(1));
@@ -97,7 +154,7 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
             inbound = timeout_at(deadline, ch.recv()) => {
                 let frame = inbound.map_err(|_| NetError::Timeout("relay idle"))??.ok_or(NetError::Closed)?;
                 deadline = crate::deadline(t.idle);
-                if let Some(reply) = on_relay_frame(frame, identity, config, &mut streams, &out_tx, &done_tx)? {
+                if let Some(reply) = on_relay_frame(frame, identity, config, slots, &mut streams, &out_tx, &done_tx)? {
                     ch.send(&reply, t).await?;
                 }
             }
@@ -106,6 +163,8 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
                 ch.send(&frame, t).await?;
             }
             Some(stream) = done_rx.recv() => {
+                // Gli id crescono e non si riusano (un id ripetuto chiude la sessione), e
+                // `done` è di questa sessione: non può togliere lo slot di uno stream più nuovo.
                 streams.slots.remove(&stream);
             }
             _ = keepalive.tick() => {
@@ -117,8 +176,15 @@ pub async fn run_session(identity: &Arc<Identity>, config: &AgentConfig) -> Resu
 }
 
 /// Coda e credito in ingresso di uno stream.
+///
+/// Lo slot vive quanto il task dello stream, non quanto lo stream sul filo: lo toglie solo il
+/// canale `done`, alla fine del task. Così la quota per relay conta i task davvero vivi e un
+/// relay compromesso che alterna `Open`, `msg1` spazzatura e `Close` non può accumulare task
+/// oltre `max_streams` (finding 0005b-1).
 struct Slot {
-    tx: mpsc::Sender<Frame>,
+    /// `None` dopo il `Close` del relay (o una sua violazione): il task ha già ricevuto tutto
+    /// quello che doveva e i frame successivi per questo id si scartano.
+    tx: Option<mpsc::Sender<Frame>>,
     /// Credito che il relay ha verso questo stream: si applica **prima** di accodare, così un
     /// relay compromesso non può riempire la coda oltre la finestra (finding 0002-14).
     recv: Window,
@@ -146,8 +212,9 @@ impl Streams {
 
 fn on_relay_frame(
     frame: Frame,
-    identity: &Arc<Identity>,
+    identity: &Arc<Keyring>,
     config: &AgentConfig,
+    slots: &Arc<Semaphore>,
     streams: &mut Streams,
     out_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<StreamId>,
@@ -164,6 +231,7 @@ fn on_relay_frame(
                 return Err(NetError::Protocol("relay reused a stream id"));
             }
             streams.last = stream.get();
+            // Quota per relay: conta anche gli stream non ancora confermati.
             if streams.slots.len() >= config.max_streams {
                 return Ok(Some(Frame::Reject {
                     stream,
@@ -174,13 +242,14 @@ fn on_relay_frame(
             streams.slots.insert(
                 stream,
                 Slot {
-                    tx,
+                    tx: Some(tx),
                     recv: Window::initial(),
                 },
             );
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
+                sessions: Arc::clone(slots),
                 authorized: config.authorized_clients.clone(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
@@ -196,25 +265,41 @@ fn on_relay_frame(
         | Frame::WindowUpdate { stream, .. }
         | Frame::Close { stream, .. } => {
             let closing = matches!(frame, Frame::Close { .. });
+            // Stream già chiuso da questa parte (slot tolto da `done`) o già chiuso dal relay
+            // (coda staccata): frame in volo o ripetuto, si scarta.
             let Some(slot) = streams.slots.get_mut(&stream) else {
-                // Stream già chiuso da questa parte: frame in volo, si scarta.
+                return Ok(None);
+            };
+            let Some(tx) = &slot.tx else {
                 return Ok(None);
             };
             let within_credit = match &frame {
                 Frame::Data { payload, .. } => slot.recv.consume(payload.len()).is_ok(),
                 _ => true,
             };
-            let queued = within_credit && slot.tx.try_send(frame).is_ok();
+            let queued = within_credit
+                && match tx.try_send(frame) {
+                    Ok(()) => true,
+                    // Il task dello stream ha già finito e il suo `Close` è in viaggio: il
+                    // frame era in volo, si scarta. Rispondere `ProtocolViolation` qui poteva
+                    // sorpassare quel `Close` e nascondere al client il motivo vero (es.
+                    // `Drained` per il limite di sessioni). Lo slot lo toglie `done`.
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(None),
+                    Err(mpsc::error::TrySendError::Full(_)) => false,
+                };
             if !queued {
-                // Solo un relay che non applica il credito può arrivare qui.
-                streams.slots.remove(&stream);
+                // Solo un relay che non applica il credito può arrivare qui. Staccare la coda
+                // fa finire il task; lo slot resta (e conta nella quota) finché non finisce.
+                slot.tx = None;
                 return Ok(Some(Frame::Close {
                     stream,
                     reason: CloseReason::ProtocolViolation,
                 }));
             }
             if closing {
-                streams.slots.remove(&stream);
+                // Il `Close` è già in coda: il task lo legge, poi vede la coda chiusa. Lo slot
+                // lo toglie solo `done`, quando il task è davvero finito (finding 0005b-1).
+                slot.tx = None;
             }
             Ok(None)
         }
@@ -228,7 +313,9 @@ fn on_relay_frame(
 
 struct StreamTask {
     io: StreamIo,
-    identity: Arc<Identity>,
+    identity: Arc<Keyring>,
+    /// Sessioni verso sshd dell'agent intero (tutti i relay).
+    sessions: Arc<Semaphore>,
     authorized: crate::Revocable<HashSet<Fingerprint>>,
     ssh_target: String,
     timeouts: Timeouts,
@@ -239,12 +326,13 @@ impl StreamTask {
         let Self {
             mut io,
             identity,
+            sessions,
             authorized,
             ssh_target,
             timeouts,
         } = self;
         let pending = match io.recv_message(&timeouts).await {
-            Ok(msg1) => noise::respond(&identity, &msg1, Channel::EndToEnd),
+            Ok(msg1) => noise::respond_any(&identity, &msg1, Channel::EndToEnd),
             // Il client ha già chiuso: rispondere con un altro `Close` non serve (finding 0002-1).
             Err(NetError::StreamClosed(_)) => return,
             Err(err) => {
@@ -296,6 +384,13 @@ impl StreamTask {
                 return;
             }
         }
+        // Solo ora, con un client vero, si occupa uno dei `max_streams` posti globali; resta
+        // occupato fino alla fine di questa funzione.
+        let Ok(_session) = sessions.try_acquire_owned() else {
+            tracing::warn!(peer = %client, "too many sessions on this agent");
+            io.close(CloseReason::Drained).await;
+            return;
+        };
         let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, TcpStream::connect(&ssh_target)).await
         else {
             tracing::warn!(target = %ssh_target, "cannot reach local ssh daemon");

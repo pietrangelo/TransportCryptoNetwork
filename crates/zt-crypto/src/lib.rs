@@ -12,7 +12,9 @@
 
 mod error;
 mod identity;
+mod keyring;
 pub mod noise;
 
 pub use error::CryptoError;
 pub use identity::{Identity, PublicKey, fingerprint_of_x25519};
+pub use keyring::Keyring;

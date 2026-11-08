@@ -44,9 +44,14 @@ enum Command {
         /// Indirizzo di ascolto.
         #[arg(long, default_value = "0.0.0.0:7443")]
         listen: std::net::SocketAddr,
-        /// Chiave segreta del relay.
+        /// Chiave segreta del relay. `SIGHUP` la ricarica: vale per le connessioni nuove.
         #[arg(long)]
         key: PathBuf,
+        /// Chiave segreta precedente, durante una rotazione: i peer che pinnano ancora la
+        /// vecchia chiave pubblica restano accettati (PROTOCOL §14). `SIGHUP` ricarica anche
+        /// questa; per toglierla serve un riavvio senza l'opzione.
+        #[arg(long)]
+        previous_key: Option<PathBuf>,
         /// Policy di accesso (TOML). `SIGHUP` la ricarica e la applica anche alle connessioni
         /// aperte; un file non valido lascia in vigore quella precedente.
         #[arg(long)]
@@ -85,6 +90,7 @@ fn run(command: Command) -> Result<(), String> {
         Command::Run {
             listen,
             key,
+            previous_key,
             policy,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -94,10 +100,36 @@ fn run(command: Command) -> Result<(), String> {
             runtime.block_on(async {
                 // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
                 let hangups = Hangups::listen().map_err(|e| e.to_string())?;
-                let identity = config::load_identity(&key).map_err(|e| e.to_string())?;
+                let key_hangups = Hangups::listen().map_err(|e| e.to_string())?;
+                let keys = config::load_keyring(&key, previous_key.as_deref())
+                    .map_err(|e| e.to_string())?;
+                // Rotazione della chiave del relay senza riavvio (PROTOCOL §14): le chiavi nuove
+                // valgono per gli handshake successivi; le connessioni aperte restano.
+                let (keys, key_updater) = Revocable::new(keys);
+                tokio::spawn(zt_net::keys::watch(
+                    "relay",
+                    keys.clone(),
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
+                let key_events = ReloadEvents {
+                    reloaded: "relay_keys_reloaded",
+                    failed: "relay_keys_reload_failed",
+                };
+                tokio::spawn(reload::on_sighup(
+                    key_hangups,
+                    key_updater,
+                    key_events,
+                    move || config::load_keyring(&key, previous_key.as_deref()),
+                ));
                 let path = policy;
                 let policy = config::load_policy(&path).map_err(|e| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
+                // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
+                // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
+                tokio::spawn(zt_net::keys::watch_agent_rotations(
+                    policy.clone(),
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 let events = ReloadEvents {
                     reloaded: "policy_reloaded",
                     failed: "policy_reload_failed",
@@ -105,7 +137,7 @@ fn run(command: Command) -> Result<(), String> {
                 tokio::spawn(reload::on_sighup(hangups, updater, events, move || {
                     config::load_policy(&path)
                 }));
-                let server = RelayServer::bind(listen, identity, policy, RelayConfig::default())
+                let server = RelayServer::bind(listen, keys, policy, RelayConfig::default())
                     .await
                     .map_err(|e| e.to_string())?;
                 systemd::notify_ready();

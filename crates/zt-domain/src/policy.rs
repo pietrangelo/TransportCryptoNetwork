@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::crypto::Fingerprint;
 use crate::error::DomainError;
@@ -48,6 +48,9 @@ pub enum PeerRole<'a> {
     },
 }
 
+/// Chiavi di agent ammesse per un nodo: la corrente e, durante una rotazione, la nuova.
+pub const MAX_AGENT_KEYS: usize = 2;
+
 /// Whitelist del relay: chi può connettersi, con quale ruolo, e verso quali nodi.
 ///
 /// Principio del minimo privilegio: una chiave ha **un solo** ruolo, un agent ha **un solo**
@@ -87,6 +90,40 @@ impl AccessPolicy {
         Ok(())
     }
 
+    /// Autorizza come agent del nodo `node` una o due chiavi: due durante la rotazione della
+    /// chiave dell'agent (PROTOCOL §14). Vale l'ultima che si registra.
+    ///
+    /// # Errors
+    /// [`DomainError::AgentKeys`] se le chiavi sono zero, più di [`MAX_AGENT_KEYS`] o
+    /// ripetute; [`DomainError::DuplicatePeer`] e [`DomainError::DuplicateNode`] come
+    /// [`Self::add_agent`]. In caso d'errore la policy non cambia.
+    pub fn add_agent_keys(
+        &mut self,
+        node: NodeId,
+        keys: &[Fingerprint],
+    ) -> Result<(), DomainError> {
+        let distinct = match keys {
+            [_] => true,
+            [a, b] => a != b,
+            _ => false,
+        };
+        if !distinct || keys.len() > MAX_AGENT_KEYS {
+            return Err(DomainError::AgentKeys(node));
+        }
+        // Tutti i controlli prima di qualsiasi modifica: nessun effetto parziale.
+        for key in keys {
+            self.ensure_new_peer(key)?;
+        }
+        if self.nodes.contains(&node) {
+            return Err(DomainError::DuplicateNode(node));
+        }
+        self.nodes.insert(node.clone());
+        for key in keys {
+            self.agents.insert(*key, node.clone());
+        }
+        Ok(())
+    }
+
     /// Autorizza la chiave `peer` come client con i permessi `grant`.
     ///
     /// # Errors
@@ -106,6 +143,18 @@ impl AccessPolicy {
         self.clients
             .get(peer)
             .map(|grant| PeerRole::Client { grant })
+    }
+
+    /// Le chiavi di agent ammesse per ogni nodo, in ordine di nodo: due per i nodi la cui
+    /// rotazione non è ancora completata (PROTOCOL §14). L'ordine delle chiavi non è
+    /// significativo.
+    #[must_use]
+    pub fn agent_keys(&self) -> BTreeMap<&NodeId, Vec<Fingerprint>> {
+        let mut by_node: BTreeMap<&NodeId, Vec<Fingerprint>> = BTreeMap::new();
+        for (key, node) in &self.agents {
+            by_node.entry(node).or_default().push(*key);
+        }
+        by_node
     }
 
     /// `true` se il client `peer` può aprire uno stream verso `target`.
@@ -216,5 +265,20 @@ mod tests {
             p.add_agent(fp(3), node("web-01")),
             Err(DomainError::DuplicateNode(node("web-01")))
         );
+    }
+
+    #[test]
+    fn agent_keys_lists_both_keys_of_a_node_in_rotation() {
+        let mut p = policy();
+        p.add_agent_keys(node("app-01"), &[fp(20), fp(21)]).unwrap();
+        let keys = p.agent_keys();
+        assert_eq!(
+            keys.keys().map(|n| n.as_str()).collect::<Vec<_>>(),
+            ["app-01", "db-01", "web-01"]
+        );
+        assert_eq!(keys.get(&node("web-01")).unwrap(), &[fp(1)]);
+        let app = keys.get(&node("app-01")).unwrap();
+        assert_eq!(app.len(), 2);
+        assert!(app.contains(&fp(20)) && app.contains(&fp(21)));
     }
 }

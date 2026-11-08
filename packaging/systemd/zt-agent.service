@@ -1,10 +1,11 @@
 # Agent TCN sui server target: nessuna porta in ascolto, solo connessioni in uscita verso il
-# relay e verso sshd su 127.0.0.1:22. Installazione: vedi docs/OPERATIONS.md §7.
+# relay e verso sshd su 127.0.0.1:22. Installazione: vedi docs/OPERATIONS.md §9.
 # File attesi:
 #   /etc/tcn               root:root 0755
 #   /etc/tcn/agent.key     tcn:tcn   0600
 #   /etc/tcn/clients.toml  root:root 0644   (systemctl reload zt-agent dopo una modifica)
 #   /etc/tcn/agent.env     root:root 0644   con TCN_RELAY, TCN_RELAY_KEY, TCN_NODE
+#                          (più relay: TCN_RELAY=r1:7443,r2:7443 e TCN_RELAY_KEY=k1,k2)
 [Unit]
 Description=TCN agent (zt-agent)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md

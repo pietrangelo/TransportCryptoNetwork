@@ -173,7 +173,7 @@ fn describe(err: &NetError, node: &NodeId) -> String {
             "node {node}: the agent closed the session (ssh daemon unreachable, or agent restarting)"
         ),
         NetError::StreamClosed(CloseReason::Drained) => {
-            format!("node {node} is draining (maintenance or shutdown)")
+            format!("node {node} is draining (maintenance, shutdown, or too many sessions)")
         }
         NetError::StreamClosed(reason) => format!("node {node}: session closed: {reason:?}"),
         NetError::Crypto(_) => {

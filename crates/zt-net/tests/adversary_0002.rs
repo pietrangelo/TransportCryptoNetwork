@@ -105,10 +105,14 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
     tokio::spawn(server.run());
     let (ssh, _) = counting_echo().await;
     tokio::spawn(agent::run(
-        Arc::clone(&agent_id),
+        Arc::new(zt_crypto::Keyring::single(
+            zt_crypto::Identity::from_secret_hex(&agent_id.to_secret_hex()).unwrap(),
+        )),
         AgentConfig {
-            relay: relay.to_string(),
-            relay_key,
+            relays: vec![zt_net::RelayEndpoint {
+                address: relay.to_string(),
+                public_key: relay_key,
+            }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
             authorized_clients: zt_net::Revocable::fixed(HashSet::from([ansible.fingerprint()])),
@@ -117,8 +121,10 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
         },
     ));
     let config = ClientConfig {
-        relay: relay.to_string(),
-        relay_key,
+        relays: vec![zt_net::RelayEndpoint {
+            address: relay.to_string(),
+            public_key: relay_key,
+        }],
         node: node("web-01"),
         node_key: agent_id.public_key(),
         timeouts: timeouts(),
@@ -192,16 +198,22 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replayed_end_to_end_handshake_never_reaches_sshd() {
     let relay_id = Identity::generate().unwrap();
+    let relay_keys =
+        zt_crypto::Keyring::single(Identity::from_secret_hex(&relay_id.to_secret_hex()).unwrap());
     let agent_id = Arc::new(Identity::generate().unwrap());
     let client_id = Identity::generate().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = listener.local_addr().unwrap();
     let (ssh, sshd_connections) = counting_echo().await;
     tokio::spawn(agent::run(
-        Arc::clone(&agent_id),
+        Arc::new(zt_crypto::Keyring::single(
+            zt_crypto::Identity::from_secret_hex(&agent_id.to_secret_hex()).unwrap(),
+        )),
         AgentConfig {
-            relay: relay_addr.to_string(),
-            relay_key: relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: relay_addr.to_string(),
+                public_key: relay_id.public_key(),
+            }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
             authorized_clients: zt_net::Revocable::fixed(HashSet::from([client_id.fingerprint()])),
@@ -212,7 +224,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
 
     // Il relay malevolo accetta l'agent.
     let (tcp, _) = listener.accept().await.unwrap();
-    let pending = channel::accept(tcp, &relay_id, Channel::Outer, &timeouts())
+    let pending = channel::accept(tcp, &relay_keys, Channel::Outer, &timeouts())
         .await
         .unwrap();
     let mut agent_ch = pending.establish(&timeouts()).await.unwrap();
@@ -272,6 +284,8 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
     let relay_id = Identity::generate().unwrap();
+    let relay_keys =
+        zt_crypto::Keyring::single(Identity::from_secret_hex(&relay_id.to_secret_hex()).unwrap());
     let agent_id = Arc::new(Identity::generate().unwrap());
     let client_id = Identity::generate().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -280,10 +294,14 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
     let mut slow = timeouts();
     slow.open = Duration::from_secs(30); // il task dello stream resta in attesa della conferma
     tokio::spawn(agent::run(
-        Arc::clone(&agent_id),
+        Arc::new(zt_crypto::Keyring::single(
+            zt_crypto::Identity::from_secret_hex(&agent_id.to_secret_hex()).unwrap(),
+        )),
         AgentConfig {
-            relay: relay_addr.to_string(),
-            relay_key: relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: relay_addr.to_string(),
+                public_key: relay_id.public_key(),
+            }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
             authorized_clients: zt_net::Revocable::fixed(HashSet::from([client_id.fingerprint()])),
@@ -292,7 +310,7 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
         },
     ));
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut agent_ch = channel::accept(tcp, &relay_id, Channel::Outer, &timeouts())
+    let mut agent_ch = channel::accept(tcp, &relay_keys, Channel::Outer, &timeouts())
         .await
         .unwrap()
         .establish(&timeouts())

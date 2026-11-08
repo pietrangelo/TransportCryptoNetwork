@@ -155,8 +155,9 @@ fn client_settings_parse_and_resolve_the_key_next_to_the_file() {
     );
     let base = std::path::Path::new("/etc/tcn");
     let s = zt_net::config::parse_client_settings("t", base, &text).unwrap();
-    assert_eq!(s.relay, "relay.example.org:7443");
-    assert_eq!(s.relay_key.to_string(), r);
+    assert_eq!(s.relays.len(), 1);
+    assert_eq!(s.relays[0].address, "relay.example.org:7443");
+    assert_eq!(s.relays[0].public_key.to_string(), r);
     assert_eq!(s.key, base.join("client.key"));
     let web = NodeId::try_from("web-01").unwrap();
     let cfg = s.client_config(&web, zt_net::Timeouts::default()).unwrap();
@@ -409,4 +410,177 @@ fn a_secret_pasted_into_a_trust_file_is_not_echoed_in_the_error() {
             assert!(!message.contains(secret), "{message}");
         }
     }
+}
+
+// ======================= Fase 5: più relay e rotazione =======================
+
+fn relays_toml(entries: &[(&str, &str)], extra: &str) -> String {
+    use std::fmt::Write as _;
+    let mut t = String::from("key = \"client.key\"\n");
+    for (addr, k) in entries {
+        let _ = write!(
+            t,
+            "\n[[relays]]\naddress = \"{addr}\"\npublic_key = \"{k}\"\n"
+        );
+    }
+    t.push_str(extra);
+    t
+}
+
+fn parse_client(text: &str) -> Result<zt_net::config::ClientSettings, ConfigError> {
+    zt_net::config::parse_client_settings("t", std::path::Path::new("/etc/tcn"), text)
+}
+
+#[test]
+fn a_client_lists_several_relays_in_order() {
+    let (a, b) = (key(), key());
+    let s = parse_client(&relays_toml(
+        &[("r1.example.org:7443", &a), ("r2.example.org:7443", &b)],
+        "",
+    ))
+    .unwrap();
+    let got: Vec<_> = s
+        .relays
+        .iter()
+        .map(|r| (r.address.as_str(), r.public_key.to_string()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![("r1.example.org:7443", a), ("r2.example.org:7443", b)]
+    );
+}
+
+#[test]
+fn a_relay_list_must_be_unambiguous_and_bounded() {
+    let (a, b) = (key(), key());
+    // Entrambe le forme insieme, o nessuna.
+    let both = format!(
+        "relay = \"r0.example.org:7443\"\nrelay_key = \"{a}\"\n{}",
+        relays_toml(&[("r1.example.org:7443", &b)], "")
+    );
+    assert!(parse_client(&both).is_err(), "relay and relays together");
+    assert!(
+        parse_client("key = \"client.key\"\n").is_err(),
+        "no relay at all"
+    );
+    assert!(
+        parse_client("relay = \"r.example.org:7443\"\nkey = \"client.key\"\n").is_err(),
+        "relay without relay_key"
+    );
+    // Indirizzo o chiave ripetuti.
+    assert!(
+        parse_client(&relays_toml(
+            &[("r1.example.org:7443", &a), ("r1.example.org:7443", &b)],
+            ""
+        ))
+        .is_err()
+    );
+    assert!(
+        parse_client(&relays_toml(
+            &[("r1.example.org:7443", &a), ("r2.example.org:7443", &a)],
+            ""
+        ))
+        .is_err()
+    );
+    // Indirizzo non valido.
+    assert!(parse_client(&relays_toml(&[("r1.example.org", &a)], "")).is_err());
+    // Al massimo MAX_RELAYS.
+    let many: Vec<(String, String)> = (0..=zt_net::MAX_RELAYS)
+        .map(|i| (format!("r{i}.example.org:7443"), key()))
+        .collect();
+    let refs: Vec<(&str, &str)> = many.iter().map(|(a, k)| (a.as_str(), k.as_str())).collect();
+    assert!(
+        parse_client(&relays_toml(&refs, "")).is_err(),
+        "too many relays"
+    );
+    assert!(parse_client(&relays_toml(&refs[..zt_net::MAX_RELAYS], "")).is_ok());
+}
+
+#[test]
+fn no_relay_key_may_double_as_a_node_key() {
+    let (a, b) = (key(), key());
+    let text = relays_toml(
+        &[("r1.example.org:7443", &a), ("r2.example.org:7443", &b)],
+        &format!("\n[[nodes]]\nnode = \"web-01\"\npublic_key = \"{b}\"\n"),
+    );
+    assert!(parse_client(&text).is_err());
+}
+
+#[test]
+fn relay_endpoints_pair_addresses_and_keys() {
+    use zt_crypto::PublicKey;
+    let k = || key().parse::<PublicKey>().unwrap();
+    let (a, b) = (k(), k());
+    let addrs = |n: usize| {
+        (0..n)
+            .map(|i| format!("r{i}.example.org:7443"))
+            .collect::<Vec<_>>()
+    };
+    let ok = zt_net::config::relay_endpoints("t", &addrs(2), &[a, b]).unwrap();
+    assert_eq!(ok.len(), 2);
+    assert_eq!(ok[1].public_key, b);
+    assert!(
+        zt_net::config::relay_endpoints("t", &addrs(2), &[a]).is_err(),
+        "count mismatch"
+    );
+    assert!(
+        zt_net::config::relay_endpoints("t", &[], &[]).is_err(),
+        "empty"
+    );
+    assert!(
+        zt_net::config::relay_endpoints("t", &addrs(2), &[a, a]).is_err(),
+        "same key twice"
+    );
+    let nine: Vec<_> = (0..=zt_net::MAX_RELAYS).map(|_| k()).collect();
+    assert!(zt_net::config::relay_endpoints("t", &addrs(nine.len()), &nine).is_err());
+}
+
+#[test]
+fn a_rotating_agent_lists_two_keys_in_the_policy() {
+    let (old, new) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let text = format!(
+        "[[agents]]\nnode = \"web-01\"\npublic_keys = [\"{}\", \"{}\"]\n",
+        new.public_key(),
+        old.public_key()
+    );
+    let p = parse_policy("p", &text).unwrap();
+    for k in [&old, &new] {
+        assert!(p.role(&k.fingerprint()).is_some());
+    }
+}
+
+#[test]
+fn agent_key_lists_are_validated() {
+    let (a, b, c) = (key(), key(), key());
+    for bad in [
+        format!("[[agents]]\nnode = \"web-01\"\npublic_key = \"{a}\"\npublic_keys = [\"{b}\"]\n"),
+        format!("[[agents]]\nnode = \"web-01\"\npublic_keys = [\"{a}\", \"{b}\", \"{c}\"]\n"),
+        format!("[[agents]]\nnode = \"web-01\"\npublic_keys = [\"{a}\", \"{a}\"]\n"),
+        "[[agents]]\nnode = \"web-01\"\npublic_keys = []\n".to_owned(),
+        "[[agents]]\nnode = \"web-01\"\n".to_owned(),
+    ] {
+        assert!(parse_policy("p", &bad).is_err(), "{bad}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_keyring_loads_both_keys_and_refuses_the_same_key_twice() {
+    let dir = std::env::temp_dir().join(format!("zt-keyring-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cur, prev) = (dir.join("cur.key"), dir.join("prev.key"));
+    let c = create_identity(&cur).unwrap();
+    let p = create_identity(&prev).unwrap();
+    let ring = zt_net::config::load_keyring(&cur, Some(&prev)).unwrap();
+    assert_eq!(ring.current().fingerprint(), c.fingerprint());
+    assert_eq!(ring.previous().unwrap().fingerprint(), p.fingerprint());
+    assert!(
+        zt_net::config::load_keyring(&cur, None)
+            .unwrap()
+            .previous()
+            .is_none()
+    );
+    assert!(zt_net::config::load_keyring(&cur, Some(&cur)).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

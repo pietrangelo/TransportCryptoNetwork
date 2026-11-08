@@ -112,15 +112,22 @@ impl Lab {
         let (clients_rx, clients) =
             Revocable::new(HashSet::from([ansible.fingerprint(), admin.fingerprint()]));
         let config = AgentConfig {
-            relay: relay.to_string(),
-            relay_key: relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: relay.to_string(),
+                public_key: relay_id.public_key(),
+            }],
             node: node("web-01"),
             ssh_target: echo().await.to_string(),
             authorized_clients: clients_rx,
             timeouts: fast(),
             max_streams: 16,
         };
-        tokio::spawn(agent::run(Arc::clone(&agent_id), config));
+        tokio::spawn(agent::run(
+            Arc::new(zt_crypto::Keyring::single(
+                zt_crypto::Identity::from_secret_hex(&agent_id.to_secret_hex()).unwrap(),
+            )),
+            config,
+        ));
         tokio::time::sleep(Duration::from_millis(300)).await;
         Self {
             relay,
@@ -135,8 +142,10 @@ impl Lab {
 
     fn config(&self) -> ClientConfig {
         ClientConfig {
-            relay: self.relay.to_string(),
-            relay_key: self.relay_id.public_key(),
+            relays: vec![zt_net::RelayEndpoint {
+                address: self.relay.to_string(),
+                public_key: self.relay_id.public_key(),
+            }],
             node: node("web-01"),
             node_key: self.agent_id.public_key(),
             timeouts: fast(),
