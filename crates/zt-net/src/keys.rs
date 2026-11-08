@@ -140,21 +140,95 @@ impl CertTrustSource for AuthorizedClients {
     }
 }
 
+/// Le fingerprint delle chiavi di una CA, in ordine stabile.
+fn fingerprints(keys: &[zt_domain::trust::TrustedCaKey]) -> String {
+    let mut all: Vec<String> = keys.iter().map(|k| k.fingerprint.to_string()).collect();
+    all.sort_unstable();
+    all.join(",")
+}
+
 /// Registra `authorities_in_use` per ogni CA e `revocations_in_use` con i conteggi della
-/// denylist (PROTOCOL §15.11).
+/// denylist (PROTOCOL §15.11). Solo nomi, fingerprint e conteggi: mai chiavi, serie o
+/// certificati.
 pub fn announce_authorities(role: &'static str, trust: &CertTrust) {
-    // RED: stub, non registra nulla.
-    let _ = (role, trust);
+    for authority in trust.authorities() {
+        let fingerprints = fingerprints(authority.keys());
+        let max_lifetime = authority.max_lifetime_secs();
+        if authority.keys().len() > 1 {
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "authorities_in_use",
+                role,
+                authority = %authority.name(),
+                fingerprints = %fingerprints,
+                max_lifetime,
+                "certificate authority in use with two keys: complete the rotation"
+            );
+        } else {
+            tracing::info!(
+                target: "zt_audit",
+                event_kind = "authorities_in_use",
+                role,
+                authority = %authority.name(),
+                fingerprints = %fingerprints,
+                max_lifetime,
+                "certificate authority in use"
+            );
+        }
+    }
+    if let Some(revocations) = trust.revocations() {
+        let (serials, keys) = revocations.counts();
+        tracing::info!(
+            target: "zt_audit",
+            event_kind = "revocations_in_use",
+            role,
+            serials,
+            keys,
+            "revocation list in use"
+        );
+    }
+}
+
+/// Registra un `ca_rotation_pending` per ogni CA con due chiavi. Restituisce quante sono.
+fn announce_ca_rotations(role: &'static str, trust: &CertTrust) -> usize {
+    let mut pending: usize = 0;
+    for (name, keys) in trust.rotations_pending() {
+        tracing::warn!(
+            target: "zt_audit",
+            event_kind = "ca_rotation_pending",
+            role,
+            authority = %name,
+            fingerprints = %fingerprints(keys),
+            "a certificate authority rotation is not complete: remove the old key"
+        );
+        pending = pending.saturating_add(1);
+    }
+    pending
 }
 
 /// Annuncia CA e denylist all'avvio e a ogni sostituzione; finché una CA ha due chiavi
 /// registra `ca_rotation_pending` subito e ogni `every`. Non ritorna.
 pub async fn watch_authorities<T: CertTrustSource>(
     role: &'static str,
-    config: Revocable<T>,
+    mut config: Revocable<T>,
     every: Duration,
 ) {
-    // RED: stub, non registra nulla.
-    let _ = (role, config, every);
-    std::future::pending::<()>().await;
+    loop {
+        let current = config.current();
+        let trust = current.cert_trust();
+        announce_authorities(role, trust);
+        let reminders = async {
+            if announce_ca_rotations(role, trust) == 0 {
+                return std::future::pending::<()>().await;
+            }
+            loop {
+                tokio::time::sleep(every).await;
+                announce_ca_rotations(role, trust);
+            }
+        };
+        tokio::select! {
+            () = config.changed() => {}
+            () = reminders => {}
+        }
+    }
 }
