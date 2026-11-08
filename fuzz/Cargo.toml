@@ -1,0 +1,45 @@
+[package]
+name = "zt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.10"
+bytes = "1.12.1"
+zt-domain = { path = "../crates/zt-domain" }
+zt-proto = { path = "../crates/zt-proto" }
+zt-crypto = { path = "../crates/zt-crypto" }
+zt-net = { path = "../crates/zt-net" }
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_responder"
+path = "fuzz_targets/noise_responder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_decrypt"
+path = "fuzz_targets/transport_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parsers"
+path = "fuzz_targets/config_parsers.rs"
+test = false
+doc = false
+bench = false

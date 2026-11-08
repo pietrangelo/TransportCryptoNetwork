@@ -8,8 +8,10 @@ members = [
     "crates/zt-net",
     "bins/zt-relay",
     "bins/zt-agent",
-    "bins/zt-client", "crates/zt-crypto", "crates/zt-application", "crates/zt-net",
+    "bins/zt-client",
 ]
+# I target di cargo-fuzz richiedono nightly: restano fuori dal workspace (vedi fuzz/README.md).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

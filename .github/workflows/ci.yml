@@ -41,3 +41,32 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server openssh-client
       - run: pipx install ansible-core
       - run: cargo test -p zt-client --test openssh -- --ignored
+
+  fuzz:
+    # Fuzzing breve a ogni PR: 60 s per target. Le campagne lunghe si lanciano a mano.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame_decoder, noise_responder, transport_decrypt, config_parsers]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo +nightly install cargo-fuzz --locked
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=1024
+        working-directory: fuzz
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+
+  deny:
+    # Supply chain: advisories RustSec, licenze ammesse, sorgenti solo da crates.io.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
