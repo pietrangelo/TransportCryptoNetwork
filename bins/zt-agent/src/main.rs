@@ -128,6 +128,12 @@ fn run(command: Command) -> Result<(), String> {
                     config::load_keyring(&key, previous_key.as_deref())
                         .map_err(|e| e.to_string())?,
                 );
+                // La chiave dell'agent cambia solo con un riavvio (PROTOCOL §14).
+                tokio::spawn(zt_net::keys::watch(
+                    "agent",
+                    Revocable::fixed_shared(Arc::clone(&keys)),
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 let path = authorized_clients;
                 let authorized =
                     config::load_authorized_clients(&path).map_err(|e| e.to_string())?;

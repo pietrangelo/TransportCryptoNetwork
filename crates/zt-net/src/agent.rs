@@ -252,7 +252,16 @@ fn on_relay_frame(
                 Frame::Data { payload, .. } => slot.recv.consume(payload.len()).is_ok(),
                 _ => true,
             };
-            let queued = within_credit && slot.tx.try_send(frame).is_ok();
+            let queued = within_credit
+                && match slot.tx.try_send(frame) {
+                    Ok(()) => true,
+                    // Il task dello stream ha già finito e il suo `Close` è in viaggio: il
+                    // frame era in volo, si scarta. Rispondere `ProtocolViolation` qui poteva
+                    // sorpassare quel `Close` e nascondere al client il motivo vero (es.
+                    // `Drained` per il limite di sessioni). Lo slot lo toglie `done`.
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(None),
+                    Err(mpsc::error::TrySendError::Full(_)) => false,
+                };
             if !queued {
                 // Solo un relay che non applica il credito può arrivare qui.
                 streams.slots.remove(&stream);

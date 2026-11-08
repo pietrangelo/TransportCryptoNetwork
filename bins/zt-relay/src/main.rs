@@ -106,6 +106,11 @@ fn run(command: Command) -> Result<(), String> {
                 // Rotazione della chiave del relay senza riavvio (PROTOCOL §14): le chiavi nuove
                 // valgono per gli handshake successivi; le connessioni aperte restano.
                 let (keys, key_updater) = Revocable::new(keys);
+                tokio::spawn(zt_net::keys::watch(
+                    "relay",
+                    keys.clone(),
+                    zt_net::keys::ROTATION_REMINDER,
+                ));
                 let key_events = ReloadEvents {
                     reloaded: "relay_keys_reloaded",
                     failed: "relay_keys_reload_failed",

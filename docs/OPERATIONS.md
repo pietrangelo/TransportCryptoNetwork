@@ -36,8 +36,11 @@ non validi fanno fallire l'avvio. Durante la rotazione della chiave di un agent 
 elenca due chiavi: `public_keys = ["<nuova>", "<vecchia>"]` al posto di `public_key`.
 
 Con più relay (§8) ognuno ha la propria chiave ma **la stessa policy**: distribuiscila a tutti
-nello stesso passaggio. Il client non aggira un relay che lo rifiuta cercandone uno più
-permissivo, quindi una policy disallineata si vede come un accesso negato.
+nello stesso passaggio e verifica che sia identica ovunque (per esempio confrontando
+`sha256sum /etc/tcn/policy.toml` su tutti i relay). Un relay che nega l'accesso a un nodo
+ferma il client, ma un relay che **non conosce** la chiave del client chiude l'handshake come
+se fosse guasto, e il client passa al successivo: una chiave tolta da un solo relay resta
+valida sugli altri finché non li aggiorni tutti (§7).
 
 ## 3. Client autorizzati sull'agent
 
@@ -165,8 +168,10 @@ Gli eventi di sicurezza hanno target `zt_audit` e un nome stabile in `fields.eve
 | `protocol_violation` | WARN | un peer ha violato il protocollo ed è stato disconnesso |
 | `access_revoked` | WARN | una ricarica ha tolto a un peer il ruolo o l'accesso a un nodo |
 | `e2e_session_started`, `e2e_session_ended` | INFO | (agent) sessione verso sshd aperta / chiusa, con `outcome` `closed`, `error` o `revoked` |
-| `policy_reloaded`, `authorized_clients_reloaded` | INFO | ricarica riuscita |
-| `policy_reload_failed`, `authorized_clients_reload_failed` | ERROR | ricarica fallita: resta la configurazione precedente |
+| `policy_reloaded`, `authorized_clients_reloaded`, `relay_keys_reloaded` | INFO | ricarica riuscita |
+| `policy_reload_failed`, `authorized_clients_reload_failed`, `relay_keys_reload_failed` | ERROR | ricarica fallita: resta la configurazione precedente |
+| `keys_in_use` | INFO, WARN con una chiave precedente | (relay e agent) all'avvio e a ogni ricarica: `role`, `current_fingerprint`, `previous_fingerprint` (`none` se non c'è) |
+| `previous_key_still_accepted` | WARN | ogni ora, finché una chiave precedente è accettata: completa la rotazione (§8) |
 
 I dati dell'evento sono campi separati: `peer` (fingerprint), `node`, `session` (hex),
 `stream`, `reason`, `rule`, secondo l'evento. Mai payload o segreti.
@@ -180,7 +185,10 @@ journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
 1. Togli la chiave da `/etc/tcn/policy.toml` sul relay e, per un client, da
    `/etc/tcn/clients.toml` sugli agent (difesa in profondità: basta uno dei due).
 2. `systemctl reload zt-relay` (e `zt-agent`). Le sessioni in corso della chiave revocata si
-   chiudono subito; la tabella completa è in `docs/PROTOCOL.md` §12.
+   chiudono subito; la tabella completa è in `docs/PROTOCOL.md` §12. Con più relay, ricarica
+   **tutti** i relay: `zt-client` passa al relay successivo quando uno non riconosce la sua
+   chiave, quindi un relay non aggiornato tiene valida la chiave revocata. Togliere la chiave
+   da `clients.toml` sugli agent la blocca comunque, qualunque relay usi.
 3. Controlla `access_revoked` nell'audit log. Se trovi `..._reload_failed`, il file non è
    valido: la configurazione precedente è ancora in vigore.
 
@@ -201,6 +209,8 @@ end-to-end (PROTOCOL §13). Con almeno due relay, il riavvio di uno non interrom
 3. Aggiorna `relay_key` (o `--relay-key`) su agent e client, quando conviene.
 4. Togli la precedente: un file non valido alla ricarica lascia le chiavi di prima
    (`relay_keys_reload_failed`), quindi la si toglie riavviando senza `--previous-key`.
+   L'evento `keys_in_use` all'avvio deve riportare `previous_fingerprint` `none`; finché non
+   è così, `previous_key_still_accepted` lo ricorda ogni ora.
 
 **Chiave di un agent**:
 

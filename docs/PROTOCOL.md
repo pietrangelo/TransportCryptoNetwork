@@ -249,6 +249,18 @@ con Ansible). Nulla cambia sul filo.
   duplicare una sessione già iniziata. Policy diverse fra i relay sono un errore di
   configurazione: il client non le «aggira» cercando un relay più permissivo.
 
+  Attenzione però: un relay che **non conosce** la chiave del client chiude il canale esterno
+  durante l'handshake, e per il client questo è indistinguibile da un relay guasto, quindi
+  passa al successivo. Una chiave tolta dalla policy di un solo relay resta valida sugli altri:
+  la revoca è completa solo quando tutti i relay hanno ricaricato la policy (o quando gli
+  agent tolgono la chiave dai loro client autorizzati, §12).
+
+- **Tempi**: i tentativi sono in sequenza, ognuno con i propri timeout (connessione,
+  handshake, `Open`). Nel caso peggiore, con *N* relay tutti irraggiungibili per timeout, il
+  client impiega *N* volte il tempo di un tentativo prima di arrendersi. Conviene mettere per
+  primi i relay più vicini e affidabili; un `ConnectTimeout` di OpenSSH più corto del totale
+  interrompe il client prima che li abbia provati tutti.
+
 ## 14. Rotazione delle chiavi
 
 Un responder (il relay sul canale esterno, l'agent su quello end-to-end) può avere, oltre alla
@@ -259,8 +271,12 @@ cambio contemporaneo in tutta la flotta.
 
 | Rotazione | Passi |
 | :- | :- |
-| chiave del relay | 1. nuova chiave; 2. il relay la carica come corrente e tiene la vecchia come precedente (`--previous-key`), con `SIGHUP`, senza riavvio; 3. si aggiornano i pin su agent e client; 4. si toglie la precedente |
+| chiave del relay | 1. nuova chiave; 2. il relay la carica come corrente e tiene la vecchia come precedente: con `SIGHUP`, senza riavvio, se è già avviato con `--previous-key` (altrimenti serve un riavvio per aggiungere l'opzione); 3. si aggiornano i pin su agent e client; 4. si toglie la precedente (un riavvio senza `--previous-key`) |
 | chiave di un agent | 1. nuova chiave; 2. la policy del relay elenca entrambe le chiavi per il nodo (`public_keys`, al massimo 2) e si ricarica; 3. l'agent si riavvia con la nuova chiave e la vecchia come precedente: la sessione esterna usa la nuova, il canale end-to-end accetta anche la vecchia; 4. si aggiornano i pin dei client; 5. si tolgono la vecchia chiave dalla policy e la precedente dall'agent |
+
+Relay e agent dichiarano nell'audit log, all'avvio e a ogni ricarica, le fingerprint delle
+chiavi che accettano (`keys_in_use`), e finché una precedente è accettata lo ricordano ogni ora
+(`previous_key_still_accepted`): una rotazione lasciata a metà non resta invisibile.
 
 Il riavvio di un agent interrompe solo le sessioni SSH di quel nodo. Il riavvio di un relay,
 con più relay, non interrompe nulla di nuovo: agent e client usano gli altri.

@@ -650,6 +650,8 @@ async fn the_session_limit_holds_for_the_whole_agent() {
     // Attende che l'agent sia registrato su entrambi.
     echo(&k.ansible, &via(r1, &r1_id)).await.unwrap();
     echo(&k.ansible, &via(r2, &r2_id)).await.unwrap();
+    // L'agent libera gli stream delle prove poco dopo che il client ha finito.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     // Una sessione aperta attraverso r1 occupa l'unico posto.
     let (mut held, local) = tokio::io::duplex(1024);
     let cfg = via(r1, &r1_id);
@@ -661,7 +663,19 @@ async fn the_session_limit_holds_for_the_whole_agent() {
         .await
         .unwrap()
         .unwrap();
-    let second = echo(&k.ansible, &via(r2, &r2_id)).await;
+    // Lo stream dell'echo di prova su r2 può non aver ancora liberato la quota di r2 (anche
+    // lei 1): finché la risposta è quella quota, si riprova. Poi deve parlare il limite globale.
+    let mut second = echo(&k.ansible, &via(r2, &r2_id)).await;
+    for _ in 0..20 {
+        if !matches!(
+            second,
+            Err(NetError::Rejected(RejectReason::ResourceExhausted))
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        second = echo(&k.ansible, &via(r2, &r2_id)).await;
+    }
     assert!(
         matches!(second, Err(NetError::StreamClosed(CloseReason::Drained))),
         "{second:?}"

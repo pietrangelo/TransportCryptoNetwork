@@ -129,6 +129,21 @@ impl Relay {
         }
     }
 
+    /// Le righe "relay listening" e `keys_in_use` dell'avvio, in qualsiasi ordine: le chiavi
+    /// accettate sono dichiarate all'avvio (finding 0005-3).
+    fn startup(&self) -> (serde_json::Value, serde_json::Value) {
+        let (mut listening, mut in_use) = (None, None);
+        while listening.is_none() || in_use.is_none() {
+            let v = self.wait_for(|_| true);
+            if v["fields"]["message"] == "relay listening" {
+                listening = Some(v);
+            } else if v["fields"]["event_kind"] == "keys_in_use" {
+                in_use = Some(v);
+            }
+        }
+        (listening.unwrap(), in_use.unwrap())
+    }
+
     fn config(&self) -> ClientConfig {
         ClientConfig {
             relays: vec![zt_net::RelayEndpoint {
@@ -170,7 +185,8 @@ async fn audit_events_are_json_with_a_stable_kind_and_no_secrets() {
     let stranger = Identity::generate().unwrap();
     let relay = Relay::start("audit", &[]);
     let _ = try_connect(&relay, &stranger).await;
-    let event = relay.wait_for(|v| v["target"] == "zt_audit");
+    let event =
+        relay.wait_for(|v| v["target"] == "zt_audit" && v["fields"]["event_kind"] != "keys_in_use");
     assert_eq!(event["fields"]["event_kind"], "authentication_failed");
     assert_eq!(event["level"], "WARN");
     assert!(event["timestamp"].is_string());
@@ -294,6 +310,18 @@ fn ready_is_notified_only_once_sighup_is_handled() {
 
 /// Fase 5 (PROTOCOL §14): la chiave del relay ruota con `SIGHUP`, senza riavvio. Dopo la
 /// ricarica valgono la chiave nuova e la precedente; quella ancora più vecchia no.
+fn assert_keys(in_use: &serde_json::Value, current: &Identity, previous: &Identity) {
+    let fields = &in_use["fields"];
+    assert_eq!(
+        fields["current_fingerprint"],
+        current.fingerprint().to_string()
+    );
+    assert_eq!(
+        fields["previous_fingerprint"],
+        previous.fingerprint().to_string()
+    );
+}
+
 #[tokio::test]
 async fn sighup_rotates_the_relay_key_without_a_restart() {
     let client = Identity::generate().unwrap();
@@ -354,8 +382,10 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
         key: Identity::from_secret_hex(&old.to_secret_hex()).unwrap(),
         dir: dir.clone(),
     };
-    let listening = relay.wait_for(|v| v["fields"]["message"] == "relay listening");
+    let (listening, in_use) = relay.startup();
     relay.addr = listening["fields"]["addr"].as_str().unwrap().to_owned();
+    assert_eq!(in_use["target"], "zt_audit");
+    assert_keys(&in_use, &old, &oldest);
 
     let reaches = |relay: &Relay, pin: &Identity| {
         let mut config = relay.config();
@@ -381,7 +411,8 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
     write_key("cur.key", &new);
     write_key("prev.key", &old);
     relay.hup();
-    relay.wait_for(|v| v["fields"]["event_kind"] == "relay_keys_reloaded");
+    let in_use = relay.wait_for(|v| v["fields"]["event_kind"] == "keys_in_use");
+    assert_keys(&in_use, &new, &old);
     assert!(reaches(&relay, &new).await, "new key after SIGHUP");
     assert!(reaches(&relay, &old).await, "previous key after SIGHUP");
     assert!(

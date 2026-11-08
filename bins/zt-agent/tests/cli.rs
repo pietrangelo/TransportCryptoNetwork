@@ -181,4 +181,12 @@ fn the_previous_key_cannot_be_the_current_key() {
         ],
     );
     assert!(out.status.code().is_none() || out.status.success());
+    // Finding 0005-3: la chiave precedente ancora accettata è dichiarata nei log.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let old_fp = Identity::from_secret_hex(std::fs::read_to_string(&old).unwrap().trim())
+        .unwrap()
+        .fingerprint()
+        .to_string();
+    assert!(stderr.contains("keys_in_use"), "{stderr}");
+    assert!(stderr.contains(&old_fp), "{stderr}");
 }

@@ -17,6 +17,7 @@ pub mod channel;
 pub mod client;
 pub mod config;
 mod error;
+pub mod keys;
 pub mod logging;
 pub mod relay;
 pub mod reload;
