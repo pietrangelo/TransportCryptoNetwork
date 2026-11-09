@@ -423,6 +423,11 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
     let not_after = match settings.certificate.as_deref() {
         Some(path) => {
             let cert = load_own_certificate(path, &identity)?;
+            // PQ-SUNSET: under the profile only a hybrid-bound certificate v2 is sent.
+            if settings.pq_only {
+                zt_net::sunset::check_certificate(&path.display().to_string(), &cert)
+                    .map_err(|e| e.to_string())?;
+            }
             if hybrid_subject(&cert.body).is_some() {
                 check_hybrid_hops(&config, path)?;
             }

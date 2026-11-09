@@ -144,6 +144,15 @@ pub enum ConfigError {
         /// The error.
         source: zt_domain::SuiteError,
     },
+    /// A setting the `pq_only` profile refuses (PQ-SUNSET, OPERATIONS §19): a classical suite,
+    /// a v1 identity or a v1 certificate still accepted.
+    #[error("{path}: pq_only: {reason}")]
+    PqOnly {
+        /// The file (or the option).
+        path: String,
+        /// What is still classical, and what the profile allows.
+        reason: String,
+    },
     /// Invalid admission limits (PROTOCOL §10.1).
     #[error("{path}: [admission]: {source}")]
     Admission {
@@ -510,6 +519,9 @@ struct NodesFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientFile {
+    /// The `pq_only` profile (PQ-SUNSET, OPERATIONS §19).
+    #[serde(default)]
+    pq_only: bool,
     /// Form with a single relay.
     #[serde(default)]
     relay: Option<String>,
@@ -1254,6 +1266,10 @@ pub struct ClientSettings {
     pub connect_deadline: std::time::Duration,
     /// `metrics_file`: where the metrics of the last session are written (R-5), if anywhere.
     pub metrics_file: Option<std::path::PathBuf>,
+    /// `pq_only` (PQ-SUNSET, OPERATIONS §19): every relay and node pinned to the hybrid IK
+    /// suite, checked at load; `zt-client` also refuses a certificate that is not v2 and
+    /// hybrid-bound ([`crate::sunset::check_certificate`]). `false` by default.
+    pub pq_only: bool,
 }
 
 impl ClientSettings {
@@ -1462,7 +1478,7 @@ pub fn parse_client_settings(
             return Err(ctx.domain(&entry.node, DomainError::DuplicateNode(node)));
         }
     }
-    Ok(ClientSettings {
+    let settings = ClientSettings {
         relays,
         key: base.join(&file.key),
         nodes,
@@ -1471,7 +1487,12 @@ pub fn parse_client_settings(
         require_outer_suite,
         connect_deadline,
         metrics_file: file.metrics_file.as_ref().map(|m| base.join(m)),
-    })
+        pq_only: file.pq_only,
+    };
+    if settings.pq_only {
+        crate::sunset::check_client(origin, &settings)?;
+    }
+    Ok(settings)
 }
 
 /// The hybrid IK suite authenticates the responder's static ML-KEM key: its pin must be a v2
@@ -1534,6 +1555,10 @@ pub struct RelaySettings {
     pub agent_idle: std::time::Duration,
     /// Idle timeout of client connections (`[liveness] client_idle_secs`).
     pub client_idle: std::time::Duration,
+    /// `[handshake] pq_only` (PQ-SUNSET, OPERATIONS §19): both sets hold the hybrid IK suite
+    /// only, and the policy is checked by [`crate::sunset::check_policy`] at every load.
+    /// `false` by default: the defaults stay compatible with a mixed fleet.
+    pub pq_only: bool,
 }
 
 /// The default idle timeout of both roles: three times the keepalive of agents older than
@@ -1556,6 +1581,7 @@ impl Default for RelaySettings {
             suites: zt_domain::SuitePolicy::classical(),
             agent_idle: DEFAULT_RELAY_IDLE,
             client_idle: DEFAULT_RELAY_IDLE,
+            pq_only: false,
         }
     }
 }
@@ -1587,6 +1613,9 @@ struct LivenessSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HandshakeSection {
+    /// The `pq_only` profile (PQ-SUNSET).
+    #[serde(default)]
+    pq_only: bool,
     #[serde(default)]
     agent_suites: Option<Vec<String>>,
     #[serde(default)]
@@ -1646,6 +1675,12 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
     }
     if let Some(names) = &file.handshake.client_suites {
         suites.clients = parse_suites(origin, names, zt_domain::HandshakeChannel::Outer)?;
+    }
+    let pq_only = file.handshake.pq_only;
+    if pq_only {
+        // Explicit sets: a set left out is the classical default.
+        crate::sunset::check_suites(origin, "[handshake] agent_suites", suites.agents)?;
+        crate::sunset::check_suites(origin, "[handshake] client_suites", suites.clients)?;
     }
     let a = file.admission;
     let mut admission = zt_application::admission::AdmissionConfig::default();
@@ -1714,6 +1749,7 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
         suites,
         agent_idle,
         client_idle,
+        pq_only,
     })
 }
 

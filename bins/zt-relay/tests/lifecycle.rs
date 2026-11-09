@@ -896,10 +896,7 @@ fn check_enforces_the_pq_only_profile_and_reports_classical_paths() {
     let out = command(&dir, "check").output().unwrap();
     assert!(out.status.success(), "{}", text(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("classical still accepted"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("classical still accepted"), "{stdout}");
     // The profile with a policy that still admits v1 identities: EX_CONFIG, for both.
     write(
         &dir.0,

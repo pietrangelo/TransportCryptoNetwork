@@ -20,7 +20,7 @@ use zt_net::logging::{self, LogFormat};
 use zt_net::metrics::{self, AgentMetrics};
 use zt_net::net::TcpDialer;
 use zt_net::reload::{self, Hangups, Outcome, Publisher};
-use zt_net::{Revocable, config, systemd};
+use zt_net::{Revocable, config, sunset, systemd};
 
 /// TCN agent.
 #[derive(Debug, Parser)]
@@ -65,6 +65,12 @@ struct AgentArgs {
     /// releases); new installations set both in `agent.env` (OPERATIONS §12).
     #[arg(long, env = "TCN_ACCEPT_CLIENT_SUITES", value_delimiter = ',')]
     accept_client_suites: Vec<String>,
+    /// The pq-only profile (PQ-SUNSET, OPERATIONS §19): every `--relay-suite` and
+    /// `--accept-client-suites` must be the hybrid IK suite, and the authorized clients must
+    /// require hybrid identities and pin composite CA keys only, at startup, in `check` and on
+    /// every reload. Off by default: the defaults stay compatible with a mixed fleet.
+    #[arg(long, env = "TCN_PQ_ONLY")]
+    pq_only: bool,
     /// Name of this node, as in the relay policy.
     #[arg(long)]
     node: String,
@@ -327,7 +333,8 @@ fn run(command: Command) -> Result<(), Failure> {
             for line in prepared.digests.to_string().split(", ") {
                 writeln!(out, "{line}").map_err(runtime_error)?;
             }
-            Ok(())
+            sunset::write_report(&mut out, prepared.pq_only, &prepared.report)
+                .map_err(runtime_error)
         }
         Command::Run {
             args,
@@ -382,6 +389,10 @@ struct Prepared {
     updater: zt_net::Updater<zt_domain::AuthorizedClients>,
     load: ClientsLoader,
     digests: Digests,
+    /// `--pq-only`.
+    pq_only: bool,
+    /// The classical paths still accepted, for `check` (PQ-SUNSET).
+    report: Vec<String>,
 }
 
 fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
@@ -390,6 +401,7 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         relay_key,
         relay_suite,
         accept_client_suites,
+        pq_only,
         node,
         key,
         previous_key,
@@ -403,6 +415,9 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         config::relay_endpoints("--relay", &relay, &relay_key).map_err(config_error)?;
     let client_suites =
         pin_suites(&mut relays, &relay_suite, &accept_client_suites).map_err(Failure::Config)?;
+    if pq_only {
+        sunset::check_agent_suites(&relays, client_suites).map_err(|e| load_error(&e))?;
+    }
     let keys =
         Arc::new(config::load_keyring(&key, previous_key.as_deref()).map_err(|e| load_error(&e))?);
     let path = authorized_clients;
@@ -418,14 +433,15 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
     let load = move || {
         let (clients, digests) =
             config::load_authorized_clients_digested(&path, revocations.as_deref())?;
-        config::reject_infrastructure_keys_as_authority(
-            &path.display().to_string(),
-            clients.cert_trust(),
-            &forbidden,
-        )?;
+        let origin = path.display().to_string();
+        config::reject_infrastructure_keys_as_authority(&origin, clients.cert_trust(), &forbidden)?;
+        if pq_only {
+            sunset::check_authorized_clients(&origin, &clients)?;
+        }
         Ok((clients, digests))
     };
     let (authorized, digests) = load().map_err(|e| load_error(&e))?;
+    let report = sunset::agent_report(&relays, client_suites, &authorized);
     let (authorized_clients, updater) = Revocable::new(authorized);
     let node = NodeId::try_from(node.as_str()).map_err(config_error)?;
     let config = AgentConfig {
@@ -448,6 +464,8 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         updater,
         load: Box::new(load),
         digests,
+        pq_only,
+        report,
     })
 }
 

@@ -346,16 +346,28 @@ fn check_enforces_the_pq_only_profile() {
     }
     let pq_command = |dir: &Dir| {
         let mut cmd = Command::new(BIN);
-        cmd.args(["--log-format", "json", "check", "--pq-only", "--node", "web-01"])
-            .args(["--relay", "127.0.0.1:9", "--relay-key"])
-            .arg(Identity::generate().unwrap().hybrid_public_key().to_string())
-            .args(["--relay-suite", HYBRID, "--accept-client-suites", HYBRID])
-            .arg("--key")
-            .arg(dir.0.join("agent.key"))
-            .arg("--authorized-clients")
-            .arg(dir.0.join("clients.toml"))
-            .env_remove("TCN_ACCEPT_CLIENT_SUITES")
-            .env_remove("TCN_PQ_ONLY");
+        cmd.args([
+            "--log-format",
+            "json",
+            "check",
+            "--pq-only",
+            "--node",
+            "web-01",
+        ])
+        .args(["--relay", "127.0.0.1:9", "--relay-key"])
+        .arg(
+            Identity::generate()
+                .unwrap()
+                .hybrid_public_key()
+                .to_string(),
+        )
+        .args(["--relay-suite", HYBRID, "--accept-client-suites", HYBRID])
+        .arg("--key")
+        .arg(dir.0.join("agent.key"))
+        .arg("--authorized-clients")
+        .arg(dir.0.join("clients.toml"))
+        .env_remove("TCN_ACCEPT_CLIENT_SUITES")
+        .env_remove("TCN_PQ_ONLY");
         cmd
     };
     // Hybrid suites, but clients.toml does not require hybrid clients.

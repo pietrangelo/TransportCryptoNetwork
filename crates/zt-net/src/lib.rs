@@ -27,6 +27,7 @@ pub mod relay;
 pub mod reload;
 mod revocable;
 mod stream;
+pub mod sunset;
 pub mod systemd;
 
 pub use error::NetError;

@@ -16,7 +16,7 @@ use zt_net::logging::{self, LogFormat};
 use zt_net::metrics::{self, RelayMetrics};
 use zt_net::relay::{RelayConfig, RelayServer};
 use zt_net::reload::{self, Hangups, Outcome, Publisher};
-use zt_net::{Revocable, Updater, config, systemd};
+use zt_net::{Revocable, Updater, config, sunset, systemd};
 
 /// TCN relay.
 #[derive(Debug, Parser)]
@@ -232,8 +232,13 @@ fn load_startup(args: &RelayArgs) -> Result<Startup, Failure> {
     };
     let keys = config::load_keyring(&args.key, args.previous_key.as_deref())
         .map_err(|e| load_error(&e))?;
-    let (policy, d) = load_policy(&args.policy, args.revocations.as_deref(), &keys)
-        .map_err(|e| load_error(&e))?;
+    let (policy, d) = load_policy(
+        &args.policy,
+        args.revocations.as_deref(),
+        &keys,
+        settings.pq_only,
+    )
+    .map_err(|e| load_error(&e))?;
     digests.extend(d);
     Ok(Startup {
         settings,
@@ -244,18 +249,24 @@ fn load_startup(args: &RelayArgs) -> Result<Startup, Failure> {
 }
 
 /// The policy and denylist, with a CA equal to a relay key (current or previous) rejected
-/// (PROTOCOL §15.9), and the digests of the bytes parsed.
+/// (PROTOCOL §15.9) and, under the `pq_only` profile, a v1 identity or CA refused (PQ-SUNSET),
+/// and the digests of the bytes parsed.
 fn load_policy(
     policy: &std::path::Path,
     revocations: Option<&std::path::Path>,
     keys: &Keyring,
+    pq_only: bool,
 ) -> Result<(AccessPolicy, Digests), ConfigError> {
     let (loaded, digests) = config::load_relay_policy_digested(policy, revocations)?;
+    let origin = policy.display().to_string();
     config::reject_infrastructure_keys_as_authority(
-        &policy.display().to_string(),
+        &origin,
         loaded.cert_trust(),
         &config::own_keys(keys, "relay"),
     )?;
+    if pq_only {
+        sunset::check_policy(&origin, &loaded)?;
+    }
     Ok((loaded, digests))
 }
 
@@ -270,6 +281,8 @@ struct Reloader {
     policy: Revocable<AccessPolicy>,
     policy_updater: Updater<AccessPolicy>,
     metrics: std::sync::Arc<RelayMetrics>,
+    /// `[handshake] pq_only` of `relay.toml`: every reloaded policy is checked against it.
+    pq_only: bool,
 }
 
 impl Reloader {
@@ -284,6 +297,7 @@ impl Reloader {
             &self.policy_path,
             self.revocations.as_deref(),
             &self.keys.current(),
+            self.pq_only,
         );
         let keys = self.load_keys(policy.as_ref().ok().map(|(p, _)| p));
         let generation = (policy.is_ok() || keys.is_ok()).then(|| generation.next());
@@ -431,7 +445,8 @@ fn check(args: &RelayArgs) -> Result<(), Failure> {
     for line in startup.digests.to_string().split(", ") {
         writeln!(out, "{line}").map_err(runtime_error)?;
     }
-    Ok(())
+    let report = sunset::relay_report(&startup.settings, &startup.policy);
+    sunset::write_report(&mut out, startup.settings.pq_only, &report).map_err(runtime_error)
 }
 
 #[allow(clippy::too_many_lines)] // the startup sequence, in the order it must happen
@@ -496,6 +511,7 @@ fn serve(
             ..
         } = args;
         let reloader = Reloader {
+            pq_only: settings.pq_only,
             key,
             previous_key,
             policy_path,
