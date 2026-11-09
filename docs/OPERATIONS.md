@@ -88,8 +88,9 @@ is reserved for the post-quantum release and is refused at startup.
 `zt-relay run --config /etc/tcn/relay.toml` sets the suites accepted per role and the
 admission limits (PROTOCOL §10.1). Without the option, or with an empty file, the defaults
 below apply. The file is read at startup only: `SIGHUP` does not reload it, so change it with a
-restart. Unknown keys, a zero or absurd limit, or an unsupported suite stop the relay at
-startup.
+restart. Unknown keys, a zero, absurd or inconsistent limit (PROTOCOL §10), or an
+unsupported suite stop the relay at startup. The relay logs the limits in force at startup
+(`admission_limits_in_use`).
 
 ```toml
 [handshake]
@@ -100,13 +101,23 @@ client_suites = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
 
 [admission]
 max_preauth = 1024               # handshakes that have not confirmed their key yet
+max_pending_per_source = 50      # ...of which at once per IPv4 address or IPv6 /64
+max_pending_per_wide = 100       # ...and per IPv6 /48 (at most max_preauth / 2)
 max_established = 8192           # confirmed connections (agents and clients)
-max_per_identity = 512           # confirmed connections of one key (at most 8192)
+agent_reserve_percent = 10       # share of max_established only agents may use (at most 50)
+max_per_identity = 512           # confirmed connections of one key (at most max_established)
 source_burst = 64                # unconfirmed handshakes per IPv4 address or IPv6 /64...
-source_refill_secs = 3           # ...then one more every 3 s
+source_refill_secs = 3           # ...then one more every 3 s (at least 3)
+identity_refund_burst = 512      # confirmed handshakes per key that give their token back...
+identity_refund_refill_ms = 100  # ...then one more every 100 ms
+wide_burst = 64                  # new IPv6 /64s per /48...
+wide_refill_secs = 1             # ...then one more every second
+max_tracked_sources = 65536      # sources (and keys) the budgets track
+max_tracked_wide = 16384         # IPv6 /48s the budget tracks
 msg1_deadline_secs = 5           # accept -> complete message 1 (at least 5)
 handshake_timeout_secs = 10      # accept -> message 2 sent (at most 300)
 first_frame_deadline_secs = 5    # message 2 -> first authentic frame
+summary_interval_secs = 10       # preauth_summary and per-identity line interval
 ```
 
 How to size it:
@@ -114,9 +125,21 @@ How to size it:
 - A connection **gives its token back** once it confirms its key (its first authentic frame), so
   `source_burst` limits only handshakes that never complete: scanners, replays, broken
   clients. A controller behind one address (Ansible with `forks = 50`, a CI runner, a NAT) can
-  open hundreds of sessions as long as at most `source_burst` are in their handshake at the same
-  time. Raise the burst if more connect at once. Lowering the refill below 3 s makes the
-  relay easier to flood and is not recommended.
+  open hundreds of sessions as long as at most `max_pending_per_source` (and `source_burst`)
+  are in their handshake at the same time. Raise both if more connect at once. The relay
+  refuses a refill under 3 s: it would make the relay easier to flood.
+- One key gives back at most `identity_refund_burst` tokens at once, then 10 per second: a
+  stolen key that loops connect, handshake, close from one address is throttled after that,
+  while 4 waves of 50 forks are not.
+- One address holds at most `max_pending_per_source` handshakes at once, and one IPv6 /48 at
+  most `max_pending_per_wide`, so one source cannot fill `max_preauth`. Filling it takes
+  `max_preauth / max_pending_per_source` sources (21 IPv4 addresses with the defaults) or
+  `max_preauth / max_pending_per_wide` /48s (11). If you expect such an attacker, raise
+  `max_preauth`; if all your clients are behind few addresses, keep the caps above their
+  concurrency.
+- `agent_reserve_percent` keeps part of `max_established` for agents: clients (for example
+  many stolen client keys) cannot fill the pool and keep a dropped agent from registering again.
+  Keep the reserve above the number of agents that connect to this relay.
 - `max_per_identity` bounds what one stolen key can hold. Set it above the largest number of
   concurrent sessions that one legitimate key needs: for a controller, its forks, or more if
   it keeps `ControlMaster` connections open to many hosts.
@@ -239,7 +262,10 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `revocations_in_use` | INFO | (relay and agent) at startup and on every reload: how many `serials` and `keys` entries the denylist has |
 | `handshake_suites_in_use` | INFO | (relay) at startup: `agent_suites`, `client_suites`, the accepted suites as comma-separated protocol names (§4.1) |
 | `handshake_suite_rejected` | WARN | (relay) a known peer completed message 1 with a suite not accepted for its role: `peer`, `suite`. It got no message 2 |
-| `preauth_summary` | INFO | (relay) every 10 s, if anything failed before key confirmation: one count per reason, `distinct_sources`, `distinct_keys`, `saturated` (see below) |
+| `preauth_summary` | INFO | (relay) every 10 s, if anything failed before key confirmation: one count per reason, `distinct_sources`, `distinct_keys`, `saturated`, `suppressed_identities` (see below) |
+| `admission_limits_in_use` | INFO | (relay) at startup: every admission limit in force (§4.1) |
+| `admission_refused` | WARN | (relay) a peer that confirmed its key was refused by `max_per_identity` (`reason = identity_limit`) or a full established pool (`established_pool_full`): `peer`. Its `Open` got `Reject RateLimited` |
+| `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
 
 The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex),
 `stream`, `reason`, `rule`, depending on the event. Never payloads or secrets.
@@ -263,19 +289,36 @@ when non-zero:
 | Field | Counts |
 | :- | :- |
 | `rate_limited` | connections refused because their source used up its budget |
+| `source_limit` | connections refused because their source (or its /48) had `max_pending_per_source` (`max_pending_per_wide`) handshakes in progress |
 | `preauth_pool_full` | connections refused because `max_preauth` handshakes were in progress |
 | `established_pool_full`, `identity_limit` | key confirmations refused by `max_established` or `max_per_identity` |
 | `handshake_failed` | message 1 valid for no accepted suite and key |
-| `timeout`, `aborted`, `oversized` | message 1 too slow, cut off, or announced longer than the largest legitimate one |
+| `timeout`, `aborted`, `oversized` | message 1 or message 2 too slow; the connection closed or failed before message 1 was complete or while message 2 was sent; message 1, or the first frame before key confirmation, announced longer than the largest legitimate one |
 | `unknown_peer` | a valid message 1 from a key that the policy does not know |
 | `unverified_certificate` | a certificate rejected before its signature was checked, from an unknown key |
 | `unconfirmed` | message 2 sent, but no authentic frame followed (a replayed message 1, a silent client) |
 | `distinct_sources`, `distinct_keys` | distinct IPv4 addresses or IPv6 /64s, and distinct unknown keys, at most 4 096 each; `saturated = true` when a limit was reached |
+| `suppressed_identities` | events about known identities beyond the 256 logged per interval (see below) |
 
-`authentication_failed` stays a per-event line for keys the configuration knows (whitelisted
-or revoked) and for certificates rejected after a pinned CA's signature was verified. A rising
-`unconfirmed` count with few `distinct_sources` is the signature of someone replaying
-recorded handshakes. A rising `unknown_peer` with many `distinct_keys` is a scanner.
+`authentication_failed` stays a line that names the peer for keys the configuration knows
+(whitelisted or revoked) and for certificates rejected after a pinned CA's signature was
+verified. A recorded message 1 can be replayed at will, though, so these lines (and
+`handshake_suite_rejected`, `admission_refused`) are rate-limited per identity: the first
+event of a `peer` in each 10 s interval is logged in full, the others are counted in one
+`<event>_repeated` line with `peer`, the reason fields and `count`. At most 256 identities are
+logged per interval; the events of further identities only add to `suppressed_identities`.
+
+How to read them:
+
+- A rising `unconfirmed` count with few `distinct_sources` is the signature of someone replaying
+  recorded handshakes. A rising `unknown_peer` with many `distinct_keys` is a scanner.
+- A revoked key (`reason = key_revoked`) or an expired certificate (`cert_check = expired`)
+  seen again and again, and especially in `authentication_failed_repeated`, is a **replay
+  signal**: someone recorded the victim's message 1 and sends it back. It is not evidence that
+  the victim is active or that its key is in use; a replay never gets past message 2.
+- `admission_refused` names a real, authenticated peer. `identity_limit` for a fleet controller
+  means `max_per_identity` is too low for its concurrency; for a key that should not be that
+  busy, it is a stolen key.
 
 ```bash
 journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
@@ -614,8 +657,25 @@ OpenSSH supports two hybrid key exchanges:
 | `mlkem768x25519-sha256` | 9.9 and later (default from 10.0) | ML-KEM-768 + X25519; preferred |
 | `sntrup761x25519-sha512@openssh.com` | 8.5 and later (default from 9.0 to 9.9) | Streamlined NTRU Prime + X25519; the alias `sntrup761x25519-sha512` exists from 9.9 |
 
-On the client (`~/.ssh/config`) and on the server (`/etc/ssh/sshd_config`), list the hybrids
-first and allow the classical exchange only for hosts that cannot do better:
+OpenSSH refuses a `KexAlgorithms` line that names an algorithm it does not know: `ssh` stops with
+`Bad SSH2 KexAlgorithms` and `sshd -t` refuses the file. So the line depends on the version
+of the OpenSSH that reads it (the client's for `~/.ssh/config`, the server's for
+`/etc/ssh/sshd_config`), not on the peer's (review 0008, finding A8-9):
+
+| OpenSSH that reads the file | `KexAlgorithms` | Examples |
+| :- | :- | :- |
+| 9.9 and later | `mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com` | Debian 13, Ubuntu 25.04, Fedora 42 |
+| 8.5 to 9.8 | `sntrup761x25519-sha512@openssh.com` | Ubuntu 22.04 (8.9), Ubuntu 24.04 (9.6), EL9 (8.7), Debian 12 (9.2) |
+| before 8.5 | no hybrid exists: upgrade OpenSSH | EL8 (8.0), Ubuntu 20.04 (8.2) |
+
+Check what a build supports, and build the line from the intersection, with:
+
+```sh
+ssh -V
+ssh -Q kex | grep -E '^(mlkem768x25519-sha256|sntrup761x25519-sha512(@openssh\.com)?)$' | paste -sd, -
+```
+
+For example, on a 9.9 or later client and server:
 
 ```sshconfig
 # ~/.ssh/config
@@ -628,8 +688,11 @@ Host *.tcn
 KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com
 ```
 
-With only hybrids listed, an old `ssh` or `sshd` fails to connect instead of silently falling
-back to a classical exchange. Check what was negotiated with `ssh -v web-01.tcn 2>&1 | grep 'kex:
-algorithm'`, and what a build supports with `ssh -Q kex`. This protects the confidentiality of
+and on an 8.5 to 9.8 client or server, `KexAlgorithms sntrup761x25519-sha512@openssh.com`. Names the peer does not
+support are harmless: the two sides negotiate the first algorithm both know. With only hybrids
+listed, a peer that supports none of them fails to connect (`no matching key exchange method
+found`) instead of silently falling back to a classical exchange; to allow that fallback for
+some hosts, append `curve25519-sha256` in a `Host` block for them only. Check what was
+negotiated with `ssh -v web-01.tcn 2>&1 | grep 'kex: algorithm'`. This protects the confidentiality of
 the SSH session. Authentication (host keys and user keys) stays classical, as it does in TCN
 until a later release.

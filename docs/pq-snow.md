@@ -52,10 +52,14 @@ state machine changes, and that state machine is the code the spike exercised.
     a KEM implementation other than the one the test vectors cover;
   - `cargo deny` keeps checking the vendored crate (its license and sources do not change).
 - **Upstream PR**, opportunistic: if a release with ML-KEM-768 appears, the vendored copy goes.
-- **Until PQ-1**, nothing ships: the `hfs` feature is enabled only in zt-crypto's
+- **Until PQ-1**, no hybrid handshake ships: the `hfs` feature is enabled only in zt-crypto's
   dev-dependencies (the spike), and `HandshakeSuite::NoiseIkhfs25519MlKem768.is_supported()` is
   `false`. Configuration refuses the suite (`SuiteError::Unsupported`), and so does the handshake
-  API (`CryptoError::UnsupportedSuite`).
+  API (`CryptoError::UnsupportedSuite`). `libcrux-ml-kem` itself, however, is already a normal
+  dependency of every release binary: its build scripts run and its code is compiled, even if
+  fat LTO removes it as unused (review 0008, finding A8-12). This is why the backend selection
+  of `.cargo/config.toml` is guarded now (`crates/zt-crypto/build.rs`, the release check of the
+  libcrux build-script output, finding A8-6), not only from PQ-1 on.
 - PQ-1 inverts the spike test `stock_snow_does_not_know_ml_kem_768` and replaces the borrowed
   label with the honest name.
 

@@ -218,9 +218,12 @@ therefore bounded by `streams × MAX_WINDOW`.
 | Limit | Value |
 | :- | -: |
 | unconfirmed connections to the relay (pre-authentication pool) | 1 024 |
+| unconfirmed connections at once per IPv4 address or IPv6 /64 / per IPv6 /48 | 50 / 100 |
 | confirmed connections to the relay (established pool) | 8 192 |
+| share of the established pool that only agents may use | 10 % (819) |
 | confirmed connections per identity | 512 |
 | unconfirmed handshakes per IPv4 address or IPv6 /64 prefix | burst of 64, then 1 every 3 s |
+| refunds of that budget per identity | burst of 512, then 10 per second |
 | new IPv6 /64 prefixes per /48 | burst of 64, then 1 per second |
 | `Open` per client connection | burst of 64, then 10 per second |
 | streams per client / per agent | 32 / 64 |
@@ -230,8 +233,11 @@ therefore bounded by `streams × MAX_WINDOW`.
 | agent and client keepalive | 30 s |
 
 The relay's admission limits are set in `relay.toml` (OPERATIONS §4.1). Every value is checked
-at startup: none may be zero, none may be absurd, and the message 1 deadline lies between 5 s
-and the handshake deadline.
+at startup: none may be zero, none may be absurd, the message 1 deadline lies between 5 s
+and the handshake deadline, the per-source refill is 3 s or slower, one identity may not hold
+more than the established pool, a source may not hold more than its /48, and a /48 may not hold
+more than half of the pre-authentication pool. The relay logs the limits in force at startup
+(`admission_limits_in_use`).
 
 ### 10.1 Admission on the relay
 A connection passes through two pools:
@@ -245,26 +251,46 @@ accept ─(per-source token, pre-auth slot)─▶ unconfirmed ─first authentic
 
 1. **At accept** the connection takes a slot in the pre-authentication pool and one token
    from the budget of its source (IPv4 address or IPv6 /64, plus the /48 bucket for new /64s).
-   A full pool or an empty budget drops it without a reply. The pool is checked first, so
-   a full pool does not spend the source's tokens.
+   A source holds at most `max_pending_per_source` unconfirmed connections at once, and all the
+   /64s of one IPv6 /48 together at most `max_pending_per_wide`. A full pool, a source at its
+   cap or an empty budget drops the connection without a reply. The pool and the caps are
+   checked first, so they do not spend the source's tokens.
 2. **Message 1** must be complete within `msg1_deadline` (≥ 5 s), however slowly it trickles
    in. Its length prefix is checked on sight: over the largest legitimate message 1 of the
    accepted suites (4 424 bytes for the classical suite, §15.3), the connection is closed
-   before any byte of the message is buffered. After the handshake the limit is the usual
-   Noise maximum (§7.1).
+   before any byte of the message is buffered. Until key confirmation (step 4) the limit is the
+   largest legitimate first transport message: 87 bytes, the tag and a `Register` or `Open` with
+   a 63-byte name. A longer prefix is refused on sight and counted as `oversized`. After key
+   confirmation the limit is the usual Noise maximum (§7.1).
 3. **Message 2** is sent if the policy (§15.4) and the suite (§7.5) accept the peer, within
    `handshake_timeout` from accept.
 4. **Key confirmation.** Message 1 can be a recording (§7.3), so message 2 proves nothing about
    the initiator. Only the first authentic transport frame does (`Register` from an agent, `Open`
    or `Ping` from a client). It must arrive within `first_frame_deadline` after message 2. Only
    then does the connection reach the relay core, move to the established pool and count
-   against its identity's concurrency limit, and the source get its token back.
+   against its identity's concurrency limit. The source gets its token back if the identity
+   still has refunds (`identity_refund_burst`, then one every `identity_refund_refill`).
+   Clients may fill the established pool only up to `max_established` minus the agents' share
+   (`agent_reserve_percent`); agents may use all of it. A confirmed identity that is refused
+   here (its concurrency limit, or a full pool) gets `Reject RateLimited` in answer to its
+   `Open`, and the relay writes an `admission_refused` line that names it.
 
 Consequences:
 
-- The per-source budget limits **unconfirmed** handshakes only. A fleet controller that opens
-  hundreds of sessions from one address is not throttled, because every confirmed session gives
-  its token back. Replays and scanners never confirm, so they spend the budget for good.
+- The per-source budget limits **unconfirmed** handshakes, and the refunds bound confirmed ones.
+  A fleet controller that opens hundreds of sessions from one address (4 waves of
+  `forks = 50`) is not throttled, because every confirmed session gives its token back. One
+  identity that loops connect, handshake, first frame, close from one address gets 512
+  handshakes at once, then 10 per second plus the source's 1 every 3 s. Replays and scanners
+  never confirm, so they spend the budget for good.
+- The pre-authentication pool is still global. With the defaults, one source holds at most 50 of
+  its 1 024 slots and one /48 at most 100, so filling it takes at least 21 IPv4 addresses (or
+  /64s in different /48s), or 11 IPv6 /48s, each holding its slots for the 5 s of
+  `msg1_deadline` at a time. An operator who expects such an attacker raises `max_preauth` or
+  lowers the caps (OPERATIONS §4.1).
+- The /48 caps the slots its /64s hold at once, not the handshakes they start: in a burst one
+  /48 can start up to `wide_burst` × `source_burst` (4 096) unconfirmed handshakes over time,
+  at most 100 at once.
 - Replays of a recorded message 1 never enter the established pool and never charge the
   victim's identity: they cannot lock the victim out.
 - A stolen identity holds at most `max_per_identity` confirmed connections, however many
@@ -273,6 +299,13 @@ Consequences:
   aggregated (§15.11). An `authentication_failed` line is written only for a key the
   configuration knows (whitelisted or revoked), or for a certificate rejected after a pinned CA's
   signature was verified. Any other key is one that anyone could have made up.
+- A recorded message 1 of a known identity can be replayed at will, for example one of a key
+  revoked since or one whose certificate has expired since. So the line about a known identity
+  (`authentication_failed`, `handshake_suite_rejected`, `admission_refused`) is written in full
+  once per identity and `summary_interval`. The repeats are counted in one
+  `<event>_repeated{peer, …, count}` line per identity and interval. At most 256 identities are
+  logged per interval; beyond them the events are only counted (`suppressed_identities` in
+  `preauth_summary`).
 
 ## 11. The client as `ProxyCommand`
 
