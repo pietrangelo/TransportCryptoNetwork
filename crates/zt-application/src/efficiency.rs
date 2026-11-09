@@ -1,6 +1,10 @@
 //! R-6 efficiency, the sans-IO decisions (resilience.md §5.6, review 0007 AP-22, D-13): how far
 //! a receiver grows a stream's window, and which connection the relay's global byte budget
-//! sheds. The byte accounting itself lives in the network adapter; these are the rules.
+//! sheds (per authenticated identity, review 0013 A13-1). The byte accounting itself lives in
+//! the network adapter; these are the rules.
+
+use std::collections::HashMap;
+use std::hash::Hash;
 
 use zt_domain::flow::{INITIAL_WINDOW, MAX_WINDOW};
 
@@ -82,21 +86,159 @@ impl WindowTuner {
     }
 }
 
-/// The connection the relay sheds when its queued bytes `total` exceed `budget` (D-13): the one
-/// with the largest backlog, the slowest reader; on a tie the newest (highest id), so a
-/// long-lived connection is not dropped for a newcomer. A connection with nothing queued is
-/// never shed. `None` within the budget.
-pub fn shed_victim(
+/// At most this fraction of the relay's budget (one over `IDENTITY_SHARE`) may be queued
+/// towards one authenticated identity, never less than one connection's full credit (review
+/// 0013, A13-1).
+pub const IDENTITY_SHARE: usize = 4;
+
+/// One connection's backlog, as the relay sees it when the budget is exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backlog<K> {
+    /// The connection.
+    pub conn: ConnId,
+    /// The authenticated identity of its peer (its fingerprint).
+    pub identity: K,
+    /// The peer is an agent.
+    pub agent: bool,
+    /// Bytes queued towards it and not yet written.
+    pub bytes: usize,
+}
+
+/// The limits [`shed_victim`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShedLimits {
+    /// The global byte budget.
+    pub budget: usize,
+    /// The most one identity may hold: a quarter of the budget, at least one connection's
+    /// credit.
+    pub identity_cap: usize,
+    /// An agent's normal credit (its streams × the largest window): shed only as a last
+    /// resort.
+    pub agent_credit: usize,
+}
+
+impl ShedLimits {
+    /// The limits for `budget`, where one connection may legitimately have `conn_credit`
+    /// bytes queued (its streams × the largest window) and an agent `agent_credit`.
+    #[must_use]
+    pub const fn new(budget: usize, conn_credit: usize, agent_credit: usize) -> Self {
+        let share = budget / IDENTITY_SHARE;
+        Self {
+            budget,
+            identity_cap: if share > conn_credit {
+                share
+            } else {
+                conn_credit
+            },
+            agent_credit,
+        }
+    }
+}
+
+/// Why a connection is shed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShedCause {
+    /// Its identity holds more than [`ShedLimits::identity_cap`].
+    IdentityCap,
+    /// The budget as a whole is exceeded and its identity holds the most of it.
+    Budget,
+}
+
+impl ShedCause {
+    /// The stable name of the cause, for the audit line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityCap => "identity_cap",
+            Self::Budget => "budget",
+        }
+    }
+}
+
+/// The connection to shed, with the identity it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shed<K> {
+    /// The connection.
+    pub conn: ConnId,
+    /// Its identity.
+    pub identity: K,
+    /// The peer is an agent.
+    pub agent: bool,
+    /// Bytes queued towards the whole identity (every connection of it).
+    pub identity_bytes: usize,
+    /// Why.
+    pub cause: ShedCause,
+}
+
+/// What one identity holds.
+struct Holding {
+    bytes: usize,
+    agent: bool,
+    /// Its largest connection: (backlog, id), the newest on a tie.
+    largest: (usize, ConnId),
+}
+
+/// The connection the relay sheds (D-13, fair per identity since review 0013, A13-1), or
+/// `None`. The backlogs are summed per authenticated identity, so spreading a backlog over many
+/// connections does not hide it:
+///
+/// 1. an identity holding more than [`ShedLimits::identity_cap`] is shed, even within the
+///    budget (the largest such identity first);
+/// 2. past the budget (`total > budget`), the identity with the largest *excess* is shed: its
+///    bytes minus, for an agent, its normal credit, so an agent within its credit is never shed
+///    for a client; when nobody has an excess (only agents within their credit hold the
+///    budget), the largest identity, as a last resort.
+///
+/// Within the identity, its largest connection goes, the newest on a tie (a long-lived
+/// connection is not dropped for a newcomer). A connection with nothing queued is never shed.
+pub fn shed_victim<K: Eq + Hash + Copy>(
     total: usize,
-    budget: usize,
-    backlogs: impl IntoIterator<Item = (ConnId, usize)>,
-) -> Option<ConnId> {
-    if total <= budget {
+    limits: &ShedLimits,
+    backlogs: impl IntoIterator<Item = Backlog<K>>,
+) -> Option<Shed<K>> {
+    let mut identities: HashMap<K, Holding> = HashMap::new();
+    for b in backlogs.into_iter().filter(|b| b.bytes > 0) {
+        let h = identities.entry(b.identity).or_insert(Holding {
+            bytes: 0,
+            agent: false,
+            largest: (0, b.conn),
+        });
+        h.bytes = h.bytes.saturating_add(b.bytes);
+        h.agent |= b.agent;
+        h.largest = h.largest.max((b.bytes, b.conn));
+    }
+    let shed = |(identity, h): (&K, &Holding), cause| Shed {
+        conn: h.largest.1,
+        identity: *identity,
+        agent: h.agent,
+        identity_bytes: h.bytes,
+        cause,
+    };
+    if let Some(over) = identities
+        .iter()
+        .filter(|(_, h)| h.bytes > limits.identity_cap)
+        .max_by_key(|(_, h)| (h.bytes, h.largest.1))
+    {
+        return Some(shed(over, ShedCause::IdentityCap));
+    }
+    if total <= limits.budget {
         return None;
     }
-    backlogs
-        .into_iter()
-        .filter(|&(_, b)| b > 0)
-        .max_by_key(|&(id, b)| (b, id))
-        .map(|(id, _)| id)
+    let excess = |h: &Holding| {
+        if h.agent {
+            h.bytes.saturating_sub(limits.agent_credit)
+        } else {
+            h.bytes
+        }
+    };
+    identities
+        .iter()
+        .filter(|(_, h)| excess(h) > 0)
+        .max_by_key(|(_, h)| (excess(h), h.largest.1))
+        .or_else(|| {
+            identities
+                .iter()
+                .max_by_key(|(_, h)| (h.bytes, h.largest.1))
+        })
+        .map(|victim| shed(victim, ShedCause::Budget))
 }

@@ -821,19 +821,22 @@ fn the_relay_writes_its_metrics_and_status_reads_them() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let baseline = foreign_listeners();
     let relay = Running::start_unlocked(&dir, &["--metrics-file", &p, "--metrics-interval", "1"]);
-    let text = wait_metric(&path, "tcn_config_generation 1");
+    let text = wait_metric(&path, "tcn_config_generation{role=\"relay\"} 1");
     assert!(
         text.contains("tcn_build_info{role=\"relay\",version=\""),
         "{text}"
     );
     relay.signal("-HUP");
     relay.event("policy_reloaded");
-    wait_metric(&path, "tcn_config_generation 2");
+    wait_metric(&path, "tcn_config_generation{role=\"relay\"} 2");
     let out = status(&path);
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("role: relay"), "{stdout}");
-    assert!(stdout.contains("tcn_config_generation 2"), "{stdout}");
+    assert!(
+        stdout.contains("tcn_config_generation{role=\"relay\"} 2"),
+        "{stdout}"
+    );
     assert_eq!(listening_sockets(relay.child.id(), &baseline), 1);
 }
 

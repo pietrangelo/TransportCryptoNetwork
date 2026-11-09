@@ -24,14 +24,14 @@ use zt_application::admission::{
     Admission, AdmissionConfig, IdentityEvent, PreauthFailure, PreauthSummary, Refusal,
     RepeatedEvent, Ticket, is_known_identity,
 };
-use zt_application::efficiency::shed_victim;
+use zt_application::efficiency::{Backlog, Shed, ShedLimits, shed_victim};
 use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
-    AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
-    HandshakeSuite, HybridFingerprint, InitiatorRole, PeerRole, RejectReason, SessionId,
+    AccessPolicy, AuthFailureReason, CertClaims, CertRef, CloseReason, DomainEvent, Fingerprint,
+    Frame, HandshakeSuite, HybridFingerprint, InitiatorRole, PeerRole, RejectReason, SessionId,
     SuitePolicy,
 };
 
@@ -61,7 +61,8 @@ pub struct RelayConfig {
     /// [`crate::metrics::export`], never served on a socket.
     pub metrics: Arc<RelayMetrics>,
     /// The global byte budget of the frames queued towards peers (R-6, D-13): past it, the
-    /// connection with the largest backlog (the slowest reader) is disconnected.
+    /// identity holding the most of it (the slowest reader) loses its largest connection, and
+    /// no identity may hold more than a quarter of it (review 0013, A13-1).
     pub queue_budget: usize,
 }
 
@@ -352,24 +353,31 @@ struct Queued {
     _charge: QueueCharge,
 }
 
-/// Bytes of a queued frame, counted in the global budget and in its connection's backlog.
+/// Bytes of a queued frame, counted in the global budget, in its connection's backlog and in
+/// its identity's.
 struct QueueCharge {
     _global: Charge,
     backlog: Arc<AtomicUsize>,
+    identity: Arc<AtomicUsize>,
     bytes: usize,
 }
 
 impl Drop for QueueCharge {
     fn drop(&mut self) {
         self.backlog.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.identity.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
 /// The hub's side of a connection's outbound queue.
 struct PeerQueue {
+    /// The authenticated identity of the peer: the budget is shared fairly per identity.
+    identity: Fingerprint,
     tx: mpsc::Sender<Queued>,
     /// Bytes queued and not yet written.
     backlog: Arc<AtomicUsize>,
+    /// Bytes queued towards every connection of the identity (set by [`Queues::connected`]).
+    identity_backlog: Arc<AtomicUsize>,
     /// Wakes the connection task when the budget sheds it, even in the middle of a write.
     shed: Arc<Notify>,
 }
@@ -381,13 +389,15 @@ struct OwnQueue {
 }
 
 impl PeerQueue {
-    fn new(frames: usize) -> (Self, OwnQueue) {
+    fn new(identity: Fingerprint, frames: usize) -> (Self, OwnQueue) {
         let (tx, rx) = mpsc::channel(frames);
         let shed = Arc::new(Notify::new());
         (
             Self {
+                identity,
                 tx,
                 backlog: Arc::new(AtomicUsize::new(0)),
+                identity_backlog: Arc::new(AtomicUsize::new(0)),
                 shed: Arc::clone(&shed),
             },
             OwnQueue { rx, shed },
@@ -414,18 +424,43 @@ fn queued_bytes(frame: &Frame) -> usize {
 struct Queues {
     peers: HashMap<ConnId, PeerQueue>,
     budget: Arc<ByteBudget>,
+    limits: ShedLimits,
+    /// Bytes queued per identity, shared by its connections' queues.
+    identities: HashMap<Fingerprint, Arc<AtomicUsize>>,
     /// Shed connections whose queued frames are not released yet: not counted twice, so one
     /// slow reader never costs another connection its place.
     shedding: Vec<(ConnId, Arc<AtomicUsize>)>,
 }
 
 impl Queues {
-    fn new(budget: Arc<ByteBudget>) -> Self {
+    fn new(budget: Arc<ByteBudget>, limits: ShedLimits) -> Self {
         Self {
             peers: HashMap::new(),
             budget,
+            limits,
+            identities: HashMap::new(),
             shedding: Vec::new(),
         }
+    }
+
+    /// A connection joined: its queue counts towards its identity's backlog.
+    fn connected(&mut self, conn: ConnId, mut queue: PeerQueue) {
+        queue.identity_backlog = Arc::clone(
+            self.identities
+                .entry(queue.identity)
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+        );
+        self.peers.insert(conn, queue);
+    }
+
+    /// Detaches a connection: its queued frames are still written, then it closes.
+    fn detach(&mut self, conn: ConnId) {
+        self.peers.remove(&conn);
+    }
+
+    /// Forgets the identities with no connection and nothing queued (every tick).
+    fn sweep(&mut self) {
+        self.identities.retain(|_, b| Arc::strong_count(b) > 1);
     }
 
     /// Queues `frame` for `conn`; `false` if the queue is full or gone.
@@ -433,9 +468,11 @@ impl Queues {
         let peer = self.peers.get(&conn)?;
         let bytes = queued_bytes(&frame);
         peer.backlog.fetch_add(bytes, Ordering::AcqRel);
+        peer.identity_backlog.fetch_add(bytes, Ordering::AcqRel);
         let charge = QueueCharge {
             _global: self.budget.charge(bytes),
             backlog: Arc::clone(&peer.backlog),
+            identity: Arc::clone(&peer.identity_backlog),
             bytes,
         };
         Some(
@@ -448,9 +485,21 @@ impl Queues {
         )
     }
 
-    /// Past the budget, the connection with the largest backlog, detached and woken.
-    fn shed(&mut self) -> Option<(ConnId, usize)> {
-        if !self.budget.exceeded() {
+    /// Past the budget, or past an identity's share of it, the largest connection of the
+    /// identity that holds the most ([`shed_victim`]), detached and woken; with its backlog.
+    /// `is_agent` tells the agents, whose normal credit is shed only as a last resort.
+    /// `sent_to` is the connection a frame was just queued for: only its identity can have
+    /// gone over its share, so the full scan runs only then or past the budget.
+    fn shed(
+        &mut self,
+        sent_to: ConnId,
+        is_agent: impl Fn(ConnId) -> bool,
+    ) -> Option<(Shed<Fingerprint>, usize)> {
+        let over_share = self
+            .peers
+            .get(&sent_to)
+            .is_some_and(|p| p.identity_backlog.load(Ordering::Acquire) > self.limits.identity_cap);
+        if !over_share && !self.budget.exceeded() {
             return None;
         }
         self.shedding.retain(|(_, b)| b.load(Ordering::Acquire) > 0);
@@ -462,15 +511,56 @@ impl Queues {
         let total = self.budget.used().saturating_sub(releasing);
         let victim = shed_victim(
             total,
-            self.budget.limit(),
-            self.peers.iter().map(|(&id, p)| (id, p.backlog())),
+            &self.limits,
+            self.peers.iter().map(|(&conn, p)| Backlog {
+                conn,
+                identity: p.identity,
+                agent: is_agent(conn),
+                bytes: p.backlog(),
+            }),
         )?;
-        let peer = self.peers.remove(&victim)?;
+        let peer = self.peers.remove(&victim.conn)?;
         let backlog = peer.backlog();
         peer.shed.notify_one();
-        self.shedding.push((victim, peer.backlog));
+        self.shedding.push((victim.conn, peer.backlog));
         Some((victim, backlog))
     }
+}
+
+/// Reports the queue budget at startup, and warns when it is below two agents' full credit
+/// (A13-1): then a single agent holding its normal credit is close to the whole budget.
+fn queue_budget_in_use(budget: usize, limits: &RelayLimits) {
+    let agent_credit = crate::budget::agent_credit(limits.max_streams_per_agent);
+    let shed = shed_limits(budget, limits);
+    if budget < agent_credit.saturating_mul(2) {
+        audit_line!(
+            true,
+            "queue_budget_below_agent_credit",
+            budget,
+            agent_credit,
+            identity_cap = shed.identity_cap,
+            "the queue budget is below two agents' full credit (OPERATIONS §18)"
+        );
+    } else {
+        tracing::info!(
+            budget,
+            agent_credit,
+            identity_cap = shed.identity_cap,
+            "queue budget in use"
+        );
+    }
+}
+
+/// The shedding limits of `budget` under `limits` (review 0013, A13-1): one connection may
+/// legitimately hold its streams × the largest window, an agent its own streams'.
+fn shed_limits(budget: usize, limits: &RelayLimits) -> ShedLimits {
+    let window = usize::try_from(MAX_WINDOW).unwrap_or(usize::MAX);
+    let agent = crate::budget::agent_credit(limits.max_streams_per_agent);
+    let conn = limits
+        .max_streams_per_agent
+        .max(limits.max_streams_per_client)
+        .saturating_mul(window);
+    ShedLimits::new(budget, conn, agent)
 }
 
 /// Outbound queue of a connection: the most that the credit allows to be enqueued.
@@ -622,7 +712,7 @@ impl<A: Acceptor> RelayServer<A> {
             progress,
             drain_rx,
             Arc::clone(&metrics),
-            config.queue_budget,
+            shed_limits(config.queue_budget, &config.limits),
         ));
         // One clone per live connection task: the drain waits for them to flush.
         let live = Arc::new(());
@@ -636,6 +726,7 @@ impl<A: Acceptor> RelayServer<A> {
             "handshake suites in use"
         );
         admission_limits_in_use(&config.admission);
+        queue_budget_in_use(config.queue_budget, &config.limits);
         let admission = Arc::new(Mutex::new(Admission::new(
             config.admission.clone(),
             mono_now(),
@@ -1188,7 +1279,7 @@ impl Connection {
     ) where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let (queue, own) = PeerQueue::new(self.capacity);
+        let (queue, own) = PeerQueue::new(peer.fingerprint, self.capacity);
         let OwnQueue { mut rx, shed } = own;
         let conn = self.conn;
         if self
@@ -1326,11 +1417,11 @@ async fn hub(
     progress: Progress,
     mut drain_rx: mpsc::Receiver<Duration>,
     metrics: Arc<RelayMetrics>,
-    queue_budget: usize,
+    limits: ShedLimits,
 ) -> DrainOutcome {
-    let budget = ByteBudget::new(queue_budget);
+    let budget = ByteBudget::new(limits.budget);
     metrics.attach_queue(&budget);
-    let mut peers = Queues::new(budget);
+    let mut peers = Queues::new(budget, limits);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     // A late tick is not caught up in a burst (A10-10): one tick per second of progress.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1354,6 +1445,7 @@ async fn hub(
                         core.client_stream_count()
                     ));
                 }
+                peers.sweep();
                 Input::Tick
             }
             Some(timeout) = drain_rx.recv(), if drain.is_none() => {
@@ -1364,12 +1456,12 @@ async fn hub(
             event = events.recv() => match event {
                 None => return DrainOutcome::default(),
                 Some(HubEvent::Connected { conn, peer, hybrid, certificate, queue }) => {
-                    peers.peers.insert(conn, queue);
+                    peers.connected(conn, queue);
                     Input::Connected { conn, peer, hybrid, certificate }
                 }
                 Some(HubEvent::Core(input)) => {
                     if let Input::Disconnected { conn } = &input {
-                        peers.peers.remove(conn);
+                        peers.detach(*conn);
                     }
                     input
                 }
@@ -1404,34 +1496,44 @@ fn execute(
         for output in core.handle(input, now) {
             match output {
                 Output::Send { conn, frame } => {
-                    count_sent(metrics, &frame);
+                    let sent = Sent::of(&frame);
                     match peers.send(conn, frame) {
-                        None | Some(true) => {}
+                        // Counted once queued, not before: a frame dropped on overflow or for a
+                        // connection already gone was never forwarded (review 0013, A13-11).
+                        Some(true) => sent.count(metrics),
+                        None => {}
                         Some(false) => {
                             // Queue full or connection already closed: detach it.
                             tracing::warn!(conn = conn.0, "outbound queue overflow");
                             metrics.queue_overflow.inc();
-                            peers.peers.remove(&conn);
+                            peers.detach(conn);
                             pending.push(Input::Disconnected { conn });
                         }
                     }
-                    if let Some((victim, backlog)) = peers.shed() {
+                    if let Some((victim, backlog)) = peers.shed(conn, |c| core.is_agent(c)) {
+                        // The identity is named (A13-1): an abuser that spreads its backlog
+                        // over many connections is visible in one line per shed connection.
                         audit_line!(
                             true,
                             "queue_budget_exceeded",
-                            conn = victim.0,
+                            conn = victim.conn.0,
+                            peer = %victim.identity,
+                            role = if victim.agent { "agent" } else { "client" },
+                            cause = victim.cause.as_str(),
                             backlog,
-                            budget = peers.budget.limit(),
-                            "byte budget exceeded: slowest reader disconnected"
+                            identity_backlog = victim.identity_bytes,
+                            budget = peers.limits.budget,
+                            identity_cap = peers.limits.identity_cap,
+                            "byte budget exceeded: the slowest reader's identity loses a connection"
                         );
                         metrics.queue_shed.inc();
-                        pending.push(Input::Disconnected { conn: victim });
+                        pending.push(Input::Disconnected { conn: victim.conn });
                     }
                 }
                 Output::Close { conn } => {
                     // Dropping the sender closes the connection after the frames already
                     // queued.
-                    peers.peers.remove(&conn);
+                    peers.detach(conn);
                 }
                 Output::Audit(event) => audit(&event),
             }
@@ -1443,13 +1545,32 @@ fn execute(
 }
 
 /// What a frame the hub sends says for the metrics: forwarded bytes, reject and close reasons.
-fn count_sent(metrics: &RelayMetrics, frame: &Frame) {
-    match frame {
-        Frame::Data { payload, .. } => metrics
-            .forwarded_bytes
-            .add(u64::try_from(payload.len()).unwrap_or(u64::MAX)),
-        Frame::Reject { reason, .. } => metrics.open_rejected(*reason),
-        Frame::Close { reason, .. } => metrics.stream_closed(*reason),
-        _ => {}
+#[derive(Clone, Copy)]
+enum Sent {
+    Data(usize),
+    Reject(RejectReason),
+    Close(CloseReason),
+    Other,
+}
+
+impl Sent {
+    fn of(frame: &Frame) -> Self {
+        match frame {
+            Frame::Data { payload, .. } => Self::Data(payload.len()),
+            Frame::Reject { reason, .. } => Self::Reject(*reason),
+            Frame::Close { reason, .. } => Self::Close(*reason),
+            _ => Self::Other,
+        }
+    }
+
+    fn count(self, metrics: &RelayMetrics) {
+        match self {
+            Self::Data(len) => metrics
+                .forwarded_bytes
+                .add(u64::try_from(len).unwrap_or(u64::MAX)),
+            Self::Reject(reason) => metrics.open_rejected(reason),
+            Self::Close(reason) => metrics.stream_closed(reason),
+            Self::Other => {}
+        }
     }
 }

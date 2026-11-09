@@ -158,7 +158,8 @@ fn client_metrics_describe_the_last_session() {
     assert_eq!(snap.get("tcn_client_last_session_failover", &[]), Some(1.0));
 }
 
-/// Generation, reloads, drain and watchdog progress are process metrics shared by both roles.
+/// Generation, reloads, drain and watchdog progress are process metrics shared by both roles,
+/// labelled with the role (review 0013, A13-3).
 #[test]
 fn process_metrics_follow_reloads_drain_and_progress() {
     let m = RelayMetrics::new();
@@ -169,17 +170,24 @@ fn process_metrics_follow_reloads_drain_and_progress() {
     m.process().progress().advance();
     m.process().progress().advance();
     let snap = Snapshot::parse(&m.render()).unwrap();
-    assert_eq!(snap.get("tcn_config_generation", &[]), Some(2.0));
+    let role = [("role", "relay")];
+    assert_eq!(snap.get("tcn_config_generation", &role), Some(2.0));
     assert_eq!(
-        snap.get("tcn_reloads_total", &[("result", "applied")]),
+        snap.get(
+            "tcn_reloads_total",
+            &[("role", "relay"), ("result", "applied")]
+        ),
         Some(1.0)
     );
     assert_eq!(
-        snap.get("tcn_reloads_total", &[("result", "rejected")]),
+        snap.get(
+            "tcn_reloads_total",
+            &[("role", "relay"), ("result", "rejected")]
+        ),
         Some(1.0)
     );
-    assert_eq!(snap.get("tcn_draining", &[]), Some(1.0));
-    assert_eq!(snap.get("tcn_watchdog_progress_total", &[]), Some(2.0));
+    assert_eq!(snap.get("tcn_draining", &role), Some(1.0));
+    assert_eq!(snap.get("tcn_watchdog_progress_total", &role), Some(2.0));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -216,11 +224,17 @@ async fn exporter_writes_at_start_and_every_interval() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let first = Snapshot::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(first.get("tcn_agent_sessions", &[]), Some(0.0));
-    assert_eq!(first.get("tcn_metrics_interval_seconds", &[]), Some(0.2));
+    assert_eq!(
+        first.get("tcn_metrics_interval_seconds", &[("role", "agent")]),
+        Some(0.2)
+    );
     m.process().set_generation(7);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let later = Snapshot::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(later.get("tcn_config_generation", &[]), Some(7.0));
+    assert_eq!(
+        later.get("tcn_config_generation", &[("role", "agent")]),
+        Some(7.0)
+    );
     task.abort();
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -241,7 +255,9 @@ fn status_reports_a_fresh_file() {
     assert!(!report.stale);
     assert!(report.text.contains("role: relay"), "{}", report.text);
     assert!(
-        report.text.contains("tcn_config_generation 3"),
+        report
+            .text
+            .contains("tcn_config_generation{role=\"relay\"} 3"),
         "{}",
         report.text
     );

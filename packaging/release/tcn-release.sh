@@ -10,9 +10,13 @@
 #
 #   tcn-release.sh keygen DIR            new key pairs in DIR (offline machine only)
 #   tcn-release.sh fingerprint DIR       SHA-256 of each public key, to publish out of band
-#   tcn-release.sh sign DIR SHA256SUMS   writes SHA256SUMS.slhdsa.sig and SHA256SUMS.ed25519.sig
-#   tcn-release.sh verify DIR SHA256SUMS [SIGDIR]
-#                                        both signatures, against the public keys in DIR
+#   tcn-release.sh sign DIR SHA256SUMS   checks SHA256SUMS, then writes SHA256SUMS.slhdsa.sig and
+#                                        SHA256SUMS.ed25519.sig
+#   tcn-release.sh verify [--pins FILE] [--tag vX.Y.Z] DIR SHA256SUMS [SIGDIR]
+#                                        both signatures, against the public keys in DIR, which
+#                                        must be pinned: by the fingerprints built into this
+#                                        script, or by FILE (review 0013, A13-4); with --tag,
+#                                        every archive must be one of that tag
 #
 # Needs bash and GNU coreutils (Linux). OPENSSL names the openssl binary (default: openssl on
 # PATH). The private keys never leave the offline machine and never reach CI.
@@ -25,6 +29,17 @@ readonly SLH_KEY=release-slhdsa.key.pem SLH_PUB=release-slhdsa.pub.pem
 readonly ED_KEY=release-ed25519.key.pem ED_PUB=release-ed25519.pub.pem
 readonly SLH_SIG_LEN=7856 ED_SIG_LEN=64
 readonly SUMS_LINE='^[0-9a-f]{64}  (tcn-v[0-9A-Za-z._+-]+\.tar\.gz)$'
+readonly PIN_LINE='^(slh-dsa-sha2-128s|ed25519) sha256:[0-9a-f]{64}$'
+readonly TAG_NAME='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+# The pinned release keys (review 0013, A13-4): the SHA-256 of each DER public key, one line per
+# key as `fingerprint` prints it. The same lines are in release-keys.fingerprints and in
+# SECURITY.md, and the release tests check that the three agree. A key that is not pinned is
+# refused, whatever directory it comes from: the keys at a tag (or in a download) are never
+# trusted on their own. Empty until the first release keys exist: verify refuses every key.
+# A rotation adds the new pair here (through a reviewed change), next to the old one.
+readonly PINNED_FINGERPRINTS='
+'
 
 die() {
   printf 'tcn-release: %s\n' "$*" >&2
@@ -54,11 +69,14 @@ key_is() {
 file_size() { stat -c %s -- "$1"; }
 
 # SHA256SUMS as the release workflow writes it: "<64 lower-case hex>  tcn-v<...>.tar.gz", one
-# per line, LF only, no paths, no duplicates, at least one.
+# per line, LF only, no paths, no duplicates, at least one; with a tag, every name starts with
+# "tcn-<tag>-". Bytes are checked before lines: bash's `read` drops NUL bytes, so a NUL could
+# hide a second entry for the same archive from the duplicate check (A13-5).
 check_sums() {
-  local sums=$1 line name names=() n
+  local sums=$1 tag=${2:-} line name names=() n
   [ -s "$sums" ] || die "$sums is empty"
-  if LC_ALL=C grep -q $'\r' "$sums"; then die "$sums has CR line ends"; fi
+  [ "$(LC_ALL=C tr -d '0-9a-zA-Z._+ \n-' <"$sums" | wc -c)" -eq 0 ] ||
+    die "$sums contains a byte that is not allowed (only [0-9A-Za-z._+ -] and LF)"
   [ "$(tail -c1 "$sums" | od -An -c | tr -d ' ')" = '\n' ] || die "$sums does not end with a newline"
   while IFS= read -r line; do
     [[ $line =~ $SUMS_LINE ]] ||
@@ -67,8 +85,42 @@ check_sums() {
     for n in "${names[@]}"; do
       [ "$n" != "$name" ] || die "$sums: $name appears twice"
     done
+    if [ -n "$tag" ] && [[ $name != "tcn-$tag-"* ]]; then
+      die "$sums: $name is not an archive of $tag"
+    fi
     names+=("$name")
   done <"$sums"
+}
+
+# The pins: from FILE, or the ones built into this script. Blank lines and comments (#) are
+# allowed; any other line must be a pin. Prints one pin per line.
+read_pins() {
+  local file=${1:-} text line
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || die "--pins $file: no such file"
+    text=$(cat -- "$file")
+  else
+    text=$PINNED_FINGERPRINTS
+  fi
+  while IFS= read -r line; do
+    case $line in '' | '#'*) continue ;; esac
+    [[ $line =~ $PIN_LINE ]] || die "${file:-built-in pins}: malformed pin line: ${line:0:120}"
+    printf '%s\n' "$line"
+  done <<<"$text"
+}
+
+# The fingerprint line of the public key PUB of kind NAME, as `fingerprint` prints it.
+fingerprint_of() {
+  local name=$1 pub=$2 hash
+  hash=$("$OPENSSL" pkey -pubin -in "$pub" -outform DER | sha256sum | cut -d' ' -f1)
+  printf '%s sha256:%s\n' "$name" "$hash"
+}
+
+# Refuses a key whose fingerprint is not among PINS (one per line).
+check_pinned() {
+  local pins=$1 name=$2 pub=$3 fp
+  fp=$(fingerprint_of "$name" "$pub")
+  grep -qxF -- "$fp" <<<"$pins" || die "$pub: not pinned ($fp); pinned keys are in SECURITY.md"
 }
 
 cmd_keygen() {
@@ -92,10 +144,8 @@ cmd_keygen() {
 
 cmd_fingerprint() {
   local dir=${1:?usage: fingerprint DIR}
-  local slh ed
-  slh=$("$OPENSSL" pkey -pubin -in "$dir/$SLH_PUB" -outform DER | sha256sum | cut -d' ' -f1)
-  ed=$("$OPENSSL" pkey -pubin -in "$dir/$ED_PUB" -outform DER | sha256sum | cut -d' ' -f1)
-  printf 'slh-dsa-sha2-128s sha256:%s\ned25519 sha256:%s\n' "$slh" "$ed"
+  fingerprint_of slh-dsa-sha2-128s "$dir/$SLH_PUB"
+  fingerprint_of ed25519 "$dir/$ED_PUB"
 }
 
 cmd_sign() {
@@ -108,6 +158,9 @@ cmd_sign() {
   done
   key_is "$dir/$SLH_PUB" SLH-DSA-SHA2-128s || die "$dir/$SLH_PUB is not an SLH-DSA-SHA2-128s key"
   key_is "$dir/$ED_PUB" ED25519 || die "$dir/$ED_PUB is not an Ed25519 key"
+  # Never sign what verify would refuse (A13-5): the plain OpenSSL commands of SECURITY.md do
+  # not check the format, so a signed malformed file would pass them.
+  check_sums "$file"
   "$OPENSSL" pkeyutl -sign -rawin -inkey "$dir/$SLH_KEY" -in "$file" \
     -out "$file.slhdsa.sig" -pkeyopt "context-string:$CONTEXT"
   "$OPENSSL" pkeyutl -sign -rawin -inkey "$dir/$ED_KEY" -in "$file" \
@@ -137,10 +190,32 @@ verify_one() {
 }
 
 cmd_verify() {
-  local dir=${1:?usage: verify DIR SHA256SUMS [SIGDIR]} sums=${2:?usage: verify DIR SHA256SUMS [SIGDIR]}
+  local usage='usage: verify [--pins FILE] [--tag vX.Y.Z] DIR SHA256SUMS [SIGDIR]'
+  local pins_file='' tag=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --pins)
+        [ $# -ge 2 ] || die "$usage"
+        pins_file=$2
+        shift 2
+        ;;
+      --tag)
+        [ $# -ge 2 ] || die "$usage"
+        tag=$2
+        [[ $tag =~ $TAG_NAME ]] || die "--tag: not a release tag (vX.Y.Z): ${tag:0:40}"
+        shift 2
+        ;;
+      --*) die "$usage" ;;
+      *) break ;;
+    esac
+  done
+  local dir=${1:-} sums=${2:-}
+  [ -n "$dir" ] && [ -n "$sums" ] || die "$usage"
   local sigdir=${3:-$(dirname -- "$sums")}
-  local base slh_sig ed_sig
+  local base slh_sig ed_sig pins
   need_openssl
+  pins=$(read_pins "$pins_file")
+  [ -n "$pins" ] || die "no release key is pinned (${pins_file:-built-in pins}): nothing can be verified"
   base=$(basename -- "$sums")
   slh_sig="$sigdir/$base.slhdsa.sig"
   ed_sig="$sigdir/$base.ed25519.sig"
@@ -148,7 +223,11 @@ cmd_verify() {
   [ -f "$dir/$ED_PUB" ] || die "$dir/$ED_PUB: no Ed25519 public key"
   key_is "$dir/$SLH_PUB" SLH-DSA-SHA2-128s || die "$dir/$SLH_PUB is not an SLH-DSA-SHA2-128s key"
   key_is "$dir/$ED_PUB" ED25519 || die "$dir/$ED_PUB is not an Ed25519 key"
-  check_sums "$sums"
+  # The keys are trusted only through their pins (A13-4): a consistent set of keys, checksums
+  # and signatures from an attacker verifies against its own keys, never against the pins.
+  check_pinned "$pins" slh-dsa-sha2-128s "$dir/$SLH_PUB"
+  check_pinned "$pins" ed25519 "$dir/$ED_PUB"
+  check_sums "$sums" "$tag"
   # Both signatures, always (AP-19): a missing one is a failure, never a skip.
   [ -f "$slh_sig" ] || die "$slh_sig: missing (both signatures are required)"
   [ -f "$ed_sig" ] || die "$ed_sig: missing (both signatures are required)"
@@ -156,7 +235,7 @@ cmd_verify() {
   [ "$(file_size "$ed_sig")" = "$ED_SIG_LEN" ] || die "$ed_sig: not a $ED_SIG_LEN-byte Ed25519 signature"
   verify_one slh "$dir/$SLH_PUB" "$sums" "$slh_sig"
   verify_one ed "$dir/$ED_PUB" "$sums" "$ed_sig"
-  printf 'OK: %s signed by both release keys\n' "$sums"
+  printf 'OK: %s signed by both pinned release keys\n' "$sums"
   cmd_fingerprint "$dir"
 }
 

@@ -141,8 +141,9 @@ struct MetricsArgs {
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
     metrics_interval: u64,
     /// The global byte budget of the frames queued towards peers, in MiB (16 to 65536; R-6,
-    /// OPERATIONS §18). Past it, the connection with the largest backlog is disconnected.
-    /// Default: a quarter of the memory (cgroup limit included), from 64 MiB to 1 GiB.
+    /// OPERATIONS §18). Past it, the identity holding the most of it loses its largest
+    /// connection; no identity may hold more than a quarter of it. Default: a quarter of the
+    /// memory (cgroup limit included), from 128 MiB to 1 GiB.
     #[arg(long, value_parser = clap::value_parser!(u64).range(16..=65536))]
     queue_budget_mib: Option<u64>,
 }

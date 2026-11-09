@@ -57,7 +57,11 @@ d=$(fresh truncate)
 head -c 7855 "$rel/SHA256SUMS.slhdsa.sig" >"$d/SHA256SUMS.slhdsa.sig" 2>/dev/null || true
 expect_refused "a truncated SLH-DSA signature: refused" 'not a 7856-byte' "$tool" verify --pins "$rel/pins" "$d/pub" "$d/SHA256SUMS"
 d=$(fresh flip)
-printf '\x01' | dd of="$d/SHA256SUMS.slhdsa.sig" bs=1 seek=100 conv=notrunc status=none 2>/dev/null || true
+# A real flip (XOR 1): writing a fixed byte was no change when the signature already had it.
+b=$(od -An -tu1 -j100 -N1 "$d/SHA256SUMS.slhdsa.sig" 2>/dev/null | tr -d ' ' || true)
+# shellcheck disable=SC2059 # the format is the octal escape of the flipped byte
+printf "\\$(printf '%03o' $((${b:-0} ^ 1)))" |
+  dd of="$d/SHA256SUMS.slhdsa.sig" bs=1 seek=100 conv=notrunc status=none 2>/dev/null || true
 expect_refused "a bit flipped in the SLH-DSA signature: refused" 'SLH-DSA signature INVALID' "$tool" verify --pins "$rel/pins" "$d/pub" "$d/SHA256SUMS"
 
 # --- identity: wrong key, wrong artefact, wrong context ------------------------------------
@@ -105,8 +109,8 @@ malformed() {
 }
 h=$(printf a | sha256sum | cut -d' ' -f1)
 h2=$(printf b | sha256sum | cut -d' ' -f1)
-malformed "a path" "malformed line" "$h  ../tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\n"
-malformed "a directory" "malformed line" "$h  bin/tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\n"
+malformed "a path" "byte that is not allowed" "$h  ../tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\n"
+malformed "a directory" "byte that is not allowed" "$h  bin/tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\n"
 malformed "a short hash" "malformed line" "${h:1}  tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\n"
 malformed "upper-case hex" "malformed line" "${h^^}  tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\n"
 malformed "CRLF line ends" "byte that is not allowed" "$h  tcn-v1.2.3-x86_64-unknown-linux-musl.tar.gz\r\n"

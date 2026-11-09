@@ -35,6 +35,11 @@ pub const STALE_INTERVALS: u32 = 3;
 
 /// The shortest interval the exporter accepts from a library caller (the CLI takes 1–3600 s).
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
+/// The largest interval the services accept (`--metrics-interval`): `status` clamps the
+/// interval a file claims to it.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(3600);
+/// How far in the future a file's write time may be (clocks of two processes, NTP slew).
+const CLOCK_SKEW: Duration = Duration::from_secs(60);
 
 /// The two samples the exporter owns: it stamps them on every write.
 const INTERVAL_METRIC: &str = "tcn_metrics_interval_seconds";
@@ -392,6 +397,10 @@ impl Process {
             &[("role", self.role), ("version", env!("CARGO_PKG_VERSION"))],
             1,
         );
+        // Every process series carries the role (review 0013, A13-3): node_exporter merges the
+        // relay's, the agent's and a client's files on one host into one registry, where two
+        // series with the same name and labels collide.
+        let role = [("role", self.role)];
         out.family(
             "tcn_process_start_time_seconds",
             "gauge",
@@ -399,7 +408,7 @@ impl Process {
         );
         out.sample(
             "tcn_process_start_time_seconds",
-            &[],
+            &role,
             unix_seconds(self.started),
         );
         out.family(
@@ -407,39 +416,42 @@ impl Process {
             "gauge",
             "Interval at which this file is rewritten.",
         );
-        out.sample(INTERVAL_METRIC, &[], DEFAULT_INTERVAL.as_secs_f64());
+        out.sample(INTERVAL_METRIC, &role, DEFAULT_INTERVAL.as_secs_f64());
         out.family(
             WRITTEN_METRIC,
             "gauge",
             "When this file was written, Unix seconds.",
         );
-        out.sample(WRITTEN_METRIC, &[], unix_seconds(SystemTime::now()));
-        out.gauge(
+        out.sample(WRITTEN_METRIC, &role, unix_seconds(SystemTime::now()));
+        out.family(
             "tcn_config_generation",
+            "gauge",
             "Configuration generation in force (1 at startup, +1 per applied reload).",
-            self.generation.get(),
         );
+        out.sample("tcn_config_generation", &role, self.generation.get());
         out.family("tcn_reloads_total", "counter", "Reloads by result.");
         out.sample(
             "tcn_reloads_total",
-            &[("result", "applied")],
+            &[("role", self.role), ("result", "applied")],
             self.applied.get(),
         );
         out.sample(
             "tcn_reloads_total",
-            &[("result", "rejected")],
+            &[("role", self.role), ("result", "rejected")],
             self.rejected.get(),
         );
-        out.counter(
+        out.family(
             "tcn_watchdog_progress_total",
+            "counter",
             "Units of work the watchdog has seen (stops moving when the process is wedged).",
-            self.progress.get(),
         );
-        out.gauge(
+        out.sample("tcn_watchdog_progress_total", &role, self.progress.get());
+        out.family(
             "tcn_draining",
+            "gauge",
             "1 while a graceful stop drains the open sessions.",
-            self.draining.get(),
         );
+        out.sample("tcn_draining", &role, self.draining.get());
     }
 }
 
@@ -641,7 +653,7 @@ impl RelayMetrics {
         );
         out.counter(
             "tcn_relay_queue_shed_total",
-            "Connections disconnected because the byte budget was exceeded (largest backlog).",
+            "Connections disconnected by the byte budget (the identity holding the most of it).",
             self.queue_shed.get(),
         );
         out.counter(
@@ -731,6 +743,7 @@ pub struct AgentMetrics {
     buffer: Budgeted,
     pub(crate) buffer_refusals: Counter,
     pub(crate) window_grows: Counter,
+    pub(crate) window_growth_refusals: Counter,
 }
 
 impl AgentMetrics {
@@ -750,6 +763,7 @@ impl AgentMetrics {
             buffer: Budgeted::default(),
             buffer_refusals: Counter::default(),
             window_grows: Counter::default(),
+            window_growth_refusals: Counter::default(),
         })
     }
 
@@ -859,6 +873,12 @@ impl AgentMetrics {
             &[("direction", "from_ssh")],
             self.from_ssh.get(),
         );
+        self.render_budget(&mut out);
+        out.0
+    }
+
+    /// The byte budget's part of [`Self::render`] (R-6).
+    fn render_budget(&self, out: &mut Exposition) {
         out.gauge(
             "tcn_agent_buffer_bytes",
             "Receive windows reserved from the global byte budget.",
@@ -876,10 +896,16 @@ impl AgentMetrics {
         );
         out.counter(
             "tcn_agent_buffer_refusals_total",
-            "Streams rejected or windows not grown because the byte budget was exhausted.",
+            "Authenticated sessions refused because the byte budget had no initial window left.",
             self.buffer_refusals.get(),
         );
-        out.0
+        // A refused growth is benign (the window stays, the transfer goes on): its own counter,
+        // so that the refusals above alert on real exhaustion only (review 0013, A13-11).
+        out.counter(
+            "tcn_agent_window_growth_refusals_total",
+            "Window growths refused because the budget was within its last quarter.",
+            self.window_growth_refusals.get(),
+        );
     }
 }
 
@@ -989,7 +1015,11 @@ impl ClientMetrics {
             "gauge",
             "When this file was written, Unix seconds.",
         );
-        out.sample(WRITTEN_METRIC, &[], unix_seconds(SystemTime::now()));
+        out.sample(
+            WRITTEN_METRIC,
+            &[("role", "client")],
+            unix_seconds(SystemTime::now()),
+        );
         out.family(
             "tcn_client_last_session_start_time_seconds",
             "gauge",
@@ -1121,18 +1151,32 @@ pub fn write_textfile(path: &Path, content: &str) -> std::io::Result<()> {
     ))
 }
 
-/// `text` with the exporter's own samples set: the interval and the time of this write.
+/// The series of `line` (its name and labels) if it is a sample of `name`, labelled or not.
+fn series_of<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(name)?;
+    if rest.starts_with(' ') {
+        line.get(..name.len())
+    } else if rest.starts_with('{') {
+        let end = rest.find('}')?;
+        line.get(..name.len().saturating_add(end).saturating_add(1))
+    } else {
+        None
+    }
+}
+
+/// `text` with the exporter's own samples set: the interval and the time of this write. The
+/// samples keep their labels (the role, review 0013 A13-3).
 #[must_use]
 pub fn stamp(text: &str, interval: Duration, now: SystemTime) -> String {
     let mut out = String::with_capacity(text.len().saturating_add(128));
     let (mut has_interval, mut has_written) = (false, false);
     for line in text.lines() {
-        if line.starts_with(&format!("{INTERVAL_METRIC} ")) {
+        if let Some(series) = series_of(line, INTERVAL_METRIC) {
             has_interval = true;
-            let _ = writeln!(out, "{INTERVAL_METRIC} {}", interval.as_secs_f64());
-        } else if line.starts_with(&format!("{WRITTEN_METRIC} ")) {
+            let _ = writeln!(out, "{series} {}", interval.as_secs_f64());
+        } else if let Some(series) = series_of(line, WRITTEN_METRIC) {
             has_written = true;
-            let _ = writeln!(out, "{WRITTEN_METRIC} {}", unix_seconds(now));
+            let _ = writeln!(out, "{series} {}", unix_seconds(now));
         } else {
             out.push_str(line);
             out.push('\n');
@@ -1353,7 +1397,7 @@ pub struct StatusReport {
 /// # Errors
 /// See [`StatusError`].
 pub fn status(path: &Path, now: SystemTime) -> Result<StatusReport, StatusError> {
-    let file = std::fs::File::open(path).map_err(StatusError::Unreadable)?;
+    let file = open_regular(path)?;
     let len = file.metadata().map_err(StatusError::Unreadable)?.len();
     if len > MAX_FILE_LEN {
         return Err(StatusError::TooLarge);
@@ -1375,22 +1419,39 @@ pub fn status(path: &Path, now: SystemTime) -> Result<StatusReport, StatusError>
             .find(|(key, _)| key == k)
             .map_or("?", |(_, v)| v.as_str())
     };
-    let written = snap
-        .get(WRITTEN_METRIC, &[])
+    let role = label("role");
+    // The process series carry the role (A13-3); a file of an older release has none.
+    let own = |name: &str| {
+        snap.get(name, &[("role", role)])
+            .or_else(|| snap.get(name, &[]))
+    };
+    let written = own(WRITTEN_METRIC)
+        .filter(|w| w.is_finite())
         .ok_or_else(|| StatusError::Invalid(format!("no {WRITTEN_METRIC}")))?;
-    let interval = snap
-        .get(INTERVAL_METRIC, &[])
+    // The file's own interval, clamped to what the services accept (A13-8): a file claiming a
+    // huge interval still goes stale.
+    let interval = own(INTERVAL_METRIC)
         .filter(|i| i.is_finite() && *i > 0.0)
-        .unwrap_or(DEFAULT_INTERVAL.as_secs_f64());
+        .unwrap_or(DEFAULT_INTERVAL.as_secs_f64())
+        .min(MAX_INTERVAL.as_secs_f64());
     let age = unix_seconds(now) - written;
+    // Written in the future (a forged file, or a dead process after a backward clock step):
+    // never fresh, refused (A13-8). A little skew between clocks is tolerated.
+    if age < -CLOCK_SKEW.as_secs_f64() {
+        return Err(StatusError::Invalid(format!(
+            "written {:.0} s in the future",
+            -age
+        )));
+    }
     let stale = !age.is_finite() || age > interval * f64::from(STALE_INTERVALS);
     let mut out = String::new();
-    let _ = writeln!(out, "role: {}", label("role"));
+    let _ = writeln!(out, "role: {role}");
     let _ = writeln!(out, "version: {}", label("version"));
     let _ = writeln!(
         out,
-        "{}: written {age:.0} s ago (interval {interval} s)",
-        if stale { "stale" } else { "fresh" }
+        "{}: written {:.0} s ago (interval {interval} s)",
+        if stale { "stale" } else { "fresh" },
+        age.max(0.0)
     );
     for s in &snap.samples {
         out.push_str(&s.name);
@@ -1406,11 +1467,38 @@ pub fn status(path: &Path, now: SystemTime) -> Result<StatusReport, StatusError>
         }
         let _ = writeln!(out, " {}", s.value);
     }
+    // Only printable ASCII reaches the terminal: control characters, and format characters such
+    // as the bidi overrides (category Cf, A13-8), become '?'. Every name and label this
+    // project writes is ASCII.
     let text = out
         .chars()
-        .map(|c| if c.is_control() && c != '\n' { '?' } else { c })
+        .map(|c| {
+            if c == '\n' || c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
         .collect();
     Ok(StatusReport { text, stale })
+}
+
+/// Opens `path` for reading without blocking (a FIFO planted there would block a plain open
+/// forever) and only if it is a regular file (A13-8).
+fn open_regular(path: &Path) -> Result<std::fs::File, StatusError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
+    let file = options.open(path).map_err(StatusError::Unreadable)?;
+    let meta = file.metadata().map_err(StatusError::Unreadable)?;
+    if !meta.is_file() {
+        return Err(StatusError::Invalid("not a regular file".into()));
+    }
+    Ok(file)
 }
 
 /// The metrics path of a service: `--metrics-file` if given, otherwise [`FILE_NAME`] in the

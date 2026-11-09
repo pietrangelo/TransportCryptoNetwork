@@ -111,11 +111,12 @@ fn concurrent_reservations_never_exceed_the_limit() {
     assert_eq!(b.used(), 0);
 }
 
-/// The relay's default: a quarter of the memory, at most 1 GiB, at least 64 MiB.
+/// The relay's default: a quarter of the memory, at most 1 GiB, at least 128 MiB (two agents'
+/// full credit, review 0013 A13-1).
 #[test]
 fn the_default_queue_budget_follows_the_memory() {
     let d = zt_net::budget::default_queue_budget();
-    assert!((64 * 1024 * 1024..=1024 * 1024 * 1024).contains(&d), "{d}");
+    assert!((128 * 1024 * 1024..=1024 * 1024 * 1024).contains(&d), "{d}");
     assert_eq!(
         zt_net::budget::queue_budget_for(Some(16 * 1024 * 1024 * 1024)),
         1024 * 1024 * 1024
@@ -126,7 +127,7 @@ fn the_default_queue_budget_follows_the_memory() {
     );
     assert_eq!(
         zt_net::budget::queue_budget_for(Some(64 * 1024 * 1024)),
-        64 * 1024 * 1024
+        128 * 1024 * 1024
     );
     assert_eq!(zt_net::budget::queue_budget_for(None), 1024 * 1024 * 1024);
 }
@@ -443,7 +444,7 @@ async fn the_largest_frame_fits_the_length_prefix() {
         payload: FramePayload::try_from(vec![9_u8; MAX_PAYLOAD_LEN]).unwrap(),
     };
     let len = zt_proto::encoded_len(&big);
-    assert!(len + zt_crypto::noise::TAG_LEN <= usize::from(u16::MAX));
+    assert!(u16::try_from(len + zt_crypto::noise::TAG_LEN).is_ok());
     c.send(&big, &t).await.unwrap();
     assert_eq!(s.recv().await.unwrap().unwrap(), big);
     assert!(FramePayload::try_from(vec![9_u8; MAX_PAYLOAD_LEN + 1]).is_err());

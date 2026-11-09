@@ -25,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zt_crypto::Identity;
 use zt_domain::trust::CertTrust;
 use zt_net::Revocable;
+use zt_net::metrics::{AgentMetrics, RelayMetrics, Snapshot};
 use zt_net::relay::RelayServer;
 
 use crate::common;
@@ -140,6 +141,58 @@ pub fn check(
     }
 }
 
+/// The R-6 accounting once the load has stopped (review 0013, A13-7): every budget and every
+/// live-object gauge must be back to zero. A leaked reservation costs no memory, so only these
+/// show it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Counters {
+    pub agent_buffer_bytes: f64,
+    pub agent_sessions: f64,
+    pub relay_queue_bytes: f64,
+    pub relay_streams: f64,
+    pub relay_client_connections: f64,
+}
+
+impl Counters {
+    /// Reads them from the agent's and the relay's metrics.
+    pub fn read(agent: &AgentMetrics, relay: &RelayMetrics) -> Self {
+        let a = Snapshot::parse(&agent.render()).unwrap();
+        let r = Snapshot::parse(&relay.render()).unwrap();
+        Self {
+            agent_buffer_bytes: a.get("tcn_agent_buffer_bytes", &[]).unwrap(),
+            agent_sessions: a.get("tcn_agent_sessions", &[]).unwrap(),
+            relay_queue_bytes: r.get("tcn_relay_queue_bytes", &[]).unwrap(),
+            relay_streams: r.get("tcn_relay_streams", &[]).unwrap(),
+            relay_client_connections: r
+                .get("tcn_relay_connections", &[("role", "client")])
+                .unwrap(),
+        }
+    }
+}
+
+/// The accounting gate: everything in [`Counters`] is zero once the load stopped.
+pub fn check_counters(c: &Counters) -> Result<(), String> {
+    let problems: Vec<String> = [
+        ("tcn_agent_buffer_bytes", c.agent_buffer_bytes),
+        ("tcn_agent_sessions", c.agent_sessions),
+        ("tcn_relay_queue_bytes", c.relay_queue_bytes),
+        ("tcn_relay_streams", c.relay_streams),
+        (
+            "tcn_relay_connections{role=\"client\"}",
+            c.relay_client_connections,
+        ),
+    ]
+    .iter()
+    .filter(|(_, v)| *v != 0.0)
+    .map(|(name, v)| format!("{name} is {v} after the load stopped"))
+    .collect();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
 /// What a soak run does.
 #[derive(Debug, Clone, Copy)]
 pub struct Plan {
@@ -155,6 +208,9 @@ pub struct Plan {
     pub sample_every: Duration,
     /// Inject a leak in every session (a descriptor, a task and 256 KiB): the gate must fail.
     pub inject_leak: bool,
+    /// One more client loop moving 4 MiB per session, so that receive windows grow inside the
+    /// budgets (the R-6 paths run, A13-7).
+    pub bulk: bool,
 }
 
 /// What a run measured.
@@ -165,6 +221,12 @@ pub struct Run {
     pub quiescent: Sample,
     pub sessions: u64,
     pub failures: u64,
+    /// Bulk sessions completed.
+    pub bulk_sessions: u64,
+    /// The budget counters and gauges once the load stopped.
+    pub counters: Counters,
+    /// Windows the agent grew.
+    pub window_grows: f64,
 }
 
 /// Runs the soak `plan` and returns its samples.
@@ -183,12 +245,15 @@ pub async fn run(plan: Plan) -> Run {
     let (policy_rx, policy_tx) = Revocable::new(policy.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let relay_metrics = RelayMetrics::new();
+    let agent_metrics = AgentMetrics::new(1);
 
     // The relay, restarted on the same port every `restart_every`.
     let stop = Arc::new(AtomicBool::new(false));
     let relay_task = {
         let (stop, policy_rx) = (Arc::clone(&stop), policy_rx.clone());
         let secret = relay_secret.to_string();
+        let metrics = Arc::clone(&relay_metrics);
         tokio::spawn(async move {
             let mut listener = Some(listener);
             while !stop.load(Ordering::Relaxed) {
@@ -202,9 +267,9 @@ pub async fn run(plan: Plan) -> Run {
                     },
                 };
                 let id = Identity::from_secret_hex(&secret).unwrap();
-                let server =
-                    RelayServer::with_acceptor(l, id, policy_rx.clone(), soak_relay_config())
-                        .unwrap();
+                let mut config = soak_relay_config();
+                config.metrics = Arc::clone(&metrics);
+                let server = RelayServer::with_acceptor(l, id, policy_rx.clone(), config).unwrap();
                 let restart_every = plan.restart_every;
                 let stop2 = Arc::clone(&stop);
                 let shutdown = async move {
@@ -223,7 +288,8 @@ pub async fn run(plan: Plan) -> Run {
         &[client.fingerprint()],
         CertTrust::default(),
     ));
-    let agent_task = tokio::spawn(zt_net::agent::run(
+    // Observed: the soak reads the agent's budget counters (A13-7).
+    let agent_task = tokio::spawn(zt_net::agent::run_observed(
         Arc::new(zt_crypto::Keyring::single(common::copy_of(&agent))),
         zt_net::agent::AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
@@ -245,15 +311,25 @@ pub async fn run(plan: Plan) -> Run {
                 stable_after: Duration::from_secs(1),
             },
         },
+        zt_net::net::TcpDialer,
+        std::future::pending(),
+        Duration::from_secs(1),
+        zt_net::agent::Observed {
+            metrics: Arc::clone(&agent_metrics),
+            buffer_budget: 64 * 1024 * 1024,
+        },
     ));
     tokio::time::sleep(Duration::from_millis(500)).await;
     let baseline = sample(start);
 
     let sessions = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(AtomicU64::new(0));
+    let bulk_sessions = Arc::new(AtomicU64::new(0));
     let load_until = tokio::time::Instant::now() + plan.duration;
     let mut workers = Vec::new();
-    for _ in 0..plan.clients {
+    for i in 0..plan.clients + usize::from(plan.bulk) {
+        let bulk = i == plan.clients;
+        let bulk_done = Arc::clone(&bulk_sessions);
         let (client, sessions, failures) = (
             Arc::clone(&client),
             Arc::clone(&sessions),
@@ -275,8 +351,12 @@ pub async fn run(plan: Plan) -> Run {
         };
         workers.push(tokio::spawn(async move {
             while tokio::time::Instant::now() < load_until {
-                if one_session(&client, &config).await {
+                let size = if bulk { BULK } else { 4096 };
+                if one_session(&client, &config, size).await {
                     sessions.fetch_add(1, Ordering::Relaxed);
+                    if bulk {
+                        bulk_done.fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
                     failures.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -304,6 +384,11 @@ pub async fn run(plan: Plan) -> Run {
     // Let closes, drains and the agent's stream tasks finish.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let quiescent = sample(start);
+    let counters = Counters::read(&agent_metrics, &relay_metrics);
+    let window_grows = Snapshot::parse(&agent_metrics.render())
+        .unwrap()
+        .get("tcn_agent_window_grows_total", &[])
+        .unwrap();
     stop.store(true, Ordering::Relaxed);
     let _ = tokio::time::timeout(Duration::from_secs(5), relay_task).await;
     agent_task.abort();
@@ -313,6 +398,9 @@ pub async fn run(plan: Plan) -> Run {
         quiescent,
         sessions: sessions.load(Ordering::Relaxed),
         failures: failures.load(Ordering::Relaxed),
+        bulk_sessions: bulk_sessions.load(Ordering::Relaxed),
+        counters,
+        window_grows,
     }
 }
 
@@ -328,20 +416,32 @@ fn soak_relay_config() -> zt_net::relay::RelayConfig {
     config
 }
 
-/// One session: connect, 4 KiB through the echo, close.
-async fn one_session(client: &Arc<Identity>, config: &zt_net::client::ClientConfig) -> bool {
-    let (mut app, local) = tokio::io::duplex(64 * 1024);
+/// What a bulk session moves each way: enough for the windows to grow (A13-7).
+const BULK: usize = 4 * 1024 * 1024;
+
+/// One session: connect, `size` bytes through the echo, close.
+async fn one_session(
+    client: &Arc<Identity>,
+    config: &zt_net::client::ClientConfig,
+    size: usize,
+) -> bool {
+    let (app, local) = tokio::io::duplex(64 * 1024);
     let (client, config) = (Arc::clone(client), config.clone());
     let task = tokio::spawn(async move { zt_net::client::connect(&client, &config, local).await });
-    let payload = [0x42_u8; 4096];
-    let ok = tokio::time::timeout(Duration::from_secs(10), async {
-        app.write_all(&payload).await.ok()?;
-        let mut back = [0_u8; 4096];
-        app.read_exact(&mut back).await.ok()?;
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let (mut rd, mut wr) = tokio::io::split(app);
+    let ok = tokio::time::timeout(Duration::from_secs(30), async {
+        let send = async { wr.write_all(&payload).await.ok() };
+        let mut back = vec![0_u8; size];
+        let recv = async { rd.read_exact(&mut back).await.ok() };
+        let (written, received) = tokio::join!(send, recv);
+        written?;
+        received?;
         (back == payload).then_some(())
     })
     .await
     .is_ok_and(|r| r.is_some());
+    let app = rd.unsplit(wr);
     drop(app);
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
     ok

@@ -175,8 +175,9 @@ struct MetricsArgs {
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
     metrics_interval: u64,
     /// The global byte budget of the streams' receive windows, in MiB (16 to 65536; R-6,
-    /// OPERATIONS §18). A stream whose initial window does not fit is rejected; windows grow
-    /// only within three quarters of it. Default: a quarter of the memory, from 64 MiB to 1 GiB.
+    /// OPERATIONS §18). An authenticated session whose initial window does not fit is closed;
+    /// windows grow only within three quarters of it. Default: a quarter of the memory, from
+    /// 128 MiB to 1 GiB.
     #[arg(long, value_parser = clap::value_parser!(u64).range(16..=65536))]
     buffer_budget_mib: Option<u64>,
 }

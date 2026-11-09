@@ -176,7 +176,7 @@ where
     let session = async {
         let window =
             crate::budget::standalone_window().ok_or(NetError::Protocol("receive window"))?;
-        let mut io = StreamIo::new(stream, from_driver, out_tx, window);
+        let mut io = StreamIo::new(stream, from_driver, out_tx, Some(window));
         let (msg1, waiting) = noise::initiate_suite(
             identity,
             &config.node_key,

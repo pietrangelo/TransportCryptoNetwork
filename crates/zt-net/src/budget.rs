@@ -2,20 +2,30 @@
 //! backpressure instead of an out-of-memory.
 //!
 //! - On the agent (and the client), every stream's receive window is a [`Reservation`]: a new
-//!   stream gets its initial window or is rejected with `ResourceExhausted`; a window grows only
+//!   session gets its initial window once the client is authenticated (review 0013, A13-2), or
+//!   is closed (`Drained`); a window grows only
 //!   while the budget has room outside its last quarter, kept for the initial windows of new
 //!   streams, so one bulk stream cannot starve the others.
-//! - On the relay, every frame queued towards a peer carries a [`Charge`]; past the budget the
-//!   relay sheds the connection with the largest backlog
-//!   ([`zt_application::efficiency::shed_victim`]).
+//! - On the relay, every frame queued towards a peer carries a [`Charge`]; past the budget, or
+//!   past an identity's share of it, the relay sheds the largest connection of the identity
+//!   that holds the most ([`zt_application::efficiency::shed_victim`], review 0013 A13-1).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MIB: usize = 1024 * 1024;
 
-/// The smallest default queue budget of the relay.
-pub const MIN_QUEUE_BUDGET: usize = 64 * MIB;
+/// An agent's full credit with `max_streams` streams: every stream's window at its largest
+/// (`MAX_WINDOW`), what the relay may legitimately have queued towards it.
+#[must_use]
+pub fn agent_credit(max_streams: usize) -> usize {
+    max_streams.saturating_mul(usize::try_from(zt_domain::flow::MAX_WINDOW).unwrap_or(usize::MAX))
+}
+
+/// The smallest default queue budget of the relay: two agents' full credit with the default
+/// 64 streams (review 0013, A13-1), so one agent holding its normal credit is never the
+/// identity over its share.
+pub const MIN_QUEUE_BUDGET: usize = 128 * MIB;
 /// The largest default queue budget of the relay.
 pub const MAX_QUEUE_BUDGET: usize = 1024 * MIB;
 
@@ -162,7 +172,7 @@ impl Drop for Charge {
 }
 
 /// The relay's queue budget for a machine with `memory` bytes (the smaller of the physical
-/// memory and the cgroup limit): a quarter of it, from 64 MiB to 1 GiB; 1 GiB if unknown.
+/// memory and the cgroup limit): a quarter of it, from 128 MiB to 1 GiB; 1 GiB if unknown.
 #[must_use]
 pub fn queue_budget_for(memory: Option<u64>) -> usize {
     memory.map_or(MAX_QUEUE_BUDGET, |m| {
@@ -179,7 +189,7 @@ pub fn default_queue_budget() -> usize {
 }
 
 /// The agent's default buffer budget: like the relay's queue budget, a quarter of the memory
-/// from 64 MiB to 1 GiB ([`queue_budget_for`]).
+/// from 128 MiB to 1 GiB ([`queue_budget_for`]).
 #[must_use]
 pub fn default_buffer_budget() -> usize {
     default_queue_budget()

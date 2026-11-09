@@ -315,6 +315,15 @@ impl<S: SessionIds> RelayCore<S> {
         self.agents.len()
     }
 
+    /// The peer of `conn` was admitted as an agent (review 0013, A13-1: the byte budget sheds
+    /// an agent's normal credit only as a last resort).
+    #[must_use]
+    pub fn is_agent(&self, conn: ConnId) -> bool {
+        self.conns
+            .get(&conn)
+            .is_some_and(|c| matches!(c.role, Role::Agent { .. }))
+    }
+
     /// Number of streams (sessions) open or opening: what a drain waits for.
     #[must_use]
     pub fn client_stream_count(&self) -> usize {

@@ -88,9 +88,9 @@ struct Shared {
 pub struct Observed {
     /// The agent's metrics, written by [`crate::metrics::export`] (the binary does it).
     pub metrics: Arc<AgentMetrics>,
-    /// The global byte budget of the streams' receive windows (R-6, AP-22): a stream whose
-    /// initial window does not fit is rejected with `ResourceExhausted`; windows grow only
-    /// within three quarters of it.
+    /// The global byte budget of the streams' receive windows (R-6, AP-22): a session whose
+    /// initial window does not fit is closed (`Drained`) once its client is authenticated;
+    /// windows grow only within three quarters of it.
     pub buffer_budget: usize,
 }
 
@@ -583,14 +583,10 @@ fn on_relay_frame<D: Dialer>(
                     reason: RejectReason::ResourceExhausted,
                 }));
             }
-            // The global byte budget (R-6): backpressure, never an out-of-memory.
-            let Some(window) = shared.budget.try_reserve(INITIAL_WINDOW as usize) else {
-                shared.metrics.buffer_refusals.inc();
-                return Ok(Some(Frame::Reject {
-                    stream,
-                    reason: RejectReason::ResourceExhausted,
-                }));
-            };
+            // The global byte budget (R-6) is charged only once the client is authenticated
+            // (`StreamTask::serve`, review 0013 A13-2): until then the per-relay quota above
+            // bounds what this relay can make the agent buffer, so a compromised relay cannot
+            // exhaust the budget that every other relay's streams share.
             let (tx, rx) = mpsc::channel(STREAM_QUEUE);
             streams.slots.insert(
                 stream,
@@ -600,7 +596,7 @@ fn on_relay_frame<D: Dialer>(
                 },
             );
             let task = StreamTask {
-                io: StreamIo::new(stream, rx, out_tx.clone(), window),
+                io: StreamIo::new(stream, rx, out_tx.clone(), None),
                 identity: Arc::clone(identity),
                 shared: shared.clone(),
                 authorized: config.authorized_clients.clone(),
@@ -925,6 +921,15 @@ impl<D: Dialer> StreamTask<D> {
             io.close(CloseReason::Drained).await;
             return;
         };
+        // The global byte budget (R-6), only now that the client is authenticated (A13-2):
+        // backpressure, never an out-of-memory.
+        let Some(window) = shared.budget.try_reserve(INITIAL_WINDOW as usize) else {
+            shared.metrics.buffer_refusals.inc();
+            tracing::warn!(peer = %client, "the agent's buffer budget is exhausted");
+            io.close(CloseReason::Drained).await;
+            return;
+        };
+        io.hold_window(window);
         // From here the permit counts the session for the drain.
         drop(handshaking);
         let _counted = Held::new(SessionGauge(Arc::clone(&shared.metrics)));
@@ -1053,7 +1058,7 @@ async fn bridge<S>(
             from_local: &metrics.from_ssh,
             to_local: &metrics.to_ssh,
             window_grows: Some(&metrics.window_grows),
-            window_refusals: Some(&metrics.buffer_refusals),
+            window_refusals: Some(&metrics.window_growth_refusals),
         }) => match result {
             Ok(()) => "closed",
             Err(err) => {

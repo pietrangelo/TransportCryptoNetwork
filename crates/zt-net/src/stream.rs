@@ -52,17 +52,20 @@ pub(crate) struct StreamIo {
     recv: Window,
     /// Bytes delivered and not yet returned as credit.
     consumed: u32,
-    /// The receive window, reserved from the byte budget (R-6).
-    window: Reservation,
+    /// The receive window, reserved from the byte budget (R-6); `None` until the peer is
+    /// authenticated on the agent (review 0013, A13-2), and then without growth.
+    window: Option<Reservation>,
 }
 
 impl StreamIo {
-    /// `window` holds the initial receive window, reserved from the byte budget.
+    /// `window` holds the initial receive window, reserved from the byte budget; the agent
+    /// passes `None` and reserves it with [`Self::hold_window`] once the client is
+    /// authenticated.
     pub(crate) fn new(
         stream: StreamId,
         rx: mpsc::Receiver<Frame>,
         tx: mpsc::Sender<Frame>,
-        window: Reservation,
+        window: Option<Reservation>,
     ) -> Self {
         Self {
             stream,
@@ -73,6 +76,11 @@ impl StreamIo {
             consumed: 0,
             window,
         }
+    }
+
+    /// The initial receive window, reserved from the byte budget after authentication.
+    pub(crate) fn hold_window(&mut self, window: Reservation) {
+        self.window = Some(window);
     }
 
     pub(crate) async fn send_frame(&self, frame: Frame) -> Result<(), NetError> {
@@ -313,7 +321,8 @@ struct Downlink<'a> {
 /// Receive-window auto-tuning inside the byte budget (R6-E4).
 struct Tuning<'a> {
     tuner: WindowTuner,
-    window: Reservation,
+    /// The reservation the window grows in; none: the window never grows.
+    window: Option<Reservation>,
     /// The receiver waited on an empty queue since the last `WindowUpdate`: it keeps up, the
     /// sender (or its window) is the bottleneck.
     starved: bool,
@@ -350,7 +359,8 @@ impl Tuning<'_> {
         }
         if self
             .window
-            .try_grow(usize::try_from(wanted).unwrap_or(usize::MAX))
+            .as_mut()
+            .is_some_and(|w| w.try_grow(usize::try_from(wanted).unwrap_or(usize::MAX)))
         {
             self.tuner.grew(wanted);
             if let Some(c) = self.grows {

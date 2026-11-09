@@ -302,6 +302,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
     }
 }
 
+/// The send-side scratch buffer keeps at most this much between frames: two `Data` chunks of
+/// the streams (16 KiB plus the tag) and their headers. A larger frame's buffer is dropped after
+/// it is sent, so a connection does not keep its high-water mark for its whole life, outside
+/// every budget (review 0013, A13-9).
+pub const SCRATCH_KEEP: usize = 2 * (16 * 1024 + 64);
+
 /// Authenticated channel: the only state in which frames can be exchanged.
 pub struct Established<IO> {
     framed: Framed<IO, LengthDelimitedCodec>,
@@ -312,6 +318,13 @@ pub struct Established<IO> {
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
+    /// The capacity the send-side scratch buffer keeps between frames (at most
+    /// [`SCRATCH_KEEP`]).
+    #[must_use]
+    pub fn scratch_capacity(&self) -> usize {
+        self.scratch.capacity()
+    }
+
     /// The authenticated identity of the peer.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
@@ -374,6 +387,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
             .get_mut(start.saturating_add(2)..)
             .ok_or(NetError::Protocol("write buffer"))
             .and_then(|tail| Ok(self.transport.encrypt_into(&self.scratch, tail)?));
+        if self.scratch.capacity() > SCRATCH_KEEP {
+            self.scratch = BytesMut::new();
+        }
         match written {
             Ok(n) if n == len => {}
             other => {

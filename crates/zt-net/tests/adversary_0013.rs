@@ -57,11 +57,13 @@ fn duplex_relay(
     let fps: Vec<_> = clients.iter().map(|c| c.fingerprint()).collect();
     let policy = common::relay_policy(&agent.fingerprint(), &fps, CertTrust::default());
     let metrics = RelayMetrics::new();
-    let config = RelayConfig {
+    let mut config = RelayConfig {
         metrics: Arc::clone(&metrics),
         queue_budget,
         ..common::relay_config()
     };
+    // A reader that does not read is cut by the write timeout too: not within this test.
+    config.timeouts.write = Duration::from_secs(60);
     let server =
         RelayServer::with_acceptor(acceptor, id, zt_net::Revocable::fixed(policy), config).unwrap();
     tokio::spawn(server.run());
@@ -136,20 +138,15 @@ async fn flooding_agent(mut ch: Established<DuplexStream>) {
     }
 }
 
-/// Opens stream `id` to `web-01` and waits for its `OpenAck`.
-async fn open(ch: &mut Established<DuplexStream>, id: u32) {
+/// Opens streams `ids` to `web-01` without reading anything (a reader that never reads).
+async fn open_unread(ch: &mut Established<DuplexStream>, ids: std::ops::RangeInclusive<u32>) {
     let t = common::timeouts();
-    let open = Frame::Open {
-        stream: common::sid(id),
-        target: common::node("web-01"),
-    };
-    ch.send(&open, &t).await.unwrap();
-    loop {
-        match ch.recv().await.unwrap().unwrap() {
-            Frame::OpenAck { .. } => return,
-            Frame::Reject { reason, .. } => panic!("rejected: {reason:?}"),
-            _ => {}
-        }
+    for id in ids {
+        let open = Frame::Open {
+            stream: common::sid(id),
+            target: common::node("web-01"),
+        };
+        ch.send(&open, &t).await.unwrap();
     }
 }
 
@@ -167,12 +164,12 @@ async fn wait_queued(m: &RelayMetrics, at_least: usize) {
         }
     })
     .await
-    .expect("the relay never queued that much");
+    .unwrap_or_else(|_| panic!("the relay never queued {at_least}: {}", m.render()));
 }
 
-/// The review's attack on the network: a slow-link download (one connection, two streams,
-/// about 512 KiB queued) and an abuser that spreads a larger backlog over three connections of
-/// one identity, each smaller than the download. Past the budget the abuser's identity is shed,
+/// The review's attack on the network: a slow-link download (one connection, three streams,
+/// about 700 KiB queued) and an abuser that spreads a larger backlog over three connections of
+/// one identity (two streams each), each smaller than the download. Past the budget the abuser's identity is shed,
 /// never the download, and the audit line names the fingerprint and the role.
 #[tokio::test(flavor = "current_thread")]
 async fn a_split_backlog_sheds_the_abusing_identity_and_the_audit_names_it() {
@@ -181,7 +178,7 @@ async fn a_split_backlog_sheds_the_abusing_identity_and_the_audit_names_it() {
     let agent = Identity::generate().unwrap();
     let honest = Identity::generate().unwrap();
     let abuser = Identity::generate().unwrap();
-    let budget = MIB + 128 * KIB;
+    let budget = 1700 * KIB;
     let (net, relay, metrics) = duplex_relay(&agent, &[&honest, &abuser], budget);
     let agent_ch = connect(&net, MIB, &agent, relay).await;
     tokio::spawn(flooding_agent(agent_ch));
@@ -189,15 +186,15 @@ async fn a_split_backlog_sheds_the_abusing_identity_and_the_audit_names_it() {
 
     // The download: a pipe of 4 KiB that it does not read for now.
     let mut honest_ch = connect(&net, 4 * KIB, &honest, relay).await;
-    open(&mut honest_ch, 1).await;
-    open(&mut honest_ch, 2).await;
-    wait_queued(&metrics, 480 * KIB).await;
+    open_unread(&mut honest_ch, 1..=3).await;
+    wait_queued(&metrics, 600 * KIB).await;
+    let download = queued(&metrics);
 
-    // The abuser: three connections, one stream each, never read.
+    // The abuser: three connections, two streams each, never read.
     let mut abusers = Vec::new();
     for _ in 0..3 {
         let mut ch = connect(&net, 4 * KIB, &abuser, relay).await;
-        open(&mut ch, 1).await;
+        open_unread(&mut ch, 1..=2).await;
         abusers.push(ch);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -221,7 +218,7 @@ async fn a_split_backlog_sheds_the_abusing_identity_and_the_audit_names_it() {
     }
     // The download is still there: it reads everything queued for it, with no close.
     let mut received = 0;
-    while received < 400 * KIB {
+    while received < download {
         match tokio::time::timeout(Duration::from_secs(5), honest_ch.recv()).await {
             Ok(Ok(Some(Frame::Data { payload, .. }))) => received += payload.len(),
             Ok(Ok(Some(Frame::Close { reason, .. }))) => panic!("download closed: {reason:?}"),
@@ -295,7 +292,7 @@ async fn streams_without_message_1_take_nothing_from_the_global_budget() {
         .unwrap();
     let mut raw = channel::connect(
         tcp,
-        &*client,
+        &client,
         &lab.relays[0].key.into(),
         Channel::Outer,
         &common::timeouts(),
@@ -337,7 +334,7 @@ fn series(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// node_exporter merges every `*.prom` file of its directory: the relay, agent and client
+/// `node_exporter` merges every `*.prom` file of its directory: the relay, agent and client
 /// files must never export the same series (same name and labels).
 #[test]
 fn relay_agent_and_client_series_are_pairwise_disjoint() {
@@ -581,6 +578,8 @@ async fn the_scratch_buffer_does_not_keep_its_high_water_mark() {
         "the scratch buffer keeps {} bytes",
         c.scratch_capacity()
     );
-    assert!(channel::SCRATCH_KEEP >= 2 * (16 * KIB + 16));
-    assert!(channel::SCRATCH_KEEP < zt_domain::limits::MAX_PAYLOAD_LEN);
+    const {
+        assert!(channel::SCRATCH_KEEP >= 2 * (16 * KIB + 16));
+        assert!(channel::SCRATCH_KEEP < zt_domain::limits::MAX_PAYLOAD_LEN);
+    }
 }
