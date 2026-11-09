@@ -347,3 +347,50 @@ fn describe(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> Strin
         other => other.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use zt_domain::HandshakeSuite;
+
+    use super::*;
+
+    const HFS: HandshakeSuite = HandshakeSuite::NoiseIkhfs25519MlKem768;
+
+    /// Finding A9-6: a client pinned to the hybrid suite, refused by an agent that does not
+    /// accept it, is told so, not only that its key is not authorized.
+    #[test]
+    fn a_refusal_names_the_pinned_hybrid_suite() {
+        let node = NodeId::try_from("web-01").unwrap();
+        for err in [
+            NetError::StreamClosed(CloseReason::Unauthorized),
+            // An agent older than PQ-1 sees an invalid handshake.
+            NetError::StreamClosed(CloseReason::ProtocolViolation),
+        ] {
+            let text = describe(&err, &node, None, HFS);
+            assert!(
+                text.contains("does not accept the pinned suite")
+                    && text.contains(HFS.protocol_name())
+                    && text.contains("OPERATIONS"),
+                "{text}"
+            );
+        }
+    }
+
+    /// With the classical suite the messages stay as they were.
+    #[test]
+    fn a_classical_refusal_does_not_mention_suites() {
+        let node = NodeId::try_from("web-01").unwrap();
+        let text = describe(
+            &NetError::StreamClosed(CloseReason::Unauthorized),
+            &node,
+            None,
+            HandshakeSuite::NoiseIk25519,
+        );
+        assert_eq!(
+            text,
+            "access denied by the agent of web-01 (client key not authorized there)"
+        );
+    }
+}

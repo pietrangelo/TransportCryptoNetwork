@@ -212,9 +212,10 @@ async fn the_confirmation_must_match_the_suite() {
     assert_eq!(relay.sshd_connections(), 2);
 }
 
-/// Resources: a message 1 over the largest legitimate one of the accepted set is refused
-/// before it is parsed. For a classical-only agent that includes a hybrid message 1 with a
-/// large certificate.
+/// Resources: a message 1 over the largest legitimate one of any suite this build runs end to
+/// end is refused before it is parsed. The bound does not depend on the accepted set: a
+/// classical-only agent still reads a hybrid message 1 with a large certificate, to name the
+/// client in `handshake_suite_rejected` (finding A9-5).
 #[tokio::test]
 async fn an_oversized_message_1_is_refused_before_parsing() {
     let log = Captured::default();
@@ -222,7 +223,7 @@ async fn an_oversized_message_1_is_refused_before_parsing() {
     let alice = id();
     for (accepted, len) in [
         (both(), HFS.max_msg1_len() + 1),
-        (AcceptedSuites::only(CLASSIC), CLASSIC.max_msg1_len() + 1),
+        (AcceptedSuites::only(CLASSIC), HFS.max_msg1_len() + 1),
     ] {
         let mut relay =
             FakeRelay::start_suites([alice.fingerprint()].into_iter().collect(), accepted).await;

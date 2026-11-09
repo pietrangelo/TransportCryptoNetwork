@@ -515,6 +515,16 @@ impl FakeRelay {
         clients: AuthorizedClients,
         client_suites: zt_domain::AcceptedSuites,
     ) -> Self {
+        Self::start_logging(clients, client_suites, zt_net::agent::IDENTITY_LOG_INTERVAL).await
+    }
+
+    /// Like [`FakeRelay::start_suites`], with the agent's per-identity log interval (finding
+    /// A9-2).
+    pub async fn start_logging(
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+        identity_log_interval: Duration,
+    ) -> Self {
         let relay_id = Identity::generate().unwrap();
         let relay_keys = zt_crypto::Keyring::single(copy_of(&relay_id));
         let agent = Arc::new(Identity::generate().unwrap());
@@ -535,6 +545,7 @@ impl FakeRelay {
                 timeouts: timeouts(),
                 max_streams: 16,
                 client_suites,
+                identity_log_interval,
             },
         ));
         let (tcp, _) = listener.accept().await.unwrap();
