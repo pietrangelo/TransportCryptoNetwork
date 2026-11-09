@@ -272,7 +272,10 @@ fn sign_appends_one_line_per_certificate_to_the_log() {
     assert_eq!(lines.len(), 2, "{lines:?}");
     for (line, out, name) in [(&lines[0], &first, "alice"), (&lines[1], &second, "bob")] {
         let cols: Vec<&str> = line.split('\t').collect();
-        assert_eq!(cols.len(), 6, "{line}");
+        // PQ-AUTH: the certificate version and the subject's hybrid fingerprint (`-`).
+        assert_eq!(cols.len(), 8, "{line}");
+        assert_eq!(cols[6], "v1");
+        assert_eq!(cols[7], "-");
         assert_eq!(Some(cols[0].to_owned()), value(&stdout(out), "serial"));
         assert_eq!(Some(cols[1].to_owned()), value(&stdout(out), "subject"));
         assert_eq!(cols[2], name);
@@ -547,4 +550,116 @@ fn an_issuance_log_that_is_the_ca_key_is_refused() {
         "the CA key still loads: {}",
         all(&out)
     );
+}
+
+// ======================= PQ-AUTH: composite CA, certificate v2 =======================
+
+/// `zt-ca keygen --v2` into `dir/ca.key`: the printed composite public key.
+fn keygen_v2(dir: &Dir) -> zt_crypto::CompositeCaPublicKey {
+    let out = run(&["keygen", "--v2", "--out", &dir.arg("ca.key")]);
+    assert!(out.status.success(), "{}", all(&out));
+    value(&stdout(&out), "public_key")
+        .unwrap_or_else(|| panic!("no public_key line: {}", stdout(&out)))
+        .parse()
+        .unwrap()
+}
+
+/// Spec (OPERATIONS §10.8): `keygen --v2` writes a `0600` `tcn-ca-secret-v2:` file and prints
+/// the composite key, its fingerprint and `ca_fp`; the secret never reaches the terminal.
+#[test]
+fn keygen_v2_creates_a_composite_ca_key() {
+    let dir = Dir::new();
+    let out = run(&["keygen", "--v2", "--out", &dir.arg("ca.key")]);
+    assert!(out.status.success(), "{}", all(&out));
+    let text = stdout(&out);
+    let key: zt_crypto::CompositeCaPublicKey = value(&text, "public_key").unwrap().parse().unwrap();
+    assert_eq!(value(&text, "ca_fp"), Some(key.ca_fp().to_string()));
+    assert_eq!(
+        value(&text, "fingerprint"),
+        Some(key.fingerprint().to_string())
+    );
+    let meta = std::fs::metadata(dir.path("ca.key")).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o600);
+    let secret = std::fs::read_to_string(dir.path("ca.key")).unwrap();
+    assert!(secret.starts_with(zt_crypto::CompositeCaSigningKey::FILE_PREFIX));
+    let ca = zt_crypto::CompositeCaSigningKey::from_secret_text(&secret).unwrap();
+    assert_eq!(ca.public_key(), key);
+    let hex = secret
+        .trim()
+        .trim_start_matches(zt_crypto::CompositeCaSigningKey::FILE_PREFIX);
+    assert!(!all(&out).contains(&hex[..64]));
+    assert!(!all(&out).contains(&hex[64..]));
+}
+
+/// Spec: a composite CA signs certificates v2 (verified after signing), logged as `v2`;
+/// `inspect` shows the version and verifies with the composite key, and refuses a v1 key.
+#[test]
+fn a_composite_ca_signs_v2_certificates_that_inspect_verifies() {
+    let dir = Dir::new();
+    let ca = keygen_v2(&dir);
+    let subject_key = Identity::generate().unwrap().public_key();
+    let subject_hex = subject_key.to_string();
+    let out = sign(&dir, "alice.cert", &[("--subject", Some(&subject_hex))]);
+    assert!(out.status.success(), "{}", all(&out));
+    let file = std::fs::read_to_string(dir.path("alice.cert")).unwrap();
+    assert!(file.starts_with(zt_crypto::CERT_FILE_PREFIX_V2));
+    let bytes = zt_crypto::decode_certificate_text(&file).unwrap();
+    let parsed = zt_domain::decode_certificate_v2(&bytes).unwrap();
+    assert_eq!(parsed.body.ca_fp(), &ca.ca_fp());
+    assert_eq!(
+        parsed.body.subject().classical(),
+        &subject_key.fingerprint()
+    );
+    let lines = log_lines(&dir);
+    let cols: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(cols.len(), 8);
+    assert_eq!(cols[1], subject_key.fingerprint().to_string());
+    assert_eq!(cols[6], "v2");
+
+    let ok = run(&[
+        "inspect",
+        "--cert",
+        &dir.arg("alice.cert"),
+        "--ca-key",
+        &ca.to_string(),
+    ]);
+    assert!(ok.status.success(), "{}", all(&ok));
+    let shown = stdout(&ok);
+    assert_eq!(value(&shown, "version").as_deref(), Some("2"));
+    assert_eq!(value(&shown, "ca_fp"), Some(ca.ca_fp().to_string()));
+    assert!(shown.contains("signature   = verified"), "{shown}");
+    // The composite's Ed25519 component alone, as a v1 key: not this certificate's CA.
+    let ed_only = ca.ed25519().to_string();
+    let bad = run(&[
+        "inspect",
+        "--cert",
+        &dir.arg("alice.cert"),
+        "--ca-key",
+        &ed_only,
+    ]);
+    assert!(!bad.status.success(), "a v1 key verified a v2 certificate");
+}
+
+/// Attack: either 32-byte half of the composite secret pasted as `--subject` is refused (each
+/// half has the shape of a public key), and a log that starts like a v2 key is refused.
+#[test]
+fn composite_secret_halves_are_never_certified() {
+    let dir = Dir::new();
+    keygen_v2(&dir);
+    let secret = std::fs::read_to_string(dir.path("ca.key")).unwrap();
+    let hex = secret
+        .trim()
+        .trim_start_matches(zt_crypto::CompositeCaSigningKey::FILE_PREFIX)
+        .to_owned();
+    for half in [&hex[..64], &hex[64..]] {
+        let out = sign(&dir, "x.cert", &[("--subject", Some(half))]);
+        // The ML-DSA seed half may not decode as a curve point at all: refused either way.
+        assert!(!out.status.success());
+        assert!(!all(&out).contains(half));
+        assert!(!dir.path("x.cert").exists());
+    }
+    std::fs::copy(dir.path("ca.key"), dir.path("copy.tsv")).unwrap();
+    std::fs::set_permissions(dir.path("copy.tsv"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = sign(&dir, "y.cert", &[("--log", Some(&dir.arg("copy.tsv")))]);
+    assert!(!out.status.success(), "{}", all(&out));
 }

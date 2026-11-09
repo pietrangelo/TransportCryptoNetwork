@@ -160,19 +160,31 @@ pub fn next_serial() -> CertSerial {
     CertSerial::try_from(b).unwrap()
 }
 
-/// An offline CA.
+/// An offline CA: v1 (Ed25519) or, with `v2`, composite ML-DSA-65 + Ed25519 (PQ-AUTH).
 pub struct Ca {
     pub key: CaSigningKey,
+    pub v2: Option<zt_crypto::CompositeCaSigningKey>,
 }
 
 impl Ca {
     pub fn new() -> Self {
         Self {
             key: CaSigningKey::generate().unwrap(),
+            v2: None,
+        }
+    }
+    /// A composite CA, which issues certificates v2.
+    pub fn new_v2() -> Self {
+        Self {
+            key: CaSigningKey::generate().unwrap(),
+            v2: Some(zt_crypto::CompositeCaSigningKey::generate().unwrap()),
         }
     }
     pub fn trusted(&self) -> TrustedCaKey {
-        trusted_ca_key(&self.key.public_key())
+        match &self.v2 {
+            Some(v2) => zt_crypto::trusted_composite_ca_key(&v2.public_key()).unwrap(),
+            None => trusted_ca_key(&self.key.public_key()),
+        }
     }
     /// A certificate for `subject` valid in `[nb, na)`.
     pub fn issue_at(
@@ -183,6 +195,22 @@ impl Ca {
         na: u64,
     ) -> (Arc<[u8]>, CertSerial) {
         let serial = next_serial();
+        if let Some(v2) = &self.v2 {
+            let body = zt_domain::CertBodyV2::new(
+                v2.public_key().ca_fp(),
+                zt_domain::CertSubject::Classical(subject.fingerprint()),
+                serial,
+                zt_domain::UnixTime::from_secs(nb),
+                zt_domain::UnixTime::from_secs(na),
+                node("alice"),
+                scope,
+            )
+            .unwrap();
+            return (
+                Arc::from(zt_crypto::sign_certificate_v2(v2, &body).unwrap()),
+                serial,
+            );
+        }
         let body = CertBody::new(
             cert_key(&self.key.public_key()),
             cert_key(subject),
