@@ -345,3 +345,84 @@ async fn ansible_playbook_runs_through_tcn() {
     );
     let _ = (&lab.fleet, NEEDS);
 }
+
+/// A relay that accepts TCP and never answers.
+async fn silent_relay() -> SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+/// Rewrites the lab's `client.toml` with `top` (top-level keys) and these relays, keeping the
+/// `[[nodes]]` entries.
+fn rewrite_relays(lab: &Lab, top: &str, relays: &[(String, zt_crypto::PublicKey)]) {
+    let path = lab._client.config();
+    let old = std::fs::read_to_string(&path).unwrap();
+    let nodes = &old[old.find("[[nodes]]").unwrap()..];
+    let mut toml = format!("{top}key = \"client.key\"\n");
+    for (addr, key) in relays {
+        toml.push_str(&format!(
+            "\n[[relays]]\naddress = \"{addr}\"\npublic_key = \"{key}\"\n"
+        ));
+    }
+    toml.push('\n');
+    toml.push_str(nodes);
+    std::fs::write(&path, toml).unwrap();
+}
+
+/// R-4 (A5-4): a first relay that never answers costs `ssh` the stagger (about 2 s), not the
+/// handshake timeout: the hedge reaches the second relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_hedges_past_a_silent_first_relay() {
+    let lab = Lab::start().await;
+    let silent = silent_relay().await;
+    rewrite_relays(
+        &lab,
+        "",
+        &[
+            (
+                silent.to_string(),
+                zt_crypto::Identity::generate().unwrap().public_key(),
+            ),
+            (lab.fleet.relay.to_string(), lab.fleet.relay_id.public_key()),
+        ],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab.ssh().arg("echo tcn-hedged")).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "tcn-hedged\n");
+    assert!(started.elapsed() < Duration::from_secs(6));
+}
+
+/// R-4: with no relay answering, `ssh` fails after `connect_deadline_secs` with exit status
+/// 255 (what Ansible retries) and the reason from `zt-client` on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_reports_the_failover_deadline() {
+    let lab = Lab::start().await;
+    let silent = silent_relay().await;
+    rewrite_relays(
+        &lab,
+        "connect_deadline_secs = 2\n",
+        &[(
+            silent.to_string(),
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab.ssh().arg("true")).await;
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{stderr}");
+    assert!(
+        stderr.contains("zt-client: no relay completed the connection within 2 s"),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(6));
+}

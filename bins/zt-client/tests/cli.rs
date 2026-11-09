@@ -160,6 +160,92 @@ async fn falls_back_to_the_next_relay_when_the_first_is_down() {
     assert!(out.success, "stderr: {}", out.stderr);
 }
 
+/// A relay that accepts TCP and never answers (overloaded, or a proxy that swallows the
+/// connection). The accepted sockets are kept open for as long as the task runs.
+async fn silent_relay() -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+/// Prepends `line` to `client.toml` (top-level keys must precede the tables).
+fn prepend(dir: &common::ClientDir, line: &str) {
+    let path = dir.config();
+    let toml = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{line}\n{toml}")).unwrap();
+}
+
+/// R-4 (A5-4): a relay that never completes the handshake is hedged after the stagger (2 s
+/// plus jitter): the session goes through the next relay in about 2 s, not after the 10 s of
+/// the handshake timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_first_relay_is_hedged_after_the_stagger() {
+    let fleet = Fleet::start().await;
+    let ssh = Counting::start(true).await;
+    fleet.start_agent(ssh.addr).await;
+    let silent = silent_relay().await;
+    let other = zt_crypto::Identity::generate().unwrap().public_key();
+    let dir = common::ClientDir::with_relays(
+        &fleet.ansible,
+        &[
+            (silent.to_string(), other),
+            (fleet.relay.to_string(), fleet.relay_id.public_key()),
+        ],
+        &[("web-01", fleet.agent_id.public_key())],
+    );
+    let started = std::time::Instant::now();
+    let mut child = dir.spawn("web-01");
+    assert_eq!(echo_through(&mut child, b"hedged").await, b"hedged");
+    let at = started.elapsed();
+    assert!(
+        at >= Duration::from_secs(2) && at < Duration::from_secs(5),
+        "{at:?}"
+    );
+    let out = finish(child, Duration::from_secs(10)).await;
+    assert!(out.success, "stderr: {}", out.stderr);
+}
+
+/// R-4: when no relay completes the connection within `connect_deadline_secs`, `zt-client`
+/// exits with 75 (EX_TEMPFAIL: try again later) and says so on stderr; stdout (the SSH channel)
+/// stays empty. OpenSSH then exits with 255, which Ansible retries (`retries`, OPERATIONS §5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_deadline_exits_with_tempfail_and_a_clear_message() {
+    let silent = silent_relay().await;
+    let me = zt_crypto::Identity::generate().unwrap();
+    let dir = common::ClientDir::new(
+        &me,
+        &silent.to_string(),
+        &zt_crypto::Identity::generate().unwrap().public_key(),
+        &[(
+            "web-01",
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    prepend(&dir, "connect_deadline_secs = 1");
+    let started = std::time::Instant::now();
+    let child = dir.spawn("web-01");
+    let out = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("zt-client did not give up")
+        .unwrap();
+    let at = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "stderr: {stderr}");
+    assert!(out.stdout.is_empty());
+    assert!(at < Duration::from_secs(3), "{at:?}");
+    assert!(
+        stderr.contains("zt-client: no relay completed the connection within 1 s")
+            && stderr.contains("connect_deadline_secs"),
+        "{stderr}"
+    );
+}
+
 // ---------- Phase 6, step 9: certificates (OPERATIONS §10.4, PROTOCOL §15.6) ----------
 
 /// Spec: `zt-client certificate` prints name, nodes, CA, serial and validity of the
