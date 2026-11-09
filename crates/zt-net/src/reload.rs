@@ -60,6 +60,29 @@ impl Outcome {
             warnings: Vec::new(),
         }
     }
+
+    /// What `reload` prints: each warning on `err` (`warning: …`) and, if applied, the
+    /// generation and the file digests on `out`. A rejection is left to the caller's exit
+    /// status.
+    ///
+    /// # Errors
+    /// A write fails.
+    pub fn write_report(
+        &self,
+        out: &mut impl std::io::Write,
+        err: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        for warning in &self.warnings {
+            writeln!(err, "warning: {warning}")?;
+        }
+        if let Ok((generation, files)) = &self.result {
+            writeln!(out, "reload applied: generation {generation}")?;
+            for line in files.split(", ").filter(|l| !l.is_empty()) {
+                writeln!(out, "{line}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The reload state published for [`request`]: the attempts started and completed and the
@@ -293,6 +316,20 @@ fn read_state(dir: &Path) -> Option<State> {
     let mut text = String::new();
     file.take(MAX_STATE_LEN).read_to_string(&mut text).ok()?;
     State::parse(&text)
+}
+
+/// [`request`] in the runtime directory `explicit`, else `$RUNTIME_DIRECTORY`
+/// ([`runtime_dir`]).
+///
+/// # Errors
+/// [`RequestError::NoRuntimeDirectory`], and see [`request`].
+pub fn request_in(
+    pid: u32,
+    explicit: Option<PathBuf>,
+    wait: Duration,
+) -> Result<Outcome, RequestError> {
+    let dir = runtime_dir(explicit).ok_or(RequestError::NoRuntimeDirectory)?;
+    request(pid, &dir, wait)
 }
 
 /// `reload --pid`: sends `SIGHUP` to `pid` and waits, up to `wait`, for the outcome of the first

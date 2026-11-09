@@ -333,26 +333,15 @@ fn run(command: Command) -> Result<(), Failure> {
 
 /// `reload`: the outcome of the running relay's own reload.
 fn request_reload(pid: u32, runtime_dir: Option<PathBuf>, wait: Duration) -> Result<(), Failure> {
-    let dir = reload::runtime_dir(runtime_dir)
-        .ok_or_else(|| runtime_error(reload::RequestError::NoRuntimeDirectory))?;
-    let outcome = reload::request(pid, &dir, wait).map_err(runtime_error)?;
-    let mut err = std::io::stderr();
-    for warning in &outcome.warnings {
-        writeln!(err, "warning: {warning}").map_err(runtime_error)?;
-    }
-    match outcome.result {
-        Ok((generation, files)) => {
-            let mut out = std::io::stdout();
-            writeln!(out, "reload applied: generation {generation}").map_err(runtime_error)?;
-            for line in files.split(", ").filter(|l| !l.is_empty()) {
-                writeln!(out, "{line}").map_err(runtime_error)?;
-            }
-            Ok(())
-        }
-        Err(reason) => Err(Failure::Config(format!(
+    let outcome = reload::request_in(pid, runtime_dir, wait).map_err(runtime_error)?;
+    outcome
+        .write_report(&mut std::io::stdout(), &mut std::io::stderr())
+        .map_err(runtime_error)?;
+    outcome.result.map(drop).map_err(|reason| {
+        Failure::Config(format!(
             "reload rejected, the previous configuration remains in force: {reason}"
-        ))),
-    }
+        ))
+    })
 }
 
 /// `check`: every file `run` loads at startup, through the same function.
