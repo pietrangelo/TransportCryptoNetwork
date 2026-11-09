@@ -44,8 +44,10 @@ pub struct ClientConfig {
     pub require_outer_suite: Option<zt_domain::HandshakeSuite>,
 }
 
-/// How long a cancelled attempt that already sent `Open` may take to send its `Close`: the
-/// agent's stream slot is released at once instead of at the relay's own timeout.
+/// How long a cancelled attempt may take to send its last frame (`Close` for an `Open`
+/// already sent, `Ping` to confirm its key), and how long it then listens for a policy refusal
+/// that crossed its `Close`: the agent's stream slot is released at once instead of at the
+/// relay's own timeout.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Connects to the node and forwards `local` until either side closes.
@@ -108,6 +110,7 @@ where
         stream,
         certificate,
         t,
+        confirm_within: config.failover.handshake,
         dialer: &dialer,
     };
     let (relay, ch, losers) = establish(&ctx, config).await?;
@@ -158,6 +161,9 @@ struct AttemptCtx<'a, D> {
     stream: StreamId,
     certificate: &'a [u8],
     t: &'a Timeouts,
+    /// From the TCP connect, how long a cancelled attempt may finish its outer handshake to
+    /// confirm its key (finding A11-1): the plan's handshake step timeout.
+    confirm_within: Duration,
     dialer: &'a D,
 }
 
@@ -180,19 +186,39 @@ type AttemptResult<S> = (usize, Outcome<S>);
 type Attempts<'a, S> =
     FuturesUnordered<Pin<Box<dyn Future<Output = AttemptResult<S>> + Send + 'a>>>;
 
-/// The attempts cancelled after the winner: each ends at once, or after sending `Close` for
-/// an `Open` already sent (bounded by [`CLOSE_GRACE`]); a late winner is closed the same way.
+/// The attempts cancelled after the winner. Each ends at once (before TCP connect), after
+/// confirming its key (in the outer handshake, finding A11-1), or after sending `Close` for an
+/// `Open` already sent; a late winner is closed the same way. All of it is bounded by the
+/// handshake step timeout and [`CLOSE_GRACE`].
 struct Losers<'a, S> {
     attempts: Attempts<'a, S>,
     stream: StreamId,
     t: &'a Timeouts,
+    relays: &'a [crate::RelayEndpoint],
+    winner: usize,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Losers<'_, S> {
     async fn close(mut self) {
-        while let Some((_, outcome)) = self.attempts.next().await {
-            if let Outcome::Acked(mut ch) = outcome {
-                close_politely(&mut ch, self.stream, self.t).await;
+        while let Some((i, outcome)) = self.attempts.next().await {
+            match outcome {
+                Outcome::Acked(mut ch) => close_politely(&mut ch, self.stream, self.t).await,
+                // The only sign that the relays' policies differ (a partial rollout, review
+                // 0005-2; finding A11-6): the session stays on the relay that accepted it.
+                Outcome::Failed(err) if !may_try_next_relay(&err) => {
+                    if let (Some(refused), Some(used)) =
+                        (self.relays.get(i), self.relays.get(self.winner))
+                    {
+                        tracing::warn!(
+                            relay = %refused.address,
+                            used_relay = %used.address,
+                            error = %err,
+                            "relays disagree on the policy: this relay refused the node that \
+                             the relay in use accepted"
+                        );
+                    }
+                }
+                Outcome::Failed(_) | Outcome::Cancelled => {}
             }
         }
     }
@@ -203,11 +229,7 @@ async fn establish<'a, D: crate::net::Dialer>(
     ctx: &'a AttemptCtx<'a, D>,
     config: &'a ClientConfig,
 ) -> Result<(usize, Established<D::Stream>, Losers<'a, D::Stream>), NetError> {
-    let mut plan = FailoverPlan::new(
-        config.failover,
-        config.relays.len(),
-        getrandom::u64().unwrap_or(0),
-    );
+    let mut plan = FailoverPlan::new(config.failover, config.relays.len(), jitter());
     let started = tokio::time::Instant::now();
     let mut attempts: Attempts<'a, D::Stream> = FuturesUnordered::new();
     // A dropped sender cancels its attempt.
@@ -242,7 +264,7 @@ async fn establish<'a, D: crate::net::Dialer>(
                 Action::TimedOut(i, step) => {
                     cancel(&mut cancels, i);
                     if let Some(relay) = config.relays.get(i) {
-                        tracing::warn!(relay = %relay.address, step = step_name(step), "relay timed out, trying the next one");
+                        tracing::warn!(relay = %relay.address, step = step_name(step), "relay timed out");
                     }
                     last = NetError::Timeout(step_name(step));
                 }
@@ -257,8 +279,10 @@ async fn establish<'a, D: crate::net::Dialer>(
             .next_wake()
             .and_then(|w| started.checked_add(w))
             .unwrap_or(started);
-        // Biased: a step already reported counts before a timer that fires at the same
-        // moment, so a handshake that just completed is never hedged.
+        // Biased, and the timer arm drains the steps reported first: a step reported before
+        // or while the timer fires (the attempts are polled before the timer) counts first,
+        // so a handshake that completes at the very instant of the stagger is never hedged
+        // (finding A11-5).
         tokio::select! {
             biased;
             Some(event) = progress_rx.recv() => {
@@ -275,36 +299,61 @@ async fn establish<'a, D: crate::net::Dialer>(
                                     cancel(&mut cancels, *j);
                                 }
                             }
-                            return Ok((i, ch, Losers { attempts, stream: ctx.stream, t: ctx.t }));
+                            let losers = Losers {
+                                attempts,
+                                stream: ctx.stream,
+                                t: ctx.t,
+                                relays: &config.relays,
+                                winner: i,
+                            };
+                            return Ok((i, ch, losers));
                         }
                         // Not in flight any more (timed out in the meantime): close it.
                         close_politely(&mut ch, ctx.stream, ctx.t).await;
                     }
                     Outcome::Cancelled => {}
+                    // Already cancelled or timed out: the plan has moved on, and so does the
+                    // log (finding A11-8).
+                    Outcome::Failed(_) if !plan.is_in_flight(i) => {}
                     Outcome::Failed(err) => {
-                        let failure = if may_try_next_relay(&err) {
-                            Failure::Unavailable
-                        } else {
-                            Failure::Refused
-                        };
-                        actions = plan.handle(now, Event::Failed(i, failure));
+                        actions = plan.handle(now, Event::Failed(i, failure(&err)));
                         // Fail closed: the other attempts end when they are dropped here.
                         if let Some(Action::GiveUp(GiveUp::Refused(_))) = actions.last() {
                             return Err(err);
                         }
-                        if config.relays.get(i.saturating_add(1)).is_some()
-                            && let Some(relay) = config.relays.get(i)
-                        {
-                            tracing::warn!(relay = %relay.address, error = %err, "relay unavailable, trying the next one");
+                        if let Some(relay) = config.relays.get(i) {
+                            tracing::warn!(relay = %relay.address, error = %err, "relay unavailable");
                         }
                         last = err;
                     }
                 }
             }
             () = tokio::time::sleep_until(wake) => {
-                actions = plan.tick(started.elapsed());
+                let now = started.elapsed();
+                while let Ok(event) = progress_rx.try_recv() {
+                    actions.extend(plan.handle(now, event));
+                }
+                actions.extend(plan.tick(now));
             }
         }
+    }
+}
+
+/// The sample of the stagger's jitter. Without a random source the fleet hedges in step
+/// (finding A10-4): it still works, and says so.
+fn jitter() -> u64 {
+    getrandom::u64().unwrap_or_else(|_| {
+        tracing::warn!("no random source: the failover stagger has no jitter");
+        0
+    })
+}
+
+/// How the plan sees a failure before the `OpenAck`.
+const fn failure(err: &NetError) -> Failure {
+    if may_try_next_relay(err) {
+        Failure::Unavailable
+    } else {
+        Failure::Refused
     }
 }
 
@@ -324,8 +373,16 @@ const fn step_name(step: Step) -> &'static str {
 }
 
 /// One attempt: connection, outer handshake and stream opening on `relay`, reporting each
-/// step; it ends as soon as `cancel` fires (or its sender is dropped), with a `Close` for an
-/// `Open` already sent.
+/// step. When `cancel` fires (or its sender is dropped) it ends:
+/// - before TCP connect: at once (the relay has charged nothing);
+/// - in the outer handshake: after completing it, within `confirm_within` of the connect, and
+///   sending one authentic frame (`Ping`, which opens nothing). That is the key confirmation
+///   for which the relay gives back the per-source token it took at accept (R-1, finding
+///   A11-1); only the key holder can produce it, so a replay still gets no refund (AP-1);
+/// - after `Open`: after sending `Close Normal` for it and listening [`CLOSE_GRACE`] for a
+///   policy refusal that crossed it (finding A11-6).
+///
+/// `Open` itself is not cancellable, so an `Open` sent is always followed by its `Close`.
 async fn attempt<'a, D: crate::net::Dialer>(
     ctx: &'a AttemptCtx<'a, D>,
     index: usize,
@@ -336,6 +393,7 @@ async fn attempt<'a, D: crate::net::Dialer>(
     let t = ctx.t;
     let failed = |e: NetError| (index, Outcome::Failed(e));
     let tcp = tokio::select! {
+        biased;
         r = timeout(t.handshake, ctx.dialer.connect(&relay.address)) => match r {
             Ok(Ok(tcp)) => tcp,
             Ok(Err(e)) => return failed(e.into()),
@@ -343,37 +401,53 @@ async fn attempt<'a, D: crate::net::Dialer>(
         },
         _ = &mut cancel => return (index, Outcome::Cancelled),
     };
+    let connected = tokio::time::Instant::now();
+    let confirm_by = connected
+        .checked_add(ctx.confirm_within)
+        .unwrap_or(connected);
     let _ = progress.try_send(Event::Connected(index));
-    let opened = tokio::select! {
-        r = async {
-            let mut ch = channel::connect_suite(
-                tcp,
-                ctx.identity,
-                &relay.public_key,
-                Channel::Outer,
-                relay.suite,
-                ctx.certificate,
-                t,
-            )
-            .await?;
-            ch.send(
-                &Frame::Open {
-                    stream: ctx.stream,
-                    target: ctx.node.clone(),
-                },
-                t,
-            )
-            .await?;
-            Ok::<_, NetError>(ch)
-        } => r,
-        _ = &mut cancel => return (index, Outcome::Cancelled),
+    let handshake = channel::connect_suite(
+        tcp,
+        ctx.identity,
+        &relay.public_key,
+        Channel::Outer,
+        relay.suite,
+        ctx.certificate,
+        t,
+    );
+    tokio::pin!(handshake);
+    // The receiver must not be polled again once it has fired.
+    let mut cancelled = false;
+    let handshake = tokio::select! {
+        biased;
+        r = &mut handshake => r,
+        _ = &mut cancel => {
+            cancelled = true;
+            match timeout_at(confirm_by, &mut handshake).await {
+                Ok(r) => r,
+                Err(_) => return (index, Outcome::Cancelled),
+            }
+        }
     };
-    let mut ch = match opened {
+    let mut ch = match handshake {
         Ok(ch) => ch,
+        Err(_) if cancelled => return (index, Outcome::Cancelled),
         Err(e) => return failed(e),
     };
+    if cancelled || !matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+        let _ = timeout(CLOSE_GRACE, ch.send(&Frame::Ping { nonce: 0 }, t)).await;
+        return (index, Outcome::Cancelled);
+    }
+    let open = Frame::Open {
+        stream: ctx.stream,
+        target: ctx.node.clone(),
+    };
+    if let Err(e) = ch.send(&open, t).await {
+        return failed(e);
+    }
     let _ = progress.try_send(Event::OuterReady(index));
     let acked = tokio::select! {
+        biased;
         r = timeout(t.open, await_ack(&mut ch, ctx.stream)) => Some(r),
         _ = &mut cancel => None,
     };
@@ -383,7 +457,11 @@ async fn attempt<'a, D: crate::net::Dialer>(
         Some(Err(_)) => failed(NetError::Timeout("open")),
         None => {
             close_politely(&mut ch, ctx.stream, t).await;
-            (index, Outcome::Cancelled)
+            // A refusal that crossed the `Close` is still worth reporting.
+            match timeout(CLOSE_GRACE, await_ack(&mut ch, ctx.stream)).await {
+                Ok(Err(e @ NetError::Rejected(_))) if !may_try_next_relay(&e) => failed(e),
+                _ => (index, Outcome::Cancelled),
+            }
         }
     }
 }

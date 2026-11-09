@@ -325,12 +325,27 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
     let suite = config.node_suite;
     result.map_err(|e| Failure {
         message: describe(&e, &node, not_after, suite),
-        code: if matches!(e, NetError::Deadline(_)) {
-            EXIT_TEMPFAIL
-        } else {
-            1
-        },
+        code: exit_code(&e),
     })
+}
+
+/// 75 (`EX_TEMPFAIL`) when trying again later may succeed: the deadline, and every give-up
+/// that says nothing about the right of access (finding A11-4): a relay unreachable, silent
+/// or dropping the connection without a reply (restart, overload, R-1 admission; also a client
+/// key the relay does not know, which it cannot tell apart), a node offline or draining, a
+/// rate limit. 1 for a definitive answer: a policy refusal, a failed handshake with a pinned
+/// key, a protocol error, the local configuration.
+fn exit_code(err: &NetError) -> u8 {
+    let temporary = matches!(
+        err,
+        NetError::Deadline(_)
+            | NetError::Io(_)
+            | NetError::Timeout(_)
+            | NetError::Closed
+            | NetError::Rejected(RejectReason::NodeOffline | RejectReason::RateLimited)
+            | NetError::StreamClosed(CloseReason::Drained)
+    );
+    if temporary { EXIT_TEMPFAIL } else { 1 }
 }
 
 /// Message for the ssh user. It never contains bytes received from the network. `not_after`
@@ -423,6 +438,30 @@ mod tests {
                     && text.contains("OPERATIONS"),
                 "{text}"
             );
+        }
+    }
+
+    /// Finding A11-4: what is temporary exits 75, a definitive answer 1.
+    #[test]
+    fn temporary_failures_exit_with_tempfail() {
+        for err in [
+            NetError::Deadline(std::time::Duration::from_secs(8)),
+            NetError::Io(std::io::ErrorKind::ConnectionRefused.into()),
+            NetError::Timeout("handshake"),
+            NetError::Closed,
+            NetError::Rejected(RejectReason::NodeOffline),
+            NetError::Rejected(RejectReason::RateLimited),
+            NetError::StreamClosed(CloseReason::Drained),
+        ] {
+            assert_eq!(exit_code(&err), EXIT_TEMPFAIL, "{err:?}");
+        }
+        for err in [
+            NetError::Rejected(RejectReason::NotAuthorized),
+            NetError::Rejected(RejectReason::UnknownNode),
+            NetError::StreamClosed(CloseReason::Unauthorized),
+            NetError::Protocol("unexpected frame"),
+        ] {
+            assert_eq!(exit_code(&err), 1, "{err:?}");
         }
     }
 

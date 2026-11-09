@@ -3,10 +3,15 @@
 //! the jitter as a random sample.
 //!
 //! - **Order:** the relays are tried in the configured order, the first one alone.
-//! - **Overall deadline** (`deadline`, 20 s): establishment (connect, outer handshake,
-//!   `OpenAck`) ends there; after `Proceed` the plan has no timer left.
+//! - **Overall deadline** (`deadline`, 8 s): establishment (connect, outer handshake,
+//!   `OpenAck`) ends there; after `Proceed` the plan has no timer left. It fits inside the 10 s
+//!   `ConnectTimeout` that Ansible passes to `ssh` by default, end-to-end handshake and SSH
+//!   banner included (review 0011, A11-2).
 //! - **Per-step timeouts:** connect 3 s from the start of the attempt, outer handshake 5 s
-//!   from the connect, `OpenAck` 10 s from the end of the handshake.
+//!   from the connect, `OpenAck` from the end of the handshake: the time left before the
+//!   deadline shared out over this relay and those not yet started, at least the stagger and at
+//!   most `open` (4 s). Relays that handshake and then sit on `Open` therefore cannot use up
+//!   the deadline before a healthy later relay is tried (A11-3).
 //! - **Staggered hedge:** a new attempt starts when nothing is in flight, or when the only
 //!   attempt in flight has **not completed connect and outer handshake** after the stagger
 //!   (2 s plus a jitter of at most a quarter of it). That is the black-hole signal. A relay that
@@ -36,7 +41,8 @@ pub struct FailoverConfig {
     pub connect: Duration,
     /// Outer handshake (and sending `Open`) of one attempt, from its connect.
     pub handshake: Duration,
-    /// Wait for the `OpenAck`, from the end of the outer handshake.
+    /// The longest wait for the `OpenAck`, from the end of the outer handshake (the plan shares
+    /// out the time left over the relays left, see the module documentation).
     pub open: Duration,
     /// Delay before hedging an attempt that has not completed its outer handshake.
     pub stagger: Duration,
@@ -45,10 +51,10 @@ pub struct FailoverConfig {
 impl Default for FailoverConfig {
     fn default() -> Self {
         Self {
-            deadline: Duration::from_secs(20),
+            deadline: Duration::from_secs(8),
             connect: Duration::from_secs(3),
             handshake: Duration::from_secs(5),
-            open: Duration::from_secs(10),
+            open: Duration::from_secs(4),
             stagger: Duration::from_secs(2),
         }
     }
@@ -147,6 +153,8 @@ struct Attempt {
     step: Step,
     /// When the current step started.
     since: Duration,
+    /// The `OpenAck` wait, fixed when the attempt enters [`Step::Open`].
+    open: Duration,
 }
 
 impl Attempt {
@@ -154,7 +162,7 @@ impl Attempt {
         let limit = match self.step {
             Step::Connect => config.connect,
             Step::Handshake => config.handshake,
-            Step::Open => config.open,
+            Step::Open => self.open,
         };
         self.since.saturating_add(limit)
     }
@@ -201,6 +209,13 @@ impl FailoverPlan {
         self.flying.len()
     }
 
+    /// `true` while an attempt on `relay` is in flight: an outcome reported for any other
+    /// relay is one the plan ignores (cancelled, timed out, never started).
+    #[must_use]
+    pub fn is_in_flight(&self, relay: usize) -> bool {
+        self.flying.iter().any(|a| a.relay == relay)
+    }
+
     /// `true` after `Proceed` or `GiveUp`.
     #[must_use]
     pub const fn is_finished(&self) -> bool {
@@ -241,9 +256,11 @@ impl FailoverPlan {
                 }
             }
             Event::OuterReady(relay) => {
+                let open = self.open_wait(now);
                 if let Some(a) = self.attempt(relay).filter(|a| a.step != Step::Open) {
                     a.step = Step::Open;
                     a.since = now;
+                    a.open = open;
                 }
             }
             Event::Acked(relay) => {
@@ -280,6 +297,20 @@ impl FailoverPlan {
             wake = wake.min(hedge);
         }
         Some(wake)
+    }
+
+    /// The `OpenAck` wait of an attempt whose outer handshake completes at `now`: the time
+    /// left shared out over it and the relays not yet started, between the stagger and `open`
+    /// (finding A11-3).
+    fn open_wait(&self, now: Duration) -> Duration {
+        let left = self.config.deadline.saturating_sub(now);
+        let unstarted = self.relays.saturating_sub(self.next);
+        let share = u32::try_from(unstarted.saturating_add(1))
+            .ok()
+            .and_then(|n| left.checked_div(n))
+            .unwrap_or(Duration::ZERO);
+        let floor = self.config.stagger.min(self.config.open);
+        share.max(floor).min(self.config.open)
     }
 
     fn attempt(&mut self, relay: usize) -> Option<&mut Attempt> {
@@ -329,6 +360,7 @@ impl FailoverPlan {
                 started: now,
                 step: Step::Connect,
                 since: now,
+                open: self.config.open,
             });
             out.push(Action::Start(self.next));
             self.next = self.next.saturating_add(1);

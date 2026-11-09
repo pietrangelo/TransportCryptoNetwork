@@ -621,9 +621,11 @@ fn a_losers_policy_refusal_is_reported() {
 }
 
 /// Finding A11-5 (mutant M3): an outer handshake that completes at the very instant of the
-/// stagger is not hedged. On 1 ms links the handshake of relay 1 completes 4 ms after the
-/// start; with a 4 ms stagger the jitter is 0 or 1 ms, so about half of the rounds put the
-/// stagger at that very instant.
+/// stagger is not hedged. On 1 ms links (TCP connect is one message on the simulator) the
+/// handshake of relay 1 completes 3 ms after the start; with a 3 ms stagger the jitter is 0
+/// (a quarter of 3 ms rounds down to 0 ms), so every round puts the stagger at that instant.
+/// At 7043bfa the `biased` select did not prevent it (the attempt reports its step while
+/// being polled, after the progress queue was checked): every round was hedged.
 #[test]
 fn a_handshake_done_at_the_stagger_instant_is_not_hedged() {
     const ROUNDS: usize = 24;
@@ -660,11 +662,11 @@ fn a_handshake_done_at_the_stagger_instant_is_not_hedged() {
 }
 
 /// The stagger of `a_handshake_done_at_the_stagger_instant_is_not_hedged`: the instant at
-/// which the outer handshake completes on 1 ms links.
-const STAGGER_MS: u64 = 4;
+/// which the outer handshake completes on 1 ms links, with no jitter.
+const STAGGER_MS: u64 = 3;
 
 /// Finding A11-3: three relays, the agent's links to relays 1 and 2 are held (half-open, G4).
-/// The OpenAck wait is shared out over the relays left, so the healthy relay 3 is reached
+/// The `OpenAck` wait is shared out over the relays left, so the healthy relay 3 is reached
 /// within the default deadline (before R-4 it took 30 s; at 7043bfa it was never dialed).
 #[test]
 fn two_stalling_relays_leave_time_for_a_healthy_third() {
@@ -715,6 +717,5 @@ fn stalling_relays_then_a_healthy_one(relays: usize) -> Outcome {
         Ok(())
     });
     sim.run().unwrap();
-    let outcome = outcome.lock().unwrap().take().unwrap();
-    outcome
+    outcome.lock().unwrap().take().unwrap()
 }
