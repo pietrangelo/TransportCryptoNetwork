@@ -246,6 +246,309 @@ fn signing_refuses_a_body_of_another_ca() {
     );
 }
 
+// ======================= attacks =======================
+
+/// A (stripping): either component replaced by zeros, or by the other certificate's, fails.
+#[test]
+fn stripping_or_replacing_one_component_fails() {
+    let ca = ca();
+    let id = client();
+    let trust = pinned(&ca);
+    let tbs = body(&ca, classical(&id)).encode_tbs();
+    let (m, e) = (sig_m(&tbs, b"TCN-cert-v2"), sig_e(&tbs));
+    assert!(verify_certificate(&by_hand(&tbs, &m, &e), &id.fingerprint(), &trust).is_ok());
+    for (sm, se) in [
+        (vec![0; 3_309], e.to_vec()),
+        (m.clone(), vec![0; 64]),
+        (vec![0; 3_309], vec![0; 64]),
+    ] {
+        assert_eq!(
+            verify_certificate(&by_hand(&tbs, &sm, &se), &id.fingerprint(), &trust).err(),
+            Some(CertRejection::BadSignature)
+        );
+    }
+    // Components of a certificate with another serial (both valid there).
+    let other_body = CertBodyV2::new(
+        ca.public_key().ca_fp(),
+        classical(&id),
+        CertSerial::try_from([8; 16]).unwrap(),
+        UnixTime::from_secs(NB),
+        UnixTime::from_secs(NA),
+        node("alice"),
+        CertScope::Only(BTreeSet::from([node("web-01")])),
+    )
+    .unwrap()
+    .encode_tbs();
+    let (m2, e2) = (sig_m(&other_body, b"TCN-cert-v2"), sig_e(&other_body));
+    for (sm, se) in [(&m2, &e), (&m, &e2)] {
+        assert_eq!(
+            verify_certificate(&by_hand(&tbs, sm, se), &id.fingerprint(), &trust).err(),
+            Some(CertRejection::BadSignature)
+        );
+    }
+}
+
+/// A (swap): `sig_E ‖ sig_M` instead of `sig_M ‖ sig_E` has the same length and fails.
+#[test]
+fn swapped_components_fail() {
+    let ca = ca();
+    let id = client();
+    let tbs = body(&ca, classical(&id)).encode_tbs();
+    let (m, e) = (sig_m(&tbs, b"TCN-cert-v2"), sig_e(&tbs));
+    let swapped = by_hand(&tbs, &e, &m);
+    assert_eq!(
+        verify_certificate(&swapped, &id.fingerprint(), &pinned(&ca)).err(),
+        Some(CertRejection::BadSignature)
+    );
+}
+
+/// A (AP-5): with a bad Ed25519 component the ML-DSA component is never needed; with a good
+/// Ed25519 component, a garbage ML-DSA component (non-canonical hints, `z` out of range) is
+/// refused without a panic. Both are `bad_signature`.
+#[test]
+fn ed25519_is_checked_first_and_garbage_ml_dsa_never_panics() {
+    let ca = ca();
+    let id = client();
+    let trust = pinned(&ca);
+    let tbs = body(&ca, classical(&id)).encode_tbs();
+    let (m, e) = (sig_m(&tbs, b"TCN-cert-v2"), sig_e(&tbs));
+    let mut bad_e = e;
+    bad_e[0] ^= 1;
+    assert_eq!(
+        verify_certificate(&by_hand(&tbs, &m, &bad_e), &id.fingerprint(), &trust).err(),
+        Some(CertRejection::BadSignature)
+    );
+    for fill in [0x00_u8, 0xff, 0x80] {
+        let garbage = vec![fill; 3_309];
+        assert_eq!(
+            verify_certificate(&by_hand(&tbs, &garbage, &e), &id.fingerprint(), &trust).err(),
+            Some(CertRejection::BadSignature)
+        );
+    }
+    // Repeated hint indices (CVE-2026-24850 class) inside an otherwise valid certificate.
+    let mut hints = m.clone();
+    let base = 3_309 - 61;
+    let count = usize::from(hints[base + 55]);
+    if count >= 2 {
+        hints[base + count - 1] = hints[base + count - 2];
+        assert_eq!(
+            verify_certificate(&by_hand(&tbs, &hints, &e), &id.fingerprint(), &trust).err(),
+            Some(CertRejection::BadSignature)
+        );
+    }
+}
+
+/// A (Malleability): a non-canonical Ed25519 `S` (S + ℓ) is refused (`verify_strict`).
+#[test]
+fn a_non_canonical_ed25519_component_is_refused() {
+    // ℓ = 2^252 + 27742317777372353535851937790883648493, little-endian.
+    const L: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+    ];
+    let ca = ca();
+    let id = client();
+    let tbs = body(&ca, classical(&id)).encode_tbs();
+    let (m, e) = (sig_m(&tbs, b"TCN-cert-v2"), sig_e(&tbs));
+    let mut s_plus_l = e;
+    let mut carry = 0_u16;
+    for i in 0..32 {
+        let sum = u16::from(s_plus_l[32 + i]) + u16::from(L[i]) + carry;
+        s_plus_l[32 + i] = sum.to_le_bytes()[0];
+        carry = sum >> 8;
+    }
+    assert_eq!(
+        verify_certificate(
+            &by_hand(&tbs, &m, &s_plus_l),
+            &id.fingerprint(),
+            &pinned(&ca)
+        )
+        .err(),
+        Some(CertRejection::BadSignature)
+    );
+}
+
+/// A (context): an ML-DSA component made with another FIPS 204 context, or without
+/// `CTX2`, fails.
+#[test]
+fn the_ml_dsa_context_and_ctx2_are_enforced() {
+    let ca = ca();
+    let id = client();
+    let tbs = body(&ca, classical(&id)).encode_tbs();
+    let e = sig_e(&tbs);
+    for ctx in [&b""[..], b"TCN-cert-v1", b"TCN-cert-v2\0"] {
+        let m = sig_m(&tbs, ctx);
+        assert_eq!(
+            verify_certificate(&by_hand(&tbs, &m, &e), &id.fingerprint(), &pinned(&ca)).err(),
+            Some(CertRejection::BadSignature)
+        );
+    }
+    // Both components over the bare TBS (no CTX2).
+    let m = MlDsa65SigningKey::from_seed(&ML_SEED)
+        .sign(&tbs, b"TCN-cert-v2", &[1; 32])
+        .unwrap();
+    let e = SigningKey::from_bytes(&ED_SEED).sign(&tbs).to_bytes();
+    assert_eq!(
+        verify_certificate(&by_hand(&tbs, &m, &e), &id.fingerprint(), &pinned(&ca)).err(),
+        Some(CertRejection::BadSignature)
+    );
+}
+
+/// A (alg confusion, AP-13): a v1 certificate signed by the composite's Ed25519 key is
+/// `unknown_authority` under the composite pin; a v2 certificate is `unknown_authority` under
+/// a v1 pin of the same Ed25519 key.
+#[test]
+fn the_algorithm_comes_from_the_pinned_key() {
+    let ca = ca();
+    let id = client();
+    // v1 under the composite pin.
+    let ed_as_v1 = CaSigningKey::from_secret_text(&format!(
+        "{}{}\n",
+        CaSigningKey::FILE_PREFIX,
+        hex::encode(ED_SEED)
+    ))
+    .unwrap();
+    let v1 = sign_certificate(
+        &ed_as_v1,
+        &CertBody::new(
+            cert_key(&ed_as_v1.public_key()),
+            cert_key(&id.public_key()),
+            CertSerial::try_from([1; 16]).unwrap(),
+            UnixTime::from_secs(NB),
+            UnixTime::from_secs(NA),
+            node("alice"),
+            CertScope::All,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        verify_certificate(&v1, &id.fingerprint(), &pinned(&ca)).err(),
+        Some(CertRejection::UnknownAuthority)
+    );
+    // v2 under a v1 pin of the composite's Ed25519 component.
+    let v2 = sign_certificate_v2(&ca, &body(&ca, classical(&id))).unwrap();
+    let v1_trust = trust_of(&[trusted_ca_key(ca.public_key().ed25519())]);
+    assert_eq!(
+        verify_certificate(&v2, &id.fingerprint(), &v1_trust).err(),
+        Some(CertRejection::UnknownAuthority)
+    );
+}
+
+/// A (Identity): a `ca_fp` that matches no pin, or another composite CA's, is
+/// `unknown_authority`, even with valid signatures of the named CA.
+#[test]
+fn an_unpinned_ca_fp_is_unknown() {
+    let id = client();
+    let other = other_ca();
+    let cert = sign_certificate_v2(&other, &body(&other, classical(&id))).unwrap();
+    assert_eq!(
+        verify_certificate(&cert, &id.fingerprint(), &pinned(&ca())).err(),
+        Some(CertRejection::UnknownAuthority)
+    );
+    // A certificate whose `ca_fp` names the pinned CA but is signed by another: bad signature.
+    let ca = ca();
+    let tbs = body(&ca, classical(&id)).encode_tbs();
+    let forged_m = MlDsa65SigningKey::from_seed(&[0x44; 32])
+        .sign(&message(&tbs), b"TCN-cert-v2", &[1; 32])
+        .unwrap();
+    let forged_e = SigningKey::from_bytes(&[0x33; 32])
+        .sign(&message(&tbs))
+        .to_bytes();
+    assert_eq!(
+        verify_certificate(
+            &by_hand(&tbs, &forged_m, &forged_e),
+            &id.fingerprint(),
+            &pinned(&ca)
+        )
+        .err(),
+        Some(CertRejection::BadSignature)
+    );
+}
+
+/// A (binding first): a certificate for another key costs no signature check; a CA that
+/// certifies its own Ed25519 component is refused.
+#[test]
+fn binding_and_self_certification() {
+    let ca = ca();
+    let id = client();
+    let cert = sign_certificate_v2(&ca, &body(&ca, classical(&id))).unwrap();
+    let stranger = Fingerprint::from_bytes([0x77; 32]);
+    assert_eq!(
+        verify_certificate(&cert, &stranger, &pinned(&ca)).err(),
+        Some(CertRejection::KeyMismatch)
+    );
+    let ca_fp = ca.public_key().fingerprint();
+    let own = sign_certificate_v2(&ca, &body(&ca, CertSubject::Classical(ca_fp))).unwrap();
+    assert_eq!(
+        verify_certificate(&own, &ca_fp, &pinned(&ca)).err(),
+        Some(CertRejection::KeyMismatch)
+    );
+}
+
+/// A (Parsing): truncated, extended and oversized certificates are `malformed`.
+#[test]
+fn truncated_or_extended_v2_certificates_are_malformed() {
+    let ca = ca();
+    let id = client();
+    let cert = sign_certificate_v2(&ca, &body(&ca, classical(&id))).unwrap();
+    for cut in [1, 64, 3_309, 3_373] {
+        assert_eq!(
+            verify_certificate(&cert[..cert.len() - cut], &id.fingerprint(), &pinned(&ca)).err(),
+            Some(CertRejection::Malformed)
+        );
+    }
+    let mut longer = cert.clone();
+    longer.push(0);
+    assert_eq!(
+        verify_certificate(&longer, &id.fingerprint(), &pinned(&ca)).err(),
+        Some(CertRejection::Malformed)
+    );
+    let mut huge = cert;
+    huge.resize(7_671, 0);
+    assert_eq!(
+        verify_certificate(&huge, &id.fingerprint(), &pinned(&ca)).err(),
+        Some(CertRejection::Malformed)
+    );
+}
+
+/// A (key text): composite keys are parsed strictly; a v1 key, uppercase hex, wrong lengths
+/// and a non-canonical Ed25519 component are refused. CA secret files of one version are
+/// refused by the other's loader.
+#[test]
+fn key_texts_are_strict_and_versions_do_not_mix() {
+    let text = ca().public_key().to_string();
+    let hex_part = text.strip_prefix("tcn-ca-pub-v2:").unwrap();
+    for bad in [
+        hex_part.to_owned(),
+        format!("tcn-ca-pub-v2:{}", hex_part.to_uppercase()),
+        format!("tcn-ca-pub-v2:{}", &hex_part[2..]),
+        format!("tcn-ca-pub-v2:{hex_part}00"),
+        format!("tcn-ca-pub-v2: {hex_part}"),
+        format!("{text}\n"),
+        // y = p (non-canonical encoding of a valid point) as the Ed25519 component.
+        format!(
+            "tcn-ca-pub-v2:edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f{}",
+            &hex_part[64..]
+        ),
+        "01".repeat(32),
+    ] {
+        assert!(
+            CompositeCaPublicKey::from_str(&bad).is_err(),
+            "{}",
+            &bad[..20.min(bad.len())]
+        );
+    }
+    let v2_secret = secret_text(ED_SEED, ML_SEED);
+    assert!(CaSigningKey::from_secret_text(&v2_secret).is_err());
+    let v1_secret = format!("{}{}\n", CaSigningKey::FILE_PREFIX, "01".repeat(32));
+    assert!(CompositeCaSigningKey::from_secret_text(&v1_secret).is_err());
+    let lettered = secret_text([0xab; 32], [0xcd; 32]);
+    assert!(CompositeCaSigningKey::from_secret_text(&lettered).is_ok());
+    let upper = lettered.replace("ab", "AB");
+    assert!(CompositeCaSigningKey::from_secret_text(&upper).is_err());
+}
+
 /// S (rotation, AP-13): a composite pin whose Ed25519 component equals the v1 key it rotates
 /// away from is a load error, so a v2 CA always has fresh components.
 #[test]
