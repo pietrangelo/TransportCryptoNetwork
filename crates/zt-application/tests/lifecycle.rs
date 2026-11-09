@@ -13,7 +13,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use zt_application::lifecycle::{ClockJumpDetector, DrainController, DrainStep, ProgressWatchdog};
+use zt_application::lifecycle::{
+    ClockJumpDetector, DrainController, DrainStep, ProgressWatchdog, WatchdogAction,
+};
 use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_domain::{
     AccessPolicy, AllowedNodes, ClientGrant, CloseReason, DomainEvent, Fingerprint, Frame, NodeId,
@@ -32,7 +34,7 @@ fn watchdog_does_not_fire_on_a_busy_but_progressing_hub() {
     let mut counter = 0_u64;
     for _ in 0..100 {
         counter += 1_000;
-        assert!(w.should_kick(counter));
+        assert_eq!(w.observe(counter), WatchdogAction::Kick);
     }
 }
 
@@ -40,10 +42,10 @@ fn watchdog_does_not_fire_on_a_busy_but_progressing_hub() {
 #[test]
 fn a_stalled_hub_stops_the_kicks() {
     let mut w = ProgressWatchdog::new();
-    assert!(w.should_kick(1));
-    assert!(!w.should_kick(1));
-    assert!(!w.should_kick(1));
-    assert!(w.should_kick(2));
+    assert_eq!(w.observe(1), WatchdogAction::Kick);
+    assert_eq!(w.observe(1), WatchdogAction::Hold);
+    assert_eq!(w.observe(1), WatchdogAction::Stalled);
+    assert_eq!(w.observe(2), WatchdogAction::Kick);
 }
 
 #[test]

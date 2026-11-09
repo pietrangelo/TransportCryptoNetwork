@@ -62,8 +62,9 @@ fn a_session_that_lived_is_followed_by_a_spread_retry() {
     assert_eq!(p.failures(), 0);
     let d = p.next(SessionEnd::Ended { lived: secs(60) }, 0);
     assert_eq!(d, Duration::ZERO);
-    // Then a failure starts again from the base.
-    assert!(p.next(SessionEnd::Failed, u64::MAX) <= secs(1));
+    // Then a failure (the relay still down) keeps the spread window as the floor of its
+    // ceiling (finding A10-4), and the doubling takes over above it.
+    assert_eq!(p.next(SessionEnd::Failed, u64::MAX), secs(10));
 }
 
 /// A spread window of zero is allowed (single relay): retry at once after a lived session.

@@ -280,7 +280,10 @@ fn half_open_agent_link_is_detected() {
         relay_key,
         [alice.fingerprint()].into_iter().collect(),
     );
+    let agent_ip = Arc::new(Mutex::new(None));
+    let agent_ip_seen = Arc::clone(&agent_ip);
     sim.client("alice", async move {
+        *agent_ip_seen.lock().unwrap() = Some(turmoil::lookup("agent"));
         let alice = Identity::from_secret_hex(&alice_secret).unwrap();
         let config = ClientConfig {
             relays: vec![RelayEndpoint {
@@ -338,6 +341,77 @@ fn half_open_agent_link_is_detected() {
         Ok(())
     });
     sim.run().unwrap();
-    let agent_arrivals = arrivals.lock().unwrap().len();
+    // Only the agent host's connections: Alice's own would satisfy a plain count (finding
+    // A10-6).
+    let agent_ip = agent_ip.lock().unwrap().unwrap();
+    let agent_arrivals = arrivals
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, ip)| *ip == agent_ip)
+        .count();
     assert!(agent_arrivals >= 2, "the agent did not reconnect");
+}
+
+/// R2-L2, the agent's side alone (finding A10-6): with a relay that would keep a silent agent
+/// for an hour, only the agent's own keepalives (three unanswered, 30 s) can notice the
+/// half-open link. It must have given up on it, and be dialing again, by the repair: it
+/// registers again soon after, long before the 90 s of the pre-R-2 keepalive.
+#[test]
+fn the_agent_alone_detects_a_half_open_link() {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(200))
+        .tick_duration(Duration::from_millis(10))
+        .rng_seed(11)
+        .build();
+    let relay = Identity::generate().unwrap();
+    let relay_key = relay.public_key();
+    let agent = Identity::generate().unwrap();
+    let mut policy = AccessPolicy::new();
+    policy
+        .add_agent(agent.fingerprint(), node("web-01"))
+        .unwrap();
+    let config = RelayConfig {
+        agent_idle: Some(Duration::from_secs(3_600)),
+        ..RelayConfig::default()
+    };
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    relay_host(
+        &mut sim,
+        relay.to_secret_hex().to_string(),
+        policy,
+        config,
+        Arc::clone(&arrivals),
+    );
+    agent_host(
+        &mut sim,
+        "agent",
+        "web-01",
+        agent.to_secret_hex().to_string(),
+        relay_key,
+        std::iter::empty().collect(),
+    );
+    let partition = Duration::from_secs(5);
+    let repair = partition + Duration::from_secs(37);
+    sim.client("operator", async move {
+        tokio::time::sleep(partition).await;
+        turmoil::partition("agent", "relay");
+        tokio::time::sleep(repair - partition).await;
+        turmoil::repair("agent", "relay");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(())
+    });
+    sim.run().unwrap();
+    let after: Vec<Duration> = arrivals
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(t, _)| *t)
+        .filter(|t| *t >= repair)
+        .collect();
+    let first = after.first().copied();
+    assert!(
+        first.is_some_and(|t| t < repair + Duration::from_secs(30)),
+        "the agent did not come back within 30 s of the repair: {first:?}"
+    );
 }
