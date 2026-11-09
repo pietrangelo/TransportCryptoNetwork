@@ -109,8 +109,8 @@ fn one_client(
 fn a_healthy_first_relay_is_used_alone() {
     let fleet = Fleet::new(2, 1);
     let kinds = vec![
-        RelayKind::Real(fleet.open_policy()),
-        RelayKind::Real(fleet.open_policy()),
+        RelayKind::Real(Box::new(fleet.open_policy())),
+        RelayKind::Real(Box::new(fleet.open_policy())),
     ];
     let (fleet, outcome, agent_ip) = one_client(fleet, kinds, || {});
     let Outcome::Echoed(at) = outcome else {
@@ -128,8 +128,8 @@ fn a_healthy_first_relay_is_used_alone() {
 fn a_black_holed_first_relay_costs_only_the_stagger() {
     let fleet = Fleet::new(2, 1);
     let kinds = vec![
-        RelayKind::Real(fleet.open_policy()),
-        RelayKind::Real(fleet.open_policy()),
+        RelayKind::Real(Box::new(fleet.open_policy())),
+        RelayKind::Real(Box::new(fleet.open_policy())),
     ];
     let (fleet, outcome, agent_ip) = one_client(fleet, kinds, || turmoil::hold("client", "relay1"));
     let Outcome::Echoed(at) = outcome else {
@@ -147,7 +147,10 @@ fn a_black_holed_first_relay_costs_only_the_stagger() {
 #[test]
 fn a_slow_handshake_relay_is_hedged() {
     let fleet = Fleet::new(2, 1);
-    let kinds = vec![RelayKind::Silent, RelayKind::Real(fleet.open_policy())];
+    let kinds = vec![
+        RelayKind::Silent,
+        RelayKind::Real(Box::new(fleet.open_policy())),
+    ];
     let (fleet, outcome, agent_ip) = one_client(fleet, kinds, || {});
     let Outcome::Echoed(at) = outcome else {
         panic!("{outcome:?}")

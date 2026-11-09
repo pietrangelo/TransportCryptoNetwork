@@ -444,6 +444,8 @@ impl Lab {
             node_suite,
             certificate: certificate.cloned(),
             timeouts: timeouts(),
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         }
     }
 

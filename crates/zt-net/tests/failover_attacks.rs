@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use failover_harness::{Fleet, Outcome, RelayKind, echo, node, sim};
 use zt_domain::{AllowedNodes, HandshakeSuite, RejectReason};
 use zt_net::NetError;
@@ -33,8 +35,8 @@ fn hedging_does_not_amplify_a_slow_but_alive_relay() {
     const CLIENTS: usize = 10;
     let fleet = Fleet::new(2, CLIENTS);
     let mut sim = sim(60, 5);
-    fleet.relay_host(&mut sim, 0, RelayKind::Real(fleet.open_policy()));
-    fleet.relay_host(&mut sim, 1, RelayKind::Real(fleet.open_policy()));
+    fleet.relay_host(&mut sim, 0, RelayKind::Real(Box::new(fleet.open_policy())));
+    fleet.relay_host(&mut sim, 1, RelayKind::Real(Box::new(fleet.open_policy())));
     fleet.agent_host(&mut sim, 16);
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     sim.client("operator", async {
@@ -86,8 +88,8 @@ fn hedging_does_not_amplify_a_slow_but_alive_relay() {
 fn all_relays_down_ends_at_the_deadline() {
     let fleet = Fleet::new(2, 1);
     let mut sim = sim(90, 7);
-    fleet.relay_host(&mut sim, 0, RelayKind::Real(fleet.open_policy()));
-    fleet.relay_host(&mut sim, 1, RelayKind::Real(fleet.open_policy()));
+    fleet.relay_host(&mut sim, 0, RelayKind::Real(Box::new(fleet.open_policy())));
+    fleet.relay_host(&mut sim, 1, RelayKind::Real(Box::new(fleet.open_policy())));
     fleet.agent_host(&mut sim, 16);
     let config = fleet.client_config();
     let secret = fleet.client_secret(0);
@@ -123,8 +125,8 @@ fn all_relays_down_ends_at_the_deadline() {
 fn black_holed_relays_give_up_before_the_deadline() {
     let fleet = Fleet::new(2, 1);
     let mut sim = sim(60, 9);
-    fleet.relay_host(&mut sim, 0, RelayKind::Real(fleet.open_policy()));
-    fleet.relay_host(&mut sim, 1, RelayKind::Real(fleet.open_policy()));
+    fleet.relay_host(&mut sim, 0, RelayKind::Real(Box::new(fleet.open_policy())));
+    fleet.relay_host(&mut sim, 1, RelayKind::Real(Box::new(fleet.open_policy())));
     fleet.agent_host(&mut sim, 16);
     let config = fleet.client_config();
     let secret = fleet.client_secret(0);
@@ -157,9 +159,13 @@ fn a_policy_answer_aborts_all_hedged_attempts() {
     let fleet = Fleet::new(3, 1);
     let mut sim = sim(60, 13);
     let only_db = AllowedNodes::Only([node("db-01")].into_iter().collect());
-    fleet.relay_host(&mut sim, 0, RelayKind::Real(fleet.open_policy()));
-    fleet.relay_host(&mut sim, 1, RelayKind::Real(fleet.policy_for(only_db)));
-    fleet.relay_host(&mut sim, 2, RelayKind::Real(fleet.open_policy()));
+    fleet.relay_host(&mut sim, 0, RelayKind::Real(Box::new(fleet.open_policy())));
+    fleet.relay_host(
+        &mut sim,
+        1,
+        RelayKind::Real(Box::new(fleet.policy_for(&only_db))),
+    );
+    fleet.relay_host(&mut sim, 2, RelayKind::Real(Box::new(fleet.open_policy())));
     fleet.agent_host(&mut sim, 16);
     let config = fleet.client_config();
     let secret = fleet.client_secret(0);
@@ -194,17 +200,18 @@ fn a_policy_answer_aborts_all_hedged_attempts() {
 /// R4-F2 and R4-F5: both attempts reach `Open` (relay 1 is slow, so it is hedged; relay 2 is
 /// slower still, so relay 1 wins while relay 2 waits for its `OpenAck`). The agent sees one
 /// end-to-end handshake (one sshd connection), and the loser's `Open` does not keep the
-/// agent's only stream slot on relay 2: a second client through relay 2 alone gets in at once.
+/// agent's only stream slot on relay 2 (`max_streams = 1`): once the first session has ended, a
+/// second client through relay 2 alone gets in at once.
 #[test]
 fn hedge_losers_release_agent_slots() {
     let fleet = Fleet::new(2, 2);
     let mut sim = sim(60, 17);
-    fleet.relay_host(&mut sim, 0, RelayKind::Real(fleet.open_policy()));
-    fleet.relay_host(&mut sim, 1, RelayKind::Real(fleet.open_policy()));
+    fleet.relay_host(&mut sim, 0, RelayKind::Real(Box::new(fleet.open_policy())));
+    fleet.relay_host(&mut sim, 1, RelayKind::Real(Box::new(fleet.open_policy())));
     fleet.agent_host(&mut sim, 1);
-    // Relay 1 (700 ms each way): connected at 1.4 s, handshake done at 2.8 s, after the hedge
-    // (2-2.5 s); `OpenAck` at about 4.2 s. Relay 2 (400 ms), hedged at 2-2.5 s: handshake done
-    // at 3.6-4.1 s, `OpenAck` not before 4.4 s, so it waits for it when relay 1 wins.
+    // Relay 1 (1 s per message): connected at 1 s, handshake done at 3 s, after the hedge
+    // (2-2.5 s); `OpenAck` at about 5 s. Relay 2 (0.7 s), hedged at 2-2.5 s: handshake done at
+    // 4.1-4.6 s, `OpenAck` not before 5.5 s, so it waits for it when relay 1 wins.
     let first = fleet.client_config();
     let mut second = fleet.client_config();
     second.relays = vec![second.relays[1].clone()];
@@ -223,7 +230,6 @@ fn hedge_losers_release_agent_slots() {
             zt_net::client::connect_with(&identity, &first, local, failover_harness::SimDialer)
                 .await
         });
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         app.write_all(b"ping").await.unwrap();
         let mut buf = [0_u8; 4];
         app.read_exact(&mut buf).await.unwrap();
@@ -231,18 +237,21 @@ fn hedge_losers_release_agent_slots() {
         tokio::time::sleep(Duration::from_secs(3)).await;
         after.store(accepts.load(Ordering::SeqCst), Ordering::SeqCst);
         o0.lock().unwrap().push(Outcome::Echoed(Duration::ZERO));
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // The session ends, so its sshd permit (one for the whole agent) is free again; only a
+        // leaked stream slot of relay 2 can now refuse the second client.
         drop(app);
+        tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(())
     });
     let o1 = Arc::clone(&outcomes);
     sim.client("client-1", async move {
         tokio::time::sleep(Duration::from_secs(15)).await;
-        o1.lock().unwrap().push(echo(&s1, second).await);
+        let o = echo(&s1, second).await;
+        o1.lock().unwrap().push(o);
         Ok(())
     });
-    sim.set_link_latency("client-0", "relay1", Duration::from_millis(700));
-    sim.set_link_latency("client-0", "relay2", Duration::from_millis(400));
+    sim.set_link_latency("client-0", "relay1", Duration::from_secs(1));
+    sim.set_link_latency("client-0", "relay2", Duration::from_millis(700));
     sim.run().unwrap();
     assert_eq!(
         accepts_after_first.load(Ordering::SeqCst),

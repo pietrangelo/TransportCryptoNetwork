@@ -138,6 +138,8 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
         node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),
+        failover: zt_net::client::FailoverConfig::default(),
+        require_outer_suite: None,
     };
 
     // Innocent session, waited for until the agent is registered.

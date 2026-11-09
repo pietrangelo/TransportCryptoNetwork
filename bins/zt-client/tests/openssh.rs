@@ -16,6 +16,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -49,7 +50,7 @@ fn text(b: &[u8]) -> String {
 /// sshd on 127.0.0.1 (free port), relay and agent in-process, ssh configuration ready.
 struct Lab {
     fleet: Fleet,
-    _client: ClientDir,
+    client: ClientDir,
     dir: PathBuf,
     ssh_config: PathBuf,
     _sshd: Child,
@@ -154,7 +155,7 @@ impl Lab {
         .unwrap();
         Self {
             fleet,
-            _client: client,
+            client,
             dir,
             ssh_config,
             _sshd: sshd,
@@ -362,14 +363,15 @@ async fn silent_relay() -> SocketAddr {
 /// Rewrites the lab's `client.toml` with `top` (top-level keys) and these relays, keeping the
 /// `[[nodes]]` entries.
 fn rewrite_relays(lab: &Lab, top: &str, relays: &[(String, zt_crypto::PublicKey)]) {
-    let path = lab._client.config();
+    let path = lab.client.config();
     let old = std::fs::read_to_string(&path).unwrap();
     let nodes = &old[old.find("[[nodes]]").unwrap()..];
     let mut toml = format!("{top}key = \"client.key\"\n");
     for (addr, key) in relays {
-        toml.push_str(&format!(
+        let _ = write!(
+            toml,
             "\n[[relays]]\naddress = \"{addr}\"\npublic_key = \"{key}\"\n"
-        ));
+        );
     }
     toml.push('\n');
     toml.push_str(nodes);

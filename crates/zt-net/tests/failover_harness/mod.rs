@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use zt_crypto::{Identity, Keyring, PublicKey};
+use zt_crypto::{Identity, Keyring};
 use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant, HandshakeSuite, NodeId};
 use zt_net::client::{self, ClientConfig};
 use zt_net::net::{Acceptor, Dialer};
@@ -73,7 +73,7 @@ pub fn sim<'a>(seconds: u64, seed: u64) -> turmoil::Sim<'a> {
 #[derive(Clone)]
 pub enum RelayKind {
     /// The real relay with this policy.
-    Real(AccessPolicy),
+    Real(Box<AccessPolicy>),
     /// Accepts TCP and never answers: a relay whose handshake never completes.
     Silent,
 }
@@ -107,11 +107,11 @@ impl Fleet {
 
     /// The policy that registers the agent and lets every client reach every node.
     pub fn open_policy(&self) -> AccessPolicy {
-        self.policy_for(AllowedNodes::All)
+        self.policy_for(&AllowedNodes::All)
     }
 
     /// The policy with every client allowed `allowed`.
-    pub fn policy_for(&self, allowed: AllowedNodes) -> AccessPolicy {
+    pub fn policy_for(&self, allowed: &AllowedNodes) -> AccessPolicy {
         let mut policy = AccessPolicy::new();
         policy
             .add_agent(self.agent.fingerprint(), node("web-01"))
@@ -155,6 +155,7 @@ impl Fleet {
                 let mut acceptor = SimAcceptor { listener, arrivals };
                 match kind {
                     RelayKind::Real(policy) => {
+                        let policy = *policy;
                         let keys = Identity::from_secret_hex(&secret).unwrap();
                         let (policy, _updater) = Revocable::new(policy);
                         let server = RelayServer::with_acceptor(

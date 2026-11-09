@@ -23,7 +23,7 @@ use std::time::Duration;
 use proptest::prelude::*;
 
 use zt_application::failover::{
-    Action, Event, FailoverConfig, FailoverPlan, Failure, GiveUp, MAX_IN_FLIGHT, Step,
+    Action, Event, FailoverConfig, FailoverPlan, Failure, GiveUp, MAX_IN_FLIGHT,
 };
 
 fn ms(n: u64) -> Duration {
@@ -37,20 +37,6 @@ fn secs(n: u64) -> Duration {
 /// A plan with the defaults and no jitter (sample 0).
 fn plan(relays: usize) -> FailoverPlan {
     FailoverPlan::new(FailoverConfig::default(), relays, 0)
-}
-
-/// Runs the plan's timer up to `until`, waking at every `next_wake`, and collects the actions.
-fn run_until(plan: &mut FailoverPlan, until: Duration) -> Vec<(Duration, Action)> {
-    let mut out = Vec::new();
-    while let Some(wake) = plan.next_wake() {
-        if wake > until {
-            break;
-        }
-        for a in plan.tick(wake) {
-            out.push((wake, a));
-        }
-    }
-    out
 }
 
 /// Connect and outer handshake of `relay` at `now`.
@@ -136,15 +122,17 @@ fn events_about_other_relays_are_ignored() {
 fn deadline_applies_to_establishment_only() {
     let mut p = plan(2);
     p.start();
-    ready(&mut p, secs(19), 0);
+    ready(&mut p, ms(100), 0);
+    p.tick(ms(10_100));
+    ready(&mut p, ms(10_200), 1);
     assert_eq!(
-        p.handle(ms(19_900), Event::Acked(0)),
-        vec![Action::Proceed(0)]
+        p.handle(ms(19_900), Event::Acked(1)),
+        vec![Action::Proceed(1)]
     );
     assert_eq!(p.next_wake(), None);
     assert!(p.tick(secs(25)).is_empty());
     assert!(
-        p.handle(secs(30), Event::Failed(0, Failure::Unavailable))
+        p.handle(secs(30), Event::Failed(1, Failure::Unavailable))
             .is_empty()
     );
 }
@@ -196,13 +184,14 @@ proptest! {
         let mut outer_ready = vec![false; relays];
         let mut proceeded = 0;
         let mut finished = false;
-        let mut apply = |actions: Vec<Action>,
+        let apply = |actions: Vec<Action>,
                          now: Duration,
                          flying: &mut Vec<usize>,
                          outer_ready: &[bool],
-                         started: &mut Vec<bool>,
+                         started: &mut [bool],
                          proceeded: &mut i32,
-                         finished: &mut bool| {
+                         finished: &mut bool,
+                         exempt: Option<usize>| {
             for a in actions {
                 prop_assert!(!*finished, "action after the end: {a:?}");
                 match a {
@@ -218,7 +207,12 @@ proptest! {
                         prop_assert!(flying.len() <= MAX_IN_FLIGHT);
                     }
                     Action::Cancel(i) | Action::TimedOut(i, _) => {
-                        prop_assert!(flying.contains(&i), "cancel of {i} not in flight");
+                        // `exempt`: the attempt just reported failed, which the plan may
+                        // time out first in the same call.
+                        prop_assert!(
+                            flying.contains(&i) || exempt == Some(i),
+                            "cancel of {i} not in flight"
+                        );
                         flying.retain(|&f| f != i);
                     }
                     Action::Proceed(i) => {
@@ -237,8 +231,9 @@ proptest! {
             prop_assert!(*proceeded <= 1);
             Ok(())
         };
-        apply(p.start(), now, &mut flying, &outer_ready, &mut started, &mut proceeded, &mut finished)?;
+        apply(p.start(), now, &mut flying, &outer_ready, &mut started, &mut proceeded, &mut finished, None)?;
         for o in ops {
+            let mut exempt = None;
             let actions = match o {
                 Op::Tick(d) => { now += ms(d); p.tick(now) }
                 Op::Connected(i) => p.handle(now, Event::Connected(i)),
@@ -251,12 +246,13 @@ proptest! {
                 Op::Failed(i, refused) => {
                     let f = if refused { Failure::Refused } else { Failure::Unavailable };
                     let out = p.handle(now, Event::Failed(i, f));
+                    exempt = Some(i);
                     // A reported failure leaves flight without an action of the plan.
                     flying.retain(|&f| f != i);
                     out
                 }
             };
-            apply(actions, now, &mut flying, &outer_ready, &mut started, &mut proceeded, &mut finished)?;
+            apply(actions, now, &mut flying, &outer_ready, &mut started, &mut proceeded, &mut finished, exempt)?;
             prop_assert_eq!(p.in_flight(), if p.is_finished() { 0 } else { flying.len() });
             if let Some(w) = p.next_wake() {
                 prop_assert!(w <= FailoverConfig::default().deadline);

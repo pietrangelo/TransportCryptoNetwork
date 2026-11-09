@@ -119,6 +119,8 @@ fn client_config(relay: &Drained, agent: &Identity) -> client::ClientConfig {
         node_suite: HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: common::timeouts(),
+        failover: zt_net::client::FailoverConfig::default(),
+        require_outer_suite: None,
     }
 }
 

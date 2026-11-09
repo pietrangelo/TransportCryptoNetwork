@@ -196,6 +196,8 @@ fn client_config(relays: Vec<RelayEndpoint>, node_key: &PublicKey) -> ClientConf
         node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),
+        failover: zt_net::client::FailoverConfig::default(),
+        require_outer_suite: None,
     }
 }
 

@@ -41,6 +41,13 @@ pub enum NetError {
     /// A task the service cannot run without stopped (for example the relay hub).
     #[error("stopped: {0}")]
     Stopped(&'static str),
+    /// No relay completed the connection within the client's overall deadline
+    /// (`connect_deadline_secs`, resilience R-4).
+    #[error(
+        "no relay completed the connection within {} s (connect_deadline_secs in client.toml)",
+        .0.as_secs()
+    )]
+    Deadline(std::time::Duration),
     /// The stream was closed by the other side.
     #[error("stream closed: {0:?}")]
     StreamClosed(CloseReason),

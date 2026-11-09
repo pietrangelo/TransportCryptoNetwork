@@ -8,12 +8,14 @@
 //! - [`admission`]: pre-authentication pool, per-source budget refunded after key
 //!   confirmation, per-identity concurrency, aggregated pre-authentication logging.
 //! - [`ratelimit`]: token bucket with an injected clock.
+//! - [`failover`]: how the client tries its relays (deadline, per-step timeouts, hedge).
 //!
 //! Time enters only as a `now: Instant` parameter; randomness only through the
 //! [`relay::SessionIds`] port. Everything is therefore deterministic in tests.
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod failover;
 pub mod flapping;
 pub mod identity_lines;
 pub mod lifecycle;

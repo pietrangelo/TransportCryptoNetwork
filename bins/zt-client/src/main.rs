@@ -73,20 +73,38 @@ fn main() -> ExitCode {
         .init();
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Keygen { out } => keygen(&out),
+        Command::Keygen { out } => keygen(&out).map_err(Failure::from),
         Command::Connect { strip_suffix, node } => match node.as_slice() {
             [name] => connect(cli.config, strip_suffix.as_deref(), name),
-            _ => Err("expected exactly one node name, and no option after it".into()),
+            _ => Err(Failure::from(
+                "expected exactly one node name, and no option after it".to_owned(),
+            )),
         },
-        Command::Certificate => certificate(cli.config.as_deref()),
+        Command::Certificate => certificate(cli.config.as_deref()).map_err(Failure::from),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
+        Err(failure) => {
             // On stderr OpenSSH shows it to the user, who is the right recipient.
-            let _ = writeln!(std::io::stderr(), "zt-client: {message}");
-            ExitCode::FAILURE
+            let _ = writeln!(std::io::stderr(), "zt-client: {}", failure.message);
+            ExitCode::from(failure.code)
         }
+    }
+}
+
+/// `EX_TEMPFAIL` (sysexits.h): no relay completed the connection within the deadline; trying
+/// again later may work. OpenSSH itself then exits with 255, which Ansible retries.
+const EXIT_TEMPFAIL: u8 = 75;
+
+/// A failed command: the message for stderr and the exit status.
+struct Failure {
+    message: String,
+    code: u8,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self { message, code: 1 }
     }
 }
 
@@ -274,7 +292,7 @@ fn config_path(flag: Option<PathBuf>) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("no configuration: use --config or {CONFIG_ENV}"))
 }
 
-fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Result<(), String> {
+fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Result<(), Failure> {
     // Everything local is validated before opening any connection.
     let node = target(name, strip_suffix)?;
     let settings: ClientSettings =
@@ -305,7 +323,14 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
     // has ended on the node side we do not wait for ssh to close stdin.
     runtime.shutdown_background();
     let suite = config.node_suite;
-    result.map_err(|e| describe(&e, &node, not_after, suite))
+    result.map_err(|e| Failure {
+        message: describe(&e, &node, not_after, suite),
+        code: if matches!(e, NetError::Deadline(_)) {
+            EXIT_TEMPFAIL
+        } else {
+            1
+        },
+    })
 }
 
 /// Message for the ssh user. It never contains bytes received from the network. `not_after`

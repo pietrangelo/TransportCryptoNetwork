@@ -487,6 +487,10 @@ struct ClientFile {
     /// over: failover then never lands on a relay pinned to another suite (finding A10-9).
     #[serde(default)]
     require_outer_suite: Option<String>,
+    /// The overall deadline of establishment in seconds (resilience R-4): 1 to 300, 20 by
+    /// default.
+    #[serde(default)]
+    connect_deadline_secs: Option<u64>,
     key: String,
     /// Client certificate file (PROTOCOL §15), relative to this file.
     #[serde(default)]
@@ -988,6 +992,9 @@ pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PublicKey>, Confi
     parse_known_nodes(&path.display().to_string(), &read_limited(path)?)
 }
 
+/// The longest `connect_deadline_secs` (the failover plan's own limit).
+const MAX_CONNECT_DEADLINE_SECS: u64 = zt_application::failover::MAX_DEADLINE.as_secs();
+
 /// Maximum length of the relay address (full DNS name plus port).
 const MAX_RELAY_LEN: usize = 261;
 
@@ -1005,6 +1012,10 @@ pub struct ClientSettings {
     pub certificate: Option<std::path::PathBuf>,
     /// The end-to-end handshake suite pinned per node (PROTOCOL §7.5).
     pub node_suites: HashMap<NodeId, zt_domain::HandshakeSuite>,
+    /// `require_outer_suite`: the outer suite every relay is pinned to (finding A10-9).
+    pub require_outer_suite: Option<zt_domain::HandshakeSuite>,
+    /// `connect_deadline_secs`: the overall deadline of establishment (resilience R-4).
+    pub connect_deadline: std::time::Duration,
 }
 
 impl ClientSettings {
@@ -1032,6 +1043,11 @@ impl ClientSettings {
                 .unwrap_or(zt_domain::HandshakeSuite::NoiseIk25519),
             certificate: None,
             timeouts,
+            failover: crate::client::FailoverConfig {
+                deadline: self.connect_deadline,
+                ..crate::client::FailoverConfig::default()
+            },
+            require_outer_suite: self.require_outer_suite,
         })
     }
 }
@@ -1105,6 +1121,7 @@ fn valid_relay(text: &str) -> bool {
 /// # public_key = "<64 hex>"
 /// # suite = "<Noise protocol name>"   (per relay; the classical suite without it)
 /// # require_outer_suite = "<Noise protocol name>"   (top level: every relay pinned to it)
+/// # connect_deadline_secs = 20   (top level: overall deadline of establishment, 1-300 s)
 /// key = "client.key"
 ///
 /// [[nodes]]
@@ -1153,20 +1170,25 @@ pub fn parse_client_settings(
             relay.suite = parse_suite(origin, text, zt_domain::HandshakeChannel::Outer)?;
         }
     }
-    if let Some(text) = &file.require_outer_suite {
-        let required = parse_suite(origin, text, zt_domain::HandshakeChannel::Outer)?;
-        if let Some(other) = relays.iter().find(|r| r.suite != required) {
-            return Err(ConfigError::Syntax {
-                path: origin.into(),
-                message: format!(
-                    "relay {} is pinned to {}, but require_outer_suite is {}",
-                    other.address,
-                    other.suite.protocol_name(),
-                    required.protocol_name()
-                ),
-            });
-        }
+    let require_outer_suite = file
+        .require_outer_suite
+        .as_ref()
+        .map(|text| parse_suite(origin, text, zt_domain::HandshakeChannel::Outer))
+        .transpose()?;
+    if let Some(required) = require_outer_suite
+        && let Some(other) = relays.iter().find(|r| r.suite != required)
+    {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: format!(
+                "relay {} is pinned to {}, but require_outer_suite is {}",
+                other.address,
+                other.suite.protocol_name(),
+                required.protocol_name()
+            ),
+        });
     }
+    let connect_deadline = connect_deadline(origin, file.connect_deadline_secs)?;
     if file.certificate.as_deref() == Some("") {
         return Err(ConfigError::Syntax {
             path: origin.into(),
@@ -1205,7 +1227,23 @@ pub fn parse_client_settings(
         nodes,
         certificate: file.certificate.as_ref().map(|c| base.join(c)),
         node_suites,
+        require_outer_suite,
+        connect_deadline,
     })
+}
+
+/// `connect_deadline_secs`: 1 to 300 s, the plan's default without it.
+fn connect_deadline(origin: &str, secs: Option<u64>) -> Result<std::time::Duration, ConfigError> {
+    match secs {
+        None => Ok(zt_application::failover::FailoverConfig::default().deadline),
+        Some(secs) if (1..=MAX_CONNECT_DEADLINE_SECS).contains(&secs) => {
+            Ok(std::time::Duration::from_secs(secs))
+        }
+        Some(_) => Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: "connect_deadline_secs must be between 1 and 300".into(),
+        }),
+    }
 }
 
 /// Reads and parses the client configuration.

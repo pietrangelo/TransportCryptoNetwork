@@ -175,6 +175,8 @@ impl Fleet {
             node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: fast_timeouts(),
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         }
     }
 }

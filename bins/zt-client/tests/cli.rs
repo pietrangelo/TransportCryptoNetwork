@@ -212,7 +212,7 @@ async fn a_silent_first_relay_is_hedged_after_the_stagger() {
 }
 
 /// R-4: when no relay completes the connection within `connect_deadline_secs`, `zt-client`
-/// exits with 75 (EX_TEMPFAIL: try again later) and says so on stderr; stdout (the SSH channel)
+/// exits with 75 (`EX_TEMPFAIL`: try again later) and says so on stderr; stdout (the SSH channel)
 /// stays empty. OpenSSH then exits with 255, which Ansible retries (`retries`, OPERATIONS §5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_deadline_exits_with_tempfail_and_a_clear_message() {

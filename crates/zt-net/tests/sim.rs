@@ -296,6 +296,8 @@ fn half_open_agent_link_is_detected() {
             node_suite: HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: timeouts(),
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         };
         let echo = |config: ClientConfig, alice: Identity| async move {
             let (mut app, local) = tokio::io::duplex(1024);

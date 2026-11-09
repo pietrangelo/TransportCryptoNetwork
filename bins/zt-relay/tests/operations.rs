@@ -161,6 +161,8 @@ impl Relay {
                 open: Duration::from_secs(2),
                 ..Timeouts::default()
             },
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         }
     }
 

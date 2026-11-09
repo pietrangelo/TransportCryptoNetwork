@@ -176,6 +176,8 @@ async fn a_hybrid_pinned_client_never_falls_back() {
         node_suite: CLASSIC,
         certificate: None,
         timeouts: common::timeouts(),
+        failover: zt_net::client::FailoverConfig::default(),
+        require_outer_suite: None,
     };
     let (_app, local) = tokio::io::duplex(1024);
     let outcome = tokio::time::timeout(
