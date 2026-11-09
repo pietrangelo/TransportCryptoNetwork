@@ -216,14 +216,20 @@ plus `tick(now)`; the actions `Start(i)`, `Cancel(i)`, `TimedOut(i, step)`, `Pro
 it (0.5 s) from an injected sample, so a fleet that starts together does not hedge together.
 `zt-net` drives it with the attempts as futures of the client's own task (nothing spawned;
 dropping the client drops every connection); a cancelled attempt that has sent `Open` sends
-`Close Normal` (bounded at 1 s). `require_outer_suite` (A10-9) is carried into `ClientConfig`
-and enforced before any dial. At the deadline `zt-client` exits 75 (`EX_TEMPFAIL`). PROTOCOL
-§13 and OPERATIONS §5 have the operator view.
+`Close Normal` (bounded at 1 s), and one cancelled in its outer handshake completes it and
+confirms its key with a `Ping`, so that R-1 refunds the token it charged (review 0011, A11-1).
+`require_outer_suite` (A10-9) is carried into `ClientConfig` and enforced before any dial.
+`zt-client` exits 75 (`EX_TEMPFAIL`) at the deadline and for every other give-up that says
+nothing about the right of access (A11-4). After review 0011 the deadline is 8 s and the
+`OpenAck` wait is the time left shared out over the relays left, between 2 s and 4 s (A11-2,
+A11-3). PROTOCOL §13 and OPERATIONS §5 have the operator view.
 
 - **`FailoverPlan` (sans-IO):** events `Started(i)`, `Failed(i, kind)`, `Acked(i)`,
   `Tick(now)`; actions `Start(i)`, `Cancel(i)`, `Proceed(i)`, `GiveUp(err)`.
-  - **Overall deadline** (`connect_deadline`, default 20 s, settable in `client.toml`).
-  - **Tighter per-step timeouts:** connect 3 s, handshake 5 s, open 10 s.
+  - **Overall deadline** (`connect_deadline`, default 20 s, settable in `client.toml`; 8 s
+    since review 0011, to fit Ansible's default `ConnectTimeout` of 10 s).
+  - **Tighter per-step timeouts:** connect 3 s, handshake 5 s, open 10 s (since review 0011:
+    the time left ÷ the relays left, between 2 s and 4 s).
   - **Staggered hedge:** start relay *i+1* when relay *i* has failed, or after a stagger of 2 s
     with no `OpenAck` yet; at most 2 attempts in flight. The first `OpenAck` wins and the others
     are closed at once (`Close Normal` on the stream, then EOF).
@@ -238,10 +244,14 @@ and enforced before any dial. At the deadline `zt-client` exits 75 (`EX_TEMPFAIL
   0005-2), and an attacker would use their own client anyway.
 - **Cost:** in the worst case each hedge doubles the handshakes, which is why there are at most
   2 in flight and why it ships after R-1. On the agent, the losing `Open` holds a per-relay
-  stream slot until its `Close` arrives (milliseconds) or the open timeout.
+  stream slot until its `Close` arrives (milliseconds) or the open timeout. Review 0011 (A11-1)
+  found that the losers also spent the client's R-1 per-source budget (cancelled before key
+  confirmation, so never refunded); they now confirm their key before they close.
 - **Ansible guidance** (OPERATIONS §5):
   - `[ssh_connection] retries = 3`: ssh exits with 255 on a ProxyCommand failure and Ansible
     retries with backoff.
+  - `[defaults] timeout` (passed to ssh as `-o ConnectTimeout`, 10 s by default) at least
+    `connect_deadline_secs` + 2 s (review 0011, A11-2).
   - `ServerAliveInterval 15` and `ServerAliveCountMax 3`.
   - A longer `ControlPersist` (for example 300 s) is safe: revocation and certificate expiry
     still close multiplexed sessions (PROTOCOL §12, §15.7).
@@ -496,17 +506,20 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 | ID | Category | Hypothesis | Expected | Test |
 | :- | :- | :- | :- | :- |
 | R4-F1 | Partition | first relay black-holed | session via relay 2 within stagger + one RTT set; total ≤ deadline | `a_black_holed_first_relay_costs_only_the_stagger` (sim) |
-| R4-F2 | State | `OpenAck` from two relays (race) | exactly one proceeds; the other is closed; agent sees one msg1 | `hedged_attempts_never_send_two_msg1` |
+| R4-F2 | State | `OpenAck` from two relays (race) | exactly one proceeds; the other is closed; agent sees one msg1 | `hedged_attempts_never_send_two_msg1` (plan), `hedge_losers_release_agent_slots` (sim: one sshd accept; a second msg1 that never completes would not show) |
 | R4-F3 | Identity | relay 1 `NotAuthorized` before relay 2 `OpenAck` | abort all (fail closed) | `a_policy_answer_aborts_all_hedged_attempts` |
 | R4-F4 | Identity | relay 2 `OpenAck` before relay 1 `NotAuthorized` | proceeds via relay 2 (accepted, documented) | `late_policy_answer_after_proceed_is_ignored` |
-| R4-F5 | Resources | hedged loser's `Open` holds an agent slot | released ≤ one RTT after the client closes it | `hedge_losers_release_agent_slots` |
-| R4-F6 | State | deadline expires mid-handshake / after `OpenAck` | before `OpenAck`: give up; after: session continues (deadline is for establishment only) | `deadline_applies_to_establishment_only` |
-| R4-F7 | Overload | Ansible burst with hedging | handshakes ≤ 2× clients; no gate refusals with R-1 | `hedging_stays_within_admission_budget` |
-| R4-F8 | Overload | relay alive but slow to relay `OpenAck` (AP-10) | no hedge: the client waits for the open timeout, then moves on; the second relay sees nobody before | `hedging_does_not_amplify_a_slow_but_alive_relay` (sim), `a_slow_open_ack_is_never_hedged` |
+| R4-F5 | Resources | hedged loser's `Open` holds an agent slot | the loser sends `Close Normal` and is closed while the session runs | `hedge_losers_release_agent_slots`, `a_loser_that_sent_open_sends_close_normal`, `the_loser_is_closed_while_the_session_runs` (sim, A11-5) |
+| R4-F6 | State | deadline expires mid-handshake / after `OpenAck` | before `OpenAck`: give up; after: session continues (deadline is for establishment only) | `deadline_applies_to_establishment_only` (plan only; the sim sessions after it have no establishment timer left) |
+| R4-F7 | Overload | Ansible burst with hedging | at most two in flight, each relay once; the losers confirm their key, so no R-1 refusals for the controller (A11-1) | `hedging_stays_within_the_plans_bounds` (plan), `hedge_losers_do_not_burn_the_controllers_admission_budget`, `a_hedge_cancelled_in_its_handshake_confirms_its_key` (sim, real R-1 admission) |
+| R4-F8 | Overload | relay alive but slow to relay `OpenAck` (AP-10) | no hedge: the client waits for the open timeout, then moves on; the second relay sees nobody before; a handshake done at the stagger instant is not hedged (A11-5) | `hedging_does_not_amplify_a_slow_but_alive_relay`, `a_handshake_done_at_the_stagger_instant_is_not_hedged` (sim), `a_slow_open_ack_is_never_hedged` |
 | R4-F9 | Identity | `require_outer_suite` with a relay pinned to another suite in a `ClientConfig` built in code (A10-9) | refused before any dial; no hedge onto it | `a_hedge_never_lands_on_a_relay_outside_require_outer_suite` |
-| R4-F10 | Resources | client dropped in the middle of a hedge | no connection left open (no spawned task) | `dropping_the_client_mid_hedge_leaks_nothing` (sim) |
-| R4-F11 | Operator | deadline passes under OpenSSH | `zt-client` exits 75 with a clear stderr line; `ssh` exits 255 (Ansible `retries`) | `the_deadline_exits_with_tempfail_and_a_clear_message`, `ssh_reports_the_failover_deadline` (e2e-openssh) |
-| R4-F12 | Partition | every relay black-holed / every agent link held | gives up after about 5 s with the last error / at the 20 s deadline | `black_holed_relays_give_up_before_the_deadline`, `all_relays_down_ends_at_the_deadline` (sim) |
+| R4-F10 | Resources | client dropped in the middle of a hedge | no connection left open (no spawned task); both attempts were in flight | `dropping_the_client_mid_hedge_leaks_nothing` (sim) |
+| R4-F11 | Operator | the client gives up under OpenSSH | `zt-client` exits 75 for every temporary give-up (deadline, unreachable, silent) with a clear stderr line; `ssh` exits 255 (Ansible `retries`) | `the_deadline_exits_with_tempfail_and_a_clear_message`, `a_refusing_relay_exits_with_tempfail`, `a_silent_relay_exits_with_tempfail_with_the_defaults`, `ssh_reports_the_failover_deadline`, `ssh_reports_a_silent_relay_with_the_default_timeouts` (e2e-openssh) |
+| R4-F12 | Partition | every relay black-holed / every agent link held | gives up after about 5 s with the last error / at the 8 s deadline | `black_holed_relays_give_up_before_the_deadline`, `all_relays_down_ends_at_the_deadline` (sim) |
+| R4-F13 | Operator | first relay handshakes then stalls on `Open`; Ansible's default `ConnectTimeout = 10` (A11-2) | `ssh` gets through the second relay within about 5 s | `one_failed_relay_fits_ansibles_connect_timeout` (plan), `ssh_fails_over_a_stalled_relay_within_ansibles_connect_timeout` (e2e-openssh) |
+| R4-F14 | Partition | two or three relays stall on `Open`, a healthy relay comes after them (A11-3) | the healthy relay is reached within the default deadline | `stalling_relays_share_the_deadline` (plan), `two_stalling_relays_leave_time_for_a_healthy_third`, `three_stalling_relays_and_a_healthy_fourth_fit_the_default_deadline` (sim) |
+| R4-F15 | Identity | a losing relay refuses the node the winner accepted (partial policy rollout, A11-6) | session kept; WARN `relays disagree on the policy` with both relays | `a_losers_policy_refusal_is_reported` (sim) |
 
 ### R-5 Observability
 

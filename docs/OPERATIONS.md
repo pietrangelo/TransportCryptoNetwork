@@ -194,6 +194,7 @@ How to size it:
 `~/.config/tcn/client.toml`:
 
 ```toml
+# connect_deadline_secs = 8         # optional, top level: give up after this long (1-300)
 relay = "relay.example.org:7443"
 relay_key = "<relay public key>"
 key = "client.key"                  # relative to this file, or absolute
@@ -204,7 +205,6 @@ key = "client.key"                  # relative to this file, or absolute
 # [[relays]]
 # address = "r2.example.org:7443"
 # public_key = "<r2 key>"
-# connect_deadline_secs = 20        # optional, top level: give up after this long (1-300)
 
 [[nodes]]
 node = "web-01"
@@ -234,17 +234,35 @@ suite = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"
 not completed TCP connect and the outer handshake after 2 s (plus up to 0.5 s of jitter) is
 hedged: the next one starts in parallel, at most two at a time. A relay that has completed the
 handshake but is slow to acknowledge the stream is **not** hedged (it is overloaded; hedging
-would double its load): the client waits up to 10 s for the `OpenAck`, then moves on. The
-per-step timeouts are 3 s (connect), 5 s (handshake) and 10 s (`OpenAck`). The whole
-establishment ends at `connect_deadline_secs` (default 20 s): `zt-client` then exits with
-status **75** (`EX_TEMPFAIL`) and says on stderr
+would double its load): the client waits for the `OpenAck`, then moves on. That wait is the
+time left before the deadline divided by the relays left (this one included), at least 2 s and
+at most 4 s: with the defaults, up to three relays that handshake and then stall still leave a
+healthy fourth one enough time. The other per-step timeouts are 3 s (connect) and 5 s
+(handshake). The whole establishment ends at `connect_deadline_secs` (default 8 s), so that
+with one failed relay of any kind the session is up within about 6 s: inside the 10 s
+`ConnectTimeout` that Ansible gives `ssh` by default (see Ansible below).
+
+When the client gives up for a reason that says nothing about the right of access (deadline,
+relays unreachable, silent or dropping the connection, node offline or draining, rate limit),
+`zt-client` exits with status **75** (`EX_TEMPFAIL`: try again later); a definitive answer
+(policy refusal, failed handshake with a pinned key, protocol or configuration error) exits
+with 1. Either way the reason is on stderr, for example
 
 ```text
-zt-client: no relay completed the connection within 20 s (connect_deadline_secs in client.toml)
+zt-client: no relay completed the connection within 8 s (connect_deadline_secs in client.toml)
+zt-client: timed out: handshake
 ```
 
-and `ssh` exits with 255. A black-holed first relay costs about 2 s instead of the 35 s of the
-sequential failover before R-4. The deadline covers establishment only, not the session.
+and `ssh` exits with 255. A relay that drops an unknown client key looks the same as a relay
+under admission pressure, so that case exits with 75 too; the stderr line names both. A
+black-holed first relay costs about 2 s instead of the 35 s of the sequential failover before
+R-4. The deadline covers establishment only, not the session.
+
+A hedge that loses the race is closed politely, so that it costs the relay nothing it keeps:
+one cancelled during its outer handshake completes it and confirms its key with a single
+`Ping` (the relay gives back the admission token it took at accept, §4.1), one that already
+sent `Open` sends `Close Normal` for it (the agent frees the stream at once). The relays still
+see these connections: see §6.
 
 As with OpenSSH's `StrictModes`, every trust file (this one, the relay policy, the agent's
 authorized clients) must be a regular file, owned by the user running the binary or by
@@ -292,6 +310,11 @@ web-02.tcn
 
 ```ini
 # ansible.cfg
+[defaults]
+# Passed to ssh as -o ConnectTimeout: keep it above connect_deadline_secs + 2 s (the
+# default 10 s fits the default 8 s deadline).
+timeout = 10
+
 [ssh_connection]
 pipelining = True
 # ssh exits with 255 when zt-client fails (deadline, relay restart): Ansible retries the
@@ -309,14 +332,19 @@ Recommended settings with several relays (resilience R-4, D-8):
 
 | Setting | Value | Why |
 | :- | :- | :- |
-| `retries` (`[ssh_connection]`) | 3 | a host that hits the 20 s deadline (status 255) is retried instead of failing the play as `UNREACHABLE` |
+| `retries` (`[ssh_connection]`) | 3 | a host whose `zt-client` gives up (status 255) is retried instead of failing the play as `UNREACHABLE` |
 | `ServerAliveInterval` / `ServerAliveCountMax` | 15 / 3 | ssh notices a dead path within about 45 s, in line with the relay's idle timeouts (§4.1) |
 | `ControlPersist` | 300s | one tunnel per host for the whole play; safe, because revocation and certificate expiry still close multiplexed sessions (PROTOCOL §12, §15.7) |
-| `ConnectTimeout` (ssh) | unset, or above 20 s | a shorter one cuts `zt-client` off before its deadline |
+| `timeout` (`[defaults]`) | 10 (default), at least `connect_deadline_secs` + 2 | Ansible always passes it to `ssh` as `-o ConnectTimeout`, and OpenSSH applies it to the banner exchange through a `ProxyCommand`: a shorter one cuts `zt-client` off before its deadline. Raise it (or `ANSIBLE_TIMEOUT`) whenever you raise `connect_deadline_secs`; a `-o ConnectTimeout` in `ssh_args` works too, because `ssh_args` come before Ansible's own option and OpenSSH keeps the first one |
+| `ConnectTimeout` (plain ssh) | unset, or at least `connect_deadline_secs` + 2 | the same, for `ssh` outside Ansible |
 
-With hedging each `zt-client` performs at most two outer handshakes, so a burst of `forks`
-costs the relays at most twice the handshakes of the hosts, which their admission budget
-(§4.1) absorbs.
+With hedging each `zt-client` has at most two outer handshakes **at once**; in total it may try
+every relay of its list (at most 8), and with `retries = 3` up to four times that per host.
+Hedges that lose do not spend the controller's admission budget at the relays: each confirms
+its key before it closes (above), and the relay refunds the source token for that, up to the
+identity's refund rate (§4.1). The budget therefore still counts only handshakes that never
+complete: a relay that cannot finish its own handshake keeps the token, as it did before
+hedging. Size `source_burst` for the `forks` of a controller behind one address, as before.
 
 ## 6. Logs and audit
 
@@ -414,6 +442,15 @@ How to read them:
 
 - A rising `unconfirmed` count with few `distinct_sources` is the signature of someone replaying
   recorded handshakes. A rising `unknown_peer` with many `distinct_keys` is a scanner.
+- Client hedging (§5) shows on the relays too, and is not an attack. A hedge that loses the
+  race confirms its key and leaves, so it is not `unconfirmed`; but one cut off before its
+  connect or handshake completed (the client gave up, or the relay was too slow to finish its
+  own handshake) counts as `aborted` or `timeout`, a few per slow relay and controller. A
+  hedge that had already sent `Open` may get as far as a `session_established` immediately
+  followed by `connection_drained` on the losing relay, with no `e2e_session_started` at the
+  agent: a session that never carried a byte, not a login. The client logs a WARN `relays
+  disagree on the policy` when a losing relay refused the node that the winning one accepted:
+  the policies of the relays differ (a reload that has not reached every relay, review 0005).
 - A revoked key (`reason = key_revoked`) or an expired certificate (`cert_check = expired`)
   seen again and again, and especially in `authentication_failed_repeated`, is a **replay
   signal**: someone recorded the victim's message 1 and sends it back. It is not evidence that
@@ -917,8 +954,13 @@ Rollout, in this order (pq.md §6.3):
 
    While pins are mixed, failover can land on a classical hop: an active attacker who resets
    the connections to the hybrid-pinned relays makes the client complete on a classical one
-   (no single pin is lowered, but that session's outer hop is classical). `zt-client` warns
-   `failover to a relay pinned to another outer suite` on stderr when it happens. Once every
+   (no single pin is lowered, but that session's outer hop is classical). With hedging
+   (§5) the attacker does not even need a reset: delaying the hybrid relay's handshake past
+   the 2 s stagger is enough, and a hybrid handshake that is simply slower on that path has
+   the same effect (review 0011, A11-7). Keep this window short, list the hybrid-pinned
+   relays first, and watch `clients_classical` fall in `outer_suites_confirmed`.
+   `zt-client` warns `failover to a relay pinned to another outer suite` on stderr when it
+   happens (Ansible hides stderr unless the connection fails: run `-vvv` on a sample). Once every
    relay a client uses accepts the hybrid suite, add
    `require_outer_suite = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"` to its
    `client.toml`: a relay pinned to any other suite is then a configuration error, so failover

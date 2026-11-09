@@ -1121,7 +1121,7 @@ fn valid_relay(text: &str) -> bool {
 /// # public_key = "<64 hex>"
 /// # suite = "<Noise protocol name>"   (per relay; the classical suite without it)
 /// # require_outer_suite = "<Noise protocol name>"   (top level: every relay pinned to it)
-/// # connect_deadline_secs = 20   (top level: overall deadline of establishment, 1-300 s)
+/// # connect_deadline_secs = 8   (top level: overall deadline of establishment, 1-300 s)
 /// key = "client.key"
 ///
 /// [[nodes]]

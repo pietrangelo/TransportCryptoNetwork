@@ -77,7 +77,7 @@ offline. Verification uses an independently installed tool, not the downloaded b
 | Admission (G1, high) | "Success" = **key confirmation** (first authentic transport frame from the initiator), not "msg2 sent", so a replayed msg1 earns nothing (AP-1). Add a first-frame deadline for clients. Per-identity limit is a **concurrency** cap charged after confirmation, so one Ansible controller with many forks is not throttled (AP-2). Unauthenticated refill stays 1 per 3 s until measured (AP-16). `msg1_deadline` ≥ 5 s or derived from the suite (AP-20). Separate pre-auth pool; pre-auth buffer cap = maximum legitimate msg1. |
 | Logging | Aggregate pre-auth failures **and** unknown identities; per-event lines only for known identities (AP-3). |
 | Reconnect | Full jitter with a spread window, 30 s cap; dead peer = no inbound frame for 3 × 10 s; `TCP_USER_TIMEOUT`. |
-| Failover (A5-4) | Overall deadline of about 20 s; hedge only while connect and outer handshake are incomplete, never after `OpenAck` delays (AP-10). |
+| Failover (A5-4) | Overall deadline of about 20 s (8 s since review 0011, A11-2); hedge only while connect and outer handshake are incomplete, never after `OpenAck` delays (AP-10). |
 | Lifecycle | SIGTERM drain with serial-restart enforcement; supervised critical tasks; watchdog driven by a **progress counter** on a non-starvable tick (AP-4); `check` subcommand in `ExecReload`; `RestartPreventExitStatus` for config errors and `LimitCORE=0` so crashes never dump keys (AP-17, AP-18). |
 | Metrics | Textfile exporter for relay **and** agent: no new listening socket anywhere (AP-21). |
 | Efficiency | Global byte budget **before** window auto-tuning (AP-22); copy reduction once the simulator can catch regressions; nightly soak. |

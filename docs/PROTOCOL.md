@@ -474,8 +474,10 @@ connects OpenSSH's stdin/stdout to the end-to-end channel.
 - **Closing.** EOF on stdin closes the stream (`Close Normal`); a close from the node side
   closes stdout and terminates the process even if stdin remains open. There is no half-close:
   SSH does not need it, because its channel EOF travels inside the SSH protocol.
-- **Exit code.** 0 only for `Close Normal` or local EOF; 1 for any other outcome, including an
-  error `Close` from the agent (for example sshd unreachable); 2 for invalid arguments.
+- **Exit code.** 0 only for `Close Normal` or local EOF; 75 (`EX_TEMPFAIL`) when the client gave
+  up for a reason that says nothing about the right of access (§13, step 6); 1 for any other
+  outcome, including an error `Close` from the agent (for example sshd unreachable); 2 for
+  invalid arguments.
 - **No write timeout on stdout.** A suspended `ssh` stops reading: the window bounds the memory
   and the session resumes when ssh starts reading again.
 
@@ -541,11 +543,20 @@ changes on the wire.
 
   | Parameter | Value | Counted from |
   | :- | :- | :- |
-  | overall deadline (`connect_deadline_secs` in `client.toml`, 1-300) | 20 s | the start of `zt-client connect` |
+  | overall deadline (`connect_deadline_secs` in `client.toml`, 1-300) | 8 s | the start of `zt-client connect` |
   | TCP connect of one attempt | 3 s | the start of the attempt |
   | outer handshake and `Open` | 5 s | the connect |
-  | `OpenAck` | 10 s | the end of the outer handshake |
+  | `OpenAck` | time left ÷ (relays not started + 1), between 2 s and 4 s | the end of the outer handshake |
   | stagger before a hedge | 2 s plus a random 0-0.5 s | the start of the attempt in flight |
+
+  The defaults are chosen so that one failed relay of any kind followed by a healthy one gives
+  a session within about 6 s, inside the 10 s `ConnectTimeout` that Ansible passes to `ssh` by
+  default, end-to-end handshake and SSH banner included (review 0011, A11-2). Sharing the
+  `OpenAck` wait out over the relays left keeps relays that handshake and then sit on `Open`
+  from using up the deadline before a healthy later relay is tried: with the defaults, three
+  such relays and a healthy fourth fit (A11-3). The 2 s floor keeps a long relay list from
+  turning a merely slow `OpenAck` into a failure; with more than four relays, those after the
+  fourth are reached only if earlier ones fail faster.
 
   1. Relay 1 starts alone. A failure starts the next relay at once.
   2. **Hedge.** If the attempt in flight has **not completed TCP connect and the outer
@@ -555,29 +566,48 @@ changes on the wire.
      so a relay that has completed the handshake but has not relayed the `OpenAck` is
      overloaded, not dead: hedging then would double the load exactly when the relays can
      least take it. The client waits up to the `OpenAck` timeout and only then moves on.
-  4. **The first `OpenAck` wins.** Every other attempt is cancelled: before `Open` its
-     connection is dropped; after `Open` it sends `Close Normal` for the stream (at most 1 s),
-     then EOF, so the relay and the agent release the stream slot at once. Message 1 of the
-     end-to-end channel is sent on **one** relay only, after its `OpenAck`; nothing is retried
-     after it.
+  4. **The first `OpenAck` wins.** Every other attempt is cancelled, in a way the relay can
+     account for (review 0011, A11-1):
+     - before TCP connect, it is dropped (the relay has charged nothing);
+     - during the outer handshake, it **completes the handshake** (within the handshake step
+       timeout from its connect) and sends one authentic frame, a `Ping`, which opens nothing,
+       then EOF. That is the key confirmation of §10.1: the relay gives back the per-source
+       token it took at accept, so hedging does not spend a client's admission budget. Only
+       the holder of the client key can produce that frame, so a replayed message 1 still
+       gets no refund (review 0007, AP-1); the identity's refund rate still applies;
+     - after `Open` (which, once started, is always completed), it sends `Close Normal` for
+       the stream (at most 1 s), so the relay and the agent release the stream slot at once,
+       and listens 1 s more for a policy `Reject` that crossed the `Close` (step 5), then EOF.
+
+     The losers end in the background of the session. Message 1 of the end-to-end channel is
+     sent on **one** relay only, after its `OpenAck`; nothing is retried after it.
   5. A **policy answer** from any relay before an `OpenAck` aborts every attempt. Accepted
-     change: if relay 2 acknowledges first, a later `NotAuthorized` from a slower relay 1 is
-     ignored (differing policies are a configuration error).
+     change: if relay 2 acknowledges first, a later `NotAuthorized` from a slower relay 1 does
+     not end the session (differing policies are a configuration error); when the client sees
+     it, it logs a WARN `relays disagree on the policy` naming both relays (A11-6).
   6. **Deadline.** When it passes before any `OpenAck`, every attempt is cancelled and
      `zt-client` exits with status **75** (`EX_TEMPFAIL`) and `zt-client: no relay completed
      the connection within N s (connect_deadline_secs in client.toml)` on stderr; `ssh` then
      exits with 255. The deadline is for establishment only: the end-to-end handshake and the
      session after the `OpenAck` keep their own timeouts. When every relay has failed before
-     the deadline, the client stops at once with the last relay's error.
+     the deadline, the client stops at once with the last relay's error; it exits with 75 too
+     when that error says nothing about the right of access (I/O, timeout, connection closed,
+     `NodeOffline`, `RateLimited`, `Close Drained`), with 1 otherwise (A11-4). The deadline is
+     therefore not the only temporary failure: black-holed or silent relays end at their step
+     timeouts, before it.
 
   The attempts are futures of the client's own task, not spawned tasks: whatever ends the
   client (a result, an error, or dropping it) closes every connection. With
   `require_outer_suite` (§7.5.2) every relay is pinned to the same suite, so neither failover
   nor a hedge can land on a weaker hop; a `ClientConfig` built in code that lists a relay
-  pinned to another suite is refused before any connection. In the worst case a hedge doubles
-  the outer handshakes of one client (two in flight), which the relay's admission control
-  (§10.1) absorbs. Put the closest and most reliable relays first. An OpenSSH
-  `ConnectTimeout` shorter than the deadline interrupts the client before it has finished.
+  pinned to another suite is refused before any connection; without it (the default, needed
+  while pins are mixed during the rollout of OPERATIONS §13) a hedge, like failover, may hand
+  the session to a relay pinned to another suite when the preferred one is slow or delayed by
+  an on-path attacker (A11-7; the client warns). A client has at most two outer handshakes in
+  flight, and at most one per relay of its list in total; the losers confirm their key (step
+  4), so the per-source budget of §10.1 still counts only handshakes that never complete. Put
+  the closest and most reliable relays first. An OpenSSH `ConnectTimeout` shorter than the
+  deadline plus about 2 s interrupts the client before it has finished.
 
 ## 14. Key rotation
 
