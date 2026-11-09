@@ -13,6 +13,7 @@ use zt_domain::AccessPolicy;
 use zt_net::config::{ConfigError, Digests};
 use zt_net::lifecycle::{self, Generation, Supervisor, Terminate};
 use zt_net::logging::{self, LogFormat};
+use zt_net::metrics::{self, RelayMetrics};
 use zt_net::relay::{RelayConfig, RelayServer};
 use zt_net::reload::{self, Hangups, Outcome, Publisher};
 use zt_net::{Revocable, Updater, config, systemd};
@@ -93,6 +94,15 @@ enum Command {
         /// (systemd's `RuntimeDirectory=`); without either, `reload` cannot be used.
         #[arg(long)]
         runtime_dir: Option<PathBuf>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
+    },
+    /// Prints the metrics file the running relay writes (R-5): its age and every value.
+    /// Exit 0 if fresh, 1 if missing or invalid, 2 if stale (older than three intervals).
+    Status {
+        /// The metrics file (`run --metrics-file`).
+        #[arg(long, default_value = "/run/zt-relay/metrics.prom")]
+        metrics_file: PathBuf,
     },
     /// Validates every file `run` loads at startup, with the same options and the same code,
     /// and prints their SHA-256; exits 78 on an invalid file, 1 on a missing or unreadable one.
@@ -118,11 +128,26 @@ enum Command {
     },
 }
 
+/// Where and how often the metrics textfile is written (R-5, OPERATIONS §16).
+#[derive(Debug, clap::Args)]
+struct MetricsArgs {
+    /// The metrics file, in the Prometheus text format for `node_exporter`'s textfile collector
+    /// (rewritten atomically, mode 0644; its directory must be writable by the service).
+    /// Default: `metrics.prom` in the runtime directory. Nothing ever listens for metrics.
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
+    /// How often the metrics file is rewritten, in seconds (1 to 3600).
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    metrics_interval: u64,
+}
+
 /// How the process fails: a configuration error is `EX_CONFIG` (78), which the unit does not
 /// restart on (`RestartPreventExitStatus=78`); anything else is 1 and is restarted.
 enum Failure {
     Config(String),
     Runtime(String),
+    /// An exit status already reported on stderr (`status`).
+    Exit(u8),
 }
 
 /// `EX_CONFIG` of `sysexits.h`.
@@ -165,6 +190,7 @@ fn main() -> ExitCode {
             tracing::error!("{message}");
             ExitCode::FAILURE
         }
+        Err(Failure::Exit(code)) => ExitCode::from(code),
     }
 }
 
@@ -226,6 +252,7 @@ struct Reloader {
     key_updater: Updater<Keyring>,
     policy: Revocable<AccessPolicy>,
     policy_updater: Updater<AccessPolicy>,
+    metrics: std::sync::Arc<RelayMetrics>,
 }
 
 impl Reloader {
@@ -276,6 +303,9 @@ impl Reloader {
                     files = %digests,
                     "configuration reloaded"
                 );
+                self.metrics
+                    .process()
+                    .reload_applied(generation.unwrap_or_default());
                 Ok((generation.unwrap_or_default(), digests.to_string()))
             }
             Err(err) => {
@@ -285,6 +315,7 @@ impl Reloader {
                     error = %err,
                     "reload failed: keeping the previous configuration"
                 );
+                self.metrics.process().reload_rejected();
                 Err(err.to_string())
             }
         };
@@ -337,7 +368,23 @@ fn run(command: Command) -> Result<(), Failure> {
             args,
             drain_timeout,
             runtime_dir,
-        } => serve(args, Duration::from_secs(drain_timeout), runtime_dir),
+            metrics,
+        } => serve(
+            args,
+            Duration::from_secs(drain_timeout),
+            runtime_dir,
+            metrics,
+        ),
+        Command::Status { metrics_file } => {
+            match metrics::status_command(
+                &metrics_file,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            ) {
+                0 => Ok(()),
+                code => Err(Failure::Exit(code)),
+            }
+        }
         Command::Reload {
             pid,
             runtime_dir,
@@ -375,6 +422,7 @@ fn serve(
     args: RelayArgs,
     drain_timeout: Duration,
     runtime_dir: Option<PathBuf>,
+    metrics_args: MetricsArgs,
 ) -> Result<(), Failure> {
     // A watchdog too short for the hub's tick would kill a healthy relay (finding A10-3).
     lifecycle::check_watchdog().map_err(Failure::Config)?;
@@ -393,7 +441,9 @@ fn serve(
             policy,
             digests,
         } = load_startup(&args)?;
+        let metrics = RelayMetrics::new();
         let relay_config = RelayConfig {
+            metrics: std::sync::Arc::clone(&metrics),
             admission: settings.admission,
             suites: settings.suites,
             agent_idle: Some(settings.agent_idle),
@@ -402,8 +452,11 @@ fn serve(
         };
         let generation = Generation::new();
         let first = lifecycle::configuration_loaded(&generation, &digests);
+        metrics.process().set_generation(first);
+        let runtime_dir = reload::runtime_dir(runtime_dir);
+        let metrics_file = metrics::default_path(metrics_args.metrics_file, runtime_dir.as_deref());
         let publisher = Publisher::new(
-            reload::runtime_dir(runtime_dir),
+            runtime_dir,
             Outcome::applied(first, digests.to_string()),
         );
         publisher.publish();
@@ -433,6 +486,7 @@ fn serve(
             key_updater,
             policy: policy.clone(),
             policy_updater,
+            metrics: std::sync::Arc::clone(&metrics),
         };
         // Policy, denylist and keys on every SIGHUP, in one step with one outcome.
         supervisor.spawn(
@@ -462,11 +516,22 @@ fn serve(
         // The watchdog follows the hub's progress, not a timer of its own (AP-4).
         supervisor.spawn("watchdog", lifecycle::watchdog("relay", server.progress()));
         supervisor.spawn("clock_watch", lifecycle::watch_clock("relay"));
+        let interval = Duration::from_secs(metrics_args.metrics_interval);
+        if let Some(path) = metrics_file.clone() {
+            let m = std::sync::Arc::clone(&metrics);
+            supervisor.spawn("metrics", metrics::export(path, interval, move || m.render()));
+        }
         lifecycle::check_clock("relay");
         systemd::notify_ready();
-        tokio::select! {
+        let outcome = tokio::select! {
             outcome = server.run_until(terminate.wait(), drain_timeout) => outcome.map_err(runtime_error),
             failure = supervisor.failed() => Err(Failure::Runtime(failure)),
+        };
+        // The drain's end is in the last file the relay writes.
+        if let Some(path) = metrics_file {
+            let text = metrics::stamp(&metrics.render(), interval, std::time::SystemTime::now());
+            let _ = metrics::write_textfile(&path, &text);
         }
+        outcome
     })
 }

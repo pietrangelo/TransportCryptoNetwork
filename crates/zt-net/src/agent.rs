@@ -26,6 +26,7 @@ use zt_domain::{
     HandshakeSuite, HybridFingerprint, NodeId, RejectReason, StreamId,
 };
 
+use crate::metrics::{AgentMetrics, Held, Traffic, auth_reason};
 use crate::net::{Dialer, TcpDialer};
 use crate::relay::{CertFields, audit, repeated_line};
 use crate::stream::{STREAM_QUEUE, StreamIo, pump};
@@ -75,6 +76,32 @@ struct Shared {
     /// Streams acknowledged to the relay and not yet holding a session permit (in mid
     /// handshake): the drain counts them too (finding A10-5).
     handshaking: Arc<AtomicUsize>,
+    /// What the agent counts (R-5).
+    metrics: Arc<AgentMetrics>,
+}
+
+/// What the agent records and how it bounds its buffers (resilience R-5, R-6).
+#[derive(Debug, Clone)]
+pub struct Observed {
+    /// The agent's metrics, written by [`crate::metrics::export`] (the binary does it).
+    pub metrics: Arc<AgentMetrics>,
+}
+
+impl Default for Observed {
+    fn default() -> Self {
+        Self {
+            metrics: AgentMetrics::new(crate::MAX_RELAYS),
+        }
+    }
+}
+
+/// A live end-to-end session, counted in `tcn_agent_sessions` until dropped.
+struct SessionGauge(Arc<AgentMetrics>);
+
+impl AsRef<crate::metrics::Gauge> for SessionGauge {
+    fn as_ref(&self) -> &crate::metrics::Gauge {
+        &self.0.sessions
+    }
 }
 
 /// One stream in mid-handshake, counted in [`Shared::handshaking`] until it is dropped.
@@ -198,6 +225,27 @@ pub async fn run_until<D: Dialer>(
     shutdown: impl Future<Output = ()>,
     drain_timeout: Duration,
 ) {
+    run_observed(
+        keys,
+        config,
+        dialer,
+        shutdown,
+        drain_timeout,
+        Observed::default(),
+    )
+    .await;
+}
+
+/// Like [`run_until`], counting into `observed.metrics` (R-5).
+#[allow(clippy::too_many_lines)] // the startup checks, then the drain, in order
+pub async fn run_observed<D: Dialer>(
+    keys: Arc<Keyring>,
+    config: AgentConfig,
+    dialer: D,
+    shutdown: impl Future<Output = ()>,
+    drain_timeout: Duration,
+    observed: Observed,
+) {
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         tracing::error!(
             relays = config.relays.len(),
@@ -244,15 +292,17 @@ pub async fn run_until<D: Dialer>(
         lines: Arc::new(Mutex::new(IdentityLines::default())),
         draining: Arc::new(AtomicBool::new(false)),
         handshaking: Arc::new(AtomicUsize::new(0)),
+        metrics: Arc::clone(&observed.metrics),
     };
     let mut sessions = tokio::task::JoinSet::new();
     sessions.spawn(identity_summaries(
         Arc::clone(&shared.lines),
         config.identity_log_interval,
     ));
-    for relay in config.relays.clone() {
+    for (index, relay) in config.relays.clone().into_iter().enumerate() {
         sessions.spawn(run_one(
             Arc::clone(&keys),
+            index,
             relay,
             config.clone(),
             shared.clone(),
@@ -266,6 +316,7 @@ pub async fn run_until<D: Dialer>(
         () = async { while sessions.join_next().await.is_some() {} } => return,
     }
     shared.draining.store(true, Ordering::SeqCst);
+    shared.metrics.process().set_draining(true);
     crate::systemd::notify("STOPPING=1");
     crate::systemd::status("draining");
     // Open sessions, and streams the relay was told `OpenAck` for that are still in their
@@ -313,6 +364,7 @@ fn liveness_config(t: &Timeouts) -> LivenessConfig {
 /// failure, the spread window after a session that lived), then the next session.
 async fn run_one<D: Dialer>(
     identity: Arc<Keyring>,
+    index: usize,
     relay: crate::RelayEndpoint,
     config: AgentConfig,
     shared: Shared,
@@ -328,8 +380,16 @@ async fn run_one<D: Dialer>(
             &shared,
             &dialer,
             &mut registered,
+            index,
         )
         .await;
+        if let Some(link) = shared.metrics.link(index) {
+            link.up.set(0);
+            if result.is_err() {
+                link.failures.inc();
+                link.consecutive.inc();
+            }
+        }
         match &result {
             Ok(()) => tracing::info!(relay = %relay.address, "relay closed the connection"),
             Err(err) => tracing::warn!(relay = %relay.address, error = %err, "relay session ended"),
@@ -357,6 +417,7 @@ async fn run_session<D: Dialer>(
     shared: &Shared,
     dialer: &D,
     registered: &mut Option<Instant>,
+    index: usize,
 ) -> Result<(), NetError> {
     let t = &config.timeouts;
     let tcp = timeout(t.handshake, dialer.connect(&relay.address))
@@ -391,6 +452,11 @@ async fn run_session<D: Dialer>(
         "registered with relay"
     );
     *registered = Some(Instant::now());
+    if let Some(link) = shared.metrics.link(index) {
+        link.up.set(1);
+        link.registrations.inc();
+        link.consecutive.set(0);
+    }
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(1024);
     let (done_tx, mut done_rx) = mpsc::channel::<StreamId>(config.max_streams.saturating_add(1));
@@ -646,6 +712,7 @@ async fn read_msg1(
     identity: &Keyring,
     timeouts: &Timeouts,
     client_suites: AcceptedSuites,
+    metrics: &AgentMetrics,
 ) -> Option<Responded> {
     let msg1 = match io.recv_message(timeouts).await {
         Ok(msg1) => msg1,
@@ -676,6 +743,7 @@ async fn read_msg1(
         } else {
             AuthFailureReason::HandshakeFailed
         };
+        metrics.auth_failed(auth_reason(reason));
         audit(&DomainEvent::AuthenticationFailed {
             peer: None,
             reason,
@@ -707,7 +775,15 @@ impl<D: Dialer> StreamTask<D> {
             dialer,
             handshaking,
         } = self;
-        let Some(responded) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
+        let Some(responded) = read_msg1(
+            &mut io,
+            &identity,
+            &timeouts,
+            client_suites,
+            &shared.metrics,
+        )
+        .await
+        else {
             return;
         };
         let (client, hybrid, suite, payload) = match &responded {
@@ -736,6 +812,7 @@ impl<D: Dialer> StreamTask<D> {
         ) {
             Ok(credential) => credential,
             Err((reason, certificate)) => {
+                shared.metrics.auth_failed(auth_reason(reason));
                 shared.audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(client),
                     reason,
@@ -752,6 +829,7 @@ impl<D: Dialer> StreamTask<D> {
         let pending = match responded {
             Responded::Pending(pending) => pending,
             Responded::Unaccepted(_) => {
+                shared.metrics.auth_failed("suite_rejected");
                 shared.audit(&DomainEvent::HandshakeSuiteRejected {
                     peer: client,
                     suite,
@@ -766,6 +844,7 @@ impl<D: Dialer> StreamTask<D> {
             if getrandom::u64().is_err() {
                 tracing::error!("the system random number generator failed");
             }
+            shared.metrics.auth_failed("handshake_failed");
             shared.audit(&DomainEvent::AuthenticationFailed {
                 peer: Some(client),
                 reason: AuthFailureReason::HandshakeFailed,
@@ -786,6 +865,7 @@ impl<D: Dialer> StreamTask<D> {
                     .decrypt(&confirm)
                     .is_ok_and(|p| p == suite.confirmation()) => {}
             Ok(_) => {
+                shared.metrics.auth_failed("unconfirmed");
                 shared.audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(client),
                     reason: AuthFailureReason::HandshakeFailed,
@@ -800,6 +880,7 @@ impl<D: Dialer> StreamTask<D> {
                 return;
             }
         }
+        shared.metrics.handshake_confirmed(suite);
         // Key confirmed: the client proved its static ML-KEM key too. A hybrid identity that
         // only a v1 entry admitted is reported (pq.md §4.6).
         if let Some(peer_v2) = hybrid
@@ -828,8 +909,10 @@ impl<D: Dialer> StreamTask<D> {
         };
         // From here the permit counts the session for the drain.
         drop(handshaking);
+        let _counted = Held::new(SessionGauge(Arc::clone(&shared.metrics)));
         let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, dialer.connect(&ssh_target)).await else {
             tracing::warn!(target = %ssh_target, "cannot reach local ssh daemon");
+            shared.metrics.ssh_failures.inc();
             io.close(CloseReason::PeerGone).await;
             return;
         };
@@ -840,7 +923,16 @@ impl<D: Dialer> StreamTask<D> {
             node,
             suite,
         };
-        bridge(io, transport, ssh, session, authorized, &timeouts).await;
+        bridge(
+            io,
+            transport,
+            ssh,
+            session,
+            authorized,
+            &timeouts,
+            &shared.metrics,
+        )
+        .await;
     }
 }
 
@@ -905,6 +997,7 @@ async fn bridge<S>(
     session: Session,
     mut authorized: crate::Revocable<AuthorizedClients>,
     timeouts: &Timeouts,
+    metrics: &AgentMetrics,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -938,7 +1031,10 @@ async fn bridge<S>(
     // lost.
     let cut = until_cut(&session, &mut authorized);
     let outcome = tokio::select! {
-        result = pump(io, transport, ssh, Some(timeouts.write)) => match result {
+        result = pump(io, transport, ssh, Some(timeouts.write), Traffic {
+            from_local: &metrics.from_ssh,
+            to_local: &metrics.to_ssh,
+        }) => match result {
             Ok(()) => "closed",
             Err(err) => {
                 tracing::debug!(error = %err, "stream ended with error");

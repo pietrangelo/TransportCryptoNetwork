@@ -7,7 +7,9 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::panic,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::format_collect,
+    clippy::case_sensitive_file_extension_comparisons
 )]
 
 mod common;
@@ -19,10 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-use common::{agent_clients, nodes, relay_config, relay_policy};
+use common::{agent_clients, relay_config, relay_policy};
 use zt_crypto::Identity;
+use zt_domain::Fingerprint;
 use zt_domain::trust::CertTrust;
-use zt_domain::{ClientGrant, Fingerprint};
 use zt_net::metrics::{
     self, AgentMetrics, RelayMetrics, Snapshot, StatusError, escape_label_value, write_textfile,
 };
@@ -123,11 +125,7 @@ fn rendered_output_is_always_well_formed() {
 }
 
 fn lab_policy(agent: &Fingerprint, client: &Identity) -> zt_domain::AccessPolicy {
-    relay_policy(
-        agent,
-        &[ClientGrant::new(client.fingerprint(), nodes(&["web-01"]))],
-        CertTrust::default(),
-    )
+    relay_policy(agent, &[client.fingerprint()], CertTrust::default())
 }
 
 /// R5-O2/R5-O3: no fingerprint, node name or address in the output, and the number of lines
@@ -210,7 +208,7 @@ fn readers_never_see_a_partial_file() {
 }
 
 /// Permissions: whatever the umask and whatever was there before, the file is 0644 (readable by
-/// node_exporter, writable only by the owner), never group- or world-writable.
+/// `node_exporter`, writable only by the owner), never group- or world-writable.
 #[test]
 fn the_file_mode_is_fixed_and_never_writable_by_others() {
     let dir = tmp("mode");
@@ -257,7 +255,7 @@ fn planted_temporary_names_are_not_followed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The temporary file never ends in `.prom`: node_exporter must not read it half-written.
+/// The temporary file never ends in `.prom`: `node_exporter` must not read it half-written.
 #[test]
 fn the_temporary_file_is_invisible_to_node_exporter() {
     let dir = tmp("tmpname");

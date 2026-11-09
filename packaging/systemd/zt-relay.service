@@ -26,6 +26,9 @@ RuntimeDirectoryMode=0700
 # Key rotation: in a drop-in --key /etc/tcn/relay.next.key
 # --previous-key /etc/tcn/relay.key and a restart (OPERATIONS §8). Every systemctl reload,
 # even one just for the policy, also rereads the keys.
+# Metrics (OPERATIONS §17): written every 15 s to /run/zt-relay/metrics.prom, read by
+# `zt-relay status`. For node_exporter, add --metrics-file in a drop-in with ReadWritePaths=
+# for its textfile directory. Nothing listens for metrics.
 ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml
 # Reloads the policy (and the keys) and live-revokes connections that are no longer
 # allowed. `reload` sends SIGHUP to the running relay and waits for its own verdict: the

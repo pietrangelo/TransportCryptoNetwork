@@ -1,5 +1,5 @@
 //! R-5 observability, specification (resilience.md §5.5, review 0007 AP-21, D-10 as
-//! corrected): counters and gauges written as a node_exporter **textfile** by the relay and the
+//! corrected): counters and gauges written as a `node_exporter` **textfile** by the relay and the
 //! agent (and optionally the client), atomically, at a configurable interval; no listening
 //! socket anywhere; a `status` reader; fixed label sets only.
 #![allow(
@@ -44,7 +44,7 @@ fn classical() -> &'static str {
 // ---------------------------------------------------------------------------------------------
 
 /// R5-M1: every family has `# HELP` and `# TYPE`, counters end in `_total`, and the output is
-/// in the Prometheus text format 0.0.4 that node_exporter's textfile collector reads.
+/// in the Prometheus text format 0.0.4 that `node_exporter`'s textfile collector reads.
 #[test]
 fn relay_metrics_render_in_the_text_exposition_format() {
     let m = RelayMetrics::new();
@@ -187,7 +187,7 @@ fn process_metrics_follow_reloads_drain_and_progress() {
 // ---------------------------------------------------------------------------------------------
 
 /// R5-M2: the file is replaced atomically (temporary file in the same directory, then
-/// `rename`), readable by node_exporter (0644) and nothing else is left behind.
+/// `rename`), readable by `node_exporter` (0644) and nothing else is left behind.
 #[test]
 fn textfile_is_written_atomically_with_mode_0644() {
     use std::os::unix::fs::PermissionsExt;
@@ -274,11 +274,7 @@ fn status_of_a_missing_file_is_an_error() {
 // ---------------------------------------------------------------------------------------------
 
 fn lab_policy(agent: &zt_domain::Fingerprint, client: &Identity) -> zt_domain::AccessPolicy {
-    relay_policy(
-        agent,
-        &[ClientGrant::new(client.fingerprint(), nodes(&["web-01"]))],
-        CertTrust::default(),
-    )
+    relay_policy(agent, &[client.fingerprint()], CertTrust::default())
 }
 
 /// R5-M4: a session moves the relay's handshake, connection, stream and byte counters, and
@@ -372,11 +368,16 @@ async fn refusals_are_counted_by_reason() {
     let agent = Arc::new(Identity::generate().unwrap());
     let mut config = relay_config();
     config.metrics = Arc::clone(&relay_metrics);
-    let policy = relay_policy(
-        &agent.fingerprint(),
-        &[ClientGrant::new(client.fingerprint(), nodes(&["db-01"]))],
-        CertTrust::default(),
-    );
+    let mut policy = relay_policy(&agent.fingerprint(), &[], CertTrust::default());
+    policy
+        .add_client(
+            client.fingerprint(),
+            ClientGrant {
+                name: common::node("c1"),
+                allowed: nodes(&["db-01"]),
+            },
+        )
+        .unwrap();
     let lab = observed::start_observed(
         Arc::clone(&agent),
         vec![(policy, config)],

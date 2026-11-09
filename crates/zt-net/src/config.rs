@@ -533,6 +533,10 @@ struct ClientFile {
     /// Client certificate file (PROTOCOL §15), relative to this file.
     #[serde(default)]
     certificate: Option<String>,
+    /// Where `zt-client connect` writes the metrics of its last session (R-5), relative to
+    /// this file. Optional.
+    #[serde(default)]
+    metrics_file: Option<String>,
     #[serde(default)]
     nodes: Vec<ClientNodeEntry>,
 }
@@ -1248,6 +1252,8 @@ pub struct ClientSettings {
     pub require_outer_suite: Option<zt_domain::HandshakeSuite>,
     /// `connect_deadline_secs`: the overall deadline of establishment (resilience R-4).
     pub connect_deadline: std::time::Duration,
+    /// `metrics_file`: where the metrics of the last session are written (R-5), if anywhere.
+    pub metrics_file: Option<std::path::PathBuf>,
 }
 
 impl ClientSettings {
@@ -1464,6 +1470,7 @@ pub fn parse_client_settings(
         node_suites,
         require_outer_suite,
         connect_deadline,
+        metrics_file: file.metrics_file.as_ref().map(|m| base.join(m)),
     })
 }
 

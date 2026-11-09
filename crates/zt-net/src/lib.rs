@@ -20,6 +20,7 @@ mod error;
 pub mod keys;
 pub mod lifecycle;
 pub mod logging;
+pub mod metrics;
 pub mod net;
 pub mod relay;
 pub mod reload;

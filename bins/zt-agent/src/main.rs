@@ -15,8 +15,9 @@ use zt_domain::{HandshakeChannel, NodeId};
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
 use zt_net::config::{ConfigError, Digests};
-use zt_net::lifecycle::{self, Generation, Progress, Supervisor, Terminate};
+use zt_net::lifecycle::{self, Generation, Supervisor, Terminate};
 use zt_net::logging::{self, LogFormat};
+use zt_net::metrics::{self, AgentMetrics};
 use zt_net::net::TcpDialer;
 use zt_net::reload::{self, Hangups, Outcome, Publisher};
 use zt_net::{Revocable, config, systemd};
@@ -125,6 +126,15 @@ enum Command {
         /// (systemd's `RuntimeDirectory=`); without either, `reload` cannot be used.
         #[arg(long)]
         runtime_dir: Option<PathBuf>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
+    },
+    /// Prints the metrics file the running agent writes (R-5): its age and every value.
+    /// Exit 0 if fresh, 1 if missing or invalid, 2 if stale (older than three intervals).
+    Status {
+        /// The metrics file (`run --metrics-file`).
+        #[arg(long, default_value = "/run/zt-agent/metrics.prom")]
+        metrics_file: PathBuf,
     },
     /// Validates every file and option `run` uses at startup, with the same options and the
     /// same code, and prints the SHA-256 of the trust files; exits 78 on an invalid file or
@@ -149,6 +159,20 @@ enum Command {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
         timeout: u64,
     },
+}
+
+/// Where and how often the metrics textfile is written (R-5, OPERATIONS §16).
+#[derive(Debug, clap::Args)]
+struct MetricsArgs {
+    /// The metrics file, in the Prometheus text format for `node_exporter`'s textfile collector
+    /// (rewritten atomically, mode 0644; its directory must be writable by the service).
+    /// Default: `metrics.prom` in the runtime directory. The agent never listens, for metrics
+    /// or anything else.
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
+    /// How often the metrics file is rewritten, in seconds (1 to 3600).
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    metrics_interval: u64,
 }
 
 /// `--max-streams` within the agent's limits (finding 0005b-4: beyond the maximum of the tokio
@@ -180,6 +204,7 @@ fn main() -> ExitCode {
             tracing::error!("{message}");
             ExitCode::FAILURE
         }
+        Err(Failure::Exit(code)) => ExitCode::from(code),
     }
 }
 
@@ -188,6 +213,8 @@ fn main() -> ExitCode {
 enum Failure {
     Config(String),
     Runtime(String),
+    /// An exit status already reported on stderr (`status`).
+    Exit(u8),
 }
 
 /// `EX_CONFIG` of `sysexits.h`.
@@ -289,11 +316,23 @@ fn run(command: Command) -> Result<(), Failure> {
             args,
             drain_timeout,
             runtime_dir,
+            metrics,
         } => serve(
             prepare(args)?,
             Duration::from_secs(drain_timeout),
             runtime_dir,
+            metrics,
         ),
+        Command::Status { metrics_file } => {
+            match metrics::status_command(
+                &metrics_file,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            ) {
+                0 => Ok(()),
+                code => Err(Failure::Exit(code)),
+            }
+        }
         Command::Reload {
             pid,
             runtime_dir,
@@ -395,10 +434,12 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
     })
 }
 
+#[allow(clippy::too_many_lines)] // the startup sequence, in the order it must happen
 fn serve(
     prepared: Prepared,
     drain_timeout: Duration,
     runtime_dir: Option<PathBuf>,
+    metrics_args: MetricsArgs,
 ) -> Result<(), Failure> {
     // A watchdog too short for the heartbeat would kill a healthy agent (finding A10-3).
     lifecycle::check_watchdog().map_err(Failure::Config)?;
@@ -422,8 +463,12 @@ fn serve(
         updater.replace(authorized);
         let generation = Generation::new();
         let first = lifecycle::configuration_loaded(&generation, &digests);
+        let metrics = AgentMetrics::new(config.relays.len());
+        metrics.process().set_generation(first);
+        let runtime_dir = reload::runtime_dir(runtime_dir);
+        let metrics_file = metrics::default_path(metrics_args.metrics_file, runtime_dir.as_deref());
         let publisher = Publisher::new(
-            reload::runtime_dir(runtime_dir),
+            runtime_dir,
             Outcome::applied(first, digests.to_string()),
         );
         publisher.publish();
@@ -447,6 +492,7 @@ fn serve(
         );
         // The authorized clients and denylist on every SIGHUP, validated by this process with
         // its own arguments; `reload` reports the outcome (finding A10-1).
+        let reload_metrics = Arc::clone(&metrics);
         supervisor.spawn(
             "authorized_clients_reload",
             reload::on_sighup(hangups, publisher, generation, move |generation| {
@@ -461,6 +507,7 @@ fn serve(
                             files = %digests,
                             "configuration reloaded"
                         );
+                        reload_metrics.process().reload_applied(generation);
                         Outcome::applied(generation, digests.to_string())
                     }
                     Err(err) => {
@@ -470,6 +517,7 @@ fn serve(
                             error = %err,
                             "reload failed: keeping the previous configuration"
                         );
+                        reload_metrics.process().reload_rejected();
                         Outcome::rejected(err.to_string())
                     }
                 }
@@ -477,7 +525,7 @@ fn serve(
         );
         // The agent has no central hub: its watchdog proves that the runtime still schedules
         // tasks (a wedged runtime stops this heartbeat too).
-        let progress = Progress::new();
+        let progress = metrics.process().progress().clone();
         let beat = progress.clone();
         supervisor.spawn("heartbeat", async move {
             let mut every = tokio::time::interval(Duration::from_secs(1));
@@ -488,11 +536,25 @@ fn serve(
         });
         supervisor.spawn("watchdog", lifecycle::watchdog("agent", progress));
         supervisor.spawn("clock_watch", lifecycle::watch_clock("agent"));
+        let interval = Duration::from_secs(metrics_args.metrics_interval);
+        if let Some(path) = metrics_file.clone() {
+            let m = Arc::clone(&metrics);
+            supervisor.spawn("metrics", metrics::export(path, interval, move || m.render()));
+        }
         lifecycle::check_clock("agent");
         systemd::notify_ready();
-        tokio::select! {
-            () = agent::run_until(keys, config, TcpDialer, terminate.wait(), drain_timeout) => Ok(()),
+        let observed = agent::Observed {
+            metrics: Arc::clone(&metrics),
+        };
+        let outcome = tokio::select! {
+            () = agent::run_observed(keys, config, TcpDialer, terminate.wait(), drain_timeout, observed) => Ok(()),
             failure = supervisor.failed() => Err(Failure::Runtime(failure)),
+        };
+        // The drain's end is in the last file the agent writes.
+        if let Some(path) = metrics_file {
+            let text = metrics::stamp(&metrics.render(), interval, std::time::SystemTime::now());
+            let _ = metrics::write_textfile(&path, &text);
         }
+        outcome
     })
 }

@@ -309,6 +309,12 @@ impl<S: SessionIds> RelayCore<S> {
         self.conns.len()
     }
 
+    /// Number of nodes with a registered agent.
+    #[must_use]
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
+    }
+
     /// Number of streams (sessions) open or opening: what a drain waits for.
     #[must_use]
     pub fn client_stream_count(&self) -> usize {

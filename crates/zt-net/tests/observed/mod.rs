@@ -73,14 +73,5 @@ pub async fn start_observed(
     clients: AuthorizedClients,
     metrics: Arc<AgentMetrics>,
 ) -> Lab {
-    start_observed_with(
-        agent,
-        relays_config,
-        clients,
-        Observed {
-            metrics,
-            ..Observed::default()
-        },
-    )
-    .await
+    start_observed_with(agent, relays_config, clients, Observed { metrics }).await
 }

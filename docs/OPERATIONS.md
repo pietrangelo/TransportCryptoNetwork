@@ -1245,3 +1245,127 @@ older suite (§13); `require_outer_suite` closes that window. During Phase 5 a v
 or a certificate-only client with a classical-kind certificate, with a stolen X25519 key is
 still admitted (over a classical handshake, or over the hybrid IK suite with the attacker's own
 ML-KEM key); that is the reason to complete Phase 5 with `require_hybrid_identity`.
+
+## 17. Metrics and `status`
+
+The relay and the agent write their counters to a **file** in the Prometheus text format, for
+node_exporter's [textfile collector](https://github.com/prometheus/node_exporter#textfile-collector).
+Nothing listens for metrics: the agent still has no listening socket at all, the relay only its
+own port (review 0007, AP-21). There is no HTTP endpoint, no `/healthz`: a load balancer in front
+of relays is not a supported topology (the per-source admission budget would see one address).
+
+| Option | Default | Meaning |
+| :- | :- | :- |
+| `--metrics-file PATH` | `metrics.prom` in the runtime directory (`/run/zt-relay`, `/run/zt-agent`) | where the file is written |
+| `--metrics-interval SECONDS` | 15 (1 to 3600) | how often it is rewritten |
+
+The file is replaced atomically (a hidden temporary file in the same directory, then `rename`),
+so node_exporter never reads half a file; it is always mode 0644 and a symlink planted at its
+path is replaced, never followed. A write that fails (directory missing, disk full) is logged
+once as `metrics_write_failed` and retried every interval; the service keeps running. The last
+write happens at the end of the drain.
+
+**Wiring node_exporter.** The runtime directory is 0700 (it also holds the reload state), so
+node_exporter cannot read the default path. Give the service a directory it may write and
+node_exporter may read, in a drop-in (`systemctl edit zt-relay`):
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 \
+    --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml \
+    --metrics-file /var/lib/node_exporter/textfile/zt-relay.prom
+ReadWritePaths=/var/lib/node_exporter/textfile
+```
+
+The directory must be writable by `tcn` (for example `root:tcn 0775`) because of the rename;
+node_exporter reads only `*.prom` files, and the temporary name never ends in `.prom`. Use a
+different file name for each service on the host (`zt-relay.prom`, `zt-agent.prom`).
+
+**`status`.** `zt-relay status` and `zt-agent status` print the file's age and every value
+(`--metrics-file`, default the runtime directory): exit 0 if fresh, 1 if missing or invalid,
+2 if stale (older than three intervals: the process stopped writing, or is wedged). Run it as
+root or as `tcn`. Control characters in the file are never printed.
+
+**What is in it.** Only roles, suites, reasons and relay indices are labels; there is never a
+fingerprint, a client or node name, a certificate field or an address, so the file reveals no
+inventory and its size is fixed (about 150 lines). Per-identity detail stays in the audit log
+(§6).
+
+| Metric | Type | Meaning |
+| :- | :- | :- |
+| `tcn_build_info{role,version}` | gauge | always 1 |
+| `tcn_config_generation` | gauge | generation in force (`configuration_loaded`, reloads) |
+| `tcn_reloads_total{result}` | counter | `applied`, `rejected` |
+| `tcn_watchdog_progress_total` | counter | the hub's (relay) or the heartbeat's (agent) progress; flat = wedged |
+| `tcn_draining` | gauge | 1 during a drain |
+| `tcn_metrics_last_write_timestamp_seconds`, `tcn_metrics_interval_seconds` | gauge | freshness |
+| `tcn_relay_preauth_failures_total{reason}` | counter | the `preauth_summary` reasons (§6), before key confirmation |
+| `tcn_relay_admission_refusals_total{reason}` | counter | confirmed identities refused (`established_pool_full`, `identity_limit`) |
+| `tcn_relay_handshakes_total{role,suite}` | counter | confirmed outer handshakes: the sunset signal of §13 |
+| `tcn_relay_auth_failures_total{reason}` | counter | known identities refused (`key_revoked`, `certificate`, `identity_downgrade`, `suite_rejected`, ...) |
+| `tcn_relay_connections{role}` | gauge | confirmed connections |
+| `tcn_relay_agents_registered`, `tcn_relay_streams` | gauge | registered nodes, open streams |
+| `tcn_relay_open_rejects_total{reason}`, `tcn_relay_stream_closes_total{reason}` | counter | `Reject` and `Close` reasons |
+| `tcn_relay_forwarded_bytes_total` | counter | `Data` bytes forwarded |
+| `tcn_relay_queue_bytes`, `tcn_relay_queue_budget_bytes` | gauge | outbound queue and its budget (§18) |
+| `tcn_relay_queue_shed_total`, `tcn_relay_queue_overflow_total` | counter | slow readers shed by the budget; peers breaking the credit |
+| `tcn_agent_relay_up{relay}` | gauge | 1 while registered with relay *n* (`--relay` order, 0-based) |
+| `tcn_agent_relay_registrations_total{relay}`, `tcn_agent_relay_session_failures_total{relay}` | counter | registrations; sessions ended by an error (reconnects) |
+| `tcn_agent_relay_consecutive_failures{relay}` | gauge | failures since the last registration |
+| `tcn_agent_sessions` | gauge | sessions bridged to sshd |
+| `tcn_agent_handshakes_total{suite}` | counter | end-to-end handshakes confirmed |
+| `tcn_agent_auth_failures_total{reason}` | counter | end-to-end refusals (`unconfirmed`: a replayed message 1) |
+| `tcn_agent_ssh_connect_failures_total` | counter | sshd unreachable |
+| `tcn_agent_session_bytes_total{direction}` | counter | `to_ssh`, `from_ssh` |
+| `tcn_agent_buffer_bytes`, `tcn_agent_buffer_budget_bytes`, `tcn_agent_buffer_refusals_total` | gauge/counter | receive windows and their budget (§18) |
+
+**Client.** `metrics_file = "zt-client.prom"` in `client.toml` (relative to it) makes
+`zt-client connect` write the outcome of its session when it ends:
+`tcn_client_last_session_outcome{outcome}`, `_relay_index` (-1: none), `_attempts`,
+`_failover` (1 if not the first relay), `_bytes{direction}`. Concurrent clients overwrite one
+another: the file describes the last session, which is enough for a cron-driven health probe
+(`ssh -o BatchMode=yes node true`), not for fleet statistics.
+
+**Dashboards.** One row per relay: `rate(tcn_relay_handshakes_total[5m])` by role and suite
+(stacked; the classical share is the §13 sunset signal), `tcn_relay_connections`,
+`tcn_relay_agents_registered`, `tcn_relay_streams`, `rate(tcn_relay_forwarded_bytes_total[5m])`,
+`rate(tcn_relay_preauth_failures_total[5m])` by reason, `tcn_relay_queue_bytes` against
+`tcn_relay_queue_budget_bytes`. Fleet view: `sum by (instance) (tcn_agent_relay_up)` (how many
+relays each agent reaches), `tcn_agent_sessions`, `rate(tcn_agent_auth_failures_total[5m])` by
+reason.
+
+**Alerts** (starting points; tune the thresholds to the fleet):
+
+```yaml
+groups:
+  - name: tcn
+    rules:
+      - alert: TcnMetricsStale            # the process stopped writing: dead or wedged
+        expr: time() - tcn_metrics_last_write_timestamp_seconds > 3 * tcn_metrics_interval_seconds
+        for: 2m
+      - alert: TcnWatchdogStalled         # progress flat while the file is still written
+        expr: rate(tcn_watchdog_progress_total[5m]) == 0
+        for: 5m
+      - alert: TcnAgentNoRelay            # an agent registered with no relay at all
+        expr: sum by (instance) (tcn_agent_relay_up) == 0
+        for: 5m
+      - alert: TcnAgentRelayDown          # one relay link down (relay restart, network)
+        expr: tcn_agent_relay_consecutive_failures >= 5
+        for: 10m
+      - alert: TcnReloadRejected          # a reload kept the previous policy: revocation not in force
+        expr: increase(tcn_reloads_total{result="rejected"}[15m]) > 0
+      - alert: TcnRelayAgentsDropped      # nodes lost by a relay
+        expr: tcn_relay_agents_registered < 0.9 * max_over_time(tcn_relay_agents_registered[1h])
+        for: 10m
+      - alert: TcnPreauthFlood            # scanning or a misconfigured client fleet
+        expr: sum by (instance) (rate(tcn_relay_preauth_failures_total[5m])) > 50
+        for: 10m
+      - alert: TcnQueueBudgetShedding     # slow readers disconnected by the byte budget (§18)
+        expr: increase(tcn_relay_queue_shed_total[15m]) > 0
+      - alert: TcnKnownIdentityRefused    # revoked keys or certificates still trying
+        expr: increase(tcn_relay_auth_failures_total{reason=~"key_revoked|certificate|identity_downgrade"}[15m]) > 0
+      - alert: TcnDraining                # a drain that lasts more than the drain timeout
+        expr: tcn_draining == 1
+        for: 5m
+```

@@ -437,10 +437,21 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
+    let metrics = zt_net::metrics::ClientMetrics::new();
     let result = runtime.block_on(async {
         let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-        client::connect(&identity, &config, local).await
+        client::connect_observed(&identity, &config, local, zt_net::net::TcpDialer, &metrics).await
     });
+    // Optional (R-5): the last session's outcome for node_exporter. A failed write never
+    // changes the session's own outcome.
+    if let Some(path) = &settings.metrics_file
+        && let Err(err) = zt_net::metrics::write_textfile(path, &metrics.render())
+    {
+        warn(&format!(
+            "metrics file {} not written: {err}",
+            path.display()
+        ));
+    }
     // Reading stdin runs on a blocking thread that cannot be interrupted: if the session
     // has ended on the node side we do not wait for ssh to close stdin.
     runtime.shutdown_background();

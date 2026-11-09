@@ -18,6 +18,7 @@ use zt_domain::flow::Window;
 use zt_domain::{CloseReason, Frame, NodeId, RejectReason, StreamId};
 
 use crate::channel::Established;
+use crate::metrics::{ClientMetrics, Traffic};
 use crate::stream::{STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
@@ -87,6 +88,44 @@ where
     L: AsyncRead + AsyncWrite + Unpin,
     D: crate::net::Dialer,
 {
+    connect_observed(identity, config, local, dialer, &ClientMetrics::new()).await
+}
+
+/// Like [`connect_with`], recording the outcome in `metrics` (R-5): the relay used, the
+/// attempts, the failover, the bytes and how the session ended.
+///
+/// # Errors
+/// Like [`connect`].
+pub async fn connect_observed<L, D>(
+    identity: &Identity,
+    config: &ClientConfig,
+    local: L,
+    dialer: D,
+    metrics: &ClientMetrics,
+) -> Result<(), NetError>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    D: crate::net::Dialer,
+{
+    let result = session(identity, config, local, dialer, metrics).await;
+    match &result {
+        Ok(()) => metrics.ended_ok(),
+        Err(err) => metrics.finished_err(err),
+    }
+    result
+}
+
+async fn session<L, D>(
+    identity: &Identity,
+    config: &ClientConfig,
+    local: L,
+    dialer: D,
+    metrics: &ClientMetrics,
+) -> Result<(), NetError>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    D: crate::net::Dialer,
+{
     let t = &config.timeouts;
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         return Err(NetError::Protocol(
@@ -113,8 +152,10 @@ where
         t,
         confirm_within: config.failover.handshake,
         dialer: &dialer,
+        metrics,
     };
     let (relay, ch, losers) = establish(&ctx, config).await?;
+    metrics.connected(relay, config.node_suite);
     // During the rollout of OPERATIONS §13 pins are mixed: an attacker who resets the
     // hybrid-pinned relays makes failover land on a classical one. Say so (finding A10-9);
     // `require_outer_suite` rules it out.
@@ -148,7 +189,17 @@ where
         // replaying message 1 cannot produce it.
         io.send_data(transport.encrypt(config.node_suite.confirmation())?)
             .await?;
-        pump(io, transport, local, None).await
+        pump(
+            io,
+            transport,
+            local,
+            None,
+            Traffic {
+                from_local: &metrics.sent,
+                to_local: &metrics.received,
+            },
+        )
+        .await
     };
     // The losers close in the background of the session, without delaying it.
     let (link, session, ()) = tokio::join!(relay_link, session, losers.close());
@@ -166,6 +217,7 @@ struct AttemptCtx<'a, D> {
     /// confirm its key (finding A11-1): the plan's handshake step timeout.
     confirm_within: Duration,
     dialer: &'a D,
+    metrics: &'a ClientMetrics,
 }
 
 /// How one attempt ended. At most [`crate::MAX_RELAYS`] exist, each briefly: boxing the
@@ -226,6 +278,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Losers<'_, S> {
 }
 
 /// Runs the [`FailoverPlan`] until a relay acknowledges the stream.
+#[allow(clippy::too_many_lines)] // the plan's actions and events, in one loop
 async fn establish<'a, D: crate::net::Dialer>(
     ctx: &'a AttemptCtx<'a, D>,
     config: &'a ClientConfig,
@@ -249,6 +302,7 @@ async fn establish<'a, D: crate::net::Dialer>(
                     let Some(relay) = config.relays.get(i) else {
                         continue;
                     };
+                    ctx.metrics.attempt_started(i);
                     let (cancel_tx, cancel_rx) = oneshot::channel();
                     if let Some(slot) = cancels.get_mut(i) {
                         *slot = Some(cancel_tx);

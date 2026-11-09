@@ -34,6 +34,7 @@ use zt_domain::{
 };
 
 use crate::lifecycle::Progress;
+use crate::metrics::{RelayMetrics, RoleLabel, auth_reason};
 use crate::net::Acceptor;
 use crate::{NetError, Timeouts, channel, lock};
 use zt_application::lifecycle::{DrainController, DrainStep};
@@ -53,6 +54,9 @@ pub struct RelayConfig {
     pub agent_idle: Option<Duration>,
     /// Idle timeout of client connections; `None`: `timeouts.idle`.
     pub client_idle: Option<Duration>,
+    /// Where the relay counts what it does (R-5): written as a textfile by
+    /// [`crate::metrics::export`], never served on a socket.
+    pub metrics: Arc<RelayMetrics>,
 }
 
 impl Default for RelayConfig {
@@ -64,6 +68,7 @@ impl Default for RelayConfig {
             suites: SuitePolicy::classical(),
             agent_idle: None,
             client_idle: None,
+            metrics: RelayMetrics::new(),
         }
     }
 }
@@ -415,8 +420,8 @@ impl<A: Acceptor> RelayServer<A> {
             listener,
             keys,
             policy,
+            progress: config.metrics.process().progress().clone(),
             config,
-            progress: Progress::new(),
         })
     }
 
@@ -475,7 +480,15 @@ impl<A: Acceptor> RelayServer<A> {
             config.limits.clone(),
             RandomIds { fallback: 0 },
         );
-        let mut hub_task = tokio::spawn(hub(core, hub_rx, policy.clone(), progress, drain_rx));
+        let metrics = Arc::clone(&config.metrics);
+        let mut hub_task = tokio::spawn(hub(
+            core,
+            hub_rx,
+            policy.clone(),
+            progress,
+            drain_rx,
+            Arc::clone(&metrics),
+        ));
         // One clone per live connection task: the drain waits for them to flush.
         let live = Arc::new(());
         tokio::pin!(shutdown);
@@ -520,7 +533,7 @@ impl<A: Acceptor> RelayServer<A> {
             };
             // A refusal is counted in the summary; the connection is dropped without a reply.
             let admitted = lock(&admission).on_accept(addr.ip(), mono_now());
-            let Ok(ticket) = admitted else {
+            let Ok(ticket) = admitted.inspect_err(|r| metrics.preauth_failure(r.as_str())) else {
                 tracing::debug!(%addr, "connection not admitted");
                 continue;
             };
@@ -528,6 +541,7 @@ impl<A: Acceptor> RelayServer<A> {
                 admission: Arc::clone(&admission),
                 ticket,
                 source: addr.ip(),
+                metrics: Arc::clone(&metrics),
             };
             next_conn = next_conn.wrapping_add(1);
             let conn = ConnId(next_conn);
@@ -544,11 +558,13 @@ impl<A: Acceptor> RelayServer<A> {
                 agent_idle: config.agent_idle.unwrap_or(config.timeouts.idle),
                 client_idle: config.client_idle.unwrap_or(config.timeouts.idle),
                 confirmed: Arc::clone(&confirmed),
+                metrics: Arc::clone(&metrics),
                 _live: Arc::clone(&live),
                 capacity,
             };
             tokio::spawn(task.serve(tcp, addr, admitted));
         }
+        metrics.process().set_draining(true);
         let drained = drain(listener, hub_task, &drain_tx, drain_timeout, &live).await;
         // The last interval's confirmed handshakes are not lost at shutdown (A10-10).
         confirmed.flush();
@@ -605,6 +621,7 @@ struct Connection {
     agent_idle: Duration,
     client_idle: Duration,
     confirmed: Arc<ConfirmedSuites>,
+    metrics: Arc<RelayMetrics>,
     /// Counts the live connection tasks for the drain.
     _live: Arc<()>,
     capacity: usize,
@@ -655,10 +672,12 @@ struct Admitted {
     admission: Arc<Mutex<Admission>>,
     ticket: Ticket,
     source: IpAddr,
+    metrics: Arc<RelayMetrics>,
 }
 
 impl Admitted {
     fn record(&self, failure: PreauthFailure, key: Option<Fingerprint>) {
+        self.metrics.preauth_failure(failure.as_str());
         lock(&self.admission).record(failure, self.source, key);
     }
 
@@ -696,6 +715,14 @@ fn initiator_role(policy: &AccessPolicy, peer: &Fingerprint) -> InitiatorRole {
     match policy.role(peer) {
         Some(PeerRole::Agent { .. }) => InitiatorRole::Agent,
         _ => InitiatorRole::Client,
+    }
+}
+
+/// The metrics label of an initiator role.
+const fn role_label(role: InitiatorRole) -> RoleLabel {
+    match role {
+        InitiatorRole::Agent => RoleLabel::Agent,
+        InitiatorRole::Client => RoleLabel::Client,
     }
 }
 
@@ -854,6 +881,7 @@ impl Connection {
             InitiatorRole::Agent => self.agent_idle,
             InitiatorRole::Client => self.client_idle,
         };
+        let _connected = self.metrics.connection(role_label(role));
         self.run(ch, peer, certificate, first, idle).await;
         drop(admitted);
     }
@@ -908,6 +936,7 @@ impl Connection {
             Ok(certificate) => certificate,
             Err((reason, certificate)) => {
                 if is_known_identity(&policy, &peer, reason) {
+                    self.metrics.auth_failed(auth_reason(reason));
                     // Known, but a recorded message 1 replays it at will (finding A8-2).
                     if admitted.log_identity(peer, IdentityEvent::AuthenticationFailed(reason)) {
                         audit(&DomainEvent::AuthenticationFailed {
@@ -928,6 +957,7 @@ impl Connection {
         let suite = pending.suite();
         let role = initiator_role(&policy, &peer);
         if self.suites.check(role, suite).is_err() {
+            self.metrics.auth_failed("suite_rejected");
             if admitted.log_identity(peer, IdentityEvent::SuiteRejected(suite)) {
                 audit(&DomainEvent::HandshakeSuiteRejected { peer, suite });
             }
@@ -967,6 +997,7 @@ impl Connection {
         }
         ch.confirmed();
         self.confirmed.note(role, suite);
+        self.metrics.handshake_confirmed(role_label(role), suite);
         tracing::debug!(%addr, %peer, conn = self.conn.0, ?suite, "peer connected");
         Some((
             ch,
@@ -993,6 +1024,7 @@ impl Connection {
     ) where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        self.metrics.admission_refused(refusal.as_str());
         if admitted.log_identity(peer, IdentityEvent::AdmissionRefused(refusal)) {
             tracing::warn!(
                 target: "zt_audit",
@@ -1146,6 +1178,7 @@ async fn hub(
     mut policy: crate::Revocable<AccessPolicy>,
     progress: Progress,
     mut drain_rx: mpsc::Receiver<Duration>,
+    metrics: Arc<RelayMetrics>,
 ) -> DrainOutcome {
     let mut peers: HashMap<ConnId, mpsc::Sender<Frame>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -1192,12 +1225,12 @@ async fn hub(
                 }
             },
         };
-        execute(&mut core, &mut peers, input, &progress);
+        execute(&mut core, &mut peers, input, &progress, &metrics);
         if let Some(d) = &drain
             && let DrainStep::Finished { expired } = d.step(mono_now(), core.client_stream_count())
         {
             let closed = core.client_stream_count();
-            execute(&mut core, &mut peers, Input::Shutdown, &progress);
+            execute(&mut core, &mut peers, Input::Shutdown, &progress, &metrics);
             // Dropping the senders closes every connection after its queued frames.
             return DrainOutcome { expired, closed };
         }
@@ -1210,6 +1243,7 @@ fn execute(
     peers: &mut HashMap<ConnId, mpsc::Sender<Frame>>,
     input: Input,
     progress: &Progress,
+    metrics: &RelayMetrics,
 ) {
     let mut pending = vec![input];
     while let Some(input) = pending.pop() {
@@ -1221,9 +1255,11 @@ fn execute(
             match output {
                 Output::Send { conn, frame } => {
                     let Some(tx) = peers.get(&conn) else { continue };
+                    count_sent(metrics, &frame);
                     if tx.try_send(frame).is_err() {
                         // Queue full or connection already closed: detach it.
                         tracing::warn!(conn = conn.0, "outbound queue overflow");
+                        metrics.queue_overflow.inc();
                         peers.remove(&conn);
                         pending.push(Input::Disconnected { conn });
                     }
@@ -1237,5 +1273,19 @@ fn execute(
             }
         }
     }
+    metrics.streams.set_usize(core.client_stream_count());
+    metrics.agents_registered.set_usize(core.agent_count());
     progress.advance();
+}
+
+/// What a frame the hub sends says for the metrics: forwarded bytes, reject and close reasons.
+fn count_sent(metrics: &RelayMetrics, frame: &Frame) {
+    match frame {
+        Frame::Data { payload, .. } => metrics
+            .forwarded_bytes
+            .add(u64::try_from(payload.len()).unwrap_or(u64::MAX)),
+        Frame::Reject { reason, .. } => metrics.open_rejected(*reason),
+        Frame::Close { reason, .. } => metrics.stream_closed(*reason),
+        _ => {}
+    }
 }

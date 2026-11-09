@@ -13,6 +13,7 @@ use zt_crypto::noise::{TAG_LEN, Transport};
 use zt_domain::flow::{INITIAL_WINDOW, MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE, Window, charge};
 use zt_domain::{CloseReason, Credit, Frame, FramePayload, StreamId};
 
+use crate::metrics::Traffic;
 use crate::{NetError, Timeouts};
 
 /// Local bytes read for each `Data`.
@@ -172,6 +173,7 @@ pub(crate) async fn pump<L>(
     transport: Transport,
     local: L,
     local_write: Option<std::time::Duration>,
+    traffic: Traffic<'_>,
 ) -> Result<(), NetError>
 where
     L: AsyncRead + AsyncWrite + Unpin,
@@ -195,8 +197,9 @@ where
         consumed,
         credit: &credit,
         transport: &transport,
+        delivered: traffic.to_local,
     };
-    let up = uplink(stream, reader, &tx, &credit, &transport);
+    let up = uplink(stream, reader, &tx, &credit, &transport, traffic.from_local);
     let result = tokio::select! {
         r = up => r,
         r = down.run(&mut writer, local_write) => r,
@@ -227,6 +230,7 @@ async fn uplink<R: AsyncRead + Unpin>(
     tx: &mpsc::Sender<Frame>,
     credit: &Semaphore,
     transport: &Mutex<Transport>,
+    read: &crate::metrics::Counter,
 ) -> Result<(), NetError> {
     let mut buf = vec![0_u8; CHUNK];
     loop {
@@ -254,6 +258,7 @@ async fn uplink<R: AsyncRead + Unpin>(
                 .await;
             return Ok(());
         }
+        read.add(u64::try_from(n).unwrap_or(u64::MAX));
         let chunk = buf.get(..n).ok_or(NetError::Protocol("read overflow"))?;
         let ciphertext = lock(transport)?.encrypt(chunk)?;
         // Only this direction consumes credit: the permits are already available.
@@ -279,6 +284,8 @@ struct Downlink<'a> {
     consumed: u32,
     credit: &'a Semaphore,
     transport: &'a Mutex<Transport>,
+    /// Plaintext bytes written to the local side.
+    delivered: &'a crate::metrics::Counter,
 }
 
 impl Downlink<'_> {
@@ -313,6 +320,8 @@ impl Downlink<'_> {
                             .map_err(|_| NetError::Timeout("local write"))??,
                         None => write.await?,
                     }
+                    self.delivered
+                        .add(u64::try_from(plaintext.len()).unwrap_or(u64::MAX));
                     self.consumed = self.consumed.saturating_add(charge(payload.len()));
                     if self.consumed >= UPDATE_THRESHOLD {
                         let credit = Credit::try_from(self.consumed)

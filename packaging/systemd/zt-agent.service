@@ -29,6 +29,9 @@ Group=tcn
 RuntimeDirectory=zt-agent
 RuntimeDirectoryMode=0700
 EnvironmentFile=/etc/tcn/agent.env
+# Metrics (OPERATIONS §17): written every 15 s to /run/zt-agent/metrics.prom, read by
+# `zt-agent status`. For node_exporter, add --metrics-file in a drop-in with ReadWritePaths=
+# for its textfile directory. Nothing listens for metrics.
 ExecStart=/usr/local/bin/zt-agent --log-format json run --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
 # Reloads the authorized clients and immediately closes the sessions of those removed.
 # `reload` sends SIGHUP to the running agent and waits for its own verdict: the agent
