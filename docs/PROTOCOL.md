@@ -279,12 +279,19 @@ decodes as a frame.
 - **Initiators.** The agent pins one suite per relay (`--relay-suite`), the client one per
   relay (`suite` in `[[relays]]`, `relay_suite` for the single-relay form). Neither ever
   retries another suite. A client may still fail over to the next relay before `OpenAck`
-  (§13), with that relay's own pin; failover never lowers a pin.
+  (§13), with that relay's own pin. Failover never lowers the pin **of a relay**, but with
+  mixed pins (during the rollout of OPERATIONS §13) it can land on a relay pinned to the
+  classical suite: an active attacker who resets the hybrid-pinned relays gets a classical
+  hop for that session. `zt-client` warns when failover changes the suite, and
+  `require_outer_suite` in `client.toml` makes any relay pinned to another suite a
+  configuration error, so failover cannot leave the required suite (review 0010, A10-9).
 - **Audit.** Every summary interval the relay writes `outer_suites_confirmed` with the number
   of key-confirmed handshakes per role and suite (`agents_classical`, `agents_hybrid`,
   `clients_classical`, `clients_hybrid`, absent when zero), without identities: this is the
   signal for the sunset of the classical suite (OPERATIONS §13), and replays never count. The
-  agent writes `relay_registered` with the pinned `suite` for every relay session.
+  agent writes `relay_registered` with the pinned `suite` for every relay session, once
+  `Register` is sent: message 2 proved that the relay accepts the suite for agents, but the
+  relay can still refuse the registration itself and close.
 - **Cost.** About 1.2 KiB more in each direction per connection and the CPU of
   docs/pq-snow.md §5, once per connection; the transport is unchanged. The relay does no KEM
   work before the policy and suite decisions (encapsulation happens when message 2 is
@@ -308,13 +315,16 @@ decodes as a frame.
 4. A `Close` from one side is forwarded to the other. The loss of a connection closes all of its
    streams with `PeerGone`.
 5. **Drain** (a graceful stop, OPERATIONS §14). A draining relay closes its listening socket at
-   once (new connections are refused, so clients and agents move to another relay, §13) and
-   keeps routing the open streams, under the policy in force and its reloads (a revocation
+   once (new connections are refused, so clients and agents move to another relay, §13),
+   answers a new `Open` on a connection that is already open with `Reject NodeOffline` (the
+   client moves on, §13), and keeps routing the open streams, under the policy in force and its reloads (a revocation
    still cuts a session). When the last stream ends, or at the drain deadline (60 s by
    default), it sends `Close Drained` on both sides of every stream still open and closes
    every connection. A draining agent answers every new `Open` with `Reject NodeOffline`, so
-   the relay and the client treat the node as offline on that path, keeps its open sessions
-   and drops its relay connections after the last one or at its deadline.
+   the relay and the client treat the node as offline on that path; a stream it acknowledged
+   before the drain and whose end-to-end handshake is not finished is waited for and then
+   closed with `Close Drained` instead of becoming a session. It keeps its open sessions and
+   drops its relay connections after the last one or at its deadline.
 
 A peer that violates a rule (frame order, role, credit, rate) loses the connection. The
 exception is frames **in flight** on a stream that is already closed (for example `Data` or
@@ -368,7 +378,9 @@ relay's idle timeout per role is the other side of the same check: it drops a si
 its registration, so a client gets `NodeOffline` at once instead of an `Open` that is never
 acknowledged. Its default stays at 90 s, three times the 30 s keepalive of agents before R-2,
 until the whole fleet is upgraded (OPERATIONS §4.1). `TCP_USER_TIMEOUT` makes the kernel give
-up on a peer that stops acknowledging within 20 s, whatever the application timers say.
+up on a peer that stops acknowledging within 20 s, whatever the application timers say. On a
+client this also means that 20–25 s of path loss (Wi-Fi roaming, a tunnel) ends the
+interactive session, where before R-2 the limit was the 90 s idle timeout.
 
 The relay's admission limits are set in `relay.toml` (OPERATIONS §4.1). Every value is checked
 at startup: none may be zero, none may be absurd, the message 1 deadline lies between 5 s
@@ -498,7 +510,10 @@ changes on the wire.
   (1 s, doubling, at most 30 s, "full jitter"); after a session that lived at least 10 s (a
   relay restart or drain) the first reconnect is uniform over the spread window
   (`--reconnect-spread`, 10 s by default), so a fleet comes back over the window and not in
-  one wave.
+  one wave. From then on the spread is also the floor of the failure bound
+  (`max(spread, min(30 s, 1 s·2ⁿ⁻¹))`): a relay still down when the first retries arrive does
+  not turn them into one-second retries that pile up when it returns (review 0010, A10-4).
+  Without randomness (the system RNG fails) the delay is the bound, never zero.
 - **Client**: has an ordered list of relays (at most 8) and tries them in the given order. It
   moves on to the next one **only** for errors that occur before the `OpenAck` and that say
   nothing about the right of access:

@@ -276,17 +276,24 @@ binaries stay composition roots that handle signals and `sd_notify`. Nothing rel
     fallback, because that could re-admit a revoked key (catalogue R3-C4).
 - **Reload safety.**
   - Add `zt-relay check …` and `zt-agent check …`, which run the same loaders and
-    infrastructure-key checks as `run`. Use them in the units as
-    `ExecReload=/usr/local/bin/zt-relay check <same args>` followed by
-    `ExecReload=/bin/kill -HUP $MAINPID`, so `systemctl reload` fails visibly when a file is
-    bad.
-  - Use `Type=notify-reload` (`RELOADING=1` / `READY=1`) only where systemd ≥ 253; RHEL 9 and
-    Debian 12 ship 252, so keep `check` as the portable path.
+    infrastructure-key checks as `run` at startup (a pre-flight before a restart).
+  - *Superseded by review 0010 (A10-1):* `ExecReload=… check <same args>` repeated
+    `ExecStart=`'s arguments, and every drop-in that OPERATIONS prescribes for `ExecStart=`
+    (`--revocations` for a pinned CA, key rotation) broke `systemctl reload`. The units now run
+    `ExecReload=zt-<bin> reload --pid $MAINPID`: it sends `SIGHUP` and waits for the running
+    process's own verdict, which the process publishes in its runtime directory
+    (`RuntimeDirectory=`) after validating its files with its own arguments. `systemctl
+    reload` fails exactly when the running process rejected the files.
+  - The process announces every `SIGHUP` with `RELOADING=1` (and `MONOTONIC_USEC=`) and
+    closes it with `READY=1`, which works with `Type=notify` on every systemd. `Type=notify-reload`
+    (systemd ≥ 253; RHEL 9 and Debian 12 ship 252) is not used: it has no way to report a
+    rejected reload, and `reload --pid` does.
   - Every `*_reloaded`, `*_reload_failed` and `*_in_use` event gains the `sha256` of each file
     and a monotonic `generation`. Fleet comparison then becomes a log query, and the same
     values appear as an info metric.
-  - Keep keys and policy reloading independently (the existing rationale stands). Document
-    that a partial reload is visible from the generations.
+  - Keep keys and policy reloading independently (the existing rationale stands): since
+    review 0010 one `SIGHUP` is one step and one generation; a key file that fails is a
+    `relay_keys_reload_failed` and a `warning:` from `reload`, never a blocked policy.
   - Optional `check --diff` against the running process is out of scope: it would need a
     control socket.
 - **Clock.**
@@ -442,15 +449,15 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 
 | ID | Category | Hypothesis | Expected | Test |
 | :- | :- | :- | :- | :- |
-| R2-L1 | Crash/restart | relay restarts with 2 000 agents | arrival rate ≤ N/W per second ± tolerance; no wave > X% in any 1 s | `reconnects_are_spread_after_a_relay_restart` (sim) |
-| R2-L2 | Partition | silent drop agent↔relay (no FIN) | both sides detect ≤ 35 s; agent reconnects; relay drops stale registration | `half_open_agent_link_is_detected` (sim) |
+| R2-L1 | Crash/restart | relay restarts with 2 000 agents, also after 2–30 s of downtime | arrival rate ≤ N/W per second ± tolerance; no wave > X% in any 1 s; ≤ 2.5× N/W with downtime (review 0010, A10-4) | `reconnects_are_spread_after_a_relay_restart` (sim), `reconnects_stay_spread_when_the_relay_is_down_for_a_while` (Monte Carlo of the policy) |
+| R2-L2 | Partition | silent drop agent↔relay (no FIN) | both sides detect ≤ 35 s; agent reconnects; relay drops stale registration | `half_open_agent_link_is_detected` (sim, the agent host's arrivals only), `the_agent_alone_detects_a_half_open_link` (sim, relay idle 1 h) |
 | R2-L3 | Operator | new relay with short idle, old agent pinging every 30 s | not disconnected while per-role idle default stays ≥ 3× old keepalive | `old_agents_survive_the_default_relay_idle` |
 | R2-L4 | State | backoff overflow after days of failures / sample = `u64::MAX` | delay ≤ cap, no overflow, no panic | `backoff_is_bounded_for_any_sample` (proptest) |
 | R2-L5 | Crash/restart | relay accepts then closes immediately (crash loop) | backoff grows (does not reset to the spread window) | `a_relay_that_drops_immediately_is_backed_off` |
 | R2-L6 | Identity | two agents with the same key flap | `agent_flapping` raised; no registration lockout | `duplicate_agents_are_reported` |
 | R2-L7 | Resources | relay floods `Pong` / never answers `Ping` | unsolicited `Pong` still a violation on relay; agent declares dead after 3 misses | `unanswered_pings_end_the_session` |
-| R2-L8 | Partition | NAT rebinding (new source port/IP mid-session) | old connection dies (TCP); new one takes over registration | `nat_rebinding_heals_via_registration_takeover` (sim) |
-| R2-L9 | Slow peer | relay with a zero TCP window | `TCP_USER_TIMEOUT` / write timeout ends it; other relays unaffected | `a_stalled_relay_does_not_block_the_others` |
+| R2-L8 | Partition | NAT rebinding (new source port/IP mid-session) | old connection dies (TCP); new one takes over registration | decided (review 0010, A10-6): the takeover is `reconnecting_agent_replaces_the_previous_connection` (core) and `duplicate_agents_are_reported_by_the_relay` (wire); the old connection dies like the half-open link of R2-L2. No separate simulation |
+| R2-L9 | Slow peer | relay with a zero TCP window | `TCP_USER_TIMEOUT` / write timeout ends it; other relays unaffected | decided (review 0010, A10-6): one loop per relay with its own timeouts, `an_unreachable_relay_does_not_stop_the_agent_on_the_others` (`ha.rs`); the socket options on both sides, `dialed_sockets_have_user_timeout_and_keepalive` (through the `Acceptor`). A zero window cannot be simulated in turmoil |
 
 ### R-3 Lifecycle and self-healing
 
@@ -461,12 +468,12 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 | R3-C3 | State | SIGHUP / revocation during drain | still applied (revocation never waits for drain) | `revocation_applies_while_draining` |
 | R3-C4 | Operator | invalid policy at restart | process refuses to start; no last-known-good fallback | `no_fallback_to_a_stale_policy` |
 | R3-C5 | Crash/restart | critical task returns (simulated: SIGHUP stream ends, hub receiver closed) | process exits non-zero; never "running without reload" | `a_dead_critical_task_terminates_the_process` |
-| R3-C6 | Crash/restart | runtime wedged (hub blocked) | watchdog not kicked → systemd restarts; disconnected relays do **not** stop the kick | `watchdog_reflects_internal_liveness_only` |
-| R3-C7 | Operator | `systemctl reload` with a bad file | `check` fails; reload exits non-zero; running config untouched | `reload_with_invalid_file_fails_visibly` |
-| R3-C8 | Operator | `check` and `run` disagree (different loaders) | impossible by construction: same function; property test over fuzzed files | `check_and_run_accept_the_same_files` |
-| R3-C9 | Side channels | config hash in logs/metrics leaks content | only SHA-256 of whole file; no hash of individual entries | `config_hashes_reveal_no_entries` |
+| R3-C6 | Crash/restart | runtime wedged (hub blocked) | watchdog not kicked → systemd restarts; disconnected relays do **not** stop the kick; no stall at start, a stall only after two checks without progress, `WatchdogSec` ≥ 3 s (review 0010, A10-3) | `a_stalled_hub_stops_the_kicks`, `an_idle_hub_still_makes_progress`, `a_stall_is_reported_after_two_checks_without_progress`, `reloads_are_announced_and_the_watchdog_does_not_stall_at_start`, `a_too_short_watchdog_is_a_configuration_error` |
+| R3-C7 | Operator | `systemctl reload` with a bad file, also with `ExecStart=` drop-ins | the running process rejects it; `reload` exits 78 with its reason; running config untouched (review 0010, A10-1) | `a_rejected_reload_fails_the_reload_command`, `reload_works_with_arguments_only_execstart_has`, `reload_is_validated_by_the_running_agent` |
+| R3-C8 | Operator | `check` and `run` disagree (different loaders); reload digests name files not in force | same function (`load_startup`, `prepare`) with the same exit codes; reload validated by the running process itself; digests of the bytes parsed, reload digests only of what a reload applies (review 0010, A10-2) | `check_and_run_accept_the_same_files` (five file sets), `a_reload_is_not_blocked_by_files_it_does_not_apply`, `one_reload_is_one_generation` |
+| R3-C9 | Side channels | config hash in logs/metrics leaks content | only SHA-256 of whole file; no hash of individual entries | decided (review 0010, A10-6): `Digests` records one SHA-256 per file and nothing else; `check_accepts_a_valid_configuration_and_prints_digests` and `a_reload_is_not_blocked_by_files_it_does_not_apply` compare it with `sha256sum` of the whole file |
 | R3-C10 | Clock | wall clock stepped back 1 h | `clock_jump` WARN; certificate decisions use the new clock (documented residual) | `backward_clock_step_is_reported` |
-| R3-C11 | Clock | wall clock before build date | ERROR at start; no certificate valid | `clock_before_release_fails_closed` |
+| R3-C11 | Clock | wall clock before build date | ERROR at start (and when the clock steps below it); no certificate valid until it passes the build date (review 0010, A10-7) | `certificates_are_refused_before_the_clock_floor` |
 | R3-C12 | Operator | agent upgraded through its own TCN session | with `--no-block` the task completes; documented | ops test in `openssh.rs` |
 | R3-C13 | Crash/restart | fleet-wide crash loop | restart delays grow (RestartSteps) or are spread; relays not hammered every 2 s | unit-file review + sim |
 | R3-C14 | State | SIGTERM before READY (startup) | exits cleanly, no half-initialised listener | `early_sigterm_is_clean` |
@@ -520,7 +527,7 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 | D-8 | Faster Ansible bursts (connection reuse) | (a) **ControlPersist guidance only now**; (b) local `zt-client` multiplexer daemon (Unix socket, `SO_PEERCRED`, one outer connection, ≤ 32 streams); (c) Noise resumption tickets (`IKpsk2`, per-relay ticket keys) | **(a)** now; re-evaluate **(b)** with PQ measurements (it amortises PQ outer handshakes without new crypto); (c) not recommended (new key-management surface, no shared state between relays) |
 | D-9 | Network simulation | (a) **`turmoil` as dev-dependency behind a narrow `Dialer`/`Acceptor` port**; (b) hand-rolled in-memory duplex simulator; (c) only sans-IO unit tests | **(a)** (needs `cargo deny` approval of a dev-only crate); (c) is necessary but not sufficient |
 | D-10 | Metrics exposure | (a) **relay: localhost HTTP, off by default; agent: textfile + `STATUS=`**; (b) Unix-socket endpoint for both; (c) logs only | **(a)**: agent keeps zero inbound ports; minimal hand-written HTTP, fuzzed |
-| D-11 | Reload feedback | (a) **`check` subcommand in `ExecReload` (portable)**, plus `Type=notify-reload` where systemd ≥ 253; (b) notify-reload only; (c) keep `kill -HUP` | **(a)** |
+| D-11 | Reload feedback | (a) `check` subcommand in `ExecReload` (portable), plus `Type=notify-reload` where systemd ≥ 253; (b) notify-reload only; (c) keep `kill -HUP`; (d) **`reload --pid $MAINPID`: the running process validates and publishes its verdict** | (a), replaced by **(d)** after review 0010 (A10-1) |
 | D-12 | Pre-auth logging | (a) **aggregate refusals (10 s summaries + counters); per-event audit only after Noise identity**; (b) keep per-connection lines | **(a)**: avoids journald dropping real audit events |
 | D-13 | Global memory protection | (a) **byte budget shedding the largest backlog + `MemoryHigh`/`MemoryMax`**; (b) unit limits only | **(a)** |
 | D-14 | Restart policy | (a) **`StartLimitIntervalSec=0` + `RestartSteps`/`RestartMaxDelaySec` where available**; (b) keep defaults | **(a)**: today a fast crash loop ends in permanent `failed` |

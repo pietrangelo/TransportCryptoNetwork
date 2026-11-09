@@ -65,10 +65,25 @@ relay you want back at once), so the fleet does not come back in one wave. The a
 every 10 s and reconnects when nothing at all arrived from the relay for 30 s (PROTOCOL §10).
 
 Both services have a `check` subcommand that takes the same options as `run`, loads and
-validates every file `run` would load, prints `configuration OK` and the SHA-256 of the trust
-and settings files, and listens on nothing. It exits 0, or 78 (`EX_CONFIG`) on a configuration
-error; `run` also exits 78 when its files are invalid, and the units do not restart on 78.
-`SIGTERM` drains the service (§14); `--drain-timeout` (default 60 s) bounds the drain.
+validates every file `run` loads at startup (through the same code), prints `configuration OK`
+and the SHA-256 of the trust and settings files, and listens on nothing. It is a pre-flight
+before a **restart**. It exits 0; 78 (`EX_CONFIG`) when a file was read and is invalid; 1 when
+a file is missing or unreadable. `run` exits the same way at startup: the units do not restart
+on 78 (an operator must fix the file) and do restart on 1 (provisioning not finished yet, a
+late mount), with their backoff. `SIGTERM` drains the service (§14); `--drain-timeout`
+(default 60 s) bounds the drain.
+
+**Reload.** `systemctl reload` runs `zt-relay reload --pid $MAINPID` (or `zt-agent
+reload`): it sends `SIGHUP` to the running service and waits for the service's **own** verdict.
+The service validates its files with the arguments it was started with (drop-ins included),
+announces the reload to systemd (`RELOADING=1`, then `READY=1`) and publishes the outcome in
+its runtime directory (`/run/zt-relay`, `/run/zt-agent`; `RuntimeDirectory=` in the units,
+`--runtime-dir` outside systemd). `reload` then exits 0 when the files were applied, 78 when
+the service rejected them and kept the previous ones (the reason is printed and is in the
+journal as `..._reload_failed`), 1 when the service did not answer. `reload` takes no file
+arguments, so a drop-in that changes `ExecStart=` (§8, §10.2) needs no change to
+`ExecReload=` (review 0010, A10-1). The relay applies the policy even when its key files
+cannot be reloaded; `reload` then prints a `warning:` line and exits 0 (§8).
 
 With multiple relays, `--relay` and `--relay-key` are repeated in the same order, or separated with
 commas (at most 8). The agent stays connected to all of them at the same time; `--max-streams`
@@ -139,7 +154,9 @@ client_idle_secs = 90            # same for client connections
 ```
 
 `[liveness]` sets the relay's idle timeout per role (PROTOCOL §10). Agents of this release ping
-every 10 s and need at least 30 s; agents before R-2 ping every 30 s and need 90 s. Lower
+every 10 s: the relay accepts 15 s or more (one keepalive plus slack), but use 30 s or more so a
+lost keepalive or two does not cost a live agent its connection. Agents before R-2 ping every
+30 s and need 90 s. Lower
 `agent_idle_secs` (for example to 35) only once every agent is upgraded: a stale registration
 then goes away in 35 s instead of 90 s, and clients get `NodeOffline` sooner after an agent's
 host dies.
@@ -200,8 +217,10 @@ public_key = "<public key of the db-01 agent>"
 Each `[[relays]]` and `[[nodes]]` entry takes an optional `suite` (and the single-relay form
 `relay_suite`): the handshake suite pinned towards that relay or that node (PROTOCOL §7.5,
 exact Noise protocol name). Without it, the classical suite. The client never falls back to
-another suite: a relay or agent that does not accept the pinned one does not answer. A node can
-pin the hybrid suite; a relay cannot in this release (§12):
+another suite: a relay or agent that does not accept the pinned one does not answer. Both can
+pin the hybrid suite: a node for the end-to-end channel (§12), a relay for the hop to it (§13).
+The top-level `require_outer_suite = "<suite>"` makes every relay pinned to another suite a
+configuration error, so failover can never land on a weaker hop (§13, step 4):
 
 ```toml
 [[nodes]]
@@ -302,13 +321,14 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `outer_suites_confirmed` | INFO | (relay) every summary interval, if any outer handshake confirmed its key: `agents_classical`, `agents_hybrid`, `clients_classical`, `clients_hybrid` (absent when zero). No identities; replays never count. The sunset signal of §13 |
 | `relay_registered` | INFO | (agent) registered with a relay: `node`, `relay` (address), `suite` (the pinned outer suite) |
 | `agent_flapping` | WARN | (relay) one node changed hands between agent connections 3 times within 60 s (two agents with the same key, or a reconnect loop): `node`, `peer`, `count`. Reported once per window; each registration still goes through |
-| `configuration_loaded` | INFO | (relay and agent) at startup: `generation` (1) and `files`, the `path=sha256:<hex>` of each trust and settings file. The reload events above carry the same `generation` (one more per successful reload) and `files` |
+| `configuration_loaded` | INFO | (relay and agent) at startup: `generation` (1) and `files`, the `path=sha256:<hex>` of each trust and settings file, computed from the bytes parsed. `policy_reloaded` and `authorized_clients_reloaded` carry the next `generation` (one per `SIGHUP` that applied something; on the relay `relay_keys_reloaded` shares it) and the `files` they applied: the policy (or authorized clients) and the denylist, never `relay.toml`, which only a restart reads |
 | `relay_draining`, `relay_drained` | INFO | (relay) `SIGTERM` received: `timeout_secs`; drain over: `expired` (streams were still open at the deadline), `streams_closed` (closed with `Close Drained`) |
 | `agent_draining`, `agent_drained` | INFO | (agent) `SIGTERM` received: `node`, `sessions`, `timeout_secs`; drain over: `expired`, `sessions` still open |
 | `critical_task_failed` | ERROR | a background task the service relies on (reload, watchdog, key or CA watch) stopped: `task`, `how`. The service exits with 1 and systemd restarts it |
-| `watchdog_stalled` | ERROR | the hub (agent: the runtime) made no progress for a third of `WatchdogSec`: the watchdog is no longer kicked and systemd will restart the service if it does not resume |
-| `clock_jumped` | WARN | the wall clock stepped against the monotonic clock by 5 s or more: `delta_secs`, `direction`. Backward steps make expired certificates valid again until corrected (§10.7) |
-| `clock_unsynchronised` | ERROR | at startup the wall clock is before this build: `now`, `floor`. Certificate checks are unreliable until the clock is set |
+| `watchdog_stalled` | ERROR | the hub (agent: the runtime) made no progress for two watchdog checks in a row (two thirds of `WatchdogSec`): the watchdog is no longer kicked and systemd will restart the service if it does not resume. The relay's progress covers its hub, not the accept loop; the agent's is a heartbeat of its runtime, not of each relay loop |
+| `clock_jumped` | WARN | the wall clock stepped against the monotonic clock by 5 s or more: `delta_secs`, `direction`. Backward steps make expired certificates valid again until corrected (§10.7). A VM suspend and resume shows up as a forward step |
+| `clock_unsynchronised` | ERROR | at startup, or when the clock steps back below it, the wall clock is before this build: `now`, `floor`. **Every certificate is refused** until the clock passes the build date again (§10.7); key-pinned clients and agents still work, so the host stays reachable |
+| `clock_synchronised` | WARN | the wall clock passed the build date again: certificates are checked again |
 | `identity_events_suppressed` | WARN | (agent) once per 10 s interval, if events about more than 256 identities occurred: `count` of the events not logged per identity (the relay reports them as `suppressed_identities` in `preauth_summary`) |
 
 The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex),
@@ -381,8 +401,9 @@ journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
    **all** the relays: `zt-client` moves on to the next relay when one does not recognise its
    key, so a relay that has not been updated keeps the revoked key valid. Removing the key
    from `clients.toml` on the agents blocks it anyway, whichever relay it uses.
-3. Check `access_revoked` in the audit log. If you find `..._reload_failed`, the file is not
-   valid: the previous configuration is still in force.
+3. `systemctl reload` fails when the service rejected the file, with its reason: the
+   previous configuration is still in force (`..._reload_failed` in the journal). Fix the file
+   and reload again. Check `access_revoked` in the audit log.
 
 A client with a certificate (§10) is not revoked by removing it from the files: its key is not there.
 The denylist is used instead (§10.5).
@@ -428,7 +449,10 @@ If a relay is already running with `--previous-key /etc/tcn/relay.prev.key`, the
 without a restart, but in this order: first `cp -p /etc/tcn/relay.key /etc/tcn/relay.prev.key`
 (identical keys: a reload fails and keeps the previous ones), then
 `mv /etc/tcn/relay.next.key /etc/tcn/relay.key` (a rename is atomic), then
-`systemctl reload zt-relay` and check `relay_keys_reloaded` and `keys_in_use`.
+`systemctl reload zt-relay` and check `relay_keys_reloaded` and `keys_in_use`. A key reload
+that fails does not fail `systemctl reload` (the policy, the urgent part, is still applied):
+`zt-relay reload` prints `warning: relay keys not reloaded …`, and the journal has
+`relay_keys_reload_failed`. One `SIGHUP` is one configuration generation for both.
 
 **An agent's key**:
 
@@ -493,10 +517,10 @@ The lifecycle directives of the units (resilience R-3):
 | Directive | Why |
 | :- | :- |
 | `After=time-sync.target` | certificates and revocations follow the wall clock (§10.7) |
-| `ExecReload=… check …` then `kill -HUP` | an invalid file fails `systemctl reload` visibly; the running service keeps its files either way |
-| `WatchdogSec=60s` | the relay's hub kicks the watchdog every 20 s, only while it processes events (its own 1 s tick counts); a stuck hub gets the relay restarted |
+| `ExecReload=… reload --pid $MAINPID`, `RuntimeDirectory=` | `SIGHUP` to the running service, which validates its own files with its own arguments; `systemctl reload` fails exactly when the service rejected them (and kept the previous ones) |
+| `WatchdogSec=60s` | the relay's hub kicks the watchdog every 20 s, only while it processes events (its own 1 s tick counts); a stuck hub gets the relay restarted. At least 3 s: a shorter value is refused at startup (exit 78), because the 1 s tick could not show progress at every check. `watchdog_stalled` means two checks in a row without progress |
 | `TimeoutStopSec=90s` | room for the drain (§14, 60 s by default) before `SIGKILL` |
-| `RestartPreventExitStatus=78` | a configuration error is not restarted in a loop: fix it, then `systemctl restart` |
+| `RestartPreventExitStatus=78` | an invalid file is not restarted in a loop: fix it, then `systemctl restart`. A missing or unreadable file exits 1 and is retried |
 | `StartLimitIntervalSec=0`, `RestartSteps=5`, `RestartMaxDelaySec=60s` | never give up restarting, but back off up to 60 s (systemd 254 and later; older versions ignore the last two) |
 | `LimitCORE=0` | no core dumps of a process holding keys; the binaries also set `PR_SET_DUMPABLE` 0 |
 
@@ -678,9 +702,10 @@ For a certificate (for example a lost laptop with key and certificate):
 3. Distribute the file to **all** the relays and **all** the agents and reload
    (`systemctl reload zt-relay`, `systemctl reload zt-agent`). Ongoing sessions of the
    certificate are closed immediately (PROTOCOL §12).
-4. Check `access_revoked` and `revocations_in_use` with the new number of entries. A
-   `policy_reload_failed` or `authorized_clients_reload_failed` means that the **revocation is not
-   in force** on that node (the previous configuration remains): fix the file and reload.
+4. A failed `systemctl reload` (and `policy_reload_failed` or
+   `authorized_clients_reload_failed` in the journal) means that the **revocation is not in
+   force** on that node (the previous configuration remains): fix the file and reload. Check
+   `access_revoked` and `revocations_in_use` with the new number of entries.
 
 Even with a relay that has not been updated, the updated agents block the certificate; conversely, an
 agent that has not been updated is protected only by the relays. Update them all.
@@ -716,7 +741,12 @@ log: a serial that does not appear in the log is a forged certificate.
 Relay and agent decide validity and expiry with their own system clock, with 2 minutes of
 tolerance only on the start of validity. Keep them synchronised, preferably with NTS
 (`chrony` with `nts`): whoever moves the clock of a relay and an agent backwards makes
-expired certificates valid again. The CA machine, being offline, must be set by hand before
+expired certificates valid again. A clock before the build date of the binaries (an RTC that
+lost its time, NTP not reached yet) is treated as unknown: relay and agent refuse every
+certificate until it passes the build date (`clock_unsynchronised`, then `clock_synchronised`),
+so a certificate that expired before the build cannot become valid again. Key-pinned peers
+are not affected. `After=time-sync.target` waits for synchronisation only when
+`systemd-time-wait-sync.service` is enabled. The CA machine, being offline, must be set by hand before
 every signing session; `zt-ca sign` prints the dates in UTC precisely so that you can check them.
 
 ## 11. SSH key exchange: post-quantum today
@@ -850,6 +880,16 @@ Rollout, in this order (pq.md §6.3):
    A client pinned to the hybrid suite at a relay that does not accept it moves on to the next
    relay with that relay's own pin, and fails if none accepts it. Distribute such a
    configuration only to upgraded clients: an older `zt-client` refuses it as a whole.
+
+   While pins are mixed, failover can land on a classical hop: an active attacker who resets
+   the connections to the hybrid-pinned relays makes the client complete on a classical one
+   (no single pin is lowered, but that session's outer hop is classical). `zt-client` warns
+   `failover to a relay pinned to another outer suite` on stderr when it happens. Once every
+   relay a client uses accepts the hybrid suite, add
+   `require_outer_suite = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"` to its
+   `client.toml`: a relay pinned to any other suite is then a configuration error, so failover
+   can never land on a weaker hop (review 0010, A10-9). This is an explicit set of one suite,
+   like the relays' accepted sets (there is still no "minimum suite" ordering).
 5. **Sunset, per role (optional, PQ-SUNSET).** When `outer_suites_confirmed` shows no
    `agents_classical` (or `clients_classical`) for a period you choose on every relay, remove
    the classical suite from that role's set, relay by relay. Agents usually get there first;
@@ -870,12 +910,15 @@ every peer that pins it towards that relay.
 cutting it (PROTOCOL §8):
 
 - **Relay**: the port closes at once, so new connections are refused and clients and agents go
-  to the other relays (§8). Open sessions continue, and the policy and its reloads still apply
+  to the other relays (§8); a new stream on a connection that is already open gets
+  `Reject NodeOffline`, so the client moves on too. Open sessions continue, and the policy and its reloads still apply
   to them, until the last one ends or `--drain-timeout` (60 s) passes; then the remaining ones
   get `Close Drained` and the relay exits 0. `relay_draining` and `relay_drained` mark the two
   ends.
 - **Agent**: new sessions get `Reject NodeOffline` on every relay (the node is offline during
-  its own drain; the client tries its next relay and then gives up), open ones continue up to
+  its own drain; the client tries its next relay and then gives up); a stream that was
+  accepted just before the drain and is still in its end-to-end handshake is counted, and gets
+  `Close Drained` instead of a session. Open ones continue up to
   `--drain-timeout`, then the agent exits 0. `agent_draining` and `agent_drained` mark the two
   ends.
 
@@ -896,4 +939,6 @@ seconds. Long-lived sessions (an interactive shell, a long `scp`) are cut at the
 
 **Configuration errors.** A restart with an invalid file exits 78 and is not retried
 (`RestartPreventExitStatus=78`); run `zt-relay check` / `zt-agent check` with the unit's options
-before restarting, as `systemctl reload` already does.
+(the ones of its drop-ins too) before restarting. A missing or unreadable file exits 1 and is
+retried with the backoff. `systemctl reload` needs no pre-flight: the running service checks
+its own files and the reload fails if it rejects them.
