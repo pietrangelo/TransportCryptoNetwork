@@ -53,6 +53,7 @@ fn command(dir: &Dir, sub: &str) -> Command {
         .arg(dir.0.join("clients.toml"))
         .env("RUNTIME_DIRECTORY", dir.0.join("run"))
         .env_remove("TCN_ACCEPT_CLIENT_SUITES")
+        .env_remove("TCN_PQ_ONLY")
         .env_remove("NOTIFY_SOCKET")
         .env_remove("WATCHDOG_USEC");
     cmd
@@ -320,4 +321,55 @@ fn the_agent_writes_its_metrics_and_never_listens() {
 
 fn text_of(out: &std::process::Output) -> String {
     text(out)
+}
+
+/// PQ-SUNSET (OPERATIONS §19): `--pq-only` refuses, in `check` and `run` alike, a classical
+/// relay pin, a classical client suite and a `clients.toml` that still admits v1 identities;
+/// the end state passes and `check` lists no classical path. Without the flag, `check` lists
+/// the classical paths still accepted.
+#[test]
+fn check_enforces_the_pq_only_profile() {
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let dir = setup("pq-only");
+    let out = command(&dir, "check").output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("classical still accepted"),
+        "{}",
+        text(&out)
+    );
+    // The flag with the classical defaults: EX_CONFIG, for check and run.
+    for sub in ["check", "run"] {
+        let out = command(&dir, sub).arg("--pq-only").output().unwrap();
+        assert_eq!(out.status.code(), Some(EX_CONFIG), "{}", text(&out));
+        assert!(text(&out).contains("pq_only"), "{}", text(&out));
+    }
+    let pq_command = |dir: &Dir| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["--log-format", "json", "check", "--pq-only", "--node", "web-01"])
+            .args(["--relay", "127.0.0.1:9", "--relay-key"])
+            .arg(Identity::generate().unwrap().hybrid_public_key().to_string())
+            .args(["--relay-suite", HYBRID, "--accept-client-suites", HYBRID])
+            .arg("--key")
+            .arg(dir.0.join("agent.key"))
+            .arg("--authorized-clients")
+            .arg(dir.0.join("clients.toml"))
+            .env_remove("TCN_ACCEPT_CLIENT_SUITES")
+            .env_remove("TCN_PQ_ONLY");
+        cmd
+    };
+    // Hybrid suites, but clients.toml does not require hybrid clients.
+    let out = pq_command(&dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(EX_CONFIG), "{}", text(&out));
+    // The end state.
+    std::fs::write(
+        dir.0.join("clients.toml"),
+        "require_hybrid_identity = [\"clients\"]\n",
+    )
+    .unwrap();
+    let out = pq_command(&dir).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("classical"), "{stdout}");
+    assert!(stdout.contains("pq-only"), "{stdout}");
 }

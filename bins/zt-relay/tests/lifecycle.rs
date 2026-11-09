@@ -883,3 +883,54 @@ fn an_invalid_metrics_interval_is_refused() {
         assert!(!out.status.success(), "{bad}: {out:?}");
     }
 }
+
+/// PQ-SUNSET (OPERATIONS §19): `[handshake] pq_only = true` is checked by `check` and `run`
+/// alike, against `relay.toml` and the policy; outside the profile `check` lists the classical
+/// paths the configuration still accepts, and the profile's end state lists none.
+#[test]
+fn check_enforces_the_pq_only_profile_and_reports_classical_paths() {
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let dir = setup("pq-only");
+    let config = dir.0.join("relay.toml").display().to_string();
+    // The default configuration: accepted, with the classical paths listed.
+    let out = command(&dir, "check").output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("classical still accepted"),
+        "{stdout}"
+    );
+    // The profile with a policy that still admits v1 identities: EX_CONFIG, for both.
+    write(
+        &dir.0,
+        "relay.toml",
+        &format!(
+            "[handshake]\npq_only = true\nagent_suites = [\"{HYBRID}\"]\nclient_suites = [\"{HYBRID}\"]\n"
+        ),
+    );
+    let out = command(&dir, "check")
+        .args(["--config", &config])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(EX_CONFIG), "{}", text(&out));
+    assert!(text(&out).contains("pq_only"), "{}", text(&out));
+    assert_eq!(startup_code(&dir, &["--config", &config]), Some(EX_CONFIG));
+    // The end state: accepted, nothing classical left.
+    let agent = Identity::generate().unwrap();
+    write(
+        &dir.0,
+        "policy.toml",
+        &format!(
+            "require_hybrid_identity = [\"agents\", \"clients\"]\n\n[[agents]]\nnode = \"web-01\"\npublic_key = \"{}\"\n",
+            agent.hybrid_public_key()
+        ),
+    );
+    let out = command(&dir, "check")
+        .args(["--config", &config])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("classical"), "{stdout}");
+    assert!(stdout.contains("pq-only"), "{stdout}");
+}

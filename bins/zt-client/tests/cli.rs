@@ -542,3 +542,90 @@ async fn a_hybrid_bound_certificate_needs_hybrid_hops_and_the_clients_own_key() 
     assert!(!out.stderr.contains("hybrid IK"), "{}", out.stderr);
     assert!(bait.count() >= 1, "{}", out.stderr);
 }
+
+// ---------- Phase 7, PQ-SUNSET (OPERATIONS §19) ----------
+
+/// A certificate v2 bound only to `subject`'s X25519 key (`subject_kind = 0x01`).
+fn classical_v2(subject: &zt_crypto::Identity) -> Vec<u8> {
+    let ca = zt_crypto::CompositeCaSigningKey::generate().unwrap();
+    let now = common::now_secs();
+    let body = zt_domain::CertBodyV2::new(
+        ca.public_key().ca_fp(),
+        zt_domain::CertSubject::Classical(subject.fingerprint()),
+        zt_domain::CertSerial::try_from([0x3e; 16]).unwrap(),
+        zt_domain::UnixTime::from_secs(now - 60),
+        zt_domain::UnixTime::from_secs(now + 3_600),
+        common::node("alice"),
+        zt_domain::CertScope::All,
+    )
+    .unwrap();
+    zt_crypto::sign_certificate_v2(&ca, &body).unwrap()
+}
+
+/// `pq_only = true` in `client.toml`: a certificate v1, or a certificate v2 not bound to the
+/// client's hybrid identity, is refused before any connection, naming the profile; a
+/// hybrid-bound certificate goes to the network. A `client.toml` that still pins a classical
+/// suite does not load.
+#[tokio::test]
+async fn a_pq_only_client_refuses_v1_certificates_before_connecting() {
+    use common::ClientDir;
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let me = zt_crypto::Identity::generate().unwrap();
+    let (relay, agent) = (
+        zt_crypto::Identity::generate().unwrap(),
+        zt_crypto::Identity::generate().unwrap(),
+    );
+    let bait = Counting::start(false).await;
+    let dir = ClientDir::new(&me, &bait.addr.to_string(), &relay.public_key(), &[]);
+    let write = |node_suite: &str| {
+        let toml = format!(
+            "pq_only = true\ncertificate = \"client.cert\"\nkey = \"client.key\"\n\n\
+             [[relays]]\naddress = \"{}\"\npublic_key = \"{}\"\nsuite = \"{HYBRID}\"\n\n\
+             [[nodes]]\nnode = \"web-01\"\npublic_key = \"{}\"\nsuite = \"{node_suite}\"\n",
+            bait.addr,
+            relay.hybrid_public_key(),
+            agent.hybrid_public_key(),
+        );
+        std::fs::write(dir.config(), toml).unwrap();
+    };
+    write(HYBRID);
+    let v1_ca = zt_crypto::CaSigningKey::generate().unwrap();
+    let now = common::now_secs();
+    let v1_body = zt_domain::CertBody::new(
+        zt_crypto::cert_key(&v1_ca.public_key()),
+        zt_crypto::cert_key(&me.public_key()),
+        zt_domain::CertSerial::try_from([0x3f; 16]).unwrap(),
+        zt_domain::UnixTime::from_secs(now - 60),
+        zt_domain::UnixTime::from_secs(now + 3_600),
+        common::node("alice"),
+        zt_domain::CertScope::All,
+    )
+    .unwrap();
+    let v1 = zt_crypto::sign_certificate(&v1_ca, &v1_body).unwrap();
+    for cert in [v1, classical_v2(&me)] {
+        std::fs::write(
+            dir.dir.join("client.cert"),
+            zt_crypto::encode_certificate_text(&cert),
+        )
+        .unwrap();
+        let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+        assert!(!out.success);
+        assert!(out.stderr.contains("pq_only"), "{}", out.stderr);
+    }
+    // A classical node pin: the configuration itself is refused.
+    write("Noise_IK_25519_ChaChaPoly_BLAKE2s");
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+    assert!(!out.success);
+    assert!(out.stderr.contains("pq_only"), "{}", out.stderr);
+    assert_eq!(bait.count(), 0, "a connection was attempted");
+    // The end state: the certificate is used and the client goes to the network.
+    write(HYBRID);
+    std::fs::write(
+        dir.dir.join("client.cert"),
+        zt_crypto::encode_certificate_text(&hybrid_bound(&me, me.hybrid_fingerprint())),
+    )
+    .unwrap();
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(15)).await;
+    assert!(!out.stderr.contains("pq_only"), "{}", out.stderr);
+    assert!(bait.count() >= 1, "{}", out.stderr);
+}
