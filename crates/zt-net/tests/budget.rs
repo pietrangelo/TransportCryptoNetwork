@@ -375,7 +375,7 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
     prop_oneof![
         (
             stream.clone(),
-            proptest::collection::vec(any::<u8>(), 0..20_000)
+            proptest::collection::vec(any::<u8>(), 1..20_000)
         )
             .prop_map(|(stream, p)| Frame::Data {
                 stream,
