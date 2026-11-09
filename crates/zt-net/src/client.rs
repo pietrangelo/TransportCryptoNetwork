@@ -161,8 +161,20 @@ struct AttemptCtx<'a, D> {
     dialer: &'a D,
 }
 
-/// The outcome of one attempt: its relay and its connection after the `OpenAck`.
-type AttemptResult<S> = (usize, Result<Established<S>, NetError>);
+/// How one attempt ended. At most [`crate::MAX_RELAYS`] exist, each briefly: boxing the
+/// connection would save nothing.
+#[allow(clippy::large_enum_variant)]
+enum Outcome<S> {
+    /// `OpenAck` received: the connection is ready for the end-to-end channel.
+    Acked(Established<S>),
+    /// No `OpenAck`: the error says why.
+    Failed(NetError),
+    /// The plan cancelled it.
+    Cancelled,
+}
+
+/// The outcome of one attempt, with the index of its relay.
+type AttemptResult<S> = (usize, Outcome<S>);
 /// Attempts in flight. They are futures of this task, not spawned tasks: dropping the set
 /// drops every connection (RAII), nothing outlives the client.
 type Attempts<'a, S> =
@@ -178,8 +190,8 @@ struct Losers<'a, S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Losers<'_, S> {
     async fn close(mut self) {
-        while let Some((_, result)) = self.attempts.next().await {
-            if let Ok(mut ch) = result {
+        while let Some((_, outcome)) = self.attempts.next().await {
+            if let Outcome::Acked(mut ch) = outcome {
                 close_politely(&mut ch, self.stream, self.t).await;
             }
         }
@@ -252,10 +264,10 @@ async fn establish<'a, D: crate::net::Dialer>(
             Some(event) = progress_rx.recv() => {
                 actions = plan.handle(started.elapsed(), event);
             }
-            Some((i, result)) = attempts.next(), if !attempts.is_empty() => {
+            Some((i, outcome)) = attempts.next(), if !attempts.is_empty() => {
                 let now = started.elapsed();
-                match result {
-                    Ok(ch) => {
+                match outcome {
+                    Outcome::Acked(mut ch) => {
                         actions = plan.handle(now, Event::Acked(i));
                         if actions.contains(&Action::Proceed(i)) {
                             for a in &actions {
@@ -266,17 +278,17 @@ async fn establish<'a, D: crate::net::Dialer>(
                             return Ok((i, ch, Losers { attempts, stream: ctx.stream, t: ctx.t }));
                         }
                         // Not in flight any more (timed out in the meantime): close it.
-                        let mut ch = ch;
                         close_politely(&mut ch, ctx.stream, ctx.t).await;
                     }
-                    Err(NetError::Stopped(CANCELLED)) => {}
-                    Err(err) => {
+                    Outcome::Cancelled => {}
+                    Outcome::Failed(err) => {
                         let failure = if may_try_next_relay(&err) {
                             Failure::Unavailable
                         } else {
                             Failure::Refused
                         };
                         actions = plan.handle(now, Event::Failed(i, failure));
+                        // Fail closed: the other attempts end when they are dropped here.
                         if let Some(Action::GiveUp(GiveUp::Refused(_))) = actions.last() {
                             return Err(err);
                         }
@@ -303,9 +315,6 @@ fn cancel(cancels: &mut [Option<oneshot::Sender<()>>], i: usize) {
     }
 }
 
-/// The marker error of a cancelled attempt.
-const CANCELLED: &str = "attempt cancelled";
-
 const fn step_name(step: Step) -> &'static str {
     match step {
         Step::Connect => "connect",
@@ -325,14 +334,14 @@ async fn attempt<'a, D: crate::net::Dialer>(
     mut cancel: oneshot::Receiver<()>,
 ) -> AttemptResult<D::Stream> {
     let t = ctx.t;
-    let cancelled = || (index, Err(NetError::Stopped(CANCELLED)));
+    let failed = |e: NetError| (index, Outcome::Failed(e));
     let tcp = tokio::select! {
         r = timeout(t.handshake, ctx.dialer.connect(&relay.address)) => match r {
             Ok(Ok(tcp)) => tcp,
-            Ok(Err(e)) => return (index, Err(e.into())),
-            Err(_) => return (index, Err(NetError::Timeout("connect"))),
+            Ok(Err(e)) => return failed(e.into()),
+            Err(_) => return failed(NetError::Timeout("connect")),
         },
-        _ = &mut cancel => return cancelled(),
+        _ = &mut cancel => return (index, Outcome::Cancelled),
     };
     let _ = progress.try_send(Event::Connected(index));
     let opened = tokio::select! {
@@ -357,11 +366,11 @@ async fn attempt<'a, D: crate::net::Dialer>(
             .await?;
             Ok::<_, NetError>(ch)
         } => r,
-        _ = &mut cancel => return cancelled(),
+        _ = &mut cancel => return (index, Outcome::Cancelled),
     };
     let mut ch = match opened {
         Ok(ch) => ch,
-        Err(e) => return (index, Err(e)),
+        Err(e) => return failed(e),
     };
     let _ = progress.try_send(Event::OuterReady(index));
     let acked = tokio::select! {
@@ -369,12 +378,12 @@ async fn attempt<'a, D: crate::net::Dialer>(
         _ = &mut cancel => None,
     };
     match acked {
-        Some(Ok(Ok(()))) => (index, Ok(ch)),
-        Some(Ok(Err(e))) => (index, Err(e)),
-        Some(Err(_)) => (index, Err(NetError::Timeout("open"))),
+        Some(Ok(Ok(()))) => (index, Outcome::Acked(ch)),
+        Some(Ok(Err(e))) => failed(e),
+        Some(Err(_)) => failed(NetError::Timeout("open")),
         None => {
             close_politely(&mut ch, ctx.stream, t).await;
-            cancelled()
+            (index, Outcome::Cancelled)
         }
     }
 }
