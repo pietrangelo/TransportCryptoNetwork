@@ -2271,6 +2271,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "proptest",
  "rustix",
  "serde",
  "sha2 0.11.1",
