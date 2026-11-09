@@ -3,14 +3,21 @@
 //! The trait never draws randomness itself: seeds and encapsulation randomness are parameters,
 //! so every provider is deterministic, checkable against the NIST ACVP and Wycheproof vectors
 //! and against an independent implementation (`tests/kem.rs`). The handshake (PQ-1) draws
-//! them from the system CSPRNG and passes them in.
+//! them from the system CSPRNG ([`KemSeed::random`]) and passes them in.
+//!
+//! Secret hygiene (review 0008, A8-12): every secret type wipes itself on drop, and the trait
+//! requires it of every provider's decapsulation key ([`zeroize::ZeroizeOnDrop`]). The ML-KEM
+//! decapsulation key is one heap-allocated `libcrux` value per key, wiped in place on drop and
+//! never rebuilt. What safe Rust cannot reach stays: the copy of a by-value argument inside
+//! `libcrux` (the seed of key generation, the encapsulation randomness) and moved-from stack
+//! slots the compiler does not reuse.
 //!
 //! [`MlKem768`] is `libcrux-ml-kem` (formally verified portable and AVX2 code; the NEON
 //! backend is disabled, see `.cargo/config.toml`). The independent `ml-kem` crate is used only
 //! in tests, as the differential oracle.
 
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Length of a KEM key-generation seed (`d ‖ z` for ML-KEM, FIPS 203 §7.1).
 pub const SEED_LEN: usize = 64;
@@ -34,16 +41,40 @@ pub enum KemError {
     /// The ciphertext does not have the length of the algorithm.
     #[error("ciphertext length")]
     CiphertextLength,
+    /// The system random number generator is not available.
+    #[error("system random generator unavailable")]
+    Random,
 }
 
-/// A key-generation seed. Secret: no `Clone`, zeroized on drop, redacted `Debug`.
-pub struct KemSeed(Zeroizing<[u8; SEED_LEN]>);
+/// A key-generation seed. Secret: no `Clone`, zeroized on drop, redacted `Debug`. It lives on
+/// the heap, so moving a seed never leaves a copy of it on the stack.
+pub struct KemSeed(Box<[u8; SEED_LEN]>);
 
 impl KemSeed {
-    /// A seed from bytes the caller drew from a CSPRNG (or a test vector).
+    /// A seed from bytes the caller drew from a CSPRNG (or a test vector). The caller's array
+    /// is a copy: wipe it if it was secret.
     #[must_use]
     pub fn from_bytes(bytes: [u8; SEED_LEN]) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self(Box::new(bytes))
+    }
+
+    /// A seed drawn from the system CSPRNG directly into its final place.
+    ///
+    /// # Errors
+    /// [`KemError::Random`] if the system random number generator is not available.
+    pub fn random() -> Result<Self, KemError> {
+        Self::filled_by(|bytes| getrandom::fill(bytes).map_err(|_| KemError::Random))
+    }
+
+    /// A seed written in place by `fill` (for example snow's random number generator). On
+    /// error the partial seed is wiped.
+    ///
+    /// # Errors
+    /// Whatever `fill` returns.
+    pub fn filled_by<E>(fill: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<Self, E> {
+        let mut seed = Self(Box::new([0_u8; SEED_LEN]));
+        fill(seed.0.as_mut_slice())?;
+        Ok(seed)
     }
 
     /// The seed bytes.
@@ -52,6 +83,14 @@ impl KemSeed {
         &self.0
     }
 }
+
+impl Drop for KemSeed {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for KemSeed {}
 
 impl core::fmt::Debug for KemSeed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -84,6 +123,8 @@ impl PartialEq for SharedSecret {
 
 impl Eq for SharedSecret {}
 
+impl ZeroizeOnDrop for SharedSecret {}
+
 impl core::fmt::Debug for SharedSecret {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("SharedSecret(<redacted>)")
@@ -100,8 +141,9 @@ pub trait Kem {
     const ENCAPSULATION_KEY_LEN: usize;
     /// Length of a ciphertext.
     const CIPHERTEXT_LEN: usize;
-    /// The secret decapsulation key.
-    type DecapsulationKey;
+    /// The secret decapsulation key. It must wipe itself on drop (finding A8-12): in a
+    /// handshake it is the ephemeral secret that forward secrecy depends on.
+    type DecapsulationKey: ZeroizeOnDrop;
 
     /// Deterministic key generation from `seed`: the decapsulation key and the encoded
     /// encapsulation key.
@@ -129,11 +171,9 @@ pub trait Kem {
     ) -> Result<SharedSecret, KemError>;
 }
 
-use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
-use zeroize::Zeroize;
+use core::ops::IndexMut;
 
-/// Length of an ML-KEM-768 decapsulation key in its expanded (FIPS 203) form.
-const MLKEM768_DK_LEN: usize = MlKem768PrivateKey::len();
+use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
 
 /// ML-KEM-768 (FIPS 203), provided by `libcrux-ml-kem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,10 +181,19 @@ pub struct MlKem768;
 
 /// An ML-KEM-768 decapsulation key. Secret: no `Clone`, zeroized on drop, redacted `Debug`.
 ///
-/// `libcrux-ml-kem` key types do not zeroize themselves, so the key lives here as zeroizing
-/// bytes and is turned into a `libcrux` value only for the duration of a decapsulation (whose
-/// temporary copy is wiped as well, as far as the compiler lets a copy be wiped).
-pub struct MlKem768DecapsulationKey(Zeroizing<[u8; MLKEM768_DK_LEN]>);
+/// `libcrux-ml-kem` key types do not zeroize themselves, so the key is kept as **one**
+/// heap-allocated `libcrux` value, used in place by every decapsulation (never rebuilt or
+/// copied) and wiped in place when it is dropped (finding A8-12).
+pub struct MlKem768DecapsulationKey(Box<MlKem768PrivateKey>);
+
+impl Drop for MlKem768DecapsulationKey {
+    fn drop(&mut self) {
+        // `IndexMut` is the only mutable access libcrux offers to the key bytes.
+        IndexMut::index_mut(&mut *self.0, 0..).zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for MlKem768DecapsulationKey {}
 
 impl core::fmt::Debug for MlKem768DecapsulationKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -159,12 +208,13 @@ impl Kem for MlKem768 {
     type DecapsulationKey = MlKem768DecapsulationKey;
 
     fn generate(seed: &KemSeed) -> (Self::DecapsulationKey, Vec<u8>) {
-        // FIPS 203 ML-KEM.KeyGen_internal(d, z), with seed = d ‖ z.
+        // FIPS 203 ML-KEM.KeyGen_internal(d, z), with seed = d ‖ z. libcrux takes the seed by
+        // value: that copy belongs to libcrux and cannot be wiped from here.
         let (sk, pk) = mlkem768::generate_key_pair(*seed.as_bytes()).into_parts();
-        let mut raw: [u8; MLKEM768_DK_LEN] = sk.into();
-        let key = MlKem768DecapsulationKey(Zeroizing::new(raw));
-        raw.zeroize();
-        (key, pk.as_slice().to_vec())
+        (
+            MlKem768DecapsulationKey(Box::new(sk)),
+            pk.as_slice().to_vec(),
+        )
     }
 
     fn encapsulate(
@@ -177,8 +227,13 @@ impl Kem for MlKem768 {
         if !mlkem768::validate_public_key(&ek) {
             return Err(KemError::InvalidEncapsulationKey);
         }
-        let (ct, ss) = mlkem768::encapsulate(&ek, *randomness);
-        Ok((ct.as_slice().to_vec(), SharedSecret::from_bytes(ss)))
+        // The randomness is passed by value: a zeroizing local holds the copy this function
+        // makes; the callee's own copy is out of reach.
+        let m = Zeroizing::new(*randomness);
+        let (ct, mut ss) = mlkem768::encapsulate(&ek, *m);
+        let secret = SharedSecret::from_bytes(ss);
+        ss.zeroize();
+        Ok((ct.as_slice().to_vec(), secret))
     }
 
     fn decapsulate(
@@ -189,10 +244,9 @@ impl Kem for MlKem768 {
         // rejection path inside ML-KEM.Decaps and yields a pseudo-random secret.
         let ct =
             MlKem768Ciphertext::try_from(ciphertext).map_err(|_| KemError::CiphertextLength)?;
-        let sk = MlKem768PrivateKey::from(&*key.0);
-        let ss = mlkem768::decapsulate(&sk, &ct);
-        let mut wipe: [u8; MLKEM768_DK_LEN] = sk.into();
-        wipe.zeroize();
-        Ok(SharedSecret::from_bytes(ss))
+        let mut ss = mlkem768::decapsulate(&key.0, &ct);
+        let secret = SharedSecret::from_bytes(ss);
+        ss.zeroize();
+        Ok(secret)
     }
 }

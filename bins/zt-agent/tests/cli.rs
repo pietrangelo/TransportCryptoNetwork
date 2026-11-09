@@ -430,7 +430,10 @@ fn the_accepted_suites_can_come_from_the_environment() {
         &run_env(
             &dir,
             &args,
-            &[("TCN_ACCEPT_CLIENT_SUITES", "Noise_XX_25519_ChaChaPoly_BLAKE2s")],
+            &[(
+                "TCN_ACCEPT_CLIENT_SUITES",
+                "Noise_XX_25519_ChaChaPoly_BLAKE2s",
+            )],
         ),
         "suite",
     );

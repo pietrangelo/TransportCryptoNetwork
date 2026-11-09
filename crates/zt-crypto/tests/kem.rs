@@ -254,8 +254,8 @@ fn secrets_are_redacted_in_debug() {
 // --- PQ-1: secret hygiene (review 0008, finding A8-12) -------------------------------------
 
 /// Every KEM secret wipes itself on drop: the trait requires it of every provider's
-/// decapsulation key, so the ephemeral key of a hybrid handshake (the secret IKhfs's forward
-/// secrecy depends on) cannot outlive the handshake in memory.
+/// decapsulation key, so the ephemeral key of a hybrid handshake (the secret that the forward
+/// secrecy of `IKhfs` depends on) cannot outlive the handshake in memory.
 #[test]
 fn kem_secrets_are_wiped_on_drop() {
     fn wiped<T: zeroize::ZeroizeOnDrop>() {}

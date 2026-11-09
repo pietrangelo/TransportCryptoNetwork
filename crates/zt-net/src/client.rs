@@ -11,7 +11,7 @@ use zt_domain::flow::Window;
 use zt_domain::{Frame, NodeId, RejectReason, StreamId};
 
 use crate::channel::Established;
-use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
+use crate::stream::{STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
 /// Configuration of a client connection.
@@ -94,7 +94,10 @@ where
         io.send_data(msg1).await?;
         let msg2 = io.recv_message(t).await?;
         let mut transport = waiting.complete(&msg2)?;
-        io.send_data(transport.encrypt(CONFIRM)?).await?;
+        // Proves to the agent that this client completed the handshake (PROTOCOL §7.3): a relay
+        // replaying message 1 cannot produce it.
+        io.send_data(transport.encrypt(config.node_suite.confirmation())?)
+            .await?;
         pump(io, transport, local, None).await
     };
     let (link, session) = tokio::join!(relay_link, session);

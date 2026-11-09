@@ -23,9 +23,8 @@ subtle.workspace = true
 hex.workspace = true
 # Phase 6: attack tests (signatures with -s, hand-written msg2 payloads). Crate already in graph.
 ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
-# PQ-0 spike (docs/pq-snow.md): the HFS code path of stock snow, for tests only. Features of
-# dev-dependencies do not reach the release binaries.
-snow = { workspace = true, features = ["hfs"] }
+# Raw snow for the attack tests (malicious peers with a chosen KEM behaviour).
+snow.workspace = true
 # `zeroize`: the oracle satisfies the `ZeroizeOnDrop` bound of `Kem::DecapsulationKey`.
 ml-kem = { workspace = true, features = ["zeroize"] }
 

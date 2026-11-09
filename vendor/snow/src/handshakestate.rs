@@ -4,6 +4,8 @@ use crate::constants::{CIPHERKEYLEN, MAXHASHLEN};
 use crate::constants::{MAXKEMCTLEN, MAXKEMPUBLEN, MAXKEMSSLEN};
 #[cfg(feature = "hfs")]
 use crate::types::Kem;
+#[cfg(feature = "hfs")]
+use zeroize::Zeroizing;
 use crate::{
     cipherstate::{CipherState, CipherStates},
     constants::{MAXDHLEN, MAXMSGLEN, PSKLEN, TAGLEN},
@@ -274,37 +276,51 @@ impl HandshakeState {
                 #[cfg(feature = "hfs")]
                 Token::E1 => {
                     let kem = self.kem.as_mut().ok_or(Error::Input)?;
-                    if kem.pub_len() > message.len() {
+                    // TCN patch 2: the provider's sizes fit snow's buffers, and the output fits
+                    // the message buffer.
+                    let (pub_len, _, _) = kem_sizes(&**kem)?;
+                    let tag = if self.symmetricstate.has_key() { TAGLEN } else { 0 };
+                    if byte_index.saturating_add(pub_len).saturating_add(tag) > message.len() {
                         return Err(Error::Input);
                     }
 
                     kem.generate(&mut *self.rng);
+                    // TCN patch 3: `generate` cannot report a failure (of the RNG, for example),
+                    // so a public key of the wrong length must not go on the wire.
+                    if kem.pubkey().len() != pub_len {
+                        return Err(Error::Kem);
+                    }
                     byte_index += self
                         .symmetricstate
                         .encrypt_and_mix_hash(kem.pubkey(), &mut message[byte_index..])?;
                 },
                 #[cfg(feature = "hfs")]
                 Token::Ekem1 => {
-                    let kem = self.kem.as_mut().unwrap();
-                    let mut kem_output_buf = [0; MAXKEMSSLEN];
+                    // TCN patch 4: errors instead of `unwrap()`.
+                    let kem = self.kem.as_mut().ok_or(Error::Kem)?;
+                    // TCN patch 2.
+                    let (pub_len, ct_len, ss_len) = kem_sizes(&**kem)?;
+                    // TCN patch 5: the shared secret is wiped from the stack.
+                    let mut kem_output_buf = Zeroizing::new([0; MAXKEMSSLEN]);
                     let mut ciphertext_buf = [0; MAXKEMCTLEN];
 
-                    if kem.ciphertext_len() > message.len() {
+                    let tag = if self.symmetricstate.has_key() { TAGLEN } else { 0 };
+                    if byte_index.saturating_add(ct_len).saturating_add(tag) > message.len() {
                         return Err(Error::Input);
                     }
 
-                    let kem_output = &mut kem_output_buf[..kem.shared_secret_len()];
-                    let ciphertext = &mut ciphertext_buf[..kem.ciphertext_len()];
-                    let pubkey = &self.kem_re.as_ref().unwrap()[..kem.pub_len()];
+                    let kem_output = &mut kem_output_buf[..ss_len];
+                    let ciphertext = &mut ciphertext_buf[..ct_len];
+                    // TCN patch 4.
+                    let pubkey = &self.kem_re.as_ref().ok_or(Error::Kem)?[..pub_len];
                     if kem.encapsulate(pubkey, kem_output, ciphertext).is_err() {
                         return Err(Error::Kem);
                     }
 
-                    byte_index += self.symmetricstate.encrypt_and_mix_hash(
-                        &ciphertext[..kem.ciphertext_len()],
-                        &mut message[byte_index..],
-                    )?;
-                    self.symmetricstate.mix_key(&kem_output[..kem.shared_secret_len()]);
+                    byte_index += self
+                        .symmetricstate
+                        .encrypt_and_mix_hash(&ciphertext[..ct_len], &mut message[byte_index..])?;
+                    self.symmetricstate.mix_key(&kem_output[..ss_len]);
                 },
             }
         }
@@ -408,32 +424,38 @@ impl HandshakeState {
                 #[cfg(feature = "hfs")]
                 Token::E1 => {
                     let kem = self.kem.as_ref().ok_or(Error::Kem)?;
+                    // TCN patch 2.
+                    let (pub_len, _, _) = kem_sizes(&**kem)?;
                     let read_len =
-                        kem.pub_len() + if self.symmetricstate.has_key() { TAGLEN } else { 0 };
+                        pub_len + if self.symmetricstate.has_key() { TAGLEN } else { 0 };
                     if ptr.len() < read_len {
                         return Err(Error::Input);
                     }
                     let mut kem_re = [0; MAXKEMPUBLEN];
                     self.symmetricstate
-                        .decrypt_and_mix_hash(&ptr[..read_len], &mut kem_re[..kem.pub_len()])?;
+                        .decrypt_and_mix_hash(&ptr[..read_len], &mut kem_re[..pub_len])?;
                     self.kem_re = Some(kem_re);
                     ptr = &ptr[read_len..];
                 },
                 #[cfg(feature = "hfs")]
                 Token::Ekem1 => {
-                    let kem = self.kem.as_ref().unwrap();
-                    let read_len = kem.ciphertext_len()
-                        + if self.symmetricstate.has_key() { TAGLEN } else { 0 };
+                    // TCN patch 4: an error instead of `unwrap()`.
+                    let kem = self.kem.as_ref().ok_or(Error::Kem)?;
+                    // TCN patch 2.
+                    let (_, ct_len, ss_len) = kem_sizes(&**kem)?;
+                    let read_len =
+                        ct_len + if self.symmetricstate.has_key() { TAGLEN } else { 0 };
                     if ptr.len() < read_len {
                         return Err(Error::Input);
                     }
                     let mut ciphertext_buf = [0; MAXKEMCTLEN];
-                    let ciphertext = &mut ciphertext_buf[..kem.ciphertext_len()];
+                    let ciphertext = &mut ciphertext_buf[..ct_len];
                     self.symmetricstate.decrypt_and_mix_hash(&ptr[..read_len], ciphertext)?;
-                    let mut kem_output_buf = [0; MAXKEMSSLEN];
-                    let kem_output = &mut kem_output_buf[..kem.shared_secret_len()];
+                    // TCN patch 5: the shared secret is wiped from the stack.
+                    let mut kem_output_buf = Zeroizing::new([0; MAXKEMSSLEN]);
+                    let kem_output = &mut kem_output_buf[..ss_len];
                     kem.decapsulate(ciphertext, kem_output)?;
-                    self.symmetricstate.mix_key(&kem_output[..kem.shared_secret_len()]);
+                    self.symmetricstate.mix_key(&kem_output[..ss_len]);
                     ptr = &ptr[read_len..];
                 },
             }
@@ -536,5 +558,19 @@ impl HandshakeState {
 impl fmt::Debug for HandshakeState {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("HandshakeState").finish()
+    }
+}
+
+/// TCN patch 2 (PATCHES.md): the sizes a KEM provider declares must be non-zero and fit snow's
+/// fixed buffers (`MAXKEMPUBLEN`, `MAXKEMCTLEN`, `MAXKEMSSLEN`). Upstream slices those buffers
+/// with the declared sizes, which panics for a provider that declares more.
+#[cfg(feature = "hfs")]
+fn kem_sizes(kem: &dyn Kem) -> Result<(usize, usize, usize), Error> {
+    let (pub_len, ct_len, ss_len) = (kem.pub_len(), kem.ciphertext_len(), kem.shared_secret_len());
+    let fits = |len: usize, max: usize| len > 0 && len <= max;
+    if fits(pub_len, MAXKEMPUBLEN) && fits(ct_len, MAXKEMCTLEN) && fits(ss_len, MAXKEMSSLEN) {
+        Ok((pub_len, ct_len, ss_len))
+    } else {
+        Err(Error::Kem)
     }
 }

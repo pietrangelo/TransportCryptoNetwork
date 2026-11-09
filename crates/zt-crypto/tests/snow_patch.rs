@@ -37,13 +37,23 @@ const PROLOGUE: &[u8] = b"TCN/2 patch test";
 fn the_vendored_snow_knows_ml_kem_768() {
     let params: NoiseParams = HONEST.parse().unwrap();
     assert_eq!(params.kem, Some(KemChoice::MlKem768));
-    assert_eq!("MLKEM768".parse::<KemChoice>().unwrap(), KemChoice::MlKem768);
+    assert_eq!(
+        "MLKEM768".parse::<KemChoice>().unwrap(),
+        KemChoice::MlKem768
+    );
     // The upstream name still parses: the patch adds, it does not rename.
     assert_eq!(
         "Kyber1024".parse::<KemChoice>().unwrap(),
         KemChoice::Kyber1024
     );
-    for wrong in ["mlkem768", "MLKEM-768", "ML-KEM-768", "MLKEM1024", "MLKEM768 ", ""] {
+    for wrong in [
+        "mlkem768",
+        "MLKEM-768",
+        "ML-KEM-768",
+        "MLKEM1024",
+        "MLKEM768 ",
+        "",
+    ] {
         assert!(wrong.parse::<KemChoice>().is_err(), "{wrong:?}");
     }
 }

@@ -119,6 +119,8 @@ impl CryptoResolver for DefaultResolver {
     fn resolve_kem(&self, choice: &KemChoice) -> Option<Box<dyn Kem>> {
         match *choice {
             KemChoice::Kyber1024 => Some(Box::new(Kyber1024::default())),
+            // TCN patch 1: no built-in ML-KEM-768, the application's resolver provides it.
+            KemChoice::MlKem768 => None,
         }
     }
 }

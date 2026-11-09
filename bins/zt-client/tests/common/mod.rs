@@ -166,7 +166,11 @@ impl Fleet {
     }
 
     /// Like [`Fleet::start_agent`], with the suites the agent accepts from clients (PQ-1).
-    pub async fn start_agent_with(&self, ssh: SocketAddr, client_suites: zt_domain::AcceptedSuites) {
+    pub async fn start_agent_with(
+        &self,
+        ssh: SocketAddr,
+        client_suites: zt_domain::AcceptedSuites,
+    ) {
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),

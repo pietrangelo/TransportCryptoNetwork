@@ -209,10 +209,17 @@ async fn ssh_runs_a_command_over_the_hybrid_suite() {
     assert_eq!(text(&out.stdout), "tcn-pq-ok\n");
     let upload = lab.dir.join("pq-upload.bin");
     random_file(&upload, 4 * 1024 * 1024);
-    let out = run(lab.ssh().arg("sha256sum").stdin(std::fs::File::open(&upload).unwrap())).await;
+    let out = run(lab
+        .ssh()
+        .arg("sha256sum")
+        .stdin(std::fs::File::open(&upload).unwrap()))
+    .await;
     assert!(out.status.success(), "{}", text(&out.stderr));
     let remote = text(&out.stdout);
-    assert_eq!(remote.split_whitespace().next().unwrap(), sha256(&upload).await);
+    assert_eq!(
+        remote.split_whitespace().next().unwrap(),
+        sha256(&upload).await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

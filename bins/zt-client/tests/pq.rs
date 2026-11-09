@@ -35,7 +35,7 @@ async fn a_node_pinned_to_the_hybrid_suite_is_reached() {
     dir.pin_last_node_suite(HFS);
 
     let mut child = dir.spawn("web-01");
-    let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..256 * 1024_usize).map(|i| (i % 251) as u8).collect();
     assert_eq!(echo_through(&mut child, &data).await, data);
     let out = finish(child, Duration::from_secs(10)).await;
     assert!(out.success, "stderr: {}", out.stderr);

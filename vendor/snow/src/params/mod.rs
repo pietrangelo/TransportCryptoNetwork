@@ -128,6 +128,9 @@ impl FromStr for HashChoice {
 pub enum KemChoice {
     /// The 1024-bit Kyber variant.
     Kyber1024,
+    /// ML-KEM-768 (FIPS 203). TCN patch 1 (see PATCHES.md): snow provides no implementation,
+    /// the application's resolver must.
+    MlKem768,
 }
 
 #[cfg(feature = "hfs")]
@@ -138,6 +141,7 @@ impl FromStr for KemChoice {
         use self::KemChoice::*;
         match s {
             "Kyber1024" => Ok(Kyber1024),
+            "MLKEM768" => Ok(MlKem768),
             _ => Err(PatternProblem::UnsupportedKemType.into()),
         }
     }

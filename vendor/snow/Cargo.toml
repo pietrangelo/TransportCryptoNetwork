@@ -61,7 +61,7 @@ default-resolver-crypto = [
     "use-curve25519",
     "use-getrandom",
 ]
-hfs = []
+hfs = ["dep:zeroize"]
 nightly = [
     "blake2/simd_opt",
     "subtle/nightly",
@@ -199,6 +199,12 @@ default-features = false
 
 [dependencies.subtle]
 version = "2.4"
+default-features = false
+
+# TCN patch 5 (PATCHES.md): wipes the KEM shared secret from the stack.
+[dependencies.zeroize]
+version = "1.8"
+optional = true
 default-features = false
 
 [dev-dependencies.criterion]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use zt_crypto::PublicKey;
-use zt_domain::NodeId;
+use zt_domain::{HandshakeChannel, NodeId};
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
 use zt_net::logging::{self, LogFormat};
@@ -55,12 +55,16 @@ enum Command {
         relay_key: Vec<PublicKey>,
         /// Handshake suite pinned for the relays (its exact Noise protocol name, PROTOCOL
         /// §7.5): one for all of them, or one per `--relay` in the same order. Without it, the
-        /// classical suite; there is never a fallback to another suite.
+        /// classical suite; there is never a fallback to another suite. Only the classical
+        /// suite runs on the relay channel in this release.
         #[arg(long, value_delimiter = ',')]
         relay_suite: Vec<String>,
         /// Handshake suites accepted from clients on the end-to-end channel (exact Noise
-        /// protocol names, comma-separated). Without it, the classical suite only.
-        #[arg(long, value_delimiter = ',')]
+        /// protocol names, comma-separated), for example
+        /// `Noise_IK_25519_ChaChaPoly_BLAKE2s,Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`.
+        /// Without it, the classical suite only (a default that never changes between
+        /// releases); new installations set both in `agent.env` (OPERATIONS §12).
+        #[arg(long, env = "TCN_ACCEPT_CLIENT_SUITES", value_delimiter = ',')]
         accept_client_suites: Vec<String>,
         /// Name of this node, as in the relay policy.
         #[arg(long)]
@@ -126,7 +130,7 @@ fn pin_suites(
 ) -> Result<zt_domain::AcceptedSuites, String> {
     let suites = relay_suite
         .iter()
-        .map(|name| config::parse_suite("--relay-suite", name))
+        .map(|name| config::parse_suite("--relay-suite", name, HandshakeChannel::Outer))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     match suites.as_slice() {
@@ -144,7 +148,12 @@ fn pin_suites(
             zt_domain::HandshakeSuite::NoiseIk25519,
         ));
     }
-    config::parse_suites("--accept-client-suites", accept_client_suites).map_err(|e| e.to_string())
+    config::parse_suites(
+        "--accept-client-suites",
+        accept_client_suites,
+        HandshakeChannel::EndToEnd,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn run(command: Command) -> Result<(), String> {

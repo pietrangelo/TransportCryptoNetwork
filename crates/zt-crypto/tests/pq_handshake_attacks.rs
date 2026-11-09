@@ -37,6 +37,9 @@ const HONEST: &str = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s";
 /// suite id (PROTOCOL §7.5).
 const E2E_PROLOGUE: &[u8] = b"TCN/2 end-to-end\x01";
 
+/// A way of damaging a message.
+type Damage = Box<dyn Fn(&[u8]) -> Vec<u8>>;
+
 fn both() -> AcceptedSuites {
     AcceptedSuites::new([CLASSIC, HFS]).unwrap()
 }
@@ -227,8 +230,13 @@ fn a_message_1_of_one_suite_is_never_valid_as_the_other() {
         noise::initiate_suite(&p.client, &p.agent_pk, Channel::EndToEnd, CLASSIC, &[]).unwrap();
     let (hybrid, _) = start(&p);
     assert_eq!(
-        noise::respond_suites(&p.keys, &classical, Channel::EndToEnd, AcceptedSuites::only(HFS))
-            .err(),
+        noise::respond_suites(
+            &p.keys,
+            &classical,
+            Channel::EndToEnd,
+            AcceptedSuites::only(HFS)
+        )
+        .err(),
         Some(CryptoError::Handshake)
     );
     assert_eq!(
@@ -319,7 +327,18 @@ fn a_damaged_message_1_is_refused() {
     let mut longer = msg1.clone();
     longer.push(0);
     bad.push(longer);
-    for at in [0, 31, 32, 600, 32 + 1_183, 32 + 1_199, 32 + 1_200, 1_247, 1_280, 1_295] {
+    for at in [
+        0,
+        31,
+        32,
+        600,
+        32 + 1_183,
+        32 + 1_199,
+        32 + 1_200,
+        1_247,
+        1_280,
+        1_295,
+    ] {
         let mut flipped = msg1.clone();
         flipped[at] ^= 0x01;
         bad.push(flipped);
@@ -339,7 +358,7 @@ fn a_damaged_message_1_is_refused() {
 #[test]
 fn a_damaged_message_2_is_refused() {
     let p = pair();
-    let mut cases: Vec<Box<dyn Fn(&[u8]) -> Vec<u8>>> = Vec::new();
+    let mut cases: Vec<Damage> = Vec::new();
     for n in [0, 1, 32, 33, 32 + 1_088, 32 + 1_103, 32 + 1_104, 1_151] {
         cases.push(Box::new(move |m: &[u8]| m[..n].to_vec()));
     }
@@ -479,6 +498,9 @@ fn a_replayed_message_1_gets_keys_the_initiator_does_not_have() {
     assert_ne!(msg2_a, msg2_b);
     let mut client = waiting.complete(&msg2_a).unwrap();
     let confirm = client.encrypt(HFS.confirmation()).unwrap();
-    assert_eq!(session_b.decrypt(&confirm).err(), Some(CryptoError::Decrypt));
+    assert_eq!(
+        session_b.decrypt(&confirm).err(),
+        Some(CryptoError::Decrypt)
+    );
     assert_eq!(session_a.decrypt(&confirm).unwrap(), b"TCN/2 ready");
 }

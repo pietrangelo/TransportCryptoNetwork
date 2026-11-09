@@ -161,7 +161,10 @@ fn suites_are_named_by_their_exact_noise_protocol_name() {
             "1",
             "",
         ] {
-            assert!(parse_suite("--x", name, channel).is_err(), "accepted {name:?}");
+            assert!(
+                parse_suite("--x", name, channel).is_err(),
+                "accepted {name:?}"
+            );
         }
         assert!(parse_suites("--x", &[], channel).is_err());
     }

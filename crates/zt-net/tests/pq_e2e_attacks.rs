@@ -139,9 +139,7 @@ async fn a_hybrid_pin_never_falls_back() {
     let _guard = log.install();
     let alice = id();
     let lab = lab(2, &alice, AcceptedSuites::only(CLASSIC)).await;
-    let outcome = lab
-        .refused_with(&alice, &lab.config_suite(None, HFS))
-        .await;
+    let outcome = lab.refused_with(&alice, &lab.config_suite(None, HFS)).await;
     assert!(outcome.is_err());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(log.events("handshake_suite_rejected").len(), 1);

@@ -1,4 +1,4 @@
-//! Sans-IO Noise IK handshake with typestate.
+//! Sans-IO Noise IK handshake with typestate, in two suites (PROTOCOL §7.5).
 //!
 //! ```text
 //! initiator (agent/client)                          responder (relay/agent)
@@ -8,11 +8,17 @@
 //!   complete() → Transport
 //! ```
 //!
+//! The hybrid suite (`IKhfs`, PQ-1, end-to-end channel) adds `e1` after `es` in message 1 (an
+//! ephemeral ML-KEM-768 encapsulation key) and `ekem1` after `ee` in message 2 (its
+//! ciphertext, then `MixKey` of the shared secret). The responder encapsulates in `accept`,
+//! after the authorization decision; the initiator decapsulates in `complete`.
+//!
 //! IK: the initiator knows and **pins** the static key of the responder; the responder learns
 //! the initiator's key from the first message. If the decision is negative the responder
 //! simply does not reply: the initiator learns nothing, not even whether its key exists.
 
 use snow::{Builder, HandshakeState, TransportState};
+pub use zt_domain::HandshakeChannel as Channel;
 use zt_domain::{AcceptedSuites, Fingerprint, HandshakeSuite};
 
 use crate::error::CryptoError;
@@ -28,45 +34,52 @@ pub const TAG_LEN: usize = 16;
 /// Maximum plaintext of a transport message.
 pub const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
 
-/// Which channel the handshake takes place on. The value goes into the Noise *prologue*, so
-/// a message of one channel is never valid on the other (domain separation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Channel {
-    /// Peer ↔ relay.
-    Outer,
-    /// Client ↔ agent, through the relay (which cannot read it).
-    EndToEnd,
-}
-
-impl Channel {
-    /// The prologue of `suite` on this channel (PROTOCOL §7.5). The classical suite keeps the
-    /// `TCN/1` prologues, so it is byte for byte the handshake of earlier releases. From PQ-1 on
-    /// a new suite has the prologue `TCN/2 <channel>` followed by its id, so a message of one
-    /// suite is never valid as another.
-    const fn prologue(self, suite: HandshakeSuite) -> Result<&'static [u8], CryptoError> {
-        match (suite, self) {
-            (HandshakeSuite::NoiseIk25519, Self::Outer) => Ok(b"TCN/1 outer"),
-            (HandshakeSuite::NoiseIk25519, Self::EndToEnd) => Ok(b"TCN/1 end-to-end"),
-            _ => Err(CryptoError::UnsupportedSuite),
+/// The prologue of `suite` on `channel` (PROTOCOL §7.5): a message of one channel or suite is
+/// never valid on another (domain separation). The classical suite keeps the `TCN/1`
+/// prologues, so it is byte for byte the handshake of earlier releases. The hybrid suite has
+/// `TCN/2 <channel>` followed by its id.
+/// `None` for a suite this version of `zt-crypto` does not know.
+const fn prologue(channel: Channel, suite: HandshakeSuite) -> Option<&'static [u8]> {
+    match (suite, channel) {
+        (HandshakeSuite::NoiseIk25519, Channel::Outer) => Some(b"TCN/1 outer"),
+        (HandshakeSuite::NoiseIk25519, Channel::EndToEnd) => Some(b"TCN/1 end-to-end"),
+        (HandshakeSuite::NoiseIkhfs25519MlKem768, Channel::Outer) => Some(b"TCN/2 outer\x01"),
+        (HandshakeSuite::NoiseIkhfs25519MlKem768, Channel::EndToEnd) => {
+            Some(b"TCN/2 end-to-end\x01")
         }
+        _ => None,
     }
 }
+
+// The `TCN/2` prologues end with the id of their suite.
+const _: () = {
+    let suite = HandshakeSuite::NoiseIkhfs25519MlKem768;
+    let mut channels = [Channel::Outer, Channel::EndToEnd].as_slice();
+    while let [channel, rest @ ..] = channels {
+        match prologue(*channel, suite) {
+            Some([b'T', b'C', b'N', b'/', b'2', .., id]) => assert!(*id == suite.id()),
+            _ => panic!("a TCN/2 prologue"),
+        }
+        channels = rest;
+    }
+};
 
 fn builder(
     local: &Identity,
     channel: Channel,
     suite: HandshakeSuite,
 ) -> Result<(Builder<'static>, zeroize::Zeroizing<[u8; 32]>), CryptoError> {
-    if !suite.is_supported() {
+    if !suite.is_supported(channel) {
         return Err(CryptoError::UnsupportedSuite);
     }
-    let prologue = channel.prologue(suite)?;
     let params = suite
         .protocol_name()
         .parse()
         .map_err(|_| CryptoError::UnsupportedSuite)?;
+    let prologue = prologue(channel, suite).ok_or(CryptoError::UnsupportedSuite)?;
     let secret = local.x25519_secret();
-    let builder = Builder::new(params)
+    // snow's primitives, and TCN's KEM provider for the hybrid suite.
+    let builder = Builder::with_resolver(params, Box::new(crate::resolver::Resolver))
         .prologue(prologue)
         .map_err(|_| CryptoError::Handshake)?;
     Ok((builder, secret))
@@ -113,7 +126,7 @@ pub fn initiate_with_payload(
 /// with another one (no downgrade).
 ///
 /// # Errors
-/// [`CryptoError::UnsupportedSuite`] if this build cannot run `suite`,
+/// [`CryptoError::UnsupportedSuite`] if this build cannot run `suite` on `channel`,
 /// [`CryptoError::MessageTooLarge`] over [`MAX_HANDSHAKE_PAYLOAD_LEN`],
 /// [`CryptoError::Handshake`] if the Noise state cannot be built.
 pub fn initiate_suite(
@@ -160,7 +173,7 @@ pub fn respond_suites(
     // A failed attempt leaves no state: each try builds a new handshake. The timing reveals
     // which suite and key worked; neither is a secret (the keys are public, and the suite is
     // implied by the length).
-    for suite in accepted.iter().filter(|s| s.is_supported()) {
+    for suite in accepted.iter().filter(|s| s.is_supported(channel)) {
         if msg1.len() < suite.msg1_overhead() || msg1.len() > suite.max_msg1_len() {
             continue;
         }
@@ -308,10 +321,13 @@ impl AuthorizationPending {
         &self.payload
     }
 
-    /// Accepts the initiator: produces `msg2` and the transport channel.
+    /// Accepts the initiator: produces `msg2` and the transport channel. With the hybrid suite
+    /// this is where the responder checks the initiator's `e1` (FIPS 203 §7.2) and
+    /// encapsulates to it.
     ///
     /// # Errors
-    /// [`CryptoError::Handshake`] if the Noise state cannot advance.
+    /// [`CryptoError::Handshake`] if the Noise state cannot advance, or if `e1` is not a valid
+    /// ML-KEM-768 encapsulation key.
     pub fn accept(mut self) -> Result<(Vec<u8>, Transport), CryptoError> {
         let msg2 = write(&mut self.state, &[])?;
         let transport = Transport::from_handshake(self.state, self.peer)?;

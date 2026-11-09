@@ -12,7 +12,9 @@ members = [
     "bins/zt-ca",
 ]
 # The cargo-fuzz targets require nightly: they stay outside the workspace (see fuzz/README.md).
-exclude = ["fuzz"]
+# `vendor/` holds patched third-party crates (`[patch.crates-io]` below): they are not members,
+# so their own tests, lints and dev-dependencies stay out of the workspace.
+exclude = ["fuzz", "vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,12 +44,15 @@ zeroize   = { version = "1.9.1", features = ["zeroize_derive"] }
 tokio      = { version = "1.54.1", default-features = false }
 tokio-util = { version = "0.7.20", default-features = false, features = ["codec"] }
 futures    = { version = "0.3.34", default-features = false, features = ["std"] }
-clap       = { version = "4.6.7", features = ["derive"] }
+# `env`: options that `agent.env` sets on new installations (TCN_ACCEPT_CLIENT_SUITES).
+clap       = { version = "4.6.7", features = ["derive", "env"] }
 tracing    = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
 
 # --- cryptography (Phase 2: Noise handshake and Ed25519 identities) ---
-snow          = { version = "0.10.0", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+# `hfs` (PQ-1): the Noise HFS modifier of the hybrid suite. The KEM comes from zt-crypto
+# (libcrux), never from snow: no `pqclean` feature. snow is the vendored, patched copy below.
+snow          = { version = "0.10.0", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom", "hfs"] }
 ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
 sha2          = "0.11.1"
 hex           = "0.4.3"
@@ -87,6 +92,12 @@ dbg_macro = "deny"
 print_stdout = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+
+# PQ-1: snow 0.10.0 with a minimal patch (the ML-KEM-768 KEM name, panics of the HFS paths
+# turned into errors, the KEM shared secret wiped). Every change is listed and tested in
+# vendor/snow/PATCHES.md; docs/pq-snow.md has the decision. Remove once upstream releases it.
+[patch.crates-io]
+snow = { path = "vendor/snow" }
 
 # Hardening of the release binaries.
 [profile.release]

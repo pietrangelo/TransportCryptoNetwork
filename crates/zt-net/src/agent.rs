@@ -16,11 +16,12 @@ use zt_crypto::noise::{self, Channel};
 use zt_domain::flow::Window;
 use zt_domain::{
     AcceptedSuites, AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection,
-    ClientCredential, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
+    ClientCredential, CloseReason, DomainEvent, Fingerprint, Frame, HandshakeChannel,
+    HandshakeSuite, NodeId, RejectReason, StreamId,
 };
 
 use crate::relay::{CertFields, audit};
-use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
+use crate::stream::{STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
 /// Agent configuration.
@@ -40,6 +41,26 @@ pub struct AgentConfig {
     pub max_streams: usize,
     /// Handshake suites accepted from clients on the end-to-end channel (PROTOCOL §7.5).
     pub client_suites: zt_domain::AcceptedSuites,
+}
+
+/// The suites in use, once at startup (finding AP-7): those accepted from clients end to end
+/// and those pinned towards the relays.
+fn handshake_suites_in_use(config: &AgentConfig) {
+    let mut relay_suites: Vec<&str> = Vec::new();
+    for relay in &config.relays {
+        let name = relay.suite.protocol_name();
+        if !relay_suites.contains(&name) {
+            relay_suites.push(name);
+        }
+    }
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "handshake_suites_in_use",
+        role = "agent",
+        client_suites = config.client_suites.names(),
+        relay_suites = relay_suites.join(","),
+        "handshake suites in use"
+    );
 }
 
 /// Maximum of `max_streams`: well below the limit of the tokio semaphore, which panics beyond
@@ -71,6 +92,20 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
         );
         return;
     }
+    // The CLI validates these too (PROTOCOL §7.5): a library user cannot run a suite on a
+    // channel that does not support it.
+    if !config
+        .client_suites
+        .all_supported(HandshakeChannel::EndToEnd)
+        || config
+            .relays
+            .iter()
+            .any(|r| !r.suite.is_supported(HandshakeChannel::Outer))
+    {
+        tracing::error!("a handshake suite is not supported on its channel");
+        return;
+    }
+    handshake_suites_in_use(&config);
     let slots = Arc::new(Semaphore::new(config.max_streams));
     let mut sessions = tokio::task::JoinSet::new();
     for relay in config.relays.clone() {
@@ -361,6 +396,48 @@ fn admit_client(
         .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))
 }
 
+/// Reads message 1 and runs the responder side up to the authorization decision. On failure
+/// the stream is closed (and audited) here.
+async fn read_msg1(
+    io: &mut StreamIo,
+    identity: &Keyring,
+    timeouts: &Timeouts,
+    client_suites: AcceptedSuites,
+) -> Option<noise::AuthorizationPending> {
+    let pending = match io.recv_message(timeouts).await {
+        // A message 1 longer than the one with the largest certificate is not even parsed
+        // (PROTOCOL §15.3): it is a rejected certificate, not a handshake to attempt.
+        Ok(msg1) if msg1.len() > client_suites.max_msg1_len() => {
+            audit(&DomainEvent::AuthenticationFailed {
+                peer: None,
+                reason: AuthFailureReason::Certificate(CertRejection::Malformed),
+                certificate: None,
+            });
+            io.close(CloseReason::Unauthorized).await;
+            return None;
+        }
+        Ok(msg1) => respond(identity, &msg1, client_suites),
+        // The client has already closed: replying with another `Close` is pointless
+        // (finding 0002-1).
+        Err(NetError::StreamClosed(_)) => return None,
+        Err(err) => {
+            tracing::debug!(error = %err, "stream ended before handshake");
+            io.close(CloseReason::Timeout).await;
+            return None;
+        }
+    };
+    let Ok(pending) = pending else {
+        audit(&DomainEvent::AuthenticationFailed {
+            peer: None,
+            reason: AuthFailureReason::HandshakeFailed,
+            certificate: None,
+        });
+        io.close(CloseReason::ProtocolViolation).await;
+        return None;
+    };
+    Some(pending)
+}
+
 impl StreamTask {
     async fn serve(self) {
         let Self {
@@ -373,38 +450,11 @@ impl StreamTask {
             timeouts,
             client_suites,
         } = self;
-        let pending = match io.recv_message(&timeouts).await {
-            // A message 1 longer than the one with the largest certificate is not even parsed
-            // (PROTOCOL §15.3): it is a rejected certificate, not a handshake to attempt.
-            Ok(msg1) if msg1.len() > client_suites.max_msg1_len() => {
-                audit(&DomainEvent::AuthenticationFailed {
-                    peer: None,
-                    reason: AuthFailureReason::Certificate(CertRejection::Malformed),
-                    certificate: None,
-                });
-                io.close(CloseReason::Unauthorized).await;
-                return;
-            }
-            Ok(msg1) => noise::respond_suites(&identity, &msg1, Channel::EndToEnd, client_suites),
-            // The client has already closed: replying with another `Close` is pointless
-            // (finding 0002-1).
-            Err(NetError::StreamClosed(_)) => return,
-            Err(err) => {
-                tracing::debug!(error = %err, "stream ended before handshake");
-                io.close(CloseReason::Timeout).await;
-                return;
-            }
-        };
-        let Ok(pending) = pending else {
-            audit(&DomainEvent::AuthenticationFailed {
-                peer: None,
-                reason: AuthFailureReason::HandshakeFailed,
-                certificate: None,
-            });
-            io.close(CloseReason::ProtocolViolation).await;
+        let Some(pending) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
             return;
         };
         let client = pending.peer();
+        let suite = pending.suite();
         // Before message 2: a rejected client does not complete the handshake and does not
         // reach sshd (like an unknown client, PROTOCOL §8 item 3).
         let credential =
@@ -420,6 +470,17 @@ impl StreamTask {
                     return;
                 }
             };
+        // A known client whose suite this agent does not accept (review 0008, A8-11): no
+        // message 2, and the suite is named so that the operator sees a client pinned ahead
+        // of (or behind) the agent's configuration.
+        if !client_suites.contains(suite) {
+            audit(&DomainEvent::HandshakeSuiteRejected {
+                peer: client,
+                suite,
+            });
+            io.close(CloseReason::Unauthorized).await;
+            return;
+        }
         let Ok((msg2, mut transport)) = pending.accept() else {
             io.close(CloseReason::ProtocolViolation).await;
             return;
@@ -431,7 +492,10 @@ impl StreamTask {
         // it. Only the real client can produce a valid transport message, so sshd is contacted
         // and the session is registered only after the confirmation (finding 0002-3).
         match io.recv_message(&timeouts).await {
-            Ok(confirm) if transport.decrypt(&confirm).is_ok_and(|p| p == CONFIRM) => {}
+            Ok(confirm)
+                if transport
+                    .decrypt(&confirm)
+                    .is_ok_and(|p| p == suite.confirmation()) => {}
             Ok(_) => {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(client),
@@ -465,16 +529,36 @@ impl StreamTask {
             client,
             credential,
             node,
+            suite,
         };
         bridge(io, transport, ssh, session, authorized, &timeouts).await;
     }
 }
 
-/// Who the client of an end-to-end session is and with which credential it was admitted.
+/// Who the client of an end-to-end session is, with which credential it was admitted and
+/// which handshake suite it used.
 struct Session {
     client: Fingerprint,
     credential: ClientCredential,
     node: NodeId,
+    suite: HandshakeSuite,
+}
+
+/// The end-to-end handshake: the accepted suites first; if none fits, the other suites this
+/// build runs end to end, only to name a known client whose suite is not accepted (the caller
+/// refuses it before message 2). Those are read-only attempts: no KEM operation and no
+/// message 2 happen before `accept`, which a rejected suite never reaches.
+fn respond(
+    keys: &Keyring,
+    msg1: &[u8],
+    accepted: AcceptedSuites,
+) -> Result<noise::AuthorizationPending, zt_crypto::CryptoError> {
+    noise::respond_suites(keys, msg1, Channel::EndToEnd, accepted).or_else(|err| {
+        match AcceptedSuites::supported(HandshakeChannel::EndToEnd).without(accepted) {
+            Some(others) => noise::respond_suites(keys, msg1, Channel::EndToEnd, others),
+            None => Err(err),
+        }
+    })
 }
 
 /// The maximum interval at which the system clock is re-read for a certificate's expiry
@@ -534,6 +618,7 @@ async fn bridge(
         event_kind = "e2e_session_started",
         peer = %client,
         %stream,
+        suite = session.suite.protocol_name(),
         credential = c.credential,
         ca = c.ca.as_deref(),
         serial = c.serial.as_deref(),

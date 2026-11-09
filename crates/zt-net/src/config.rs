@@ -1062,7 +1062,7 @@ pub fn parse_client_settings(
     };
     for (relay, text) in relays.iter_mut().zip(suite_texts) {
         if let Some(text) = text {
-            relay.suite = parse_suite(origin, text)?;
+            relay.suite = parse_suite(origin, text, zt_domain::HandshakeChannel::Outer)?;
         }
     }
     if file.certificate.as_deref() == Some("") {
@@ -1089,7 +1089,9 @@ pub fn parse_client_settings(
             return Err(ctx.domain(&entry.node, DomainError::DuplicatePeer(key.fingerprint())));
         }
         if let Some(text) = &entry.suite {
-            node_suites.insert(node.clone(), parse_suite(origin, text)?);
+            // The node pin is the end-to-end channel (PROTOCOL §7.5).
+            let suite = parse_suite(origin, text, zt_domain::HandshakeChannel::EndToEnd)?;
+            node_suites.insert(node.clone(), suite);
         }
         if nodes.insert(node.clone(), key).is_some() {
             return Err(ctx.domain(&entry.node, DomainError::DuplicateNode(node)));
@@ -1205,10 +1207,10 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
     let file: RelayFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
     let mut suites = zt_domain::SuitePolicy::classical();
     if let Some(names) = &file.handshake.agent_suites {
-        suites.agents = parse_suites(origin, names)?;
+        suites.agents = parse_suites(origin, names, zt_domain::HandshakeChannel::Outer)?;
     }
     if let Some(names) = &file.handshake.client_suites {
-        suites.clients = parse_suites(origin, names)?;
+        suites.clients = parse_suites(origin, names, zt_domain::HandshakeChannel::Outer)?;
     }
     let a = file.admission;
     let mut admission = zt_application::admission::AdmissionConfig::default();
@@ -1268,32 +1270,37 @@ pub fn load_relay_settings(path: &Path) -> Result<RelaySettings, ConfigError> {
 }
 
 /// One handshake suite by its exact Noise protocol name (no case folding, trimming or
-/// aliases), which this build must be able to run.
+/// aliases), which this build must be able to run on `channel`.
 ///
 /// # Errors
 /// [`ConfigError::Suite`] with [`zt_domain::SuiteError::Unknown`] or
 /// [`zt_domain::SuiteError::Unsupported`].
-pub fn parse_suite(origin: &str, name: &str) -> Result<zt_domain::HandshakeSuite, ConfigError> {
+pub fn parse_suite(
+    origin: &str,
+    name: &str,
+    channel: zt_domain::HandshakeChannel,
+) -> Result<zt_domain::HandshakeSuite, ConfigError> {
     let fail = |source| ConfigError::Suite {
         path: origin.into(),
         entry: redact_hex(name),
         source,
     };
     let suite: zt_domain::HandshakeSuite = name.parse().map_err(fail)?;
-    if !suite.is_supported() {
+    if !suite.is_supported(channel) {
         return Err(fail(zt_domain::SuiteError::Unsupported));
     }
     Ok(suite)
 }
 
 /// An accepted set of suites by their Noise protocol names: non-empty, no repetition, every
-/// suite supported by this build.
+/// suite supported by this build on `channel`.
 ///
 /// # Errors
 /// [`ConfigError::Suite`].
 pub fn parse_suites(
     origin: &str,
     names: &[String],
+    channel: zt_domain::HandshakeChannel,
 ) -> Result<zt_domain::AcceptedSuites, ConfigError> {
     let suites = names
         .iter()
@@ -1305,7 +1312,7 @@ pub fn parse_suites(
         entry: "suites".into(),
         source,
     })?;
-    if !set.all_supported() {
+    if !set.all_supported(channel) {
         return Err(ConfigError::Suite {
             path: origin.into(),
             entry: "suites".into(),

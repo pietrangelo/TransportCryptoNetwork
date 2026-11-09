@@ -315,7 +315,7 @@ impl RelayServer {
     ) -> Result<Self, NetError> {
         config.admission.validate()?;
         for set in [config.suites.agents, config.suites.clients] {
-            if !set.all_supported() {
+            if !set.all_supported(zt_domain::HandshakeChannel::Outer) {
                 return Err(NetError::Suite(zt_domain::SuiteError::Unsupported));
             }
         }

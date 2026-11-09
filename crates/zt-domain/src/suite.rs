@@ -6,8 +6,9 @@
 //! the suite travels in the clear (finding AP-11): a responder finds the suite by trying the
 //! ones it accepts, as it already tries its current and previous key.
 //!
-//! Adding a suite (PQ-1) means a new variant, its sizes, and flipping
-//! [`HandshakeSuite::is_supported`] once `zt-crypto` can run it.
+//! A suite is supported per [`HandshakeChannel`]: PQ-1 runs the hybrid suite on the
+//! end-to-end channel only, which needs no relay upgrade; the outer channel follows in a later
+//! release by flipping [`HandshakeSuite::is_supported`] for it.
 
 use std::fmt;
 use std::str::FromStr;
@@ -21,6 +22,15 @@ const MLKEM768_EK_LEN: usize = 1_184;
 /// ML-KEM-768 ciphertext (FIPS 203).
 const MLKEM768_CT_LEN: usize = 1_088;
 
+/// The two channels a handshake runs on (PROTOCOL §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HandshakeChannel {
+    /// Peer ↔ relay.
+    Outer,
+    /// Client ↔ agent, through the relay (which cannot read it).
+    EndToEnd,
+}
+
 /// A handshake suite: one Noise protocol name, one prologue, one set of message sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -28,8 +38,8 @@ pub enum HandshakeSuite {
     /// `Noise_IK_25519_ChaChaPoly_BLAKE2s` with the `TCN/1` prologues: the classical suite,
     /// byte for byte the handshake of every release so far.
     NoiseIk25519,
-    /// `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`: reserved for PQ-1, not supported by
-    /// this build.
+    /// `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` with the `TCN/2` prologues: hybrid
+    /// forward secrecy (X25519 and ML-KEM-768). PQ-1: end-to-end channel only.
     NoiseIkhfs25519MlKem768,
 }
 
@@ -55,8 +65,8 @@ impl HandshakeSuite {
     /// Every suite this version of the protocol knows, supported or not.
     pub const ALL: [Self; 2] = [Self::NoiseIk25519, Self::NoiseIkhfs25519MlKem768];
 
-    /// The suite id. It never travels in the clear: from PQ-1 on it is mixed into the prologue
-    /// of the suites that have one (the classical suite keeps the `TCN/1` prologue).
+    /// The suite id. It never travels in the clear: it is mixed into the prologue of the
+    /// suites that have one (the classical suite keeps the `TCN/1` prologue).
     #[must_use]
     pub const fn id(self) -> u8 {
         match self {
@@ -74,12 +84,24 @@ impl HandshakeSuite {
         }
     }
 
-    /// `true` if this build can run the suite. Configuration refuses the others.
+    /// `true` if this build can run the suite on `channel`. Configuration refuses the others.
     #[must_use]
-    pub const fn is_supported(self) -> bool {
+    pub const fn is_supported(self, channel: HandshakeChannel) -> bool {
+        match (self, channel) {
+            (Self::NoiseIk25519, _)
+            | (Self::NoiseIkhfs25519MlKem768, HandshakeChannel::EndToEnd) => true,
+            // The relays are upgraded in a later release (docs/pq-resilience-plan.md §4).
+            (Self::NoiseIkhfs25519MlKem768, HandshakeChannel::Outer) => false,
+        }
+    }
+
+    /// The plaintext of the client's first end-to-end transport message (PROTOCOL §7.3): it
+    /// proves the client completed the handshake, so a replayed message 1 never reaches sshd.
+    #[must_use]
+    pub const fn confirmation(self) -> &'static [u8] {
         match self {
-            Self::NoiseIk25519 => true,
-            Self::NoiseIkhfs25519MlKem768 => false,
+            Self::NoiseIk25519 => b"TCN/1 ready",
+            Self::NoiseIkhfs25519MlKem768 => b"TCN/2 ready",
         }
     }
 
@@ -131,6 +153,11 @@ const _: () = {
         assert!(suite.max_msg1_len() <= crate::limits::NOISE_MAX_MESSAGE_LEN);
         assert!(suite.msg2_len() <= crate::limits::NOISE_MAX_MESSAGE_LEN);
         assert!(suite.id() < 8);
+        // Every suite runs on at least one channel, and the classical one on both.
+        assert!(
+            suite.is_supported(HandshakeChannel::EndToEnd)
+                || suite.is_supported(HandshakeChannel::Outer)
+        );
         rest = tail;
     }
 };
@@ -211,6 +238,28 @@ impl AcceptedSuites {
             .filter(move |s| self.contains(*s))
     }
 
+    /// Every suite this build runs on `channel`.
+    #[must_use]
+    pub const fn supported(channel: HandshakeChannel) -> Self {
+        let mut bits = 0;
+        let mut rest = HandshakeSuite::ALL.as_slice();
+        while let [suite, tail @ ..] = rest {
+            if suite.is_supported(channel) {
+                bits |= suite.bit();
+            }
+            rest = tail;
+        }
+        Self { bits }
+    }
+
+    /// The suites of `self` that are not in `other`, or `None` if there are none (a set is
+    /// never empty).
+    #[must_use]
+    pub const fn without(self, other: Self) -> Option<Self> {
+        let bits = self.bits & !other.bits;
+        if bits == 0 { None } else { Some(Self { bits }) }
+    }
+
     /// The union of two sets.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
@@ -233,12 +282,12 @@ impl AcceptedSuites {
         max
     }
 
-    /// `true` if every suite of the set is supported by this build.
+    /// `true` if every suite of the set is supported by this build on `channel`.
     #[must_use]
-    pub const fn all_supported(self) -> bool {
+    pub const fn all_supported(self, channel: HandshakeChannel) -> bool {
         let mut rest = HandshakeSuite::ALL.as_slice();
         while let [suite, tail @ ..] = rest {
-            if self.contains(*suite) && !suite.is_supported() {
+            if self.contains(*suite) && !suite.is_supported(channel) {
                 return false;
             }
             rest = tail;

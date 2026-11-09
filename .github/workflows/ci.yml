@@ -85,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frame_decoder, noise_responder, transport_decrypt, config_parsers, relay_core, cert_decoder, cert_verify, admission]
+        target: [frame_decoder, noise_responder, noise_initiator, transport_decrypt, config_parsers, relay_core, cert_decoder, cert_verify, admission]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -20,8 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::{
-    Ca, Captured, Lab, agent_clients, assert_alive, field, relay_config, relay_policy, scope,
-    trust,
+    Ca, Captured, Lab, agent_clients, assert_alive, field, relay_config, relay_policy, scope, trust,
 };
 use zt_crypto::Identity;
 use zt_domain::{AcceptedSuites, AllowedNodes, HandshakeSuite};
@@ -48,7 +47,11 @@ fn unchanged_relay() -> RelayConfig {
 async fn lab(whitelist: &[&Arc<Identity>], accepted: AcceptedSuites) -> Lab {
     let agent = id();
     let keys: Vec<_> = whitelist.iter().map(|c| c.fingerprint()).collect();
-    let policy = relay_policy(&agent.fingerprint(), &keys, zt_domain::trust::CertTrust::new());
+    let policy = relay_policy(
+        &agent.fingerprint(),
+        &keys,
+        zt_domain::trust::CertTrust::new(),
+    );
     Lab::start_suites(
         agent,
         vec![(policy, unchanged_relay())],
@@ -79,7 +82,11 @@ async fn a_hybrid_session_crosses_an_unchanged_relay() {
     );
     let established = log.events("session_established");
     assert_eq!(established.len(), 1, "{}", log.text());
-    assert!(field(&established[0], "suite").is_none(), "{}", established[0]);
+    assert!(
+        field(&established[0], "suite").is_none(),
+        "{}",
+        established[0]
+    );
 }
 
 /// A certificate travels in message 1 of both channels (PROTOCOL §15.3): on the outer one

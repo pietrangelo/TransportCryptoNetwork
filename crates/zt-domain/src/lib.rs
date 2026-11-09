@@ -43,5 +43,7 @@ pub use payload::FramePayload;
 pub use policy::{
     AccessPolicy, Admission, AllowedNodes, ClientCredential, ClientGrant, MAX_AGENT_KEYS, PeerRole,
 };
-pub use suite::{AcceptedSuites, HandshakeSuite, InitiatorRole, SuiteError, SuitePolicy};
+pub use suite::{
+    AcceptedSuites, HandshakeChannel, HandshakeSuite, InitiatorRole, SuiteError, SuitePolicy,
+};
 pub use trust::{Authority, CertTrust, Revocations, TrustedCaKey};
