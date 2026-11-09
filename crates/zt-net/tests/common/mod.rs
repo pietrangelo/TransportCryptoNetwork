@@ -226,6 +226,34 @@ impl Ca {
             serial,
         )
     }
+    /// A v2 certificate bound to the hybrid identity of `subject` (`subject_kind = 0x02`),
+    /// valid from a minute ago for one hour.
+    pub fn issue_hybrid(
+        &self,
+        subject: &zt_crypto::HybridPublicKey,
+        scope: CertScope,
+    ) -> (Arc<[u8]>, CertSerial) {
+        let v2 = self.v2.as_ref().expect("a composite CA");
+        let now = now_secs();
+        let serial = next_serial();
+        let body = zt_domain::CertBodyV2::new(
+            v2.public_key().ca_fp(),
+            zt_domain::CertSubject::Hybrid {
+                classical: subject.fingerprint(),
+                hybrid: subject.hybrid_fingerprint(),
+            },
+            serial,
+            zt_domain::UnixTime::from_secs(now - 60),
+            zt_domain::UnixTime::from_secs(now + 3_540),
+            node("alice"),
+            scope,
+        )
+        .unwrap();
+        (
+            Arc::from(zt_crypto::sign_certificate_v2(v2, &body).unwrap()),
+            serial,
+        )
+    }
     /// A certificate valid from a minute ago for one hour.
     pub fn issue(&self, subject: &PublicKey, scope: CertScope) -> (Arc<[u8]>, CertSerial) {
         let now = now_secs();
@@ -302,7 +330,29 @@ pub fn relay_config() -> RelayConfig {
 pub struct Relay {
     pub addr: SocketAddr,
     pub key: PublicKey,
+    /// The relay's v2 public key (PQ-AUTH), for the hybrid IK suite.
+    pub hybrid: zt_crypto::HybridPublicKey,
     pub policy: Updater<AccessPolicy>,
+}
+
+impl Relay {
+    /// The key a peer pins for this relay with `suite`: the v2 key for the hybrid IK suite.
+    pub fn pin(&self, suite: zt_domain::HandshakeSuite) -> zt_crypto::PeerKey {
+        if suite.requires_hybrid_identity() {
+            self.hybrid.clone().into()
+        } else {
+            self.key.into()
+        }
+    }
+}
+
+/// The key a peer pins for `id` with `suite` (PQ-AUTH).
+pub fn pin_of(id: &Identity, suite: zt_domain::HandshakeSuite) -> zt_crypto::PeerKey {
+    if suite.requires_hybrid_identity() {
+        id.hybrid_public_key().into()
+    } else {
+        id.public_key().into()
+    }
 }
 
 pub async fn start_relay(policy: AccessPolicy) -> Relay {
@@ -313,6 +363,7 @@ pub async fn start_relay(policy: AccessPolicy) -> Relay {
 pub async fn start_relay_with(policy: AccessPolicy, config: RelayConfig) -> Relay {
     let id = Identity::generate().unwrap();
     let key = id.public_key();
+    let hybrid = id.hybrid_public_key();
     let (rx, updater) = Revocable::new(policy);
     let server = RelayServer::bind("127.0.0.1:0".parse().unwrap(), id, rx, config)
         .await
@@ -322,6 +373,7 @@ pub async fn start_relay_with(policy: AccessPolicy, config: RelayConfig) -> Rela
     Relay {
         addr,
         key,
+        hybrid,
         policy: updater,
     }
 }
@@ -410,7 +462,7 @@ impl Lab {
                     .iter()
                     .map(|r| zt_net::RelayEndpoint {
                         address: r.addr.to_string(),
-                        public_key: r.key,
+                        public_key: r.pin(relay_suite),
                         suite: relay_suite,
                     })
                     .collect(),
@@ -463,12 +515,12 @@ impl Lab {
                 .iter()
                 .map(|r| zt_net::RelayEndpoint {
                     address: r.addr.to_string(),
-                    public_key: r.key,
+                    public_key: r.pin(relay_suite),
                     suite: relay_suite,
                 })
                 .collect(),
             node: node("web-01"),
-            node_key: self.agent.public_key(),
+            node_key: pin_of(&self.agent, node_suite),
             node_suite,
             certificate: certificate.cloned(),
             timeouts: timeouts(),
@@ -601,7 +653,7 @@ impl FakeRelay {
             zt_net::agent::AgentConfig {
                 relays: vec![zt_net::RelayEndpoint {
                     address: addr.to_string(),
-                    public_key: relay_id.public_key(),
+                    public_key: relay_id.public_key().into(),
                     suite: zt_domain::HandshakeSuite::NoiseIk25519,
                 }],
                 node: node("web-01"),

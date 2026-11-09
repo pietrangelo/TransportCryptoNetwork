@@ -663,3 +663,46 @@ fn composite_secret_halves_are_never_certified() {
     let out = sign(&dir, "y.cert", &[("--log", Some(&dir.arg("copy.tsv")))]);
     assert!(!out.status.success(), "{}", all(&out));
 }
+
+/// Spec (PQ-AUTH, AP-6): `--subject` takes a `tcn-pub-v2:` key; a composite CA then binds
+/// the certificate to the hybrid identity (`subject_kind = 0x02`) and the log carries both
+/// fingerprints, the v1 one first (the revocation unit). A v1 CA refuses a v2 subject: a v1
+/// certificate cannot bind it.
+#[test]
+fn a_v2_subject_gets_a_hybrid_bound_certificate() {
+    let dir = Dir::new();
+    let _ca = keygen_v2(&dir);
+    let subject = Identity::generate().unwrap();
+    let v2 = subject.hybrid_public_key().to_string();
+    let out = sign(&dir, "alice.cert", &[("--subject", Some(&v2))]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(
+        value(&stdout(&out), "subject_v2"),
+        Some(subject.hybrid_fingerprint().to_string())
+    );
+    let file = std::fs::read_to_string(dir.path("alice.cert")).unwrap();
+    let bytes = zt_crypto::decode_certificate_text(&file).unwrap();
+    let parsed = zt_domain::decode_certificate_v2(&bytes).unwrap();
+    assert_eq!(
+        parsed.body.subject(),
+        &zt_domain::CertSubject::Hybrid {
+            classical: subject.fingerprint(),
+            hybrid: subject.hybrid_fingerprint(),
+        }
+    );
+    let lines = log_lines(&dir);
+    let cols: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(cols[1], subject.fingerprint().to_string());
+    assert_eq!(cols[7], subject.hybrid_fingerprint().to_string());
+    let shown = stdout(&run(&["inspect", "--cert", &dir.arg("alice.cert")]));
+    assert_eq!(
+        value(&shown, "subject_v2"),
+        Some(subject.hybrid_fingerprint().to_string())
+    );
+
+    let v1_dir = Dir::new();
+    let _ = keygen(&v1_dir);
+    let refused = sign(&v1_dir, "bob.cert", &[("--subject", Some(&v2))]);
+    assert!(!refused.status.success());
+    assert!(!v1_dir.path("bob.cert").exists());
+}

@@ -507,3 +507,35 @@ fn repeated_or_unknown_accepted_suites_are_refused() {
         );
     }
 }
+
+/// Spec (PQ-AUTH, D13): `keygen` prints the v1 and the v2 public key with their fingerprints;
+/// the v2 key is the one this seed derives.
+#[test]
+fn keygen_prints_both_public_keys() {
+    let dir = setup("keygen-v2");
+    let path = dir.0.join("new.key");
+    let out = Command::new(BIN)
+        .args(["keygen", "--out", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let secret = std::fs::read_to_string(&path).unwrap();
+    let id = Identity::from_secret_hex(&secret).unwrap();
+    let value = |name: &str| {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.trim() == name).then(|| v.trim().trim_matches('"').to_owned())
+        })
+    };
+    assert_eq!(value("public_key"), Some(id.public_key().to_string()));
+    assert_eq!(value("fingerprint"), Some(id.fingerprint().to_string()));
+    assert_eq!(
+        value("public_key_v2"),
+        Some(id.hybrid_public_key().to_string())
+    );
+    assert_eq!(
+        value("fingerprint_v2"),
+        Some(id.hybrid_fingerprint().to_string())
+    );
+}
