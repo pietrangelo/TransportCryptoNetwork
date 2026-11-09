@@ -756,3 +756,143 @@ fn remote_fingerprint(state: &HandshakeState) -> Result<Fingerprint, CryptoError
     let key: [u8; 32] = raw.try_into().map_err(|_| CryptoError::Handshake)?;
     Ok(fingerprint_of_x25519(&key))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    //! Counted operations of the responder (finding A12-6 of review 0012) and the KEM
+    //! authentication of the initiator (A12-9). Unit tests: they need the crate's counters
+    //! and its own `psk2` derivation.
+    use super::*;
+
+    const CLASSIC: HandshakeSuite = HandshakeSuite::NoiseIk25519;
+    const HFS: HandshakeSuite = HandshakeSuite::NoiseIkhfs25519MlKem768;
+    const HYBRID: HandshakeSuite = HandshakeSuite::NoiseIkHybrid25519MlKem768;
+
+    fn id(b: u8) -> Identity {
+        Identity::from_secret_hex(&hex::encode([b; 32])).unwrap()
+    }
+
+    fn all() -> AcceptedSuites {
+        AcceptedSuites::new([CLASSIC, HFS, HYBRID]).unwrap()
+    }
+
+    /// The operations `f` ran: X25519 multiplications, static decapsulations, full Noise
+    /// trials.
+    fn counted<T>(f: impl FnOnce() -> T) -> (T, ops::Counts) {
+        ops::reset();
+        let out = f();
+        (out, ops::get())
+    }
+
+    /// A12-6: an invalid message 1 that fits the length bounds of every suite costs, per key,
+    /// one X25519 multiplication shared by the classical and `IKhfs` suites, plus one
+    /// decapsulation and one multiplication for the hybrid IK suite; never a Noise state. The
+    /// classical responder alone costs one multiplication per key.
+    #[test]
+    fn an_invalid_message_1_costs_a_bounded_number_of_operations() {
+        let mut garbage = vec![0_u8; 4_000];
+        getrandom::fill(&mut garbage).unwrap();
+        let one = Keyring::single(id(0x01));
+        let two = Keyring::rotating(id(0x02), id(0x03)).unwrap();
+        for (keys, n) in [(&one, 1), (&two, 2)] {
+            for channel in [Channel::Outer, Channel::EndToEnd] {
+                let (r, c) = counted(|| respond_suites(keys, &garbage, channel, all()));
+                assert!(r.is_err());
+                assert_eq!(
+                    c,
+                    ops::Counts {
+                        dh: 2 * n,
+                        decaps: n,
+                        trials: 0
+                    },
+                    "{n} keys"
+                );
+                let (r, c) = counted(|| {
+                    respond_suites(keys, &garbage, channel, AcceptedSuites::only(CLASSIC))
+                });
+                assert!(r.is_err());
+                assert_eq!(
+                    c,
+                    ops::Counts {
+                        dh: n,
+                        decaps: 0,
+                        trials: 0
+                    },
+                    "{n} keys"
+                );
+                // The identify pass of an agent that accepts only the classical suite adds
+                // no operation (one multiplication covers both pre-PQ-AUTH suites).
+                let (r, c) = counted(|| {
+                    respond_or_identify(keys, &garbage, channel, AcceptedSuites::only(CLASSIC))
+                });
+                assert!(r.is_err());
+                assert_eq!(
+                    c,
+                    ops::Counts {
+                        dh: n,
+                        decaps: 0,
+                        trials: 0
+                    },
+                    "{n} keys"
+                );
+            }
+        }
+        // Too short for the hybrid IK suite: no decapsulation at all.
+        let (r, c) = counted(|| respond_suites(&one, &garbage[..3_000], Channel::Outer, all()));
+        assert!(r.is_err());
+        assert_eq!(
+            c,
+            ops::Counts {
+                dh: 1,
+                decaps: 0,
+                trials: 0
+            }
+        );
+    }
+
+    /// A12-6: a valid message 1 runs exactly one full Noise trial, whatever its suite and key,
+    /// and the hybrid IK suite decapsulates `ct1` once.
+    #[test]
+    fn a_valid_message_1_runs_one_noise_trial() {
+        let (client, previous, current) = (id(0x10), id(0x11), id(0x12));
+        let pin = previous.hybrid_public_key();
+        let keys = Keyring::rotating(current, previous).unwrap();
+        for suite in [CLASSIC, HFS, HYBRID] {
+            let (msg1, _) =
+                initiate_suite(&client, pin.clone(), Channel::Outer, suite, b"cert").unwrap();
+            let (r, c) = counted(|| respond_suites(&keys, &msg1, Channel::Outer, all()));
+            let pending = r.unwrap();
+            assert_eq!(pending.suite(), suite);
+            assert_eq!(pending.payload(), b"cert");
+            assert_eq!(c.trials, 1, "{suite:?}");
+            assert!(c.decaps <= 2, "{suite:?}: {c:?}");
+        }
+    }
+
+    /// A12-9 (mutant M4 of review 0012): the CRQC impostor has the victim's X25519 secret and
+    /// sends the victim's (public) ML-KEM key, but lacks its decapsulation key. It derives
+    /// `psk2` exactly as the product does, from what it can compute (here, a decapsulation
+    /// with another key): the handshake must fail at message 2 or at key confirmation.
+    #[test]
+    fn a_crqc_impostor_without_the_static_key_shares_no_transport_key() {
+        let (victim, attacker, agent) = (id(0x21), id(0x22), id(0x23));
+        let keys = Keyring::single(id(0x23));
+        for channel in [Channel::Outer, Channel::EndToEnd] {
+            let (msg1, mut impostor) =
+                initiate_suite(&victim, agent.hybrid_public_key(), channel, HYBRID, &[]).unwrap();
+            impostor.static_dk = Some(Box::new(attacker.static_decapsulation_key()));
+            let pending =
+                respond_suites(&keys, &msg1, channel, AcceptedSuites::only(HYBRID)).unwrap();
+            assert_eq!(pending.hybrid_peer(), Some(victim.hybrid_fingerprint()));
+            let (msg2, mut responder) = pending.accept().unwrap();
+            if let Ok(mut transport) = impostor.complete(&msg2) {
+                let confirmation = transport.encrypt(b"register").unwrap();
+                assert!(
+                    responder.decrypt(&confirmation).is_err(),
+                    "the impostor confirmed the key"
+                );
+            }
+        }
+    }
+}

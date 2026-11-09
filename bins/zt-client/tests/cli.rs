@@ -449,3 +449,96 @@ async fn a_certificate_carrying_the_client_secret_is_refused() {
     .await;
     assert!(out.success, "stderr: {}", out.stderr);
 }
+
+// ---------- Review 0012, A12-7: hybrid-bound certificates ----------
+
+/// A certificate v2 bound to `subject`'s X25519 key and to `hybrid` (`subject_kind = 0x02`).
+fn hybrid_bound(subject: &zt_crypto::Identity, hybrid: zt_domain::HybridFingerprint) -> Vec<u8> {
+    let ca = zt_crypto::CompositeCaSigningKey::generate().unwrap();
+    let now = common::now_secs();
+    let body = zt_domain::CertBodyV2::new(
+        ca.public_key().ca_fp(),
+        zt_domain::CertSubject::Hybrid {
+            classical: subject.fingerprint(),
+            hybrid,
+        },
+        zt_domain::CertSerial::try_from([0x3d; 16]).unwrap(),
+        zt_domain::UnixTime::from_secs(now - 60),
+        zt_domain::UnixTime::from_secs(now + 3_600),
+        common::node("alice"),
+        zt_domain::CertScope::All,
+    )
+    .unwrap();
+    zt_crypto::sign_certificate_v2(&ca, &body).unwrap()
+}
+
+/// A12-7: a hybrid-bound certificate passes only a hybrid IK handshake that proves exactly
+/// its fingerprint v2, and the client sends it on both hops. `zt-client` therefore refuses,
+/// before any connection and naming the cause: a certificate bound to another fingerprint v2
+/// than the client's own key, and a relay or node not pinned to the hybrid IK suite. With
+/// every hop on the hybrid IK suite the certificate is used (here the relay is unreachable).
+#[tokio::test]
+async fn a_hybrid_bound_certificate_needs_hybrid_hops_and_the_clients_own_key() {
+    use common::ClientDir;
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let me = zt_crypto::Identity::generate().unwrap();
+    let (relay, agent) = (
+        zt_crypto::Identity::generate().unwrap(),
+        zt_crypto::Identity::generate().unwrap(),
+    );
+    let bait = Counting::start(false).await;
+    let write = |dir: &ClientDir, relay_suite: Option<&str>, node_suite: Option<&str>| {
+        let line =
+            |suite: Option<&str>| suite.map_or_else(String::new, |s| format!("suite = \"{s}\"\n"));
+        let toml = format!(
+            "certificate = \"client.cert\"\nkey = \"client.key\"\n\n\
+             [[relays]]\naddress = \"{}\"\npublic_key = \"{}\"\n{}\n\
+             [[nodes]]\nnode = \"web-01\"\npublic_key = \"{}\"\n{}",
+            bait.addr,
+            relay.hybrid_public_key(),
+            line(relay_suite),
+            agent.hybrid_public_key(),
+            line(node_suite),
+        );
+        std::fs::write(dir.config(), toml).unwrap();
+    };
+    let dir = ClientDir::new(&me, &bait.addr.to_string(), &relay.public_key(), &[]);
+    // Bound to another key's fingerprint v2.
+    let other = zt_crypto::Identity::generate()
+        .unwrap()
+        .hybrid_fingerprint();
+    dir.add_certificate(&hybrid_bound(&me, other), 0o644);
+    write(&dir, Some(HYBRID), Some(HYBRID));
+    let config = dir.config();
+    for child in [
+        spawn_with(&["--config", config.to_str().unwrap(), "certificate"], &[]),
+        dir.spawn("web-01"),
+    ] {
+        let out = finish(child, Duration::from_secs(10)).await;
+        assert!(!out.success);
+        assert!(out.stderr.contains("fingerprint v2"), "{}", out.stderr);
+    }
+    // Bound to the client's own key, with a classical hop.
+    std::fs::write(
+        dir.dir.join("client.cert"),
+        zt_crypto::encode_certificate_text(&hybrid_bound(&me, me.hybrid_fingerprint())),
+    )
+    .unwrap();
+    for (relay_suite, node_suite, named) in [
+        (None, Some(HYBRID), "relay"),
+        (Some(HYBRID), None, "web-01"),
+    ] {
+        write(&dir, relay_suite, node_suite);
+        let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+        assert!(!out.success);
+        assert!(out.stderr.contains("hybrid IK"), "{}", out.stderr);
+        assert!(out.stderr.contains(named), "{}", out.stderr);
+    }
+    assert_eq!(bait.count(), 0, "a connection was attempted");
+    // Every hop on the hybrid IK suite: the certificate is accepted locally and the client
+    // goes to the network.
+    write(&dir, Some(HYBRID), Some(HYBRID));
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(15)).await;
+    assert!(!out.stderr.contains("hybrid IK"), "{}", out.stderr);
+    assert!(bait.count() >= 1, "{}", out.stderr);
+}

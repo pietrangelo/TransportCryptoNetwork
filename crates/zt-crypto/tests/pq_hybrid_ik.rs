@@ -586,7 +586,8 @@ fn a_replayed_message_1_shares_no_key() {
 }
 
 /// Attack (Downgrade, AP-11): a message of one suite is never read as another, in every
-/// direction, and the responder of a set without the hybrid suite only identifies it.
+/// direction, and the responder of a set without the hybrid suite does not even identify it:
+/// that would need its static decapsulation key (finding A12-4 of review 0012).
 #[test]
 fn no_suite_is_read_as_another() {
     let (client, agent) = (node(0x1e), node(0x2f));
@@ -600,13 +601,15 @@ fn no_suite_is_read_as_another() {
             noise::initiate_suite(&client.id, &v2, Channel::Outer, suite, &[]).unwrap();
         assert!(noise::respond_suites(&ring, &other, Channel::Outer, only(HYBRID)).is_err());
     }
-    match noise::respond_or_identify(&ring, &hybrid, Channel::Outer, classic_and_hfs).unwrap() {
-        Responded::Unaccepted(found) => {
-            assert_eq!(found.suite(), HYBRID);
-            assert_eq!(found.peer(), client.id.fingerprint());
-            assert_eq!(found.hybrid_peer(), Some(client.id.hybrid_fingerprint()));
+    assert!(noise::respond_or_identify(&ring, &hybrid, Channel::Outer, classic_and_hfs).is_err());
+    // Accepted, it is pending with the initiator's hybrid identity.
+    match noise::respond_or_identify(&ring, &hybrid, Channel::Outer, only(HYBRID)).unwrap() {
+        Responded::Pending(pending) => {
+            assert_eq!(pending.suite(), HYBRID);
+            assert_eq!(pending.peer(), client.id.fingerprint());
+            assert_eq!(pending.hybrid_peer(), Some(client.id.hybrid_fingerprint()));
         }
-        Responded::Pending(_) => panic!("accepted outside the set"),
+        Responded::Unaccepted(_) => panic!("refused inside the set"),
     }
 }
 

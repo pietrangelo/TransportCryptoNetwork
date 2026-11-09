@@ -325,17 +325,29 @@ fn ed25519_is_checked_first_and_garbage_ml_dsa_never_panics() {
             Some(CertRejection::BadSignature)
         );
     }
-    // Repeated hint indices (CVE-2026-24850 class) inside an otherwise valid certificate.
-    let mut hints = m.clone();
+    // Repeated hint indices (CVE-2026-24850 class) inside an otherwise valid certificate. The
+    // first polynomial needs at least two hints for the repetition: the signing randomness is
+    // varied until it has them, so the check never silently checks nothing (A12-9).
     let base = 3_309 - 61;
-    let count = usize::from(hints[base + 55]);
-    if count >= 2 {
-        hints[base + count - 1] = hints[base + count - 2];
-        assert_eq!(
-            verify_certificate(&by_hand(&tbs, &hints, &e), &id.fingerprint(), &trust).err(),
-            Some(CertRejection::BadSignature)
-        );
-    }
+    let (mut hints, count) = (0_u8..=255)
+        .map(|r| {
+            let m = MlDsa65SigningKey::from_seed(&ML_SEED)
+                .sign(&message(&tbs), b"TCN-cert-v2", &[r; 32])
+                .unwrap();
+            let count = usize::from(m[base + 55]);
+            (m, count)
+        })
+        .find(|(_, count)| *count >= 2)
+        .expect("a signature whose first polynomial has two hints");
+    assert!(
+        verify_certificate(&by_hand(&tbs, &hints, &e), &id.fingerprint(), &trust).is_ok(),
+        "the unmodified signature verifies"
+    );
+    hints[base + count - 1] = hints[base + count - 2];
+    assert_eq!(
+        verify_certificate(&by_hand(&tbs, &hints, &e), &id.fingerprint(), &trust).err(),
+        Some(CertRejection::BadSignature)
+    );
 }
 
 /// A (Malleability): a non-canonical Ed25519 `S` (S + ℓ) is refused (`verify_strict`).

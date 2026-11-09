@@ -4,9 +4,12 @@
 //! bytes anywhere (bit 0 set, bit 2 clear); or with modified bytes in the ML-DSA component only
 //! (bits 0 and 2 set), which keeps the Ed25519 component valid (finding AP-5: the ML-DSA
 //! verifier must be the one that refuses).
+//! With mode bit 3 the genuine certificate is a **hybrid-bound** one (`subject_kind = 0x02`)
+//! and the verifier is `verify_certificate_hybrid` (finding A12-9 of review 0012).
 //! Properties: no panic; an accepted input is, byte for byte, the genuine certificate, with
-//! its own claims; the intact certificate is accepted; the same certificate for another peer,
-//! or with another hybrid fingerprint, is rejected.
+//! its own claims; the intact certificate is accepted; the same certificate for another peer
+//! is rejected; the hybrid-bound one is rejected over a handshake that proved no fingerprint
+//! v2, or another one.
 #![no_main]
 
 use std::sync::OnceLock;
@@ -14,13 +17,14 @@ use std::sync::OnceLock;
 use libfuzzer_sys::fuzz_target;
 use zt_crypto::{
     CompositeCaSigningKey, Identity, sign_certificate_v2, trusted_composite_ca_key,
-    verify_certificate,
+    verify_certificate, verify_certificate_hybrid,
 };
 use zt_domain::cert::{CERT_V2_SIGNATURE_LEN, MLDSA65_SIGNATURE_LEN};
 use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
 use zt_domain::trust::{CertTrust, Revocations};
 use zt_domain::{
-    AllowedNodes, CertBodyV2, CertScope, CertSerial, CertSubject, Fingerprint, NodeId, UnixTime,
+    AllowedNodes, CertBodyV2, CertScope, CertSerial, CertSubject, Fingerprint, HybridFingerprint,
+    NodeId, UnixTime,
 };
 
 struct Fixture {
@@ -29,6 +33,10 @@ struct Fixture {
     other: Fingerprint,
     genuine: Vec<u8>,
     body: CertBodyV2,
+    /// The peer's fingerprint v2, another one, and the certificate bound to the former.
+    peer_v2: HybridFingerprint,
+    other_v2: HybridFingerprint,
+    genuine_hybrid: Vec<u8>,
 }
 
 fn fixture() -> &'static Fixture {
@@ -49,6 +57,20 @@ fn fixture() -> &'static Fixture {
         )
         .expect("valid body");
         let genuine = sign_certificate_v2(&ca, &body).expect("sign");
+        let hybrid_body = CertBodyV2::new(
+            ca.public_key().ca_fp(),
+            CertSubject::Hybrid {
+                classical: peer.fingerprint(),
+                hybrid: peer.hybrid_fingerprint(),
+            },
+            CertSerial::try_from([0x43; 16]).expect("non-zero"),
+            UnixTime::from_secs(1_800_000_000),
+            UnixTime::from_secs(1_800_003_600),
+            node("alice"),
+            CertScope::All,
+        )
+        .expect("valid body");
+        let genuine_hybrid = sign_certificate_v2(&ca, &hybrid_body).expect("sign");
         let mut trust = CertTrust::new();
         trust
             .add_authority(
@@ -65,6 +87,9 @@ fn fixture() -> &'static Fixture {
             other: other.fingerprint(),
             genuine,
             body,
+            peer_v2: peer.hybrid_fingerprint(),
+            other_v2: other.hybrid_fingerprint(),
+            genuine_hybrid,
         }
     })
 }
@@ -74,10 +99,16 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
+    let hybrid = mode & 8 != 0;
+    let genuine = if hybrid {
+        &f.genuine_hybrid
+    } else {
+        &f.genuine
+    };
     let input = if mode & 1 == 0 {
         rest.to_vec()
     } else {
-        let mut cert = f.genuine.clone();
+        let mut cert = genuine.clone();
         // The ML-DSA component is [L-3373, L-64); the whole certificate otherwise.
         let (base, span) = if mode & 4 != 0 {
             (
@@ -103,6 +134,24 @@ fuzz_target!(|data: &[u8]| {
         }
         cert
     };
+    if hybrid {
+        match verify_certificate_hybrid(&input, &f.peer, Some(&f.peer_v2), &f.trust) {
+            Ok(claims) => {
+                assert_eq!(&input, genuine, "a modified certificate was accepted");
+                assert_eq!(claims.subject_hybrid(), Some(&f.peer_v2));
+            }
+            Err(_) => assert_ne!(&input, genuine, "the genuine certificate was rejected"),
+        }
+        for proved in [None, Some(&f.other_v2)] {
+            assert!(
+                // Only the classical-kind genuine certificate passes without the binding.
+                verify_certificate_hybrid(&input, &f.peer, proved, &f.trust).is_err()
+                    || input == f.genuine,
+                "a hybrid-bound certificate was accepted without its fingerprint v2"
+            );
+        }
+        return;
+    }
     match verify_certificate(&input, &f.peer, &f.trust) {
         Ok(claims) => {
             assert_eq!(input, f.genuine, "a modified certificate was accepted");

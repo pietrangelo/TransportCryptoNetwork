@@ -599,7 +599,14 @@ fn a_composite_ca_signs_v2_certificates_that_inspect_verifies() {
     let ca = keygen_v2(&dir);
     let subject_key = Identity::generate().unwrap().public_key();
     let subject_hex = subject_key.to_string();
-    let out = sign(&dir, "alice.cert", &[("--subject", Some(&subject_hex))]);
+    let out = sign(
+        &dir,
+        "alice.cert",
+        &[
+            ("--subject", Some(&subject_hex)),
+            ("--classical-subject", Some("<flag>")),
+        ],
+    );
     assert!(out.status.success(), "{}", all(&out));
     let file = std::fs::read_to_string(dir.path("alice.cert")).unwrap();
     assert!(file.starts_with(zt_crypto::CERT_FILE_PREFIX_V2));
@@ -705,4 +712,63 @@ fn a_v2_subject_gets_a_hybrid_bound_certificate() {
     let refused = sign(&v1_dir, "bob.cert", &[("--subject", Some(&v2))]);
     assert!(!refused.status.success());
     assert!(!v1_dir.path("bob.cert").exists());
+}
+
+/// A12-1 (review 0012): a composite CA issues hybrid-bound certificates by default. A 64-hex
+/// subject, which would give a classical-kind certificate that a CRQC can reuse with its own
+/// ML-KEM key, needs the explicit `--classical-subject`, and the choice is printed and logged;
+/// `--classical-subject` with a `tcn-pub-v2:` key is a contradiction.
+#[test]
+fn a_composite_ca_needs_an_explicit_choice_for_a_classical_subject() {
+    let dir = Dir::new();
+    keygen_v2(&dir);
+    let alice = Identity::generate().unwrap();
+    let hex = alice.public_key().to_string();
+    let refused = sign(&dir, "a.cert", &[("--subject", Some(&hex))]);
+    assert!(!refused.status.success());
+    assert!(
+        all(&refused).contains("--classical-subject"),
+        "{}",
+        all(&refused)
+    );
+    assert!(!dir.path("a.cert").exists());
+    assert!(log_lines(&dir).is_empty());
+    let chosen = sign(
+        &dir,
+        "b.cert",
+        &[
+            ("--subject", Some(&hex)),
+            ("--classical-subject", Some("<flag>")),
+        ],
+    );
+    assert!(chosen.status.success(), "{}", all(&chosen));
+    assert_eq!(
+        value(&stdout(&chosen), "subject_kind").as_deref(),
+        Some("classical")
+    );
+    let v2 = alice.hybrid_public_key().to_string();
+    let bound = sign(&dir, "c.cert", &[("--subject", Some(&v2))]);
+    assert!(bound.status.success(), "{}", all(&bound));
+    assert_eq!(
+        value(&stdout(&bound), "subject_kind").as_deref(),
+        Some("hybrid")
+    );
+    let contradiction = sign(
+        &dir,
+        "d.cert",
+        &[
+            ("--subject", Some(&v2)),
+            ("--classical-subject", Some("<flag>")),
+        ],
+    );
+    assert!(!contradiction.status.success());
+    assert!(!dir.path("d.cert").exists());
+    // A v1 CA signs only classical certificates: the flag changes nothing there.
+    let v1_dir = Dir::new();
+    keygen(&v1_dir);
+    assert!(
+        sign(&v1_dir, "e.cert", &[("--subject", Some(&hex))])
+            .status
+            .success()
+    );
 }

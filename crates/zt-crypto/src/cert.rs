@@ -594,3 +594,71 @@ pub fn decode_certificate_text(text: &str) -> Result<Vec<u8>, CertFormatError> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    //! The AP-5 order (finding A12-3 of review 0012): Ed25519 first, and the ML-DSA verifier
+    //! is not even called when the Ed25519 component is invalid.
+    use std::collections::BTreeSet;
+
+    use zt_domain::trust::{CertTrust, Revocations};
+    use zt_domain::{AllowedNodes, CertBodyV2, CertScope, CertSerial, CertSubject, NodeId};
+
+    use super::*;
+    use crate::Identity;
+
+    fn node(n: &str) -> NodeId {
+        NodeId::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn ml_dsa_is_verified_only_after_ed25519() {
+        let text = format!(
+            "{}{}{}\n",
+            CompositeCaSigningKey::FILE_PREFIX,
+            hex::encode([0x11; 32]),
+            hex::encode([0x12; 32])
+        );
+        let ca = CompositeCaSigningKey::from_secret_text(&text).unwrap();
+        let client = Identity::from_secret_hex(&hex::encode([0x13; 32])).unwrap();
+        let body = CertBodyV2::new(
+            ca.public_key().ca_fp(),
+            CertSubject::Classical(client.fingerprint()),
+            CertSerial::try_from([1; 16]).unwrap(),
+            zt_domain::UnixTime::from_secs(1_800_000_000),
+            zt_domain::UnixTime::from_secs(1_800_003_600),
+            node("alice"),
+            CertScope::Only(BTreeSet::from([node("web-01")])),
+        )
+        .unwrap();
+        let cert = sign_certificate_v2(&ca, &body).unwrap();
+        let mut trust = CertTrust::new();
+        trust
+            .add_authority(
+                node("ca"),
+                &[trusted_composite_ca_key(&ca.public_key()).unwrap()],
+                AllowedNodes::All,
+                28_800,
+            )
+            .unwrap();
+        trust.set_revocations(Revocations::new([], []).unwrap());
+        let verify = |bytes: &[u8]| {
+            mldsa_calls::reset();
+            let result = verify_certificate(bytes, &client.fingerprint(), &trust);
+            (result.err(), mldsa_calls::get())
+        };
+        // Genuine: both components verified, ML-DSA once.
+        assert_eq!(verify(&cert), (None, 1));
+        // A bad Ed25519 component (the last 64 bytes): refused without ML-DSA.
+        let mut bad_e = cert.clone();
+        let last = bad_e.len() - 1;
+        bad_e[last] ^= 1;
+        assert_eq!(verify(&bad_e), (Some(CertRejection::BadSignature), 0));
+        // A bad ML-DSA component with a good Ed25519 one: ML-DSA runs and refuses.
+        let mut bad_m = cert.clone();
+        let in_sig_m = cert.len() - 64 - 100;
+        bad_m[in_sig_m] ^= 1;
+        assert_eq!(verify(&bad_m), (Some(CertRejection::BadSignature), 1));
+    }
+}
