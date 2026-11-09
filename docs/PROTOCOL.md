@@ -115,23 +115,27 @@ X25519 form is used (Edwards → Montgomery map). The **fingerprint** is
 Small-order public keys are rejected at load time.
 
 ### 7.3 Handshake
-`Noise_IK_25519_ChaChaPoly_BLAKE2s` (the classical suite, §7.5), with a different prologue per
-channel. The payload of
+The suite pinned by the initiator (§7.5): `Noise_IK_25519_ChaChaPoly_BLAKE2s` (the classical
+suite, the default) on both channels, or `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the
+hybrid suite) on the end-to-end channel only. Each channel and suite has its own prologue. The
+payload of
 message 2 MUST be empty (the initiator rejects a message 2 with a payload); the payload of
 message 1 is either empty or contains a client certificate (§15.3), and a responder rejects a
 payload that is neither empty nor a valid certificate.
 
 | Channel | Initiator | Responder | Prologue |
 | :- | :- | :- | :- |
-| outer | agent or client | relay | `TCN/1 outer` |
-| end-to-end | client | agent (inside `Data` frames) | `TCN/1 end-to-end` |
+| outer | agent or client | relay | `TCN/1 outer` (classical suite only) |
+| end-to-end | client | agent (inside `Data` frames) | classical: `TCN/1 end-to-end`; hybrid: `TCN/2 end-to-end` ‖ `0x01` |
 
 The initiator pins the responder's key. The responder learns the initiator's identity from the
 first message and, if it is not on its whitelist, **does not respond**: it closes without
 sending the second message.
 
-On the end-to-end channel the client's first transport message MUST have `TCN/1 ready` as its
-plaintext. IK message 1 can be replayed by anyone who observes it (the relay): only after this
+On the end-to-end channel the client's first transport message MUST have the confirmation of
+its suite as its plaintext: `TCN/1 ready` for the classical suite, `TCN/2 ready` for the hybrid
+one. The confirmation of the other suite, or any other plaintext, closes the stream
+(`ProtocolViolation`) without contacting sshd. IK message 1 can be replayed by anyone who observes it (the relay): only after this
 confirmation does the agent contact sshd and register the session.
 
 ### 7.4 Rekey
@@ -151,7 +155,7 @@ configuration: exact, with no case folding, trimming or aliases.
 | Suite | Id | Message 1 | Message 2 | This release |
 | :- | :- | -: | -: | :- |
 | `Noise_IK_25519_ChaChaPoly_BLAKE2s` | `0x00` | 96 + payload | 48 | supported, the default |
-| `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | reserved for PQ-1, refused |
+| `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | supported on the end-to-end channel only (PQ-1); refused on the outer one |
 
 Message 1 of the classical suite is `e` (32) + encrypted `s` (32 + 16) + the payload tag (16).
 In IKhfs, `e1` (the 1 184-byte ML-KEM-768 encapsulation key) follows `es`, so it is encrypted
@@ -177,7 +181,68 @@ Rules:
   releases: a release that adds a suite does not accept it until it is configured. On the relay
   the role is known only after message 1. A peer whose suite is accepted for the other role
   gets no message 2 and produces `handshake_suite_rejected` (WARN).
-- A suite that this build cannot run is a configuration error at startup, on every side.
+- A suite that this build cannot run **on that channel** is a configuration error at startup,
+  on every side. In this release the outer channel runs only the classical suite: a hybrid
+  `--relay-suite`, relay pin or `relay.toml` entry stops the process.
+
+#### 7.5.1 The hybrid suite on the end-to-end channel (PQ-1)
+
+The end-to-end handshake is opaque `Data` payload for the relay, so the hybrid suite needs no
+change on the relays: a relay of any earlier release forwards it. Its message 1 (at most
+1 296 + 4 328 = 5 624 bytes) and message 2 (1 152 bytes) fit one `Data` frame
+(`MAX_PAYLOAD_LEN`, checked with `const` assertions); the frame budget does not change.
+
+Transcript, with the prologue `TCN/2 end-to-end` ‖ `0x01` and the protocol name above
+(Noise §5 and the HFS extension, revision 1):
+
+```text
+<- s
+...
+-> e, es, e1, s, ss        e1: ML-KEM-768 encapsulation key (1 184), encrypted under es
+<- e, ee, ekem1, se        ekem1: ML-KEM-768 ciphertext (1 088), encrypted; then MixKey(ss_kem)
+```
+
+The KEM is `libcrux-ml-kem` (FIPS 203), plugged into snow through its resolver; snow's own KEM
+code is not used (docs/pq-snow.md, `vendor/snow/PATCHES.md`). A wrong ciphertext gives a
+different shared secret (implicit rejection): message 2 then fails its AEAD tag like any other
+corruption, with the same error and no oracle on which field was wrong.
+
+The agent (responder) handles message 1 as follows:
+
+1. A length outside the accepted set's bounds is refused before Noise runs.
+2. It tries the accepted suites whose message 1 can have that length.
+3. Only if none succeeds, it tries the other suites it supports on this channel, to recognise
+   a known client whose suite it does not accept. That client gets no message 2: the agent
+   records `handshake_suite_rejected` (WARN, with `peer` and `suite`) and closes the stream
+   with `Unauthorized`. An unknown key produces no per-suite line, whatever its suite.
+4. The confirmation of the suite (`TCN/2 ready`) must arrive before sshd is contacted.
+
+An agent that accepts both suites spends at most one extra hybrid trial on an invalid
+message 1 of a length both suites can have (the `both suites` row of docs/pq-snow.md §5).
+
+What IKhfs gives, and what it does not (AP-23):
+
+- **Gives:** confidentiality of the end-to-end session against an adversary who records the
+  traffic today and has a quantum computer later ("harvest now, decrypt later"), as long as
+  ML-KEM-768 holds; if ML-KEM fails, X25519 alone, as in the classical suite.
+- **Does not give post-quantum authentication.** Identities remain X25519 static keys: a
+  quantum adversary *active during the handshake* can impersonate either side.
+- **Does not hide identities post-quantumly.** The client's static key in message 1 is
+  encrypted under `es` (X25519 only): a recorded handshake reveals it to a future quantum
+  adversary, and with it which client reached which agent.
+- **Does not change IK's properties:** no protection against key-compromise impersonation of
+  the responder, message 1 replayable (hence the confirmation, §7.3).
+- **Leaks lengths.** The suite is visible to anyone who sees the sizes of the `Data` frames
+  (1 296 + payload vs 96 + payload).
+- **The relay channel stays classical.** The outer handshake, and with it the routing metadata
+  and the client's identity towards the relay, is X25519 only until a later phase.
+- **HFS is not a final standard.** The pattern follows the Noise HFS extension (revision 1),
+  not an RFC; the protocol name binds the exact construction, and a different construction
+  would get a new suite id.
+
+Memory: the agent's and the client's ML-KEM decapsulation key and seed are wiped when dropped;
+snow wipes its KEM output buffer. Not wiped in this release: snow's internal HKDF and DH
+temporaries, and the copies libcrux makes of its by-value arguments.
 
 ## 8. Lifecycle
 
@@ -541,8 +606,8 @@ Message 1 can be replayed (§7.3). A replayed message 1 with a valid certificate
 complete the handshake (it needs the client's ephemeral key), costs the responder at most one
 extra signature verification, within the per-source budget (§10.1), and produces no success event:
 the events that name an accepted certificate (§15.11) are recorded only after an authentic
-transport message from the client (`Open` on the outer channel, `TCN/1 ready` on the end-to-end
-one).
+transport message from the client (`Open` on the outer channel, the suite's confirmation on the
+end-to-end one, §7.3).
 
 Compatibility: a relay or agent older than Phase 6 ignores the payload of message 1; a client
 with a certificate and without an entry in its policy is therefore treated as an unknown key (no
@@ -554,7 +619,8 @@ bytes already include the payload's AEAD tag (§7.5). It fits both in a Noise me
 payload of a `Data` frame (verified with a `const` assertion), and it is the relay's
 pre-authentication buffer cap for the classical suite (§10.1). Releases before PQ-0 counted the
 tag twice (`96 + 4 328 + 16`); that bound was 16 bytes too loose and never refused a legitimate
-message. A
+message. Under the hybrid suite (end-to-end only) the bound is `1 296 + 4 328 = 5 624` bytes,
+which also fits a `Data` frame. A
 responder rejects a message 1 payload longer than `MAX_CERT_LEN` without interpreting it.
 
 ### 15.4 Verification: order of checks
@@ -867,7 +933,7 @@ The vector was computed outside the project; as for framing, if the test
 | certificate name equal to that of another client | names authorise nothing; audits always have fingerprint, CA and serial |
 | removing the certificate to fall back on the whitelist (downgrade) | the payload is authenticated by Noise: removing it requires the client's secret key; whitelist precedence is the operator's choice, not the peer's |
 | compromised relay forging or altering certificates towards the agent | the relay does not have the CA key; the end-to-end certificate is encrypted towards the agent; the agent verifies it by itself, including its own node being in scope |
-| compromised relay replaying end-to-end message 1 | as today: without `TCN/1 ready` no sshd and no registered session (finding 0002-3) |
+| compromised relay replaying end-to-end message 1 | as today: without the suite's confirmation (`TCN/1 ready` or `TCN/2 ready`) no sshd and no registered session (finding 0002-3) |
 | replayed message 1 to make a client appear in the audits | success events are recorded only after an authentic message (§15.3) |
 | CA signing a certificate for an agent's key | `role_conflict` on the relay; the key cannot open streams |
 | relay and agent clock moved backwards | accepted residual risk (§15.6); NTS recommended; denylist |

@@ -77,11 +77,15 @@ two options:
 
 - `--relay-suite <name>`: the suite pinned towards the relays, one for all of them or one per
   `--relay` in the same order. The agent never falls back to another suite.
-- `--accept-client-suites <name>[,<name>…]`: the suites accepted from clients on the end-to-end
-  channel.
+- `--accept-client-suites <name>[,<name>…]` (or the environment variable
+  `TCN_ACCEPT_CLIENT_SUITES`, same syntax): the suites accepted from clients on the end-to-end
+  channel. Without it, the classical suite alone.
 
-This release supports only the classical suite. `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`
-is reserved for the post-quantum release and is refused at startup.
+This release adds the hybrid suite `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (ML-KEM-768
++ X25519) on the **end-to-end channel only**: in `--accept-client-suites` and in a client's
+`[[nodes]] suite`. Relays need no upgrade, option or restart for it. On the outer channel
+(`--relay-suite`, `relay.toml`, a client's relay pins) it is refused at startup. The agent logs
+the suites in force at startup (`handshake_suites_in_use`). To introduce it, follow §12.
 
 ### 4.1 `relay.toml`: suites and admission limits
 
@@ -176,7 +180,15 @@ public_key = "<public key of the db-01 agent>"
 Each `[[relays]]` and `[[nodes]]` entry takes an optional `suite` (and the single-relay form
 `relay_suite`): the handshake suite pinned towards that relay or that node (PROTOCOL §7.5,
 exact Noise protocol name). Without it, the classical suite. The client never falls back to
-another suite: a relay or agent that does not accept the pinned one does not answer.
+another suite: a relay or agent that does not accept the pinned one does not answer. A node can
+pin the hybrid suite; a relay cannot in this release (§12):
+
+```toml
+[[nodes]]
+node = "web-01"
+public_key = "<public key of the web-01 agent>"
+suite = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"
+```
 
 As with OpenSSH's `StrictModes`, every trust file (this one, the relay policy, the agent's
 authorized clients) must be a regular file, owned by the user running the binary or by
@@ -250,7 +262,7 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `access_denied` | WARN | a client requested a node that the policy does not grant it |
 | `protocol_violation` | WARN | a peer violated the protocol and was disconnected |
 | `access_revoked` | WARN | a reload removed a peer's role or its access to a node |
-| `e2e_session_started`, `e2e_session_ended` | INFO | (agent) session to sshd opened / closed, with `outcome` `closed`, `error` or `revoked` |
+| `e2e_session_started`, `e2e_session_ended` | INFO | (agent) session to sshd opened / closed, with `outcome` `closed`, `error` or `revoked`; `e2e_session_started` names the end-to-end `suite` |
 | `policy_reloaded`, `authorized_clients_reloaded`, `relay_keys_reloaded` | INFO | reload succeeded |
 | `policy_reload_failed`, `authorized_clients_reload_failed`, `relay_keys_reload_failed` | ERROR | reload failed: the previous configuration remains |
 | `keys_in_use` | INFO, WARN with a previous key | (relay and agent) at startup and on every reload: `role`, `current_fingerprint`, `previous_fingerprint` (`none` if there is none) |
@@ -261,7 +273,8 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `ca_rotation_pending` | WARN | (relay and agent) at startup, on every reload and every hour, for each CA with two keys: complete the rotation (§10.6) |
 | `revocations_in_use` | INFO | (relay and agent) at startup and on every reload: how many `serials` and `keys` entries the denylist has |
 | `handshake_suites_in_use` | INFO | (relay) at startup: `agent_suites`, `client_suites`, the accepted suites as comma-separated protocol names (§4.1) |
-| `handshake_suite_rejected` | WARN | (relay) a known peer completed message 1 with a suite not accepted for its role: `peer`, `suite`. It got no message 2 |
+| `handshake_suites_in_use` | INFO | (agent) at startup: `role=agent`, `client_suites` (accepted end to end) and `relay_suites` (pinned towards the relays) |
+| `handshake_suite_rejected` | WARN | (relay) a known peer completed message 1 with a suite not accepted for its role; (agent) a known client sent an end-to-end message 1 with a suite the agent does not accept: `peer`, `suite`. It got no message 2 |
 | `preauth_summary` | INFO | (relay) every 10 s, if anything failed before key confirmation: one count per reason, `distinct_sources`, `distinct_keys`, `saturated`, `suppressed_identities` (see below) |
 | `admission_limits_in_use` | INFO | (relay) at startup: every admission limit in force (§4.1) |
 | `admission_refused` | WARN | (relay) a peer that confirmed its key was refused by `max_per_identity` (`reason = identity_limit`) or a full established pool (`established_pool_full`): `peer`. Its `Open` got `Reject RateLimited` |
@@ -424,6 +437,17 @@ filter and addresses restricted to IPv4/IPv6/Unix (`systemd-analyze security`: 1
 `tcn:tcn 0600`, trust files and directories owned by root or by `tcn` and not writable by
 others. For the agent, `/etc/tcn/agent.env` contains `TCN_RELAY`, `TCN_RELAY_KEY` and `TCN_NODE`;
 if the relay's IP is fixed, enable `IPAddressDeny=any` / `IPAddressAllow=` in the unit.
+
+A **new installation** should also accept both end-to-end suites, so that clients can move to
+the hybrid one node by node without touching the agent again (§12):
+
+```sh
+# /etc/tcn/agent.env
+TCN_ACCEPT_CLIENT_SUITES=Noise_IK_25519_ChaChaPoly_BLAKE2s,Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s
+```
+
+The built-in default stays the classical suite alone (PROTOCOL §7.5): an upgrade never changes
+what an agent accepts unless this line is added.
 
 The units are `Type=notify`: `systemctl start` returns when the service has loaded its key and
 trust files and is already handling `SIGHUP`, so a `systemctl reload` right afterwards is safe. The
@@ -647,7 +671,8 @@ every signing session; `zt-ca sign` prints the dates in UTC precisely so that yo
 
 ## 11. SSH key exchange: post-quantum today
 
-TCN's own handshake becomes post-quantum in a later release (PROTOCOL §7.5). The SSH session
+TCN's end-to-end handshake can be post-quantum (hybrid) since PQ-1 (§12); the relay channel and
+all authentication stay classical (PROTOCOL §7.5.1). The SSH session
 that runs inside the tunnel can be protected **now**: it is end-to-end between `ssh` and `sshd`,
 and a recorded tunnel (harvest now, decrypt later) still has the SSH key exchange inside it.
 OpenSSH supports two hybrid key exchanges:
@@ -696,3 +721,38 @@ some hosts, append `curve25519-sha256` in a `Host` block for them only. Check wh
 negotiated with `ssh -v web-01.tcn 2>&1 | grep 'kex: algorithm'`. This protects the confidentiality of
 the SSH session. Authentication (host keys and user keys) stays classical, as it does in TCN
 until a later release.
+
+## 12. Hybrid end-to-end suite: rollout and rollback
+
+The hybrid suite `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` protects the client ↔ agent
+channel against "harvest now, decrypt later" (PROTOCOL §7.5.1, including what it does not
+protect). It is negotiated by no one: each client pins it per node, each agent accepts an
+explicit set. Relays are not involved and keep running unchanged.
+
+Rollout, in this order:
+
+1. **Agents.** Upgrade `zt-agent` and accept both suites (`TCN_ACCEPT_CLIENT_SUITES` in
+   `agent.env`, §9, or `--accept-client-suites`), then restart it. Check the startup line
+   `handshake_suites_in_use` with `role=agent`: `client_suites` names both. Existing clients
+   keep working with the classical suite.
+2. **Clients, node by node.** Upgrade `zt-client` and add
+   `suite = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"` to the `[[nodes]]` entries whose
+   agents completed step 1. Check `e2e_session_started` on the agent: its `suite` is the hybrid
+   one. A client pinned to the hybrid suite towards an agent that does not accept it **fails
+   closed** (no session, no fallback); the agent logs `handshake_suite_rejected` if it is
+   already an upgraded agent, and an older agent ignores it as an invalid handshake
+   (`handshake_failed`).
+3. **Later (PQ-SUNSET), optional.** Once every client of an agent pins the hybrid suite (no
+   `e2e_session_started` with the classical suite for a period you choose), accept only the
+   hybrid one on that agent. Classical clients then fail with `handshake_suite_rejected`.
+
+Rollback is the reverse order:
+
+1. Accept both suites again on the agents that accept only the hybrid one (step 3).
+2. Remove `suite` from the clients' `[[nodes]]` entries (back to the classical suite).
+3. Only then, if needed, remove the hybrid suite from the agents or downgrade them. Doing this
+   before step 2 cuts off the clients that still pin the hybrid suite.
+
+Cost: the hybrid handshake adds about 1.2 KiB to each end-to-end message and roughly 0.1–0.2 ms
+of CPU per side (docs/pq-snow.md §5). The relay sees larger `Data` frames during the handshake
+and nothing else.

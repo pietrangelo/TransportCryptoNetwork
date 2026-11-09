@@ -1,6 +1,7 @@
 # PQ-0: the `snow` decision for IKhfs
 
-Status: **decided** (PQ-0). The patch lands in PQ-1 (Phase 2). Finding AP-14 of review 0007 asked
+Status: **decided** (PQ-0), **landed** in PQ-1 (Phase 2): `vendor/snow`, described patch by
+patch in `vendor/snow/PATCHES.md`. Finding AP-14 of review 0007 asked
 for this decision, and for a spike test that backs it, before any PQ code.
 
 ## 1. Question
@@ -21,7 +22,9 @@ does it need a patch? If it needs one, how big is it?
 
 ## 3. What the spike shows
 
-`crates/zt-crypto/tests/snow_hfs_spike.rs` builds the IKhfs handshake on stock snow (feature
+(Historical: the spike was `crates/zt-crypto/tests/snow_hfs_spike.rs` in PQ-0. PQ-1 replaced it
+with `snow_patch.rs`, which tests each patch, and `pq_handshake.rs`, which runs the real
+handshake.) The spike built the IKhfs handshake on stock snow (feature
 `hfs`, which pulls no `pqcrypto`). It plugs `zt_crypto::kem::MlKem768` (libcrux) in through a
 `CryptoResolver`, under the borrowed label of option (b), **in a test only**:
 
@@ -46,7 +49,7 @@ state machine changes, and that state machine is the code the spike exercised.
   - `vendor/snow` (0.10.0, with its checksum recorded) and `[patch.crates-io] snow = { path = "vendor/snow" }`;
   - changes, each covered by a test: `KemChoice::MlKem768` and `"MLKEM768"` in the parser;
     `MAXKEMPUBLEN` / `MAXKEMCTLEN` stay at 4 096 (ML-KEM-768 fits); the three `unwrap()` calls in
-    `Token::E1`/`Token::Ekem1` (`handshakestate.rs`) become `Err(Error::Input)` (AP-14: the
+    `Token::E1`/`Token::Ekem1` (`handshakestate.rs`) become errors (AP-14: the
     least-exercised code in the TCB, under `panic = "abort"`);
   - no KEM inside snow: the resolver hands it `zt_crypto::kem::MlKem768`, so snow never sees
     a KEM implementation other than the one the test vectors cover;
@@ -63,39 +66,59 @@ state machine changes, and that state machine is the code the spike exercised.
 - PQ-1 inverts the spike test `stock_snow_does_not_know_ml_kem_768` and replaces the borrowed
   label with the honest name.
 
-## 5. Baseline (classical suite and ML-KEM-768)
+What PQ-1 actually landed (`vendor/snow/PATCHES.md`): patches 1 (`MLKEM768`) and 4 (no
+`unwrap()`, as `Error::Kem`) as decided, plus three found while writing them: 2, KEM sizes
+checked against snow's buffers (the declared sizes indexed fixed stack arrays); 3, a public key
+of the wrong length after `generate` is an error (an RNG failure would otherwise send a short
+`e1`); 5, the KEM shared secret buffer is `Zeroizing` (A8-12). In TCN the hybrid suite is
+supported on the end-to-end channel only; the outer channel still refuses it.
+
+## 5. Baseline (classical and hybrid suites, ML-KEM-768)
 
 `crates/zt-crypto/tests/baseline.rs`, ignored by default:
 
 ```sh
-cargo test --release -p zt-crypto --test baseline -- --ignored --nocapture
+cargo test --release -p zt-crypto --test baseline -- --ignored --nocapture --test-threads 1
 ```
 
 The machine: Intel Xeon at 2.10 GHz, 4 vCPU, a shared cloud VM (so expect noise in the p99),
-`x86_64`, release build, libcrux portable and AVX2 code paths, 2 000 rounds after warm-up.
+`x86_64`, release build, libcrux portable and AVX2 code paths, 2 000 rounds after warm-up, a
+400-byte certificate in message 1. Figures of PQ-1 (2026-11-09), median / p99 in µs:
 
-| Operation | median | p99 |
-| :- | -: | -: |
-| ML-KEM-768 keygen (libcrux) | 21.6 µs | 41.5 µs |
-| ML-KEM-768 encapsulate | 22.8 µs | 40.4 µs |
-| ML-KEM-768 decapsulate | 23.4 µs | 60.7 µs |
-| initiator: write message 1 | 202.1 µs | 343.1 µs |
-| responder: read message 1 (unauthenticated cost) | 148.7 µs | 270.3 µs |
-| responder: reject an invalid message 1 | 93.0 µs | 174.0 µs |
-| responder: read message 1 and write message 2 | 297.2 µs | 499.5 µs |
-| full handshake, both sides | 1 010.3 µs | 1 231.6 µs |
+| Operation | classical, end to end | hybrid, end to end | Δ p99 |
+| :- | -: | -: | -: |
+| initiator: write message 1 | 251 / 395 | 312 / 460 | +65 |
+| responder: read message 1 (unauthenticated cost) | 209 / 325 | 214 / 333 | +8 |
+| responder: reject an invalid message 1 | 122 / 203 | 149 / 256 | +53 |
+| responder: read message 1 and write message 2 | 306 / 569 | 522 / 681 | +112 |
+| initiator: read message 2 | 114 / 225 | 217 / 315 | +90 |
+| full handshake, both sides | 618 / 1 039 | 900 / 1 285 | +246 |
+
+| Other | median / p99 |
+| :- | -: |
+| both suites accepted: reject an invalid hybrid-length message 1 | 299 / 360 |
+| classical, outer channel: full handshake | 636 / 1 145 |
+| ML-KEM-768 keygen (libcrux) | 32.7 / 50.8 |
+| ML-KEM-768 encapsulate | 35.9 / 57.6 |
+| ML-KEM-768 decapsulate | 36.1 / 56.0 |
+
+PQ-0's figures (same VM type, another day) were 21.6 / 41.5, 22.8 / 40.4 and 23.4 / 60.7 µs
+for the three KEM operations and 1 010 / 1 232 µs for a full classical handshake: the VM is
+noisy, so compare rows of one run only.
 
 Reading it:
 
+- **Perf gate (pq.md §7: at most +200 µs p99 per side on `x86_64`): passed.** The responder
+  adds +112 µs p99 (read message 1 and write message 2); the initiator +65 µs (write
+  message 1) and +90 µs (read message 2), +155 µs in all. The "full handshake" row adds
+  both sides.
 - IKhfs adds one keygen on the initiator, one encapsulation on the responder (after the
-  authorization decision, in `accept`) and one decapsulation on the initiator. That is about
-  25 µs per side at the median, well within the PQ-1 performance gate (pq.md §7: at most
-  +200 µs p99 per side on `x86_64`).
-- Before authentication, the responder's cost barely changes with IKhfs: `e1` adds one AEAD
-  decryption of 1 200 bytes, and the KEM work happens only after the decision. So the per-source budget
-  of R-1 needs no tightening for PQ (AP-16). The unauthenticated refill stays one handshake
-  every 3 s per source. Only the burst rose (20 → 64), for fleets that open 50 sessions at
-  once (`forks = 50`). At about 150 µs of responder CPU per unauthenticated message 1, a full
-  burst costs one core under 10 ms.
+  authorization decision, in `accept`) and one decapsulation on the initiator, plus the AEAD
+  and hashing of about 2.3 KiB more transcript.
+- Before authentication, the responder's cost barely changes with IKhfs (+8 µs median): `e1`
+  adds one AEAD decryption of 1 200 bytes, and the KEM work happens only after the decision.
+  An agent that accepts both suites tries both on an invalid message 1 of a length both can
+  have, about 300 µs. So the per-source budget of R-1 needs no tightening for PQ (AP-16), and
+  the relay is not involved at all in this release (the hybrid suite runs end to end only).
 - aarch64 figures (NEON backend disabled, see `.cargo/config.toml`) are still to be recorded on
-  real hardware; PQ-1 must add them before the gate is evaluated there.
+  real hardware before the gate is evaluated there.

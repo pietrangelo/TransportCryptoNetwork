@@ -6,6 +6,9 @@
 #   /etc/tcn/clients.toml  root:root 0644   (systemctl reload zt-agent after a change)
 #   /etc/tcn/agent.env     root:root 0644   with TCN_RELAY, TCN_RELAY_KEY, TCN_NODE
 #                          (multiple relays: TCN_RELAY=r1:7443,r2:7443 and TCN_RELAY_KEY=k1,k2)
+#                          and, for new installations, the end-to-end suites (OPERATIONS §9, §12):
+#                          TCN_ACCEPT_CLIENT_SUITES=Noise_IK_25519_ChaChaPoly_BLAKE2s,Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s
+#                          (read by zt-agent itself; without it, the classical suite alone)
 [Unit]
 Description=TCN agent (zt-agent)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
