@@ -1,7 +1,7 @@
 # Post-quantum and resilience roadmap (pre-implementation plan)
 
-Status: phases 1–3 implemented (PQ-0, R-1, PQ-1 end to end and on the outer hops, R-2, R-3);
-phases 4–7 pending. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
+Status: phases 1–4 implemented (PQ-0, R-1, PQ-1 end to end and on the outer hops, R-2, R-3,
+R-4 failover deadline and limited hedge, which closes backlog A5-4); phases 5–7 pending. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
 
 This plan merges two independent design analyses and the adversary review of both:
 
@@ -94,7 +94,7 @@ because the relay is blind.
 | 1 | **PQ-0 ∥ R-1** | Suite id type, accepted sets, KEM trait, test vectors, baselines on x86_64/aarch64 musl, vendored snow patch, SSH KEX guidance. In parallel: admission fixes (AP-1/AP-2) | no |
 | 2 | **PQ-1 E2E** | IKhfs on the client↔agent channel only. Upgrades clients and agents, not relays | E2E handshake only |
 | 3 | **PQ-1 outer ∥ R-2 + R-3** | IKhfs on both hops, rolled out with the new drain and rolling-restart tooling; simulator, reconnect, liveness, lifecycle | hop handshakes |
-| 4 | **R-4** | Failover deadline and limited hedge (closes A5-4) | no |
+| 4 | **R-4** | Failover deadline and limited hedge (closes A5-4; implemented) | no |
 | 5 | **PQ-AUTH** | Cert v2 composite, hybrid identities, hybrid IK, unified fingerprints | yes |
 | 6 | **R-5, R-6, PQ-REL** | Metrics, efficiency + soak, SLH-DSA release signing | no |
 | 7 | **PQ-SUNSET** | Remove classical-only suites from accepted sets, event-driven | config |

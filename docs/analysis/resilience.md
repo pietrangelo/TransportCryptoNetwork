@@ -93,7 +93,7 @@ Severity uses the adversary reviews' scale: high blocks a merge, medium, or low.
 | G2 | **Pre-auth handshakes share slots with established peers.** 4 096 slots cover agents, clients and handshakes together. An attacker from about 205 IPv4 addresses (20 each) can hold every slot by sending msg1 slowly within the 10 s handshake timeout. Established peers keep working, but reconnecting agents and new clients are locked out. The handshake codec also accepts a length prefix up to 65 535, and `LengthDelimitedCodec` reserves the declared length up front (to confirm with a test). That is up to 64 KiB buffered per pre-auth connection (256 MiB total), although a real msg1 is at most `96 + 4 328 + 16` bytes. | medium | `channel.rs` `codec()`, `accept` |
 | G3 | **Synchronised reconnects (thundering herd).** The jitter is added on top of the delay, and the first retry after a long session is 1.0–1.5 s for everyone. The relay restarts in about 2 s plus startup, so the fleet arrives in a few waves about 1.5 s wide. The listen backlog is tokio's default of 1 024. Handshake CPU runs on the async workers, so a storm also adds latency to established SSH sessions. This is moderate with classic Noise (4 X25519 per responder handshake, about 0.2 ms). With PQ, bytes per handshake grow 10–40× and CPU 2–4×. | medium (PQ: medium+) | `agent.rs:99–110` |
 | G4 | **Slow dead-peer detection.** Idle is 90 s and keepalive 30 s. The relay never probes; the agent treats a `Ping` from the relay as a protocol error, so relay-side probing would be a wire-semantics change. A silent NAT drop or a host crash with no FIN leaves the relay routing `Open`s to a dead agent for up to 90 s. Each client waits the 15 s `open` timeout, then fails over. `TCP_USER_TIMEOUT` and TCP keepalive are not set. | medium | `agent.rs:312–315`, `Timeouts` |
-| G5 | **No overall client deadline (A5-4).** Up to 35 s per relay, sequential. Each `zt-client` is a fresh process, so it keeps no memory of a bad relay between invocations. | low→medium for Ansible | `client.rs:61`, review 0005 #4 |
+| G5 | **No overall client deadline (A5-4).** Up to 35 s per relay, sequential. Each `zt-client` is a fresh process, so it keeps no memory of a bad relay between invocations. **Closed by R-4** (§5.3). | low→medium for Ansible | `client.rs:61`, review 0005 #4 |
 | G6 | **No graceful drain or zero-downtime upgrade.** No SIGTERM handler: the process dies and every SSH session through it drops, including `ControlPersist` masters, and Ansible tasks fail. `CloseReason::Drained` exists but is used only for the session limit. A PQ rollout needs rolling restarts of every relay. | medium | `bins/*/main.rs` |
 | G7 | **Detached critical tasks.** The hub, both SIGHUP handlers and the watchers are `tokio::spawn`ed and their handles dropped. If one returns without panicking (for example `Signal::recv` → `None`, or the hub's receiver closing), the process keeps running in a degraded state. The worst case is that SIGHUP is silently ignored, so **revocation stops working without anyone noticing**. In test builds, which unwind, a panicking spawned task is swallowed and the test can still pass. | medium | `zt-relay/src/main.rs`, `agent.rs` `run` |
 | G8 | **No watchdog, and the restart policy can give up.** No `WatchdogSec`, so a wedged runtime (deadlock, livelock) stays up forever. With `RestartSec=2s` and the default `StartLimitBurst=5` / `StartLimitIntervalSec=10s`, a fast crash loop puts the unit permanently into `failed`. A crash bug triggered by one frame makes the whole agent fleet crash-loop in step, and each restart reconnects to every relay. | low–medium | `packaging/systemd/*.service` |
@@ -206,6 +206,19 @@ binaries stay composition roots that handle signals and `sd_notify`. Nothing rel
   because whoever holds the key could use a block to deny service.
 
 ### 5.3 Client failover deadline (A5-4, G5)
+
+**Implemented (R-4, closes A5-4).** `zt_application::failover::FailoverPlan` with the review
+0007 change (AP-10): the hedge fires only while the attempt in flight has not completed connect
+and outer handshake; once it has, the client waits for the `OpenAck` up to the open timeout and
+never hedges. The events are `Connected(i)`, `OuterReady(i)`, `Acked(i)`, `Failed(i, kind)`
+plus `tick(now)`; the actions `Start(i)`, `Cancel(i)`, `TimedOut(i, step)`, `Proceed(i)`,
+`GiveUp(Deadline | Exhausted | Refused(i))`. The stagger gets a jitter of at most a quarter of
+it (0.5 s) from an injected sample, so a fleet that starts together does not hedge together.
+`zt-net` drives it with the attempts as futures of the client's own task (nothing spawned;
+dropping the client drops every connection); a cancelled attempt that has sent `Open` sends
+`Close Normal` (bounded at 1 s). `require_outer_suite` (A10-9) is carried into `ClientConfig`
+and enforced before any dial. At the deadline `zt-client` exits 75 (`EX_TEMPFAIL`). PROTOCOL
+§13 and OPERATIONS §5 have the operator view.
 
 - **`FailoverPlan` (sans-IO):** events `Started(i)`, `Failed(i, kind)`, `Acked(i)`,
   `Tick(now)`; actions `Start(i)`, `Cancel(i)`, `Proceed(i)`, `GiveUp(err)`.
@@ -489,6 +502,11 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 | R4-F5 | Resources | hedged loser's `Open` holds an agent slot | released ≤ one RTT after the client closes it | `hedge_losers_release_agent_slots` |
 | R4-F6 | State | deadline expires mid-handshake / after `OpenAck` | before `OpenAck`: give up; after: session continues (deadline is for establishment only) | `deadline_applies_to_establishment_only` |
 | R4-F7 | Overload | Ansible burst with hedging | handshakes ≤ 2× clients; no gate refusals with R-1 | `hedging_stays_within_admission_budget` |
+| R4-F8 | Overload | relay alive but slow to relay `OpenAck` (AP-10) | no hedge: the client waits for the open timeout, then moves on; the second relay sees nobody before | `hedging_does_not_amplify_a_slow_but_alive_relay` (sim), `a_slow_open_ack_is_never_hedged` |
+| R4-F9 | Identity | `require_outer_suite` with a relay pinned to another suite in a `ClientConfig` built in code (A10-9) | refused before any dial; no hedge onto it | `a_hedge_never_lands_on_a_relay_outside_require_outer_suite` |
+| R4-F10 | Resources | client dropped in the middle of a hedge | no connection left open (no spawned task) | `dropping_the_client_mid_hedge_leaks_nothing` (sim) |
+| R4-F11 | Operator | deadline passes under OpenSSH | `zt-client` exits 75 with a clear stderr line; `ssh` exits 255 (Ansible `retries`) | `the_deadline_exits_with_tempfail_and_a_clear_message`, `ssh_reports_the_failover_deadline` (e2e-openssh) |
+| R4-F12 | Partition | every relay black-holed / every agent link held | gives up after about 5 s with the last error / at the 20 s deadline | `black_holed_relays_give_up_before_the_deadline`, `all_relays_down_ends_at_the_deadline` (sim) |
 
 ### R-5 Observability
 

@@ -204,6 +204,7 @@ key = "client.key"                  # relative to this file, or absolute
 # [[relays]]
 # address = "r2.example.org:7443"
 # public_key = "<r2 key>"
+# connect_deadline_secs = 20        # optional, top level: give up after this long (1-300)
 
 [[nodes]]
 node = "web-01"
@@ -228,6 +229,22 @@ node = "web-01"
 public_key = "<public key of the web-01 agent>"
 suite = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"
 ```
+
+**Failover** (PROTOCOL §13, resilience R-4). The relays are tried in order. A relay that has
+not completed TCP connect and the outer handshake after 2 s (plus up to 0.5 s of jitter) is
+hedged: the next one starts in parallel, at most two at a time. A relay that has completed the
+handshake but is slow to acknowledge the stream is **not** hedged (it is overloaded; hedging
+would double its load): the client waits up to 10 s for the `OpenAck`, then moves on. The
+per-step timeouts are 3 s (connect), 5 s (handshake) and 10 s (`OpenAck`). The whole
+establishment ends at `connect_deadline_secs` (default 20 s): `zt-client` then exits with
+status **75** (`EX_TEMPFAIL`) and says on stderr
+
+```text
+zt-client: no relay completed the connection within 20 s (connect_deadline_secs in client.toml)
+```
+
+and `ssh` exits with 255. A black-holed first relay costs about 2 s instead of the 35 s of the
+sequential failover before R-4. The deadline covers establishment only, not the session.
 
 As with OpenSSH's `StrictModes`, every trust file (this one, the relay policy, the agent's
 authorized clients) must be a regular file, owned by the user running the binary or by
@@ -277,12 +294,29 @@ web-02.tcn
 # ansible.cfg
 [ssh_connection]
 pipelining = True
+# ssh exits with 255 when zt-client fails (deadline, relay restart): Ansible retries the
+# connection, with a growing pause between attempts.
+retries = 3
+ssh_args = -o ControlMaster=auto -o ControlPersist=300s -o ServerAliveInterval=15 -o ServerAliveCountMax=3
 ```
 
 Each Ansible SSH connection starts its own `zt-client`, that is, one connection to the relay
 with a single stream. The limit that matters is the agent's: `--max-streams` (default 16)
 concurrent sessions per node, to be kept above the Ansible `forks` that can target the
 same host. With `ControlPersist`, connections to the same host are reused.
+
+Recommended settings with several relays (resilience R-4, D-8):
+
+| Setting | Value | Why |
+| :- | :- | :- |
+| `retries` (`[ssh_connection]`) | 3 | a host that hits the 20 s deadline (status 255) is retried instead of failing the play as `UNREACHABLE` |
+| `ServerAliveInterval` / `ServerAliveCountMax` | 15 / 3 | ssh notices a dead path within about 45 s, in line with the relay's idle timeouts (§4.1) |
+| `ControlPersist` | 300s | one tunnel per host for the whole play; safe, because revocation and certificate expiry still close multiplexed sessions (PROTOCOL §12, §15.7) |
+| `ConnectTimeout` (ssh) | unset, or above 20 s | a shorter one cuts `zt-client` off before its deadline |
+
+With hedging each `zt-client` performs at most two outer handshakes, so a burst of `forks`
+costs the relays at most twice the handshakes of the hosts, which their admission budget
+(§4.1) absorbs.
 
 ## 6. Logs and audit
 
