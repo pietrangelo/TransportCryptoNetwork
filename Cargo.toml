@@ -71,6 +71,9 @@ toml  = "1.2.1"
 # --- test ---
 proptest   = "1.12.0"
 tokio-test = "0.4.6"
+# R-2: deterministic network simulation behind `zt_net::net` (dev-dependency only, D-9 of
+# docs/analysis/resilience.md). Exact pin: the simulator's scheduling is part of the tests.
+turmoil    = "=0.7.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

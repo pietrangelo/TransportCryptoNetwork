@@ -32,6 +32,7 @@ tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", 
 hex.workspace = true
 snow.workspace = true
 ed25519-dalek.workspace = true
+turmoil.workspace = true
 
 [lints]
 workspace = true
