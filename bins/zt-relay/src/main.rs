@@ -63,6 +63,11 @@ enum Command {
         /// the policy: if either file is invalid, both previous ones remain.
         #[arg(long)]
         revocations: Option<PathBuf>,
+        /// Handshake suites per role and admission limits (`relay.toml`, OPERATIONS §4.1).
+        /// Without it, the classical suite and the defaults of PROTOCOL §10.1. Read at
+        /// startup only: `SIGHUP` does not reload it.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -131,7 +136,17 @@ fn run(command: Command) -> Result<(), String> {
             previous_key,
             policy,
             revocations,
+            config: settings,
         } => {
+            let settings = match &settings {
+                Some(path) => config::load_relay_settings(path).map_err(|e| e.to_string())?,
+                None => config::RelaySettings::default(),
+            };
+            let relay_config = RelayConfig {
+                admission: settings.admission,
+                suites: settings.suites,
+                ..RelayConfig::default()
+            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -197,7 +212,7 @@ fn run(command: Command) -> Result<(), String> {
                 };
                 tokio::spawn(reload::on_sighup(hangups, updater, events, load));
                 let authorities = policy.clone();
-                let server = RelayServer::bind(listen, keys, policy, RelayConfig::default())
+                let server = RelayServer::bind(listen, keys, policy, relay_config)
                     .await
                     .map_err(|e| e.to_string())?;
                 // Pinned CAs and denylist announced after "relay listening" and on every reload;

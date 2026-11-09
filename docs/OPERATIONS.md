@@ -70,6 +70,61 @@ zt-agent run --relay r1.example.org:7443,r2.example.org:7443 \
     --relay-key <r1 key>,<r2 key> --node web-01 ...
 ```
 
+Handshake suites (PROTOCOL §7.5) are named by their exact Noise protocol name. Without any
+option every side uses the classical suite `Noise_IK_25519_ChaChaPoly_BLAKE2s`, which is the
+handshake of every earlier release. This default never changes with an upgrade. The agent has
+two options:
+
+- `--relay-suite <name>`: the suite pinned towards the relays, one for all of them or one per
+  `--relay` in the same order. The agent never falls back to another suite.
+- `--accept-client-suites <name>[,<name>…]`: the suites accepted from clients on the end-to-end
+  channel.
+
+This release supports only the classical suite. `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`
+is reserved for the post-quantum release and is refused at startup.
+
+### 4.1 `relay.toml`: suites and admission limits
+
+`zt-relay run --config /etc/tcn/relay.toml` sets the suites accepted per role and the
+admission limits (PROTOCOL §10.1). Without the option, or with an empty file, the defaults
+below apply. The file is read at startup only: `SIGHUP` does not reload it, so change it with a
+restart. Unknown keys, a zero or absurd limit, or an unsupported suite stop the relay at
+startup.
+
+```toml
+[handshake]
+# Explicit sets, not ordered; there is no "minimum suite". Agents and clients are separate
+# because laptops upgrade last.
+agent_suites  = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
+client_suites = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
+
+[admission]
+max_preauth = 1024               # handshakes that have not confirmed their key yet
+max_established = 8192           # confirmed connections (agents and clients)
+max_per_identity = 512           # confirmed connections of one key (at most 8192)
+source_burst = 64                # unconfirmed handshakes per IPv4 address or IPv6 /64...
+source_refill_secs = 3           # ...then one more every 3 s
+msg1_deadline_secs = 5           # accept -> complete message 1 (at least 5)
+handshake_timeout_secs = 10      # accept -> message 2 sent (at most 300)
+first_frame_deadline_secs = 5    # message 2 -> first authentic frame
+```
+
+How to size it:
+
+- A connection **gives its token back** once it confirms its key (its first authentic frame), so
+  `source_burst` limits only handshakes that never complete: scanners, replays, broken
+  clients. A controller behind one address (Ansible with `forks = 50`, a CI runner, a NAT) can
+  open hundreds of sessions as long as at most `source_burst` are in their handshake at the same
+  time. Raise the burst if more connect at once. Lowering the refill below 3 s makes the
+  relay easier to flood and is not recommended.
+- `max_per_identity` bounds what one stolen key can hold. Set it above the largest number of
+  concurrent sessions that one legitimate key needs: for a controller, its forks, or more if
+  it keeps `ControlMaster` connections open to many hosts.
+- `max_preauth` is the room for handshakes in progress. When it is full, new connections are
+  dropped (counted as `preauth_pool_full`) while established sessions keep working.
+- Every client sends a frame right after its handshake. A client that stays silent for
+  `first_frame_deadline_secs` is closed and counted as `unconfirmed`.
+
 ## 5. Client: `zt-client`
 
 `~/.config/tcn/client.toml`:
@@ -94,6 +149,11 @@ public_key = "<public key of the web-01 agent>"
 node = "db-01"
 public_key = "<public key of the db-01 agent>"
 ```
+
+Each `[[relays]]` and `[[nodes]]` entry takes an optional `suite` (and the single-relay form
+`relay_suite`): the handshake suite pinned towards that relay or that node (PROTOCOL §7.5,
+exact Noise protocol name). Without it, the classical suite. The client never falls back to
+another suite: a relay or agent that does not accept the pinned one does not answer.
 
 As with OpenSSH's `StrictModes`, every trust file (this one, the relay policy, the agent's
 authorized clients) must be a regular file, owned by the user running the binary or by
@@ -177,6 +237,9 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `authorities_in_use` | INFO, WARN with two keys | (relay and agent) at startup and on every reload, for each pinned CA: `authority`, `fingerprints`, `max_lifetime` |
 | `ca_rotation_pending` | WARN | (relay and agent) at startup, on every reload and every hour, for each CA with two keys: complete the rotation (§10.6) |
 | `revocations_in_use` | INFO | (relay and agent) at startup and on every reload: how many `serials` and `keys` entries the denylist has |
+| `handshake_suites_in_use` | INFO | (relay) at startup: `agent_suites`, `client_suites`, the accepted suites as comma-separated protocol names (§4.1) |
+| `handshake_suite_rejected` | WARN | (relay) a known peer completed message 1 with a suite not accepted for its role: `peer`, `suite`. It got no message 2 |
+| `preauth_summary` | INFO | (relay) every 10 s, if anything failed before key confirmation: one count per reason, `distinct_sources`, `distinct_keys`, `saturated` (see below) |
 
 The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex),
 `stream`, `reason`, `rule`, depending on the event. Never payloads or secrets.
@@ -190,6 +253,29 @@ With certificates (§10), `session_established`, `e2e_session_started`, `access_
 After signature verification (from `serial_revoked` onwards) it also reports `ca`, `serial`,
 `cert_name` and `not_after` of the rejected certificate; before that (`malformed` … `bad_signature`) never,
 because those data are not signed by anyone.
+
+Before key confirmation (PROTOCOL §10.1) the relay writes **no line per connection**: anyone
+can make up keys, and one line per attempt would let a scanner bury the real events. A
+connection refused or failed before it confirmed its key is only counted in
+`preauth_summary`, which never names an identity or an address. Its fields, present only
+when non-zero:
+
+| Field | Counts |
+| :- | :- |
+| `rate_limited` | connections refused because their source used up its budget |
+| `preauth_pool_full` | connections refused because `max_preauth` handshakes were in progress |
+| `established_pool_full`, `identity_limit` | key confirmations refused by `max_established` or `max_per_identity` |
+| `handshake_failed` | message 1 valid for no accepted suite and key |
+| `timeout`, `aborted`, `oversized` | message 1 too slow, cut off, or announced longer than the largest legitimate one |
+| `unknown_peer` | a valid message 1 from a key that the policy does not know |
+| `unverified_certificate` | a certificate rejected before its signature was checked, from an unknown key |
+| `unconfirmed` | message 2 sent, but no authentic frame followed (a replayed message 1, a silent client) |
+| `distinct_sources`, `distinct_keys` | distinct IPv4 addresses or IPv6 /64s, and distinct unknown keys, at most 4 096 each; `saturated = true` when a limit was reached |
+
+`authentication_failed` stays a per-event line for keys the configuration knows (whitelisted
+or revoked) and for certificates rejected after a pinned CA's signature was verified. A rising
+`unconfirmed` count with few `distinct_sources` is the signature of someone replaying
+recorded handshakes. A rising `unknown_peer` with many `distinct_keys` is a scanner.
 
 ```bash
 journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
@@ -515,3 +601,35 @@ tolerance only on the start of validity. Keep them synchronised, preferably with
 (`chrony` with `nts`): whoever moves the clock of a relay and an agent backwards makes
 expired certificates valid again. The CA machine, being offline, must be set by hand before
 every signing session; `zt-ca sign` prints the dates in UTC precisely so that you can check them.
+
+## 11. SSH key exchange: post-quantum today
+
+TCN's own handshake becomes post-quantum in a later release (PROTOCOL §7.5). The SSH session
+that runs inside the tunnel can be protected **now**: it is end-to-end between `ssh` and `sshd`,
+and a recorded tunnel (harvest now, decrypt later) still has the SSH key exchange inside it.
+OpenSSH supports two hybrid key exchanges:
+
+| Algorithm | OpenSSH | Notes |
+| :- | :- | :- |
+| `mlkem768x25519-sha256` | 9.9 and later (default from 10.0) | ML-KEM-768 + X25519; preferred |
+| `sntrup761x25519-sha512@openssh.com` | 8.5 and later (default from 9.0 to 9.9) | Streamlined NTRU Prime + X25519; the alias `sntrup761x25519-sha512` exists from 9.9 |
+
+On the client (`~/.ssh/config`) and on the server (`/etc/ssh/sshd_config`), list the hybrids
+first and allow the classical exchange only for hosts that cannot do better:
+
+```sshconfig
+# ~/.ssh/config
+Host *.tcn
+    KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com
+```
+
+```sshconfig
+# /etc/ssh/sshd_config (then: sshd -t && systemctl reload sshd)
+KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com
+```
+
+With only hybrids listed, an old `ssh` or `sshd` fails to connect instead of silently falling
+back to a classical exchange. Check what was negotiated with `ssh -v web-01.tcn 2>&1 | grep 'kex:
+algorithm'`, and what a build supports with `ssh -Q kex`. This protects the confidentiality of
+the SSH session. Authentication (host keys and user keys) stays classical, as it does in TCN
+until a later release.

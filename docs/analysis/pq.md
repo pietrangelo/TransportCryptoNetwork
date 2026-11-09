@@ -136,13 +136,13 @@ into the prologue, and uses `ss` as the PSK. Runs on stock `snow`.
   snow, but costs **+1 RTT per channel**, and on the outer channel the relay encapsulates for
   unauthenticated sources (DoS). Good fallback if (b) is blocked.
 
-**(b) Noise HFS modifier (`IKhfs`).** Tokens `e1` (ephemeral KEM ek after `e`) and `ekem1`
+**(b) Noise HFS modifier (`IKhfs`).** Tokens `e1` (ephemeral KEM ek, after the first DH of the message: `es` in IK; corrected in PQ-0, see `docs/pq-snow.md` §3) and `ekem1`
 (ciphertext after `ee`, then `MixKey(kem_ss)`):
 
 ```
 <- s
 ...
--> e, e1, es, s, ss          (e1 = 1184 B in clear; ephemeral, so nothing to hide)
+-> e, es, e1, s, ss          (e1 = 1184 B + 16 B tag: HFS §5 puts it after es, so encrypted)
 <- e, ee, ekem1, se          (ekem1 = 1088 B + 16 B tag, encrypted)
 ```
 

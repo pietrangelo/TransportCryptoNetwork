@@ -53,6 +53,15 @@ enum Command {
         /// Public key of each relay (64 hex characters), in the same order as `--relay`.
         #[arg(long, required = true, value_delimiter = ',')]
         relay_key: Vec<PublicKey>,
+        /// Handshake suite pinned for the relays (its exact Noise protocol name, PROTOCOL
+        /// §7.5): one for all of them, or one per `--relay` in the same order. Without it, the
+        /// classical suite; there is never a fallback to another suite.
+        #[arg(long, value_delimiter = ',')]
+        relay_suite: Vec<String>,
+        /// Handshake suites accepted from clients on the end-to-end channel (exact Noise
+        /// protocol names, comma-separated). Without it, the classical suite only.
+        #[arg(long, value_delimiter = ',')]
+        accept_client_suites: Vec<String>,
         /// Name of this node, as in the relay policy.
         #[arg(long)]
         node: String,
@@ -108,6 +117,36 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--relay-suite` (one for all relays, or one per `--relay`) and `--accept-client-suites`
+/// (PROTOCOL §7.5): exact Noise protocol names, the classical suite when absent.
+fn pin_suites(
+    relays: &mut [zt_net::RelayEndpoint],
+    relay_suite: &[String],
+    accept_client_suites: &[String],
+) -> Result<zt_domain::AcceptedSuites, String> {
+    let suites = relay_suite
+        .iter()
+        .map(|name| config::parse_suite("--relay-suite", name))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    match suites.as_slice() {
+        [] => {}
+        [one] => relays.iter_mut().for_each(|r| r.suite = *one),
+        many if many.len() == relays.len() => {
+            for (r, suite) in relays.iter_mut().zip(many) {
+                r.suite = *suite;
+            }
+        }
+        _ => return Err("--relay-suite: give one suite, or one per --relay".into()),
+    }
+    if accept_client_suites.is_empty() {
+        return Ok(zt_domain::AcceptedSuites::only(
+            zt_domain::HandshakeSuite::NoiseIk25519,
+        ));
+    }
+    config::parse_suites("--accept-client-suites", accept_client_suites).map_err(|e| e.to_string())
+}
+
 fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Keygen { out } => {
@@ -123,6 +162,8 @@ fn run(command: Command) -> Result<(), String> {
         Command::Run {
             relay,
             relay_key,
+            relay_suite,
+            accept_client_suites,
             node,
             key,
             previous_key,
@@ -138,8 +179,9 @@ fn run(command: Command) -> Result<(), String> {
             runtime.block_on(async move {
                 // Before reading the files: a SIGHUP during the read is not lost.
                 let hangups = Hangups::listen().map_err(|e| e.to_string())?;
-                let relays = config::relay_endpoints("--relay", &relay, &relay_key)
+                let mut relays = config::relay_endpoints("--relay", &relay, &relay_key)
                     .map_err(|e| e.to_string())?;
+                let client_suites = pin_suites(&mut relays, &relay_suite, &accept_client_suites)?;
                 let keys = Arc::new(
                     config::load_keyring(&key, previous_key.as_deref())
                         .map_err(|e| e.to_string())?,
@@ -184,9 +226,7 @@ fn run(command: Command) -> Result<(), String> {
                     authorized_clients,
                     timeouts: Timeouts::default(),
                     max_streams,
-                    client_suites: zt_domain::AcceptedSuites::only(
-                        zt_domain::HandshakeSuite::NoiseIk25519,
-                    ),
+                    client_suites,
                 };
                 let events = ReloadEvents {
                     reloaded: "authorized_clients_reloaded",

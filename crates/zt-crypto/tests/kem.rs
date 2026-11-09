@@ -2,7 +2,7 @@
 //!
 //! One harness, generic over [`Kem`], runs the NIST ACVP and Wycheproof known-answer vectors
 //! (`tests/vectors/mlkem768.txt`) against every provider: `libcrux-ml-kem` (the production
-//! provider) and RustCrypto `ml-kem` (a test-only, independent oracle). A differential test then
+//! provider) and the `ml-kem` crate (a test-only, independent oracle). A differential test then
 //! checks that the two agree on inputs no vector covers.
 #![allow(
     clippy::unwrap_used,
@@ -21,7 +21,7 @@ use zt_crypto::kem::{
 
 // --- the oracle: RustCrypto ml-kem behind the same trait ---------------------------------
 
-/// RustCrypto `ml-kem`, adapted to TCN's trait. Test-only: it never enters a binary.
+/// The `ml-kem` crate, adapted to TCN's trait. Test-only: it never enters a binary.
 struct Oracle;
 
 impl Kem for Oracle {

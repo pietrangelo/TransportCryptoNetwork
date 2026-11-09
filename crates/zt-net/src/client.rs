@@ -84,10 +84,11 @@ where
     let relay_link = drive(ch, stream, to_stream, out_rx, t);
     let session = async {
         let mut io = StreamIo::new(stream, from_driver, out_tx);
-        let (msg1, waiting) = noise::initiate_with_payload(
+        let (msg1, waiting) = noise::initiate_suite(
             identity,
             &config.node_key,
             Channel::EndToEnd,
+            config.node_suite,
             certificate,
         )?;
         io.send_data(msg1).await?;
@@ -113,11 +114,12 @@ async fn open(
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
     let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect_with_payload(
+    let mut ch = channel::connect_suite(
         tcp,
         identity,
         &relay.public_key,
         Channel::Outer,
+        relay.suite,
         certificate,
         t,
     )

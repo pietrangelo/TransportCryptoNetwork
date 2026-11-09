@@ -366,15 +366,16 @@ async fn garbage_on_the_wire_does_not_affect_other_peers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn silent_connections_are_dropped_after_the_handshake_timeout() {
-    let mut config = test_relay_config();
-    config.timeouts.handshake = Duration::from_millis(300);
+async fn silent_connections_are_dropped_at_the_msg1_deadline() {
+    // The message 1 deadline cannot go below 5 s (finding AP-20, PROTOCOL §10.1).
+    let config = test_relay_config();
+    assert_eq!(config.admission.msg1_deadline, Duration::from_secs(5));
     let fleet = Fleet::start(config).await;
     let mut tcp = TcpStream::connect(fleet.relay).await.unwrap();
     // Slowloris: half a length prefix and then silence.
     tcp.write_all(&[0x00]).await.unwrap();
     let mut buf = [0_u8; 8];
-    let read = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf)).await;
+    let read = tokio::time::timeout(Duration::from_secs(7), tcp.read(&mut buf)).await;
     assert!(
         matches!(read, Ok(Ok(0) | Err(_))),
         "expected hang-up, got {read:?}"

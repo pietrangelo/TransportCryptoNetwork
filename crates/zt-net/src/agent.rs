@@ -12,12 +12,11 @@ use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout, timeout_at};
 use zt_crypto::Keyring;
-use zt_crypto::noise::{self, Channel, MAX_HANDSHAKE_PAYLOAD_LEN};
+use zt_crypto::noise::{self, Channel};
 use zt_domain::flow::Window;
-use zt_domain::limits::NOISE_MSG1_OVERHEAD;
 use zt_domain::{
-    AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection, ClientCredential,
-    CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
+    AcceptedSuites, AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection,
+    ClientCredential, CloseReason, DomainEvent, Fingerprint, Frame, NodeId, RejectReason, StreamId,
 };
 
 use crate::relay::{CertFields, audit};
@@ -129,11 +128,13 @@ async fn run_session(
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
     let _ = tcp.set_nodelay(true);
-    let mut ch = channel::connect(
+    let mut ch = channel::connect_suite(
         tcp,
         identity.current(),
         &relay.public_key,
         Channel::Outer,
+        relay.suite,
+        &[],
         t,
     )
     .await?;
@@ -258,6 +259,7 @@ fn on_relay_frame(
                 node: config.node.clone(),
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
+                client_suites: config.client_suites,
             };
             let done = done_tx.clone();
             tokio::spawn(async move {
@@ -328,6 +330,8 @@ struct StreamTask {
     node: NodeId,
     ssh_target: String,
     timeouts: Timeouts,
+    /// Suites accepted from clients (PROTOCOL §7.5).
+    client_suites: AcceptedSuites,
 }
 
 /// Steps 1–10 and 12 of PROTOCOL §15.4 on the end-to-end channel, with this agent's CAs,
@@ -367,11 +371,12 @@ impl StreamTask {
             node,
             ssh_target,
             timeouts,
+            client_suites,
         } = self;
         let pending = match io.recv_message(&timeouts).await {
             // A message 1 longer than the one with the largest certificate is not even parsed
             // (PROTOCOL §15.3): it is a rejected certificate, not a handshake to attempt.
-            Ok(msg1) if msg1.len() > MAX_MSG1_LEN => {
+            Ok(msg1) if msg1.len() > client_suites.max_msg1_len() => {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: None,
                     reason: AuthFailureReason::Certificate(CertRejection::Malformed),
@@ -380,7 +385,7 @@ impl StreamTask {
                 io.close(CloseReason::Unauthorized).await;
                 return;
             }
-            Ok(msg1) => noise::respond_any(&identity, &msg1, Channel::EndToEnd),
+            Ok(msg1) => noise::respond_suites(&identity, &msg1, Channel::EndToEnd, client_suites),
             // The client has already closed: replying with another `Close` is pointless
             // (finding 0002-1).
             Err(NetError::StreamClosed(_)) => return,
@@ -464,9 +469,6 @@ impl StreamTask {
         bridge(io, transport, ssh, session, authorized, &timeouts).await;
     }
 }
-
-/// The longest possible end-to-end message 1: the one with the largest certificate.
-const MAX_MSG1_LEN: usize = NOISE_MSG1_OVERHEAD.saturating_add(MAX_HANDSHAKE_PAYLOAD_LEN);
 
 /// Who the client of an end-to-end session is and with which credential it was admitted.
 struct Session {

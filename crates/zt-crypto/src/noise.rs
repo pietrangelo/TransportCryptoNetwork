@@ -19,8 +19,6 @@ use crate::error::CryptoError;
 use crate::identity::{Identity, PublicKey, fingerprint_of_x25519};
 use crate::keyring::Keyring;
 
-const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
-
 /// Maximum length of a Noise message.
 pub const MAX_MESSAGE_LEN: usize = 65_535;
 
@@ -41,10 +39,15 @@ pub enum Channel {
 }
 
 impl Channel {
-    const fn prologue(self) -> &'static [u8] {
-        match self {
-            Self::Outer => b"TCN/1 outer",
-            Self::EndToEnd => b"TCN/1 end-to-end",
+    /// The prologue of `suite` on this channel (PROTOCOL §7.5). The classical suite keeps the
+    /// `TCN/1` prologues, so it is byte for byte the handshake of earlier releases. From PQ-1 on
+    /// a new suite has the prologue `TCN/2 <channel>` followed by its id, so a message of one
+    /// suite is never valid as another.
+    const fn prologue(self, suite: HandshakeSuite) -> Result<&'static [u8], CryptoError> {
+        match (suite, self) {
+            (HandshakeSuite::NoiseIk25519, Self::Outer) => Ok(b"TCN/1 outer"),
+            (HandshakeSuite::NoiseIk25519, Self::EndToEnd) => Ok(b"TCN/1 end-to-end"),
+            _ => Err(CryptoError::UnsupportedSuite),
         }
     }
 }
@@ -52,11 +55,19 @@ impl Channel {
 fn builder(
     local: &Identity,
     channel: Channel,
+    suite: HandshakeSuite,
 ) -> Result<(Builder<'static>, zeroize::Zeroizing<[u8; 32]>), CryptoError> {
-    let params = PATTERN.parse().map_err(|_| CryptoError::Handshake)?;
+    if !suite.is_supported() {
+        return Err(CryptoError::UnsupportedSuite);
+    }
+    let prologue = channel.prologue(suite)?;
+    let params = suite
+        .protocol_name()
+        .parse()
+        .map_err(|_| CryptoError::UnsupportedSuite)?;
     let secret = local.x25519_secret();
     let builder = Builder::new(params)
-        .prologue(channel.prologue())
+        .prologue(prologue)
         .map_err(|_| CryptoError::Handshake)?;
     Ok((builder, secret))
 }
@@ -77,7 +88,7 @@ pub fn initiate(
 }
 
 /// Like [`initiate`], with `payload` encrypted in message 1 (the client certificate,
-/// PROTOCOL §15.3).
+/// PROTOCOL §15.3). Always the classical suite.
 ///
 /// # Errors
 /// [`CryptoError::MessageTooLarge`] over [`MAX_HANDSHAKE_PAYLOAD_LEN`],
@@ -88,10 +99,34 @@ pub fn initiate_with_payload(
     channel: Channel,
     payload: &[u8],
 ) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    initiate_suite(
+        local,
+        remote,
+        channel,
+        HandshakeSuite::NoiseIk25519,
+        payload,
+    )
+}
+
+/// Initiator with an explicit, pinned `suite` (PROTOCOL §7.5). There is no fallback: if the
+/// responder does not accept `suite` it does not answer, and the initiator does not retry
+/// with another one (no downgrade).
+///
+/// # Errors
+/// [`CryptoError::UnsupportedSuite`] if this build cannot run `suite`,
+/// [`CryptoError::MessageTooLarge`] over [`MAX_HANDSHAKE_PAYLOAD_LEN`],
+/// [`CryptoError::Handshake`] if the Noise state cannot be built.
+pub fn initiate_suite(
+    local: &Identity,
+    remote: &PublicKey,
+    channel: Channel,
+    suite: HandshakeSuite,
+    payload: &[u8],
+) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    let (builder, secret) = builder(local, channel, suite)?;
     if payload.len() > MAX_HANDSHAKE_PAYLOAD_LEN {
         return Err(CryptoError::MessageTooLarge);
     }
-    let (builder, secret) = builder(local, channel)?;
     let remote_static = remote.x25519();
     let mut state = builder
         .local_private_key(secret.as_ref())
@@ -104,39 +139,45 @@ pub fn initiate_with_payload(
         AwaitingResponse {
             state,
             responder: remote.fingerprint(),
+            suite,
         },
     ))
 }
 
-/// Initiator with an explicit, pinned `suite` (PROTOCOL §7.5): there is no fallback to another
-/// suite (RED stub).
+/// Responder that tries every supported suite of `accepted`, each with the current key and
+/// then the previous one (PROTOCOL §7.5, §14). Nothing on the wire names the suite (AP-11):
+/// a suite whose message 1 cannot have this length is skipped without running Noise.
 ///
 /// # Errors
-/// Always (stub).
-pub fn initiate_suite(
-    _local: &Identity,
-    _remote: &PublicKey,
-    _channel: Channel,
-    _suite: HandshakeSuite,
-    _payload: &[u8],
-) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
-    Err(CryptoError::UnsupportedSuite)
-}
-
-/// Responder that tries the suites of `accepted` (RED stub).
-///
-/// # Errors
-/// Always (stub).
+/// [`CryptoError::Handshake`] if `msg1` is not valid for any accepted suite and key. The
+/// error is the same whatever the reason (no oracle).
 pub fn respond_suites(
-    _keys: &Keyring,
-    _msg1: &[u8],
-    _channel: Channel,
-    _accepted: AcceptedSuites,
+    keys: &Keyring,
+    msg1: &[u8],
+    channel: Channel,
+    accepted: AcceptedSuites,
 ) -> Result<AuthorizationPending, CryptoError> {
+    // A failed attempt leaves no state: each try builds a new handshake. The timing reveals
+    // which suite and key worked; neither is a secret (the keys are public, and the suite is
+    // implied by the length).
+    for suite in accepted.iter().filter(|s| s.is_supported()) {
+        if msg1.len() < suite.msg1_overhead() || msg1.len() > suite.max_msg1_len() {
+            continue;
+        }
+        if let Ok(pending) = respond_one(keys.current(), msg1, channel, suite) {
+            return Ok(pending);
+        }
+        if let Some(previous) = keys.previous()
+            && let Ok(pending) = respond_one(previous, msg1, channel, suite)
+        {
+            return Ok(pending);
+        }
+    }
     Err(CryptoError::Handshake)
 }
 
-/// Responder: reads the first message and finds out who the initiator is.
+/// Responder: reads the first message and finds out who the initiator is. Always the
+/// classical suite.
 ///
 /// # Errors
 /// [`CryptoError::Handshake`] if the message is not valid for this identity and channel.
@@ -145,10 +186,19 @@ pub fn respond(
     msg1: &[u8],
     channel: Channel,
 ) -> Result<AuthorizationPending, CryptoError> {
+    respond_one(local, msg1, channel, HandshakeSuite::NoiseIk25519)
+}
+
+fn respond_one(
+    local: &Identity,
+    msg1: &[u8],
+    channel: Channel,
+    suite: HandshakeSuite,
+) -> Result<AuthorizationPending, CryptoError> {
     if msg1.len() > MAX_MESSAGE_LEN {
         return Err(CryptoError::Handshake);
     }
-    let (builder, secret) = builder(local, channel)?;
+    let (builder, secret) = builder(local, channel, suite).map_err(|_| CryptoError::Handshake)?;
     let mut state = builder
         .local_private_key(secret.as_ref())
         .and_then(Builder::build_responder)
@@ -170,11 +220,12 @@ pub fn respond(
         state,
         peer,
         payload: buffer,
+        suite,
     })
 }
 
-/// Responder with a [`Keyring`]: accepts a `msg1` encrypted to the current key or to the
-/// previous one (PROTOCOL §14).
+/// Responder with a [`Keyring`]: accepts a classical `msg1` encrypted to the current key or
+/// to the previous one (PROTOCOL §14).
 ///
 /// # Errors
 /// [`CryptoError::Handshake`] if `msg1` is not valid for either of the two keys.
@@ -183,13 +234,12 @@ pub fn respond_any(
     msg1: &[u8],
     channel: Channel,
 ) -> Result<AuthorizationPending, CryptoError> {
-    // A failed attempt leaves no state: each `respond` builds a new handshake.
-    // The timing reveals which key worked; that is not a secret (both are public).
-    match (respond(keys.current(), msg1, channel), keys.previous()) {
-        (Ok(pending), _) => Ok(pending),
-        (Err(_), Some(previous)) => respond(previous, msg1, channel),
-        (Err(err), None) => Err(err),
-    }
+    respond_suites(
+        keys,
+        msg1,
+        channel,
+        AcceptedSuites::only(HandshakeSuite::NoiseIk25519),
+    )
 }
 
 /// The initiator has sent `msg1` and awaits the response.
@@ -198,13 +248,14 @@ pub fn respond_any(
 pub struct AwaitingResponse {
     state: HandshakeState,
     responder: Fingerprint,
+    suite: HandshakeSuite,
 }
 
 impl AwaitingResponse {
-    /// The suite of this handshake (RED stub).
+    /// The suite of this handshake.
     #[must_use]
-    pub fn suite(&self) -> HandshakeSuite {
-        HandshakeSuite::NoiseIkhfs25519MlKem768
+    pub const fn suite(&self) -> HandshakeSuite {
+        self.suite
     }
 
     /// Completes the handshake with the second message.
@@ -237,13 +288,14 @@ pub struct AuthorizationPending {
     state: HandshakeState,
     peer: Fingerprint,
     payload: Vec<u8>,
+    suite: HandshakeSuite,
 }
 
 impl AuthorizationPending {
-    /// The suite the initiator used (RED stub).
+    /// The suite the initiator used.
     #[must_use]
-    pub fn suite(&self) -> HandshakeSuite {
-        HandshakeSuite::NoiseIkhfs25519MlKem768
+    pub const fn suite(&self) -> HandshakeSuite {
+        self.suite
     }
 
     /// The authenticated identity of the initiator.

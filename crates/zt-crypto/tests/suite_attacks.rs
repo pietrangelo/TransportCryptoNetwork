@@ -1,6 +1,12 @@
 //! PQ-0 attack catalogue for the suite-aware handshake: suites outside the accepted set are not
 //! even tried, channels stay separated, lengths outside the suite bounds are refused.
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    missing_docs
+)]
 
 use zt_crypto::noise::{self, Channel};
 use zt_crypto::{CryptoError, Identity, Keyring};

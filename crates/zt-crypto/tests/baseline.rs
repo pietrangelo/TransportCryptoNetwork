@@ -7,7 +7,7 @@
 //! ```
 //!
 //! It prints the median and the 99th percentile per operation. PQ-1 compares its own numbers
-//! against these (the perf gate in pq.md §7: ≤ +200 µs p99 per side on x86_64). The figures
+//! against these (the perf gate in pq.md §7: ≤ +200 µs p99 per side on `x86_64`). The figures
 //! recorded so far are in docs/pq-snow.md §5.
 #![allow(
     clippy::unwrap_used,
@@ -16,7 +16,6 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     missing_docs
 )]
 
@@ -31,11 +30,12 @@ const ROUNDS: usize = 2_000;
 
 fn report(name: &str, mut samples: Vec<Duration>) {
     samples.sort_unstable();
-    let at = |q: f64| samples[((samples.len() as f64 - 1.0) * q) as usize];
+    // Nearest-rank percentile, in integers: `per_mille` of the sorted samples.
+    let at = |per_mille: usize| samples[(samples.len() - 1) * per_mille / 1_000];
     println!(
         "{name:<40} median {:>8.1} µs   p99 {:>8.1} µs   (n = {})",
-        at(0.5).as_secs_f64() * 1e6,
-        at(0.99).as_secs_f64() * 1e6,
+        at(500).as_secs_f64() * 1e6,
+        at(990).as_secs_f64() * 1e6,
         samples.len()
     );
 }

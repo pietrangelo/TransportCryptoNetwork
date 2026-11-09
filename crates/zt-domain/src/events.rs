@@ -143,8 +143,7 @@ impl DomainEvent {
             Self::ConnectionDrained { .. } => "connection_drained",
             Self::AccessRevoked { .. } => "access_revoked",
             Self::CertificateExpired { .. } => "certificate_expired",
-            // RED stub (PQ-0).
-            Self::HandshakeSuiteRejected { .. } => "audit_event",
+            Self::HandshakeSuiteRejected { .. } => "handshake_suite_rejected",
         }
     }
 
@@ -157,6 +156,7 @@ impl DomainEvent {
                 | Self::AccessDenied { .. }
                 | Self::ProtocolViolation { .. }
                 | Self::AccessRevoked { .. }
+                | Self::HandshakeSuiteRejected { .. }
         )
     }
 }

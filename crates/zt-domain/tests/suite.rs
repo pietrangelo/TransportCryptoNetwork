@@ -56,12 +56,13 @@ fn classical_message_sizes_are_exact() {
     assert_eq!(CLASSIC.msg2_len(), 48);
 }
 
-/// IKhfs (PROTOCOL §7.5): `e1` (1 184, in clear) after `e`; `ekem1` (1 088 + 16) in msg2.
+/// `IKhfs` (PROTOCOL §7.5): `e1` (1 184 + 16) after `es`, so encrypted (HFS §5, confirmed by
+/// the snow spike); `ekem1` (1 088 + 16) in msg2.
 #[test]
 fn hybrid_message_sizes_are_those_of_the_plan() {
-    assert_eq!(HFS.msg1_overhead(), 32 + 1_184 + (32 + 16) + 16);
-    assert_eq!(HFS.msg1_overhead(), 1_280);
-    assert_eq!(HFS.max_msg1_len(), 1_280 + MAX_CERT_LEN);
+    assert_eq!(HFS.msg1_overhead(), 32 + (1_184 + 16) + (32 + 16) + 16);
+    assert_eq!(HFS.msg1_overhead(), 1_296);
+    assert_eq!(HFS.max_msg1_len(), 1_296 + MAX_CERT_LEN);
     assert_eq!(HFS.msg2_len(), 32 + (1_088 + 16) + 16);
     assert_eq!(HFS.msg2_len(), 1_152);
 }
@@ -101,10 +102,10 @@ fn a_set_with_a_reserved_suite_is_representable_but_not_supported() {
 #[test]
 fn the_message_1_cap_is_the_largest_legitimate_message_of_the_set() {
     assert_eq!(AcceptedSuites::only(CLASSIC).max_msg1_len(), 4_424);
-    assert_eq!(AcceptedSuites::only(HFS).max_msg1_len(), 5_608);
+    assert_eq!(AcceptedSuites::only(HFS).max_msg1_len(), 5_624);
     assert_eq!(
         AcceptedSuites::new([CLASSIC, HFS]).unwrap().max_msg1_len(),
-        5_608
+        5_624
     );
 }
 

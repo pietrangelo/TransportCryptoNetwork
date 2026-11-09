@@ -11,18 +11,23 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{Framed, LengthDelimitedCodec, LengthDelimitedCodecError};
 use zt_crypto::noise::{self, Channel, MAX_MESSAGE_LEN};
 use zt_crypto::{Identity, Keyring, PublicKey};
-use zt_domain::{Fingerprint, Frame};
+use zt_domain::{AcceptedSuites, Fingerprint, Frame, HandshakeSuite};
 use zt_proto::FrameDecoder;
 
 use crate::{NetError, Timeouts};
 
 fn codec() -> LengthDelimitedCodec {
+    codec_capped(MAX_MESSAGE_LEN)
+}
+
+/// A codec that refuses, on sight of the length prefix, any message over `max` bytes.
+fn codec_capped(max: usize) -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
         .length_field_length(2)
-        .max_frame_length(MAX_MESSAGE_LEN)
+        .max_frame_length(max)
         .new_codec()
 }
 
@@ -54,7 +59,16 @@ pub async fn connect<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    connect_with_payload(io, local, remote, channel, &[], timeouts).await
+    connect_suite(
+        io,
+        local,
+        remote,
+        channel,
+        HandshakeSuite::NoiseIk25519,
+        &[],
+        timeouts,
+    )
+    .await
 }
 
 /// Like [`connect`], with `payload` in message 1 (the client certificate, PROTOCOL §15.3).
@@ -72,9 +86,38 @@ pub async fn connect_with_payload<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    connect_suite(
+        io,
+        local,
+        remote,
+        channel,
+        HandshakeSuite::NoiseIk25519,
+        payload,
+        timeouts,
+    )
+    .await
+}
+
+/// Like [`connect_with_payload`], with the pinned `suite` (PROTOCOL §7.5). There is no
+/// fallback to another suite.
+///
+/// # Errors
+/// Like [`connect`]; [`NetError::Crypto`] for a suite this build cannot run.
+pub async fn connect_suite<IO>(
+    io: IO,
+    local: &Identity,
+    remote: &PublicKey,
+    channel: Channel,
+    suite: HandshakeSuite,
+    payload: &[u8],
+    timeouts: &Timeouts,
+) -> Result<Established<IO>, NetError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
     let mut framed = Framed::new(io, codec());
     let handshake = async {
-        let (msg1, waiting) = noise::initiate_with_payload(local, remote, channel, payload)?;
+        let (msg1, waiting) = noise::initiate_suite(local, remote, channel, suite, payload)?;
         framed.send(Bytes::from(msg1)).await?;
         let msg2 = read_message(&mut framed).await?;
         Ok::<_, NetError>(waiting.complete(&msg2)?)
@@ -90,6 +133,7 @@ where
 }
 
 /// Responder-side handshake (relay): reads the first message and stops before replying.
+/// Classical suite only, within `timeouts.handshake`.
 ///
 /// # Errors
 /// [`NetError::Timeout`] past `timeouts.handshake`, [`NetError::Crypto`] on invalid messages.
@@ -102,12 +146,16 @@ pub async fn accept<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut framed = Framed::new(io, codec());
-    let msg1 = timeout(timeouts.handshake, read_message(&mut framed))
-        .await
-        .map_err(|_| NetError::Timeout("handshake"))??;
-    let pending = noise::respond_any(local, &msg1, channel)?;
-    Ok(Pending { framed, pending })
+    accept_suites(
+        io,
+        local,
+        channel,
+        AcceptedSuites::only(HandshakeSuite::NoiseIk25519),
+        AcceptDeadlines {
+            msg1: timeouts.handshake,
+        },
+    )
+    .await
 }
 
 /// Deadlines of a responder handshake (PROTOCOL §10.1).
@@ -117,25 +165,44 @@ pub struct AcceptDeadlines {
     pub msg1: std::time::Duration,
 }
 
-/// Responder-side handshake that accepts the suites of `accepted` and buffers at most the
-/// longest legitimate message 1 of those suites (RED stub: like [`accept`]).
+/// Responder-side handshake that accepts the suites of `accepted` (PROTOCOL §7.5) and
+/// buffers at most the longest legitimate message 1 of those suites (§10.1, finding G2): a
+/// longer length prefix is refused as soon as it is read, before any byte of the message is
+/// buffered. Message 1 must be complete within `deadlines.msg1`, however slowly it trickles in
+/// (finding AP-20).
 ///
 /// # Errors
-/// Like [`accept`].
+/// [`NetError::Timeout`] past `deadlines.msg1`, [`NetError::Oversized`] for a length prefix
+/// over the cap, [`NetError::Closed`] or [`NetError::Io`] if the peer goes away first,
+/// [`NetError::Crypto`] if message 1 is valid for no accepted suite and key.
 pub async fn accept_suites<IO>(
     io: IO,
     local: &Keyring,
     channel: Channel,
-    _accepted: zt_domain::AcceptedSuites,
+    accepted: AcceptedSuites,
     deadlines: AcceptDeadlines,
-    timeouts: &Timeouts,
 ) -> Result<Pending<IO>, NetError>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut t = timeouts.clone();
-    t.handshake = deadlines.msg1;
-    accept(io, local, channel, &t).await
+    let mut framed = Framed::new(io, codec_capped(accepted.max_msg1_len()));
+    let msg1 = match timeout(deadlines.msg1, framed.next()).await {
+        Err(_) => return Err(NetError::Timeout("message 1")),
+        Ok(None) => return Err(NetError::Closed),
+        Ok(Some(Err(err))) if is_too_long(&err) => return Err(NetError::Oversized),
+        Ok(Some(Err(err))) => return Err(NetError::Io(err)),
+        Ok(Some(Ok(msg1))) => msg1,
+    };
+    let pending = noise::respond_suites(local, &msg1, channel, accepted)?;
+    // After the handshake the messages are transport messages again, up to the Noise maximum.
+    framed.codec_mut().set_max_frame_length(MAX_MESSAGE_LEN);
+    Ok(Pending { framed, pending })
+}
+
+/// `true` if `err` is the codec's refusal of a length prefix over its maximum.
+fn is_too_long(err: &std::io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<LengthDelimitedCodecError>)
 }
 
 /// Half-completed handshake: the responder knows the peer and must decide.
@@ -156,7 +223,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
 
     /// The suite the peer used (PROTOCOL §7.5).
     #[must_use]
-    pub fn suite(&self) -> zt_domain::HandshakeSuite {
+    pub fn suite(&self) -> HandshakeSuite {
         self.pending.suite()
     }
 

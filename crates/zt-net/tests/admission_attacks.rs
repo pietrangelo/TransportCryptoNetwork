@@ -47,6 +47,20 @@ async fn lab(config: RelayConfig, clients: &[&Identity]) -> Lab {
     .await
 }
 
+/// The sum of the numeric field `key` over the `preauth_summary` lines: a burst of failures
+/// may straddle two intervals.
+fn summed(lines: &[String], key: &str) -> u64 {
+    let needle = format!("\"{key}\":");
+    lines
+        .iter()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(&needle)?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        })
+        .sum()
+}
+
 /// `true` if the relay closes `tcp` within `within` without sending anything.
 async fn closed_silently(tcp: &mut TcpStream, within: Duration) -> bool {
     let mut buf = [0_u8; 1];
@@ -135,7 +149,10 @@ async fn replayed_msg1_is_not_refunded_and_names_no_one() {
     // One token left: the victim's real session uses it and gives it back.
     let (mut app, _t) = lab.session(&victim, None).await.unwrap();
     common::assert_alive(&mut app).await;
-    // Without refunds the replays have used up the rest of the budget.
+    // The victim's token came back: one more replay spends it, and is not refunded either.
+    assert!(probe_relay(relay.addr, &msg1).await.is_some());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Without refunds the replays have used up the whole budget.
     let mut tcp = TcpStream::connect(relay.addr).await.unwrap();
     let probe = msg1.clone();
     tcp.write_all(&u16::try_from(probe.len()).unwrap().to_be_bytes())
@@ -143,20 +160,23 @@ async fn replayed_msg1_is_not_refunded_and_names_no_one() {
         .unwrap();
     tcp.write_all(&probe).await.unwrap();
     assert!(closed_silently(&mut tcp, Duration::from_secs(2)).await);
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    // No line names the victim for the replays: only the aggregated summary counts them.
+    // One summary interval (1 s) plus the summary task's polling period.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // No line names the victim for the replays: only the aggregated summary counts them. The
+    // one `session_established` is the victim's real session.
     let victim_fp = victim.fingerprint().to_string();
-    for kind in ["authentication_failed", "session_established"] {
-        for line in logs.events(kind) {
-            assert_ne!(
-                field(&line, "peer").as_deref(),
-                Some(victim_fp.as_str()),
-                "{line}"
-            );
-        }
-    }
-    let all = logs.events("preauth_summary").join("\n");
-    assert!(all.contains("\"unconfirmed\":3"), "{all}");
+    let names_victim = |kind: &str| {
+        logs.events(kind)
+            .iter()
+            .filter(|line| field(line, "peer").as_deref() == Some(victim_fp.as_str()))
+            .count()
+    };
+    assert_eq!(names_victim("authentication_failed"), 0, "{}", logs.text());
+    assert_eq!(names_victim("session_established"), 1, "{}", logs.text());
+    let summaries = logs.events("preauth_summary");
+    let all = summaries.join("\n");
+    assert_eq!(summed(&summaries, "unconfirmed"), 4, "{all}");
+    assert_eq!(summed(&summaries, "rate_limited"), 1, "{all}");
     assert!(!all.contains(&victim_fp), "{all}");
 }
 
@@ -184,8 +204,8 @@ async fn replayed_msg1_does_not_enter_the_established_pool() {
             .await
             .unwrap();
         tcp.write_all(&msg1).await.unwrap();
-        let mut head = [0_u8; 2];
-        tcp.read_exact(&mut head).await.unwrap();
+        let mut prefix = [0_u8; 2];
+        tcp.read_exact(&mut prefix).await.unwrap();
         held.push(tcp);
     }
     let client = Arc::new(client);
@@ -233,7 +253,9 @@ async fn noise_speaking_scanner_with_fresh_keys_cannot_crowd_out_audit_events() 
     let agent = Arc::new(Identity::generate().unwrap());
     let mut trust = CertTrust::new();
     trust.set_revocations(zt_domain::trust::Revocations::new([], [revoked.fingerprint()]).unwrap());
-    let policy = relay_policy(&agent.fingerprint(), &[], trust);
+    // `relay_policy` keeps a trust only with authorities: the denylist is set directly.
+    let mut policy = relay_policy(&agent.fingerprint(), &[], CertTrust::new());
+    policy.set_cert_trust(trust).unwrap();
     let lab = Lab::start_configured(
         agent,
         vec![(policy, with_admission(|a| a.source_burst = 1_000))],
@@ -246,7 +268,7 @@ async fn noise_speaking_scanner_with_fresh_keys_cannot_crowd_out_audit_events() 
         let msg1 = raw_msg1(seed, &relay.key, Channel::Outer, &[]);
         assert_eq!(probe_relay(relay.addr, &msg1).await, None);
     }
-    let msg1 = raw_msg1(*revoked_seed(&revoked), &relay.key, Channel::Outer, &[]);
+    let msg1 = raw_msg1(revoked_seed(&revoked), &relay.key, Channel::Outer, &[]);
     assert_eq!(probe_relay(relay.addr, &msg1).await, None);
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let failures = logs.events("authentication_failed");
@@ -255,16 +277,21 @@ async fn noise_speaking_scanner_with_fresh_keys_cannot_crowd_out_audit_events() 
         field(&failures[0], "reason").as_deref(),
         Some("key_revoked")
     );
-    let all = logs.events("preauth_summary").join("\n");
-    assert!(all.contains("\"unknown_peer\":30"), "{all}");
-    assert!(all.contains("\"distinct_keys\":30"), "{all}");
+    let summaries = logs.events("preauth_summary");
+    let all = summaries.join("\n");
+    assert_eq!(summed(&summaries, "unknown_peer"), 30, "{all}");
+    // Each key is fresh, so the per-interval distinct counts add up to 30 too.
+    assert_eq!(summed(&summaries, "distinct_keys"), 30, "{all}");
+    assert!(
+        summaries.len() <= 4,
+        "one summary per interval, not per connection: {all}"
+    );
 }
 
 /// The seed of an identity created by [`Identity::generate`], via its secret hex.
-fn revoked_seed(id: &Identity) -> Box<[u8; 32]> {
-    let bytes: [u8; 32] = hex::decode(id.to_secret_hex().as_str())
+fn revoked_seed(id: &Identity) -> [u8; 32] {
+    hex::decode(id.to_secret_hex().as_str())
         .unwrap()
         .try_into()
-        .unwrap();
-    Box::new(bytes)
+        .unwrap()
 }

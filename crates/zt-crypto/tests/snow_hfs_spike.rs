@@ -172,8 +172,9 @@ fn stock_snow_does_not_know_ml_kem_768() {
 #[test]
 fn the_hfs_path_of_stock_snow_runs_with_ml_kem_768_plugged_in() {
     let run = handshake(&[], None).unwrap();
-    // msg1 = e (32) + e1 (1 184, clear) + s (32 + 16) + payload tag (16).
-    assert_eq!(run.msg1.len(), 1_280);
+    // msg1 = e (32) + e1 (1 184 + 16: placed after `es`, so encrypted, HFS §5) + s (32 + 16)
+    // + payload tag (16).
+    assert_eq!(run.msg1.len(), 1_296);
     // msg2 = e (32) + ekem1 (1 088 + 16) + payload tag (16).
     assert_eq!(run.msg2.len(), 1_152);
 }
@@ -182,14 +183,13 @@ fn the_hfs_path_of_stock_snow_runs_with_ml_kem_768_plugged_in() {
 fn a_certificate_payload_adds_exactly_its_length_to_message_1() {
     let payload = vec![0x5a; 4_328];
     let run = handshake(&payload, None).unwrap();
-    assert_eq!(run.msg1.len(), 1_280 + 4_328);
+    assert_eq!(run.msg1.len(), 1_296 + 4_328);
 }
 
 #[test]
 fn a_modified_e1_is_rejected_by_the_responder() {
-    // e1 travels in clear but is mixed into the transcript hash: the encrypted `s` that
-    // follows no longer authenticates.
-    for at in [32, 32 + 600, 32 + 1_183] {
+    // e1 is encrypted under the `es` key: any modified byte (or its tag) fails the AEAD.
+    for at in [32, 32 + 600, 32 + 1_183, 32 + 1_199] {
         assert!(handshake(&[], Some(at)).is_err(), "byte {at}");
     }
 }

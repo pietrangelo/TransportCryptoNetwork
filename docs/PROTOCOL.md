@@ -115,7 +115,8 @@ X25519 form is used (Edwards → Montgomery map). The **fingerprint** is
 Small-order public keys are rejected at load time.
 
 ### 7.3 Handshake
-`Noise_IK_25519_ChaChaPoly_BLAKE2s`, with a different prologue per channel. The payload of
+`Noise_IK_25519_ChaChaPoly_BLAKE2s` (the classical suite, §7.5), with a different prologue per
+channel. The payload of
 message 2 MUST be empty (the initiator rejects a message 2 with a payload); the payload of
 message 1 is either empty or contains a client certificate (§15.3), and a responder rejects a
 payload that is neither empty nor a valid certificate.
@@ -141,6 +142,42 @@ message closes the channel; a forged message does not increment the receiver's c
 period has a key derived one-way from the previous one, so a copy of the process memory does
 not decrypt recorded traffic from past periods. With the 30 s keepalive an idle channel changes
 key every ~8.5 hours; an SSH session every ~16 MiB.
+
+### 7.5 Handshake suites
+A **suite** fixes the Noise protocol name, the prologues and the message sizes of a handshake.
+Each suite has one identifier, its Noise protocol name, which is also its only spelling in
+configuration: exact, with no case folding, trimming or aliases.
+
+| Suite | Id | Message 1 | Message 2 | This release |
+| :- | :- | -: | -: | :- |
+| `Noise_IK_25519_ChaChaPoly_BLAKE2s` | `0x00` | 96 + payload | 48 | supported, the default |
+| `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | reserved for PQ-1, refused |
+
+Message 1 of the classical suite is `e` (32) + encrypted `s` (32 + 16) + the payload tag (16).
+In IKhfs, `e1` (the 1 184-byte ML-KEM-768 encapsulation key) follows `es`, so it is encrypted
+too (+ 16). Message 2 carries `ekem1` (1 088 + 16) between `ee` and `se`.
+
+Rules:
+
+- **No suite travels in the clear.** There is no envelope, magic or version byte in front of
+  message 1. A responder finds the suite by trying, in turn, each suite it accepts whose
+  message 1 can have the received length, with its current key and then its previous one
+  (§14). A length outside every accepted suite's bounds is refused without running Noise, and
+  with the same error as an invalid message (no oracle). The classical suite is byte for byte
+  the handshake of earlier releases: v1 peers interoperate in both directions.
+- **Domain separation.** The classical suite keeps the `TCN/1` prologues. From PQ-1 on, a new
+  suite has its own prologue (`TCN/2 <channel>` followed by its id), so that a message of one
+  suite is never valid as another.
+- **The initiator pins one suite** per relay and per node (`suite`, OPERATIONS §5). It never
+  falls back to another: if the responder does not accept that suite, it does not answer.
+- **The responder accepts explicit sets, per role.** The relay has one set for agents and
+  one for clients (`relay.toml`, OPERATIONS §4.1). The agent has one set for clients on the
+  end-to-end channel (`--accept-client-suites`). The sets are not ordered and there is no
+  "minimum suite". The default is the classical suite alone. It does not change between
+  releases: a release that adds a suite does not accept it until it is configured. On the relay
+  the role is known only after message 1. A peer whose suite is accepted for the other role
+  gets no message 2 and produces `handshake_suite_rejected` (WARN).
+- A suite that this build cannot run is a configuration error at startup, on every side.
 
 ## 8. Lifecycle
 
@@ -180,13 +217,62 @@ therefore bounded by `streams × MAX_WINDOW`.
 
 | Limit | Value |
 | :- | -: |
-| concurrent connections to the relay | 4 096 |
-| handshakes per IPv4 address or per IPv6 /64 prefix | burst of 20, then 1 every 3 s |
+| unconfirmed connections to the relay (pre-authentication pool) | 1 024 |
+| confirmed connections to the relay (established pool) | 8 192 |
+| confirmed connections per identity | 512 |
+| unconfirmed handshakes per IPv4 address or IPv6 /64 prefix | burst of 64, then 1 every 3 s |
+| new IPv6 /64 prefixes per /48 | burst of 64, then 1 per second |
 | `Open` per client connection | burst of 64, then 10 per second |
 | streams per client / per agent | 32 / 64 |
 | `Ping` per connection | burst of 10, then 1 every 5 s |
-| handshake / idle / write | 10 s / 90 s / 30 s |
+| relay: complete message 1 / message 2 sent / first authentic frame | 5 s / 10 s / 5 s after message 2 |
+| initiator handshake / idle / write | 10 s / 90 s / 30 s |
 | agent and client keepalive | 30 s |
+
+The relay's admission limits are set in `relay.toml` (OPERATIONS §4.1). Every value is checked
+at startup: none may be zero, none may be absurd, and the message 1 deadline lies between 5 s
+and the handshake deadline.
+
+### 10.1 Admission on the relay
+A connection passes through two pools:
+
+```text
+accept ─(per-source token, pre-auth slot)─▶ unconfirmed ─first authentic frame─▶ established
+   │ refused: dropped without a reply          │ token refunded, identity charged
+   ▼                                           ▼ closed: slot freed, token stays spent
+ counted in preauth_summary                  counted in preauth_summary
+```
+
+1. **At accept** the connection takes a slot in the pre-authentication pool and one token
+   from the budget of its source (IPv4 address or IPv6 /64, plus the /48 bucket for new /64s).
+   A full pool or an empty budget drops it without a reply. The pool is checked first, so
+   a full pool does not spend the source's tokens.
+2. **Message 1** must be complete within `msg1_deadline` (≥ 5 s), however slowly it trickles
+   in. Its length prefix is checked on sight: over the largest legitimate message 1 of the
+   accepted suites (4 424 bytes for the classical suite, §15.3), the connection is closed
+   before any byte of the message is buffered. After the handshake the limit is the usual
+   Noise maximum (§7.1).
+3. **Message 2** is sent if the policy (§15.4) and the suite (§7.5) accept the peer, within
+   `handshake_timeout` from accept.
+4. **Key confirmation.** Message 1 can be a recording (§7.3), so message 2 proves nothing about
+   the initiator. Only the first authentic transport frame does (`Register` from an agent, `Open`
+   or `Ping` from a client). It must arrive within `first_frame_deadline` after message 2. Only
+   then does the connection reach the relay core, move to the established pool and count
+   against its identity's concurrency limit, and the source get its token back.
+
+Consequences:
+
+- The per-source budget limits **unconfirmed** handshakes only. A fleet controller that opens
+  hundreds of sessions from one address is not throttled, because every confirmed session gives
+  its token back. Replays and scanners never confirm, so they spend the budget for good.
+- Replays of a recorded message 1 never enter the established pool and never charge the
+  victim's identity: they cannot lock the victim out.
+- A stolen identity holds at most `max_per_identity` confirmed connections, however many
+  addresses it has.
+- Failures before confirmation never produce one log line per connection: they are
+  aggregated (§15.11). An `authentication_failed` line is written only for a key the
+  configuration knows (whitelisted or revoked), or for a certificate rejected after a pinned CA's
+  signature was verified. Any other key is one that anyone could have made up.
 
 ## 11. The client as `ProxyCommand`
 
@@ -420,7 +506,7 @@ end-to-end channel the agent would have to respond to unknown clients. The `Open
 
 Message 1 can be replayed (§7.3). A replayed message 1 with a valid certificate does not
 complete the handshake (it needs the client's ephemeral key), costs the responder at most one
-extra signature verification, within the handshake limit (§10), and produces no success event:
+extra signature verification, within the per-source budget (§10.1), and produces no success event:
 the events that name an accepted certificate (§15.11) are recorded only after an authentic
 transport message from the client (`Open` on the outer channel, `TCN/1 ready` on the end-to-end
 one).
@@ -430,8 +516,12 @@ with a certificate and without an entry in its policy is therefore treated as an
 response). A client without a certificate changes nothing. The frames' `version` byte and the
 prologues remain unchanged.
 
-Sizes: message 1 with the largest certificate is `96 + 4 328 + 16` bytes long and fits both in
-a Noise message and in the payload of a `Data` frame (verified with a `const` assertion). A
+Sizes: message 1 with the largest certificate is `96 + 4 328 = 4 424` bytes long, where the 96
+bytes already include the payload's AEAD tag (§7.5). It fits both in a Noise message and in the
+payload of a `Data` frame (verified with a `const` assertion), and it is the relay's
+pre-authentication buffer cap for the classical suite (§10.1). Releases before PQ-0 counted the
+tag twice (`96 + 4 328 + 16`); that bound was 16 bytes too loose and never refused a legitimate
+message. A
 responder rejects a message 1 payload longer than `MAX_CERT_LEN` without interpreting it.
 
 ### 15.4 Verification: order of checks
@@ -668,6 +758,12 @@ only serial number (hexadecimal), CA and client fingerprints, name and expiry.
 | `ca_rotation_pending` | WARN | at startup, on every reload and every hour, for each CA with two keys |
 | `revocations_in_use` | INFO | at startup and on every reload: `serials`, `keys` (how many entries) |
 
+From R-1 on (§10.1), the relay writes `authentication_failed` only for a key the configuration
+knows, or for a certificate rejected after its signature was verified (from `serial_revoked`
+on). Other failures before key confirmation are counted in `preauth_summary`. On the agent
+every rejection keeps its own line: a flood there needs a compromised relay, and its streams
+are bounded per relay.
+
 Comparing the serial numbers seen in the audits with the `zt-ca` issuance register
 (OPERATIONS §10) reveals a certificate that the CA did not issue, i.e. a compromised CA.
 
@@ -688,7 +784,7 @@ Comparing the serial numbers seen in the audits with the `zt-ca` issuance regist
 
 The cost of a message 1 with a certificate, for its receiver, is at most one extra signature
 verification compared with today, and only after the binding check (step 4): it stays within
-the per-address handshake limit (§10) on the relay and within the per-relay stream quota on the
+the per-source budget of unconfirmed handshakes (§10.1) on the relay and within the per-relay stream quota on the
 agent. The relay core keeps, for each connection with a certificate, only the verified data (at
 most 64 nodes), not the certificate bytes.
 

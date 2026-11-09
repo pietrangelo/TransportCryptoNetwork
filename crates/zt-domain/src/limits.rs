@@ -60,7 +60,8 @@ pub const MAX_REVOKED_SERIALS: usize = 16_384;
 pub const MAX_REVOKED_KEYS: usize = 4_096;
 
 /// Bytes of Noise IK message 1 beyond the payload: `e` (32) + encrypted `s` (32 + 16) + payload
-/// tag (16).
+/// tag (16). The payload tag is included: the longest message 1 is `NOISE_MSG1_OVERHEAD +
+/// MAX_CERT_LEN`. Per-suite values: [`crate::HandshakeSuite::msg1_overhead`].
 pub const NOISE_MSG1_OVERHEAD: usize = 96;
 
 // Compile-time proofs: if someone raises a limit inconsistently, the build fails.
@@ -72,8 +73,9 @@ const _: () = {
     assert!(MAX_PAYLOAD_LEN <= u16::MAX as usize);
     assert!(MAX_NODE_ID_LEN <= MAX_PAYLOAD_LEN);
     // Message 1 carrying the largest certificate fits in a `Data` frame and in a Noise message
-    // (PROTOCOL §15.3).
-    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= MAX_PAYLOAD_LEN);
-    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= NOISE_MAX_MESSAGE_LEN);
+    // (PROTOCOL §15.3). `NOISE_MSG1_OVERHEAD` already contains the payload tag; the bounds of
+    // every suite are checked in `suite.rs`.
+    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN <= MAX_PAYLOAD_LEN);
+    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN <= NOISE_MAX_MESSAGE_LEN);
     assert!(MIN_CERT_LEN <= MAX_CERT_LEN);
 };

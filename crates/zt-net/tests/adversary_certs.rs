@@ -34,8 +34,9 @@ fn some_agent() -> Fingerprint {
 }
 
 /// A: a stolen certificate presented with a different static key does not get message 2 from
-/// either the relay or the agent; the audit log says `key_mismatch` and, since the signature
-/// has not been verified, names neither CA nor serial (§15.4 step 4, §15.11).
+/// either the relay or the agent. Since the signature has not been verified the thief's key is
+/// one anyone could make up: the relay only counts it in `preauth_summary` (finding AP-3), and
+/// nothing names the CA or the serial (§15.4 step 4, §15.11).
 #[tokio::test]
 async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
     let log = Captured::default();
@@ -70,19 +71,14 @@ async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
         "the relay answered a stolen certificate"
     );
     let failed = log.events("authentication_failed");
-    let thief_line = failed
-        .iter()
-        .find(|l| field(l, "peer") == Some(thief.fingerprint().to_string()))
-        .unwrap_or_else(|| panic!("no authentication_failed for the thief: {}", log.text()));
-    assert_eq!(
-        field(thief_line, "cert_check").as_deref(),
-        Some("key_mismatch")
+    assert!(
+        failed
+            .iter()
+            .all(|l| field(l, "peer") != Some(thief.fingerprint().to_string())),
+        "the thief's unverified key got its own line: {failed:#?}"
     );
-    assert_eq!(field(thief_line, "reason").as_deref(), Some("certificate"));
-    assert!(field(thief_line, "serial").is_none(), "{thief_line}");
-    assert!(field(thief_line, "ca").is_none(), "{thief_line}");
-    // No rejection names the serial: the thief's signature was never verified.
-    assert!(failed.iter().all(|l| !l.contains(&serial.to_string())));
+    // No line names the serial: the thief's signature was never verified.
+    assert!(!log.text().contains(&serial.to_string()), "{}", log.text());
 
     // The same on the end-to-end channel, towards the agent.
     let mut fake = FakeRelay::start(agent_clients(
@@ -595,7 +591,14 @@ async fn authentication_failed_after_the_signature_names_ca_and_serial() {
     names_certificate(&line_for(&alice), "serial_revoked", &revoked_serial);
     let msg1 = raw_msg1(carol_seed, &relay.key, Channel::Outer, &forged);
     assert!(probe_relay(relay.addr, &msg1).await.is_none());
-    names_nothing(&line_for(&carol));
+    // Before the signature the key is unknown: only counted, never its own line (AP-3).
+    assert!(
+        log.events("authentication_failed")
+            .iter()
+            .all(|l| field(l, "peer") != Some(carol.fingerprint().to_string())),
+        "{}",
+        log.text()
+    );
     // Positive check: the intact certificate passes.
     let msg1 = raw_msg1(carol_seed, &relay.key, Channel::Outer, &good);
     assert!(probe_relay(relay.addr, &msg1).await.is_some());

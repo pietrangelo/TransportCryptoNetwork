@@ -1,6 +1,13 @@
 //! Sans-IO key encapsulation (PQ-0): the provider trait and ML-KEM-768.
 //!
-//! RED stub: every operation fails closed until the implementation lands.
+//! The trait never draws randomness itself: seeds and encapsulation randomness are parameters,
+//! so every provider is deterministic, checkable against the NIST ACVP and Wycheproof vectors
+//! and against an independent implementation (`tests/kem.rs`). The handshake (PQ-1) draws
+//! them from the system CSPRNG and passes them in.
+//!
+//! [`MlKem768`] is `libcrux-ml-kem` (formally verified portable and AVX2 code; the NEON
+//! backend is disabled, see `.cargo/config.toml`). The independent `ml-kem` crate is used only
+//! in tests, as the differential oracle.
 
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -122,12 +129,22 @@ pub trait Kem {
     ) -> Result<SharedSecret, KemError>;
 }
 
-/// ML-KEM-768 (FIPS 203), provided by `libcrux-ml-kem` (RED stub).
+use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
+use zeroize::Zeroize;
+
+/// Length of an ML-KEM-768 decapsulation key in its expanded (FIPS 203) form.
+const MLKEM768_DK_LEN: usize = MlKem768PrivateKey::len();
+
+/// ML-KEM-768 (FIPS 203), provided by `libcrux-ml-kem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MlKem768;
 
-/// An ML-KEM-768 decapsulation key (RED stub).
-pub struct MlKem768DecapsulationKey(());
+/// An ML-KEM-768 decapsulation key. Secret: no `Clone`, zeroized on drop, redacted `Debug`.
+///
+/// `libcrux-ml-kem` key types do not zeroize themselves, so the key lives here as zeroizing
+/// bytes and is turned into a `libcrux` value only for the duration of a decapsulation (whose
+/// temporary copy is wiped as well, as far as the compiler lets a copy be wiped).
+pub struct MlKem768DecapsulationKey(Zeroizing<[u8; MLKEM768_DK_LEN]>);
 
 impl core::fmt::Debug for MlKem768DecapsulationKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -136,23 +153,46 @@ impl core::fmt::Debug for MlKem768DecapsulationKey {
 }
 
 impl Kem for MlKem768 {
-    const ALGORITHM: &'static str = "";
-    const ENCAPSULATION_KEY_LEN: usize = 0;
-    const CIPHERTEXT_LEN: usize = 0;
+    const ALGORITHM: &'static str = "ML-KEM-768";
+    const ENCAPSULATION_KEY_LEN: usize = MlKem768PublicKey::len();
+    const CIPHERTEXT_LEN: usize = MlKem768Ciphertext::len();
     type DecapsulationKey = MlKem768DecapsulationKey;
 
-    fn generate(_: &KemSeed) -> (Self::DecapsulationKey, Vec<u8>) {
-        (MlKem768DecapsulationKey(()), Vec::new())
+    fn generate(seed: &KemSeed) -> (Self::DecapsulationKey, Vec<u8>) {
+        // FIPS 203 ML-KEM.KeyGen_internal(d, z), with seed = d ‖ z.
+        let (sk, pk) = mlkem768::generate_key_pair(*seed.as_bytes()).into_parts();
+        let mut raw: [u8; MLKEM768_DK_LEN] = sk.into();
+        let key = MlKem768DecapsulationKey(Zeroizing::new(raw));
+        raw.zeroize();
+        (key, pk.as_slice().to_vec())
     }
 
     fn encapsulate(
-        _: &[u8],
-        _: &[u8; ENCAPSULATION_RANDOMNESS_LEN],
+        encapsulation_key: &[u8],
+        randomness: &[u8; ENCAPSULATION_RANDOMNESS_LEN],
     ) -> Result<(Vec<u8>, SharedSecret), KemError> {
-        Err(KemError::InvalidEncapsulationKey)
+        let ek = MlKem768PublicKey::try_from(encapsulation_key)
+            .map_err(|_| KemError::EncapsulationKeyLength)?;
+        // FIPS 203 §7.2 input check (type and modulus) before the key is used.
+        if !mlkem768::validate_public_key(&ek) {
+            return Err(KemError::InvalidEncapsulationKey);
+        }
+        let (ct, ss) = mlkem768::encapsulate(&ek, *randomness);
+        Ok((ct.as_slice().to_vec(), SharedSecret::from_bytes(ss)))
     }
 
-    fn decapsulate(_: &Self::DecapsulationKey, _: &[u8]) -> Result<SharedSecret, KemError> {
-        Err(KemError::CiphertextLength)
+    fn decapsulate(
+        key: &Self::DecapsulationKey,
+        ciphertext: &[u8],
+    ) -> Result<SharedSecret, KemError> {
+        // Length is the only check: a wrong ciphertext of the right length takes the implicit
+        // rejection path inside ML-KEM.Decaps and yields a pseudo-random secret.
+        let ct =
+            MlKem768Ciphertext::try_from(ciphertext).map_err(|_| KemError::CiphertextLength)?;
+        let sk = MlKem768PrivateKey::from(&*key.0);
+        let ss = mlkem768::decapsulate(&sk, &ct);
+        let mut wipe: [u8; MLKEM768_DK_LEN] = sk.into();
+        wipe.zeroize();
+        Ok(SharedSecret::from_bytes(ss))
     }
 }

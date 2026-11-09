@@ -186,21 +186,26 @@ async fn try_connect(relay: &Relay, who: &Identity) -> Result<(), NetError> {
 
 #[tokio::test]
 async fn audit_events_are_json_with_a_stable_kind_and_no_secrets() {
+    // A revoked key is a known identity: it gets its own line. A stranger's key (anyone can
+    // make one up) is only counted in `preauth_summary` (finding AP-3).
+    let revoked = Identity::generate().unwrap();
+    let denylist = format!("serials = []\nkeys = [\"{}\"]\n", revoked.public_key());
+    let dir = CaDir::new("audit", &policy_text(&[]), Some(&denylist));
+    let revocations = dir.revocations_arg();
+    let relay = dir.start(&["--revocations", &revocations]);
     let stranger = Identity::generate().unwrap();
-    let relay = Relay::start("audit", &[]);
     let _ = try_connect(&relay, &stranger).await;
-    let event =
-        relay.wait_for(|v| v["target"] == "zt_audit" && v["fields"]["event_kind"] != "keys_in_use");
-    assert_eq!(event["fields"]["event_kind"], "authentication_failed");
+    let _ = try_connect(&relay, &revoked).await;
+    let event = relay.wait_for(|v| v["fields"]["event_kind"] == "authentication_failed");
     assert_eq!(event["level"], "WARN");
     assert!(event["timestamp"].is_string());
     // Structured fields, not a `Debug` string to parse (finding 0004-4).
     assert_eq!(
         event["fields"]["peer"],
-        stranger.fingerprint().to_string(),
+        revoked.fingerprint().to_string(),
         "{event}"
     );
-    assert_eq!(event["fields"]["reason"], "UnknownPeer", "{event}");
+    assert_eq!(event["fields"]["reason"], "key_revoked", "{event}");
     assert!(event["fields"].get("event").is_none(), "{event}");
     let text = event.to_string();
     assert!(!text.contains(relay.key.to_secret_hex().as_str()));
@@ -695,6 +700,19 @@ async fn sighup_reloads_revocations_and_cuts_a_revoked_certificate() {
     )
     .await
     .unwrap();
+    // Key confirmation (PROTOCOL §10.1): the relay counts the connection as established only
+    // after a first authentic frame.
+    live.send(
+        &zt_domain::Frame::Ping { nonce: 1 },
+        &relay.config().timeouts,
+    )
+    .await
+    .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), live.recv()).await;
+    assert!(
+        matches!(pong, Ok(Ok(Some(zt_domain::Frame::Pong { nonce: 1 })))),
+        "{pong:?}"
+    );
 
     std::fs::write(
         relay.dir.join("revoked.toml"),

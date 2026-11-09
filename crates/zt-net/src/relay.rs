@@ -1,8 +1,9 @@
 //! Relay server.
 //!
 //! ```text
-//!  accept ─▶ limits (connections, per-IP rate) ─▶ connection task: handshake, policy,
-//!                                                  recv/send with timeouts
+//!  accept ─▶ admission (pre-auth pool, per-source ─▶ connection task: message 1, policy,
+//!            budget, PROTOCOL §10.1)                 suite, message 2, first authentic frame
+//!                                                    (key confirmation), recv/send
 //!                         Input ▼  ▲ Frame (bounded queue per connection)
 //!                          hub: RelayCore (sole owner of the state)
 //! ```
@@ -11,22 +12,23 @@
 //! that respects the credit) that connection is closed.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
-use tokio::time::timeout_at;
-use zt_application::admission::AdmissionConfig;
-use zt_application::ratelimit::HandshakeGate;
+use tokio::sync::mpsc;
+use tokio::time::{timeout, timeout_at};
+use zt_application::admission::{
+    Admission, AdmissionConfig, PreauthFailure, PreauthSummary, Ticket, is_known_identity,
+};
 use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
     AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
-    SessionId, SuitePolicy,
+    InitiatorRole, PeerRole, SessionId, SuitePolicy,
 };
 
 use crate::{NetError, Timeouts, channel};
@@ -184,6 +186,9 @@ pub(crate) fn audit(event: &DomainEvent) {
             );
         }
         // `DomainEvent` is `non_exhaustive`: a new event at least stays readable.
+        DomainEvent::HandshakeSuiteRejected { peer, suite } => {
+            emit!(%peer, suite = suite.protocol_name(), "handshake suite rejected");
+        }
         other => emit!(event = ?other, "audit event"),
     }
 }
@@ -307,6 +312,12 @@ impl RelayServer {
         policy: impl Into<crate::Revocable<AccessPolicy>>,
         config: RelayConfig,
     ) -> Result<Self, NetError> {
+        config.admission.validate()?;
+        for set in [config.suites.agents, config.suites.clients] {
+            if !set.all_supported() {
+                return Err(NetError::Suite(zt_domain::SuiteError::Unsupported));
+            }
+        }
         let policy = policy.into();
         let keys = keys.into();
         let listener = TcpListener::bind(addr).await?;
@@ -350,17 +361,18 @@ impl RelayServer {
         );
         tokio::spawn(hub(core, hub_rx, policy.clone()));
 
-        // RED stub (R-1): the old single pool and gate, fed from the admission limits.
-        let a = &config.admission;
-        let slots = Arc::new(Semaphore::new(a.max_established));
-        let mut gate = HandshakeGate::new(
-            a.max_tracked_sources,
-            a.source_burst,
-            a.source_refill,
-            a.wide_burst,
-            a.wide_refill,
-            a.max_tracked_wide,
+        audit_line!(
+            false,
+            "handshake_suites_in_use",
+            agent_suites = config.suites.agents.names(),
+            client_suites = config.suites.clients.names(),
+            "handshake suites in use"
         );
+        let admission = Arc::new(Mutex::new(Admission::new(
+            config.admission.clone(),
+            std::time::Instant::now(),
+        )));
+        tokio::spawn(summaries(Arc::downgrade(&admission)));
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
         loop {
@@ -373,14 +385,17 @@ impl RelayServer {
                     continue;
                 }
             };
-            let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
-                tracing::warn!(%addr, "connection limit reached");
+            // A refusal is counted in the summary; the connection is dropped without a reply.
+            let admitted = lock(&admission).on_accept(addr.ip(), std::time::Instant::now());
+            let Ok(ticket) = admitted else {
+                tracing::debug!(%addr, "connection not admitted");
                 continue;
             };
-            if !gate.admit(addr.ip(), std::time::Instant::now()) {
-                tracing::warn!(%addr, "handshake rate limit");
-                continue;
-            }
+            let admitted = Admitted {
+                admission: Arc::clone(&admission),
+                ticket,
+                source: addr.ip(),
+            };
             let _ = tcp.set_nodelay(true);
             next_conn = next_conn.wrapping_add(1);
             let conn = ConnId(next_conn);
@@ -392,12 +407,11 @@ impl RelayServer {
                 policy: policy.clone(),
                 hub: hub_tx.clone(),
                 timeouts: config.timeouts.clone(),
+                admission: config.admission.clone(),
+                suites: config.suites,
                 capacity,
             };
-            tokio::spawn(async move {
-                task.serve(tcp, addr).await;
-                drop(permit);
-            });
+            tokio::spawn(task.serve(tcp, addr, admitted));
         }
     }
 }
@@ -408,42 +422,212 @@ struct Connection {
     policy: crate::Revocable<AccessPolicy>,
     hub: mpsc::Sender<HubEvent>,
     timeouts: Timeouts,
+    admission: AdmissionConfig,
+    suites: SuitePolicy,
     capacity: usize,
 }
 
+/// `lock` that survives a poisoned mutex: the admission state stays consistent across a panic
+/// (each operation is a few map updates), and refusing every connection would be worse.
+fn lock(admission: &Mutex<Admission>) -> MutexGuard<'_, Admission> {
+    admission.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One admitted connection: its admission ticket is released when the connection ends, on
+/// every path.
+struct Admitted {
+    admission: Arc<Mutex<Admission>>,
+    ticket: Ticket,
+    source: IpAddr,
+}
+
+impl Admitted {
+    fn record(&self, failure: PreauthFailure, key: Option<Fingerprint>) {
+        lock(&self.admission).record(failure, self.source, key);
+    }
+
+    /// Key confirmation: `true` if the connection may join the established pool.
+    fn confirm(&self, peer: Fingerprint) -> bool {
+        lock(&self.admission)
+            .on_confirmed(self.ticket, peer, std::time::Instant::now())
+            .is_ok()
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        lock(&self.admission).release(self.ticket);
+    }
+}
+
+/// How a failed message 1 is counted.
+fn msg1_failure(err: &NetError) -> PreauthFailure {
+    match err {
+        NetError::Timeout(_) => PreauthFailure::Timeout,
+        NetError::Oversized => PreauthFailure::Oversized,
+        NetError::Closed | NetError::Io(_) => PreauthFailure::Aborted,
+        _ => PreauthFailure::HandshakeFailed,
+    }
+}
+
+/// The role of an admitted initiator: an agent if its key is an agent's, otherwise a client
+/// (by key or certificate).
+fn initiator_role(policy: &AccessPolicy, peer: &Fingerprint) -> InitiatorRole {
+    match policy.role(peer) {
+        Some(PeerRole::Agent { .. }) => InitiatorRole::Agent,
+        _ => InitiatorRole::Client,
+    }
+}
+
+/// Emits the aggregated `preauth_summary` (finding AP-3) until the relay goes away.
+async fn summaries(admission: std::sync::Weak<Mutex<Admission>>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tick.tick().await;
+        let Some(admission) = admission.upgrade() else {
+            return;
+        };
+        let summary = lock(&admission).poll_summary(std::time::Instant::now());
+        if let Some(summary) = summary {
+            preauth_summary(&summary);
+        }
+    }
+}
+
+/// One flat field per failure kind (absent when zero), the distinct counts, never an
+/// identity or an address.
+fn preauth_summary(s: &PreauthSummary) {
+    let n = |kind: PreauthFailure| {
+        s.counts
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, count)| *count)
+    };
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "preauth_summary",
+        rate_limited = n(PreauthFailure::RateLimited),
+        preauth_pool_full = n(PreauthFailure::PreauthPoolFull),
+        established_pool_full = n(PreauthFailure::EstablishedPoolFull),
+        identity_limit = n(PreauthFailure::IdentityLimit),
+        handshake_failed = n(PreauthFailure::HandshakeFailed),
+        timeout = n(PreauthFailure::Timeout),
+        oversized = n(PreauthFailure::Oversized),
+        unknown_peer = n(PreauthFailure::UnknownPeer),
+        unverified_certificate = n(PreauthFailure::UnverifiedCertificate),
+        unconfirmed = n(PreauthFailure::Unconfirmed),
+        aborted = n(PreauthFailure::Aborted),
+        distinct_sources = s.distinct_sources,
+        distinct_keys = s.distinct_keys,
+        saturated = s.saturated,
+        "pre-authentication failures"
+    );
+}
+
 impl Connection {
-    async fn serve(self, tcp: TcpStream, addr: SocketAddr) {
-        let pending = match channel::accept(tcp, &self.keys, Channel::Outer, &self.timeouts).await {
-            Ok(pending) => pending,
-            Err(err) => {
-                audit(&DomainEvent::AuthenticationFailed {
-                    peer: None,
-                    reason: AuthFailureReason::HandshakeFailed,
-                    certificate: None,
-                });
+    async fn serve(self, tcp: TcpStream, addr: SocketAddr, admitted: Admitted) {
+        let Some((ch, peer, certificate, first)) = self.handshake(tcp, addr, &admitted).await
+        else {
+            return;
+        };
+        self.run(ch, peer, certificate, first).await;
+        drop(admitted);
+    }
+
+    /// Message 1 to key confirmation (PROTOCOL §10.1). Failures of unknown identities are only
+    /// counted; a known identity gets its own audit line (finding AP-3).
+    async fn handshake(
+        &self,
+        tcp: TcpStream,
+        addr: SocketAddr,
+        admitted: &Admitted,
+    ) -> Option<(
+        channel::Established<TcpStream>,
+        Fingerprint,
+        Option<Arc<CertClaims>>,
+        Frame,
+    )> {
+        let handshake_deadline = crate::deadline(self.admission.handshake_timeout);
+        let deadlines = channel::AcceptDeadlines {
+            msg1: self.admission.msg1_deadline,
+        };
+        let accepted = self.suites.any_role();
+        let pending = match timeout_at(
+            handshake_deadline,
+            channel::accept_suites(tcp, &self.keys, Channel::Outer, accepted, deadlines),
+        )
+        .await
+        {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(err)) => {
                 tracing::debug!(%addr, error = %err, "handshake failed");
-                return;
+                admitted.record(msg1_failure(&err), None);
+                return None;
+            }
+            Err(_) => {
+                admitted.record(PreauthFailure::Timeout, None);
+                return None;
             }
         };
         let peer = pending.peer();
+        let policy = self.policy.current();
         // PROTOCOL §15.4, before message 2: a rejection is equivalent to an unknown key, which
         // does not even receive the second handshake message.
-        let certificate = match admit(&self.policy.current(), &peer, pending.payload()) {
+        let certificate = match admit(&policy, &peer, pending.payload()) {
             Ok(certificate) => certificate,
             Err((reason, certificate)) => {
-                audit(&DomainEvent::AuthenticationFailed {
-                    peer: Some(peer),
-                    reason,
-                    certificate,
-                });
-                return;
+                if is_known_identity(&policy, &peer, reason) {
+                    audit(&DomainEvent::AuthenticationFailed {
+                        peer: Some(peer),
+                        reason,
+                        certificate,
+                    });
+                } else if matches!(reason, AuthFailureReason::Certificate(_)) {
+                    admitted.record(PreauthFailure::UnverifiedCertificate, Some(peer));
+                } else {
+                    admitted.record(PreauthFailure::UnknownPeer, Some(peer));
+                }
+                return None;
             }
         };
-        let Ok(mut ch) = pending.establish(&self.timeouts).await else {
-            return;
+        // The suite must be accepted for the role, not only for some role (PROTOCOL §7.5).
+        let suite = pending.suite();
+        if self
+            .suites
+            .check(initiator_role(&policy, &peer), suite)
+            .is_err()
+        {
+            audit(&DomainEvent::HandshakeSuiteRejected { peer, suite });
+            return None;
+        }
+        let Ok(Ok(mut ch)) =
+            timeout_at(handshake_deadline, pending.establish(&self.timeouts)).await
+        else {
+            admitted.record(PreauthFailure::Aborted, None);
+            return None;
         };
+        // Key confirmation (finding AP-1): message 2 proves nothing about the initiator, whose
+        // message 1 may be a recording. Only an authentic transport frame does.
+        let Ok(Ok(Some(first))) = timeout(self.admission.first_frame_deadline, ch.recv()).await
+        else {
+            admitted.record(PreauthFailure::Unconfirmed, None);
+            return None;
+        };
+        if !admitted.confirm(peer) {
+            tracing::debug!(%addr, %peer, "established pool or identity limit reached");
+            return None;
+        }
         tracing::debug!(%addr, %peer, conn = self.conn.0, "peer connected");
+        Some((ch, peer, certificate, first))
+    }
 
+    async fn run(
+        self,
+        mut ch: channel::Established<TcpStream>,
+        peer: Fingerprint,
+        certificate: Option<Arc<CertClaims>>,
+        first: Frame,
+    ) {
         let (tx, mut rx) = mpsc::channel(self.capacity);
         let conn = self.conn;
         if self
@@ -454,6 +638,14 @@ impl Connection {
                 certificate,
                 tx,
             })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if self
+            .hub
+            .send(HubEvent::Core(Input::Received { conn, frame: first }))
             .await
             .is_err()
         {
@@ -500,13 +692,13 @@ impl Connection {
 /// which the core re-checks against the current policy.
 /// The rejection from [`admit`]: the reason and, after signature verification, the certificate
 /// (PROTOCOL §15.11).
-type Refusal = (AuthFailureReason, Option<CertRef>);
+type AdmitRefusal = (AuthFailureReason, Option<CertRef>);
 
 fn admit(
     policy: &AccessPolicy,
     peer: &Fingerprint,
     payload: &[u8],
-) -> Result<Option<Arc<CertClaims>>, Refusal> {
+) -> Result<Option<Arc<CertClaims>>, AdmitRefusal> {
     let trust = policy.cert_trust();
     // Step 1, even without a certificate.
     if trust.is_key_revoked(peer) {

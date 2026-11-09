@@ -344,6 +344,9 @@ struct AgentEntry {
 struct RelayEntry {
     address: String,
     public_key: String,
+    /// The pinned suite (PROTOCOL §7.5); the classical suite if absent.
+    #[serde(default)]
+    suite: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +402,16 @@ struct PolicyFile {
     authorities: Vec<AuthorityEntry>,
 }
 
+/// A `[[nodes]]` entry of `client.toml`: a known node, optionally with its pinned suite.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientNodeEntry {
+    node: String,
+    public_key: String,
+    #[serde(default)]
+    suite: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NodesFile {
@@ -414,6 +427,9 @@ struct ClientFile {
     relay: Option<String>,
     #[serde(default)]
     relay_key: Option<String>,
+    /// The pinned suite of the single relay (PROTOCOL §7.5).
+    #[serde(default)]
+    relay_suite: Option<String>,
     /// Form with several relays, in order of preference (PROTOCOL §13).
     #[serde(default)]
     relays: Vec<RelayEntry>,
@@ -422,7 +438,7 @@ struct ClientFile {
     #[serde(default)]
     certificate: Option<String>,
     #[serde(default)]
-    nodes: Vec<NodeEntry>,
+    nodes: Vec<ClientNodeEntry>,
 }
 
 /// Replaces long hexadecimal sequences (32 characters or more) in a parser message.
@@ -924,7 +940,11 @@ impl ClientSettings {
             relays: self.relays.clone(),
             node: node.clone(),
             node_key: *node_key,
-            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
+            node_suite: self
+                .node_suites
+                .get(node)
+                .copied()
+                .unwrap_or(zt_domain::HandshakeSuite::NoiseIk25519),
             certificate: None,
             timeouts,
         })
@@ -1018,7 +1038,7 @@ pub fn parse_client_settings(
     let (addresses, key_texts): (Vec<String>, Vec<String>) =
         match (&file.relay, &file.relay_key, file.relays.as_slice()) {
             (Some(relay), Some(key), []) => (vec![relay.clone()], vec![key.clone()]),
-            (None, None, list) if !list.is_empty() => list
+            (None, None, list) if !list.is_empty() && file.relay_suite.is_none() => list
                 .iter()
                 .map(|r| (r.address.clone(), r.public_key.clone()))
                 .unzip(),
@@ -1033,7 +1053,19 @@ pub fn parse_client_settings(
         .iter()
         .map(|t| ctx.key("relay_key", t))
         .collect::<Result<Vec<_>, _>>()?;
-    let relays = relay_endpoints(origin, &addresses, &relay_keys)?;
+    let mut relays = relay_endpoints(origin, &addresses, &relay_keys)?;
+    // Without `suite` the classical suite: a fixed default that never changes between
+    // releases (finding AP-7).
+    let suite_texts: Vec<Option<&String>> = if file.relays.is_empty() {
+        vec![file.relay_suite.as_ref()]
+    } else {
+        file.relays.iter().map(|r| r.suite.as_ref()).collect()
+    };
+    for (relay, text) in relays.iter_mut().zip(suite_texts) {
+        if let Some(text) = text {
+            relay.suite = parse_suite(origin, text)?;
+        }
+    }
     if file.certificate.as_deref() == Some("") {
         return Err(ConfigError::Syntax {
             path: origin.into(),
@@ -1047,6 +1079,7 @@ pub fn parse_client_settings(
         });
     }
     let mut nodes = HashMap::new();
+    let mut node_suites = HashMap::new();
     for entry in &file.nodes {
         let node = ctx.node(&entry.node, &entry.node)?;
         let key = ctx.key(&entry.node, &entry.public_key)?;
@@ -1055,6 +1088,9 @@ pub fn parse_client_settings(
             .any(|r| r.public_key.fingerprint() == key.fingerprint())
         {
             return Err(ctx.domain(&entry.node, DomainError::DuplicatePeer(key.fingerprint())));
+        }
+        if let Some(text) = &entry.suite {
+            node_suites.insert(node.clone(), parse_suite(origin, text)?);
         }
         if nodes.insert(node.clone(), key).is_some() {
             return Err(ctx.domain(&entry.node, DomainError::DuplicateNode(node)));
@@ -1065,8 +1101,7 @@ pub fn parse_client_settings(
         key: base.join(&file.key),
         nodes,
         certificate: file.certificate.as_ref().map(|c| base.join(c)),
-        // RED stub (PQ-0): no per-node suite yet.
-        node_suites: HashMap::new(),
+        node_suites,
     })
 }
 
@@ -1091,46 +1126,155 @@ pub struct RelaySettings {
     pub suites: zt_domain::SuitePolicy,
 }
 
-/// Parses `relay.toml` (RED stub).
-///
-/// # Errors
-/// Always (stub).
-pub fn parse_relay_settings(origin: &str, _text: &str) -> Result<RelaySettings, ConfigError> {
-    Err(ConfigError::Syntax {
-        path: origin.into(),
-        message: "not implemented".into(),
-    })
+impl Default for RelaySettings {
+    /// What an empty `relay.toml` gives.
+    fn default() -> Self {
+        Self {
+            admission: zt_application::admission::AdmissionConfig::default(),
+            suites: zt_domain::SuitePolicy::classical(),
+        }
+    }
 }
 
-/// Reads and parses `relay.toml` (RED stub).
+/// `relay.toml`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayFile {
+    #[serde(default)]
+    handshake: HandshakeSection,
+    #[serde(default)]
+    admission: AdmissionSection,
+}
+
+/// `[handshake]` of `relay.toml`: the accepted suites per role (finding AP-7). There is no
+/// minimum suite, only explicit sets.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandshakeSection {
+    #[serde(default)]
+    agent_suites: Option<Vec<String>>,
+    #[serde(default)]
+    client_suites: Option<Vec<String>>,
+}
+
+/// `[admission]` of `relay.toml`: every key optional, the defaults of PROTOCOL §10.1.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionSection {
+    max_preauth: Option<usize>,
+    max_established: Option<usize>,
+    max_per_identity: Option<usize>,
+    source_burst: Option<u32>,
+    source_refill_secs: Option<u64>,
+    msg1_deadline_secs: Option<u64>,
+    handshake_timeout_secs: Option<u64>,
+    first_frame_deadline_secs: Option<u64>,
+}
+
+/// Parses `relay.toml` (OPERATIONS §4.1). An empty file gives the defaults: the classical
+/// suite for both roles and the admission limits of PROTOCOL §10.1.
+///
+/// ```toml
+/// [handshake]
+/// agent_suites = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
+/// client_suites = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
+///
+/// [admission]
+/// max_preauth = 1024
+/// source_burst = 64
+/// msg1_deadline_secs = 5
+/// ```
 ///
 /// # Errors
-/// Always (stub).
+/// [`ConfigError::Syntax`] for an unknown key or a wrong type, [`ConfigError::Suite`] for an
+/// unknown, unsupported, repeated or empty suite list, [`ConfigError::Admission`] for limits
+/// that do not validate.
+pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, ConfigError> {
+    let ctx = Ctx(origin);
+    let file: RelayFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    let mut suites = zt_domain::SuitePolicy::classical();
+    if let Some(names) = &file.handshake.agent_suites {
+        suites.agents = parse_suites(origin, names)?;
+    }
+    if let Some(names) = &file.handshake.client_suites {
+        suites.clients = parse_suites(origin, names)?;
+    }
+    let a = file.admission;
+    let mut admission = zt_application::admission::AdmissionConfig::default();
+    let secs = std::time::Duration::from_secs;
+    admission.max_preauth = a.max_preauth.unwrap_or(admission.max_preauth);
+    admission.max_established = a.max_established.unwrap_or(admission.max_established);
+    admission.max_per_identity = a.max_per_identity.unwrap_or(admission.max_per_identity);
+    admission.source_burst = a.source_burst.unwrap_or(admission.source_burst);
+    admission.source_refill = a.source_refill_secs.map_or(admission.source_refill, secs);
+    admission.msg1_deadline = a.msg1_deadline_secs.map_or(admission.msg1_deadline, secs);
+    admission.handshake_timeout = a
+        .handshake_timeout_secs
+        .map_or(admission.handshake_timeout, secs);
+    admission.first_frame_deadline = a
+        .first_frame_deadline_secs
+        .map_or(admission.first_frame_deadline, secs);
+    admission
+        .validate()
+        .map_err(|source| ConfigError::Admission {
+            path: origin.into(),
+            source,
+        })?;
+    Ok(RelaySettings { admission, suites })
+}
+
+/// Reads and parses `relay.toml`.
+///
+/// # Errors
+/// See [`parse_relay_settings`]; also a file writable by group or others.
 pub fn load_relay_settings(path: &Path) -> Result<RelaySettings, ConfigError> {
-    parse_relay_settings(&path.display().to_string(), "")
+    parse_relay_settings(&path.display().to_string(), &read_limited(path)?)
 }
 
-/// One handshake suite by its Noise protocol name (RED stub).
+/// One handshake suite by its exact Noise protocol name (no case folding, trimming or
+/// aliases), which this build must be able to run.
 ///
 /// # Errors
-/// Always (stub).
-pub fn parse_suite(origin: &str, _name: &str) -> Result<zt_domain::HandshakeSuite, ConfigError> {
-    Err(ConfigError::Syntax {
+/// [`ConfigError::Suite`] with [`zt_domain::SuiteError::Unknown`] or
+/// [`zt_domain::SuiteError::Unsupported`].
+pub fn parse_suite(origin: &str, name: &str) -> Result<zt_domain::HandshakeSuite, ConfigError> {
+    let fail = |source| ConfigError::Suite {
         path: origin.into(),
-        message: "not implemented".into(),
-    })
+        entry: redact_hex(name),
+        source,
+    };
+    let suite: zt_domain::HandshakeSuite = name.parse().map_err(fail)?;
+    if !suite.is_supported() {
+        return Err(fail(zt_domain::SuiteError::Unsupported));
+    }
+    Ok(suite)
 }
 
-/// An accepted set of suites by their Noise protocol names (RED stub).
+/// An accepted set of suites by their Noise protocol names: non-empty, no repetition, every
+/// suite supported by this build.
 ///
 /// # Errors
-/// Always (stub).
+/// [`ConfigError::Suite`].
 pub fn parse_suites(
     origin: &str,
-    _names: &[String],
+    names: &[String],
 ) -> Result<zt_domain::AcceptedSuites, ConfigError> {
-    Err(ConfigError::Syntax {
+    let suites = names
+        .iter()
+        .map(|name| name.parse::<zt_domain::HandshakeSuite>())
+        .collect::<Result<Vec<_>, _>>();
+    let set = suites.and_then(zt_domain::AcceptedSuites::new);
+    let set = set.map_err(|source| ConfigError::Suite {
         path: origin.into(),
-        message: "not implemented".into(),
-    })
+        entry: "suites".into(),
+        source,
+    })?;
+    if !set.all_supported() {
+        return Err(ConfigError::Suite {
+            path: origin.into(),
+            entry: "suites".into(),
+            source: zt_domain::SuiteError::Unsupported,
+        });
+    }
+    Ok(set)
 }
