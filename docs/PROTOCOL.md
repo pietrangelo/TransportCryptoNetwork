@@ -782,8 +782,13 @@ payload of a `Data` frame (verified with a `const` assertion), and it is the rel
 pre-authentication buffer cap for the classical suite (§10.1). Releases before PQ-0 counted the
 tag twice (`96 + 4 328 + 16`); that bound was 16 bytes too loose and never refused a legitimate
 message. Under the hybrid suite (end-to-end only) the bound is `1 296 + 4 328 = 5 624` bytes,
-which also fits a `Data` frame. A
-responder rejects a message 1 payload longer than `MAX_CERT_LEN` without interpreting it.
+which also fits a `Data` frame.
+
+With certificates v2 (§15.14) the payload bound is the longest certificate of any version,
+`MAX_ANY_CERT_LEN = 7 670`: message 1 is at most `96 + 7 670 = 7 766` bytes under the
+classical suite and `1 296 + 7 670 = 8 966` under the hybrid one, and both remain the relay's
+pre-authentication caps. A responder rejects a message 1 payload longer than
+`MAX_ANY_CERT_LEN` without interpreting it.
 
 ### 15.4 Verification: order of checks
 
@@ -1011,7 +1016,7 @@ only serial number (hexadecimal), CA and client fingerprints, name and expiry.
 | `event_kind` | Level | When, and added fields |
 | :- | :- | :- |
 | `authentication_failed` | WARN | a check from §15.4 fails: `reason` (`key_revoked` or `certificate`), `cert_check`; `ca`, `serial`, `cert_name` and `not_after` only after step 6 (signature verified), on relay and agent |
-| `session_established` (relay), `e2e_session_started` (agent) | INFO | `credential` = `key` or `certificate`; for a certificate also `ca`, `serial`, `cert_name`, `not_after`. Recorded only after an authentic message from the client (§15.3) |
+| `session_established` (relay), `e2e_session_started` (agent) | INFO | `credential` = `key` or `certificate`; for a certificate also `ca`, `serial`, `cert_name`, `not_after` and `cert_version` (1 or 2, §15.14). Recorded only after an authentic message from the client (§15.3) |
 | `access_denied` | WARN | as today, with the same certificate fields |
 | `access_revoked` | WARN | as today, with the same certificate fields |
 | `certificate_expired` | INFO | (relay and agent) a session authorised by a certificate was closed at expiry: `peer`, `ca`, `serial` |
@@ -1034,6 +1039,9 @@ Comparing the serial numbers seen in the audits with the `zt-ca` issuance regist
 | :- | -: | :- |
 | `MAX_CERT_LEN` | 4 328 bytes | 64 nodes of 63 bytes, 63-byte name; fits in a `Data` and in a message 1 |
 | `MIN_CERT_LEN` | 170 bytes | the shortest certificate (`scope = 0x01`, 1-byte name) |
+| `MAX_CERT_V2_LEN` | 7 670 bytes | v2: hybrid subject, 64 nodes of 63 bytes, 63-byte name, 3 373-byte composite signature (§15.14) |
+| `MIN_CERT_V2_LEN` | 3 480 bytes | the shortest v2 certificate (classical subject, `scope = 0x01`, 1-byte name) |
+| `MAX_ANY_CERT_LEN` | 7 670 bytes | the message 1 payload bound of every suite |
 | `MAX_CERT_NODES` | 64 | beyond that, use `scope = 0x01` with a dedicated CA |
 | `MAX_CERT_LIFETIME` | 86 400 s | "short" by construction |
 | `max_lifetime` of a CA | 60..=86 400 s, default 28 800 | per CA |
@@ -1077,7 +1085,106 @@ db 2d 3c ba 5d 72 ca 67 09 bf 1d 94 12 1b f3 74
 The vector was computed outside the project; as for framing, if the test
 `reference_vector_matches_the_protocol` contradicts it, this document must be corrected.
 
-### 15.14 Attacks considered
+### 15.14 Certificate v2: composite ML-DSA-65 + Ed25519 (PQ-AUTH)
+
+A certificate v1 is only as strong as Ed25519: an adversary with a quantum computer who
+recovers a CA secret key from its public key can mint certificates for any key. Certificate v2
+is signed by a **composite** CA key, an Ed25519 key **and** an ML-DSA-65 key (FIPS 204), and is
+valid only when **both** signatures verify (decision D11 of `docs/pq-resilience-plan.md`). The
+classical half keeps the security of v1 if ML-DSA or its implementation fails; the ML-DSA half
+holds against a quantum adversary. Node keys still never sign (§15.2).
+
+**Format.** The fields after `serial` are those of §15.1 (rules 4–6 apply unchanged):
+
+```
+ offset    size field
+ --------  ---  -------------------------------------------------------------
+   0        4   magic         "TCNC"
+   4        1   version       0x02
+   5        1   sig_alg       0x02 (ML-DSA-65 + Ed25519); 0x03 and 0x04 are reserved, refused
+   6       32   ca_fp         SHA-256("TCN CA fingerprint v2\0" ‖ sig_alg ‖ ed25519 ‖ mldsa65)
+  38        1   subject_kind  0x01 classical, 0x02 hybrid
+  39       32   subject_fp    the client's fingerprint (§7.2, X25519 form)
+ (71       32   subject_fp_v2 only with subject_kind 0x02: hybrid fingerprint, §7.5.3)
+   …       16   serial        as §15.1
+   …        8   not_before
+   …        8   not_after
+   …        …   name, scope, node_count, nodes   as §15.1
+ L-3373  3309   sig_M         ML-DSA-65 signature
+ L-64      64   sig_E         Ed25519 signature
+```
+
+Decoder rules, in addition to those of §15.1:
+
+1. The version byte selects the decoder; each version has its own length bounds, checked
+   **before** any other field: v1 `170..=4 328`, v2 `MIN_CERT_V2_LEN..=MAX_CERT_V2_LEN`
+   (`3 480..=7 670`). Any other version is an error.
+2. `sig_alg` MUST be `0x02`; `subject_kind` MUST be `0x01` or `0x02`.
+3. After the last node exactly 3 373 bytes MUST remain (`sig_M ‖ sig_E`).
+
+The encoding remains canonical: one byte representation per content, apart from the
+signatures. Certificate v2 names its subject by **fingerprint**, not by key: the binding
+(step 4) compares fingerprints, in constant time, before any signature.
+
+**Signature.** Both components sign the same message
+`M' = "TCN client certificate v2\0" ‖ TBS`, where TBS is bytes `[0, L-3373)`:
+
+- `sig_E = Ed25519-Sign(ed_secret, M')` (pure Ed25519, deterministic);
+- `sig_M = ML-DSA-65.Sign(mldsa_secret, M', ctx = "TCN-cert-v2")`, hedged (fresh 32-byte
+  `rnd`), FIPS 204 external interface with the context string.
+
+The v2 context differs from the v1 one, so neither component of a v2 certificate verifies as a
+v1 certificate, and the FIPS 204 `ctx` separates certificate signatures from any other use of
+the ML-DSA key.
+
+**Verification** (§15.4 steps 3–6 for v2):
+
+1. step 3: format, rules above;
+2. step 4: `subject_fp` equals the fingerprint the handshake authenticated; with
+   `subject_kind = 0x02`, `subject_fp_v2` also equals the hybrid fingerprint the handshake
+   authenticated (suite `IKhfs+psk0+psk2`, §7.5.3). A hybrid-bound certificate never passes a
+   classical handshake: that would be a downgrade;
+3. step 5: a pinned **composite** key whose `ca_fp` equals the certificate's. The pin decides
+   the algorithm, not the certificate: a v1 (Ed25519) pin never verifies a v2 certificate, and
+   a composite pin never verifies a v1 certificate, even with the same Ed25519 bytes (finding
+   AP-13). A CA does not certify itself: the Ed25519 half of the pin MUST NOT be the subject;
+4. step 6: **Ed25519 first** (`verify_strict`), **then** ML-DSA-65 with the pinned ML-DSA key
+   and `ctx = "TCN-cert-v2"`. Both MUST pass. The order means that, until a quantum computer
+   exists, only a holder of a CA-signed TBS for its own authenticated key reaches the ML-DSA
+   verifier (finding AP-5).
+
+Steps 7–11 (denylist, time, scope, roles) are unchanged and version-independent.
+
+**The ML-DSA verifier** is RustCrypto `ml-dsa` at one exact version, the same in the fleet and
+in `zt-ca`. `zt-ca` verifies every certificate it signs with that verifier before writing it
+(verify-after-sign, finding AP-5): a certificate the fleet would reject never leaves the CA.
+The verifier passes the NIST ACVP key-generation vectors and the Wycheproof ML-DSA-65
+verification and signing vectors, and agrees on all of them, and on mutated signatures, with
+the independent `libcrux-ml-dsa` (test-only).
+
+**Keys and files.**
+
+| Text | Content |
+| :- | :- |
+| `tcn-ca-secret-v2:` + 128 hex | Ed25519 seed (32) ‖ ML-DSA-65 seed ξ (32); `zt-ca` only, mode `0600`, zeroized in memory |
+| `tcn-ca-pub-v2:` + 3 968 hex | Ed25519 public key (32) ‖ ML-DSA-65 public key (1 952); in `[[authorities]]` |
+| `tcn-client-cert-v2:` + hex | a certificate v2; the prefix MUST match the version byte |
+| `TCNCA2:` + 64 hex | `ca_fp`, as `zt-ca inspect` shows it |
+
+In the audit logs a composite CA is named by the fingerprint of its Ed25519 half, as a v1 CA,
+so that the conflict checks of §15.9 (a CA key that is also a peer key, a key in two entries)
+cover both versions. A composite key MUST NOT reuse the Ed25519 key of the v1 key it replaces.
+
+**Migration** uses the CA rotation of §15.9: an `[[authorities]]` entry pins the composite key
+next to the v1 key (`public_keys = ["tcn-ca-pub-v2:…", "<v1 key>"]`), both kinds of certificate
+are accepted during the overlap, and removing the v1 key ends v1 acceptance. There is no
+automatic downgrade: a v1 certificate passes only where a v1 key is pinned (OPERATIONS §10.8).
+
+**Sizes.** A v2 certificate with a classical subject is 3 480 bytes at least and 7 638 bytes at
+most; with a hybrid subject, 32 bytes more (7 670). The message 1 payload bound of every suite
+is the longest certificate of any version, `MAX_ANY_CERT_LEN = 7 670`.
+
+### 15.15 Attacks considered
 
 | Attack | Defence |
 | :- | :- |
@@ -1099,6 +1206,11 @@ The vector was computed outside the project; as for framing, if the test
 | replayed message 1 to make a client appear in the audits | success events are recorded only after an authentic message (§15.3) |
 | CA signing a certificate for an agent's key | `role_conflict` on the relay; the key cannot open streams |
 | relay and agent clock moved backwards | accepted residual risk (§15.6); NTS recommended; denylist |
+| quantum forgery of a CA signature (Ed25519 broken) | certificate v2: the ML-DSA-65 component must also verify (§15.14) |
+| stripping or swapping one component of a v2 signature; a v2 body with a v1 signature | both components are mandatory and sign `"TCN client certificate v2\0" ‖ TBS`; the lengths are fixed; the v1 and v2 contexts differ |
+| CA algorithm confusion (a v2 certificate checked with a v1 pin or the reverse; a reserved `sig_alg`) | the pin carries the algorithm; `ca_fp` covers `sig_alg` and both keys; `0x03`/`0x04` refused (§15.14) |
+| crafted ML-DSA signatures against the verifier (hint encoding, `use_hint`) | Ed25519 verified first; exact pin of `ml-dsa`; ACVP and Wycheproof vectors; differential tests against `libcrux-ml-dsa`; fuzz target `cert_v2_verify`; verify-after-sign in `zt-ca` |
+| a hybrid-bound certificate presented over a classical handshake | `subject_fp_v2` must equal the hybrid fingerprint the handshake authenticated (§15.14) |
 
 ## 16. Out of scope
 

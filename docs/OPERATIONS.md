@@ -398,7 +398,8 @@ The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex
 
 With certificates (§10), `session_established`, `e2e_session_started`, `access_denied` and
 `access_revoked` also have `credential` (`key` or `certificate`) and, for a certificate, `ca`
-(fingerprint of the CA), `serial`, `cert_name` and `not_after`. `authentication_failed` has
+(fingerprint of the CA), `serial`, `cert_name`, `not_after` and `cert_version` (`1`, or `2`
+for a post-quantum certificate, §10.8). `authentication_failed` has
 `reason = certificate` (or `key_revoked`) and `cert_check` with the check that failed (`malformed`,
 `key_mismatch`, `unknown_authority`, `bad_signature`, `serial_revoked`, `not_yet_valid`,
 `expired`, `lifetime_exceeds_authority`, `role_conflict`, `node_out_of_scope`; PROTOCOL §15.4).
@@ -713,7 +714,8 @@ all agents.
    - `--not-before <Unix seconds>` issues a certificate for a future window (scheduled
      maintenance); by default it starts from now.
    - `--log` is mandatory: `zt-ca` appends a line for each certificate (serial,
-     fingerprint, name, start, expiry, scope). It is needed to revoke (§10.5) and to notice
+     fingerprint, name, start, expiry, scope, certificate version `v1`/`v2`, hybrid
+     fingerprint or `-`). It is needed to revoke (§10.5) and to notice
      certificates that the CA did not issue (PROTOCOL §15.11). Keep it with the CA key,
      but in a separate file: `zt-ca` rejects a log that is the key file (same
      file, hard link or copy) or a symbolic link.
@@ -819,6 +821,68 @@ so a certificate that expired before the build cannot become valid again. Key-pi
 are not affected. `After=time-sync.target` waits for synchronisation only when
 `systemd-time-wait-sync.service` is enabled. The CA machine, being offline, must be set by hand before
 every signing session; `zt-ca sign` prints the dates in UTC precisely so that you can check them.
+
+### 10.8 Certificates v2: the post-quantum CA
+
+A v1 CA is an Ed25519 key: a future quantum computer could recover it from the public key
+pinned everywhere and sign certificates for any client. A **v2 CA** is a composite key,
+Ed25519 **and** ML-DSA-65, and its certificates are valid only when both signatures verify
+(PROTOCOL §15.14). Nothing changes for clients: the same `client.toml`, the same key, a
+different certificate file.
+
+**Creating a v2 CA** (on the offline machine, as in §10.1):
+
+```bash
+zt-ca keygen --v2 --out /media/ca/ops-ca.v2.key
+# public_key  = "tcn-ca-pub-v2:<3 968 hex>"
+# fingerprint = SHA256:...        (its Ed25519 half: the name in the audit logs)
+# ca_fp       = TCNCA2:...        (the fingerprint that certificates v2 carry)
+```
+
+The secret file is `tcn-ca-secret-v2:<128 hex>` (both seeds), `0600`; back it up as the v1 one.
+The public key is long (about 4 KB of text): copy it from the `zt-ca` output, never retype
+it. `zt-ca sign --ca <v2 key>` issues certificates v2 (`tcn-client-cert-v2:` files, about
+3.5–7.7 KB), with the same options as §10.3; every certificate is verified after signing with
+the fleet's own verifier before it is written. `zt-ca inspect --cert alice.cert` prints
+`version = 2` and `ca_fp`; with `--ca-key <tcn-ca-pub-v2:…>` it also verifies both
+signatures.
+
+**Rollout** (the rotation of §10.6, with the v2 key as "new"):
+
+1. Upgrade **all** relays and agents to a release that knows certificates v2 (PQ-AUTH) and
+   check that they run it. An older relay or agent refuses `tcn-ca-pub-v2:` keys at load
+   time, so the next step fails loudly there instead of locking clients out.
+2. `zt-ca keygen --v2` as above.
+3. On all relays and agents, pin both keys in the CA's entry and reload:
+
+   ```toml
+   [[authorities]]
+   name = "ops-ca"
+   public_keys = ["tcn-ca-pub-v2:<…>", "<v1 key>"]
+   allow = ["web-01", "web-02"]
+   ```
+
+   `authorities_in_use` shows both fingerprints and `ca_rotation_pending` reminds you every
+   hour. v1 and v2 certificates are both accepted.
+4. Sign only with the v2 key from here on. `session_established` and `e2e_session_started`
+   carry `cert_version`: count the `cert_version = 1` sessions to see who still uses a v1
+   certificate.
+5. Once `max_lifetime` has passed since the last v1 certificate (see the CA log, column
+   `v1`), pin only the v2 key (`public_key = "tcn-ca-pub-v2:<…>"`) and reload. From then on
+   a v1 certificate is refused with `unknown_authority`. Archive or destroy the v1 key.
+
+There is no automatic downgrade: a relay or agent accepts a v1 certificate only while a v1
+key is pinned in that CA's entry. The two keys of an entry must be different CAs: a v2 key
+built on the same Ed25519 key as the v1 one is a load error.
+
+**Rollback**: until step 5 nothing is lost: sign v1 certificates again with the v1 key,
+still pinned. After step 5, pin the v1 key again next to the v2 one (step 3) and reload; v2
+certificates already issued stay valid.
+
+**Sizes and cost**: a message 1 with a v2 certificate is about 3.6–7.8 KB (8.9 KB at most
+under the hybrid suite), well within the relay's pre-authentication cap, which follows the
+largest certificate. Verifying a v2 certificate costs one Ed25519 and one ML-DSA-65
+verification, only after the cheap checks (binding, pinned CA).
 
 ## 11. SSH key exchange: post-quantum today
 
