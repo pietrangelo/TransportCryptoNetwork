@@ -690,3 +690,124 @@ fn a_too_short_watchdog_is_a_configuration_error() {
     assert_eq!(out.status.code(), Some(EX_CONFIG), "{}", text(&out));
     assert!(text(&out).contains("WatchdogSec"), "{}", text(&out));
 }
+
+// ---------------------------------------------------------------------------------------------
+// R-5: the metrics textfile and `status` (resilience.md §5.5, review 0007 AP-21)
+// ---------------------------------------------------------------------------------------------
+
+/// Waits until `path` holds a line that starts with `prefix`, and returns the file.
+fn wait_metric(path: &Path, prefix: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && text.lines().any(|l| l.starts_with(prefix))
+        {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {prefix} in {}: {:?}",
+            path.display(),
+            std::fs::read_to_string(path)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// TCP sockets of `pid` in the `LISTEN` state (AP-21: no new listening socket).
+fn listening_sockets(pid: u32) -> usize {
+    let inodes: std::collections::HashSet<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter_map(|t| {
+            let t = t.to_string_lossy().into_owned();
+            Some(t.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+        })
+        .collect();
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|t| t.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
+        .filter(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() > 9 && f[3] == "0A" && inodes.contains(f[9])
+        })
+        .count()
+}
+
+fn status(path: &Path) -> std::process::Output {
+    Command::new(BIN)
+        .args(["status", "--metrics-file"])
+        .arg(path)
+        .output()
+        .unwrap()
+}
+
+/// R5-M5: `run --metrics-file` writes the textfile at the interval, the generation follows a
+/// reload, `status` reads it, and the relay still listens on its one port only.
+#[test]
+fn the_relay_writes_its_metrics_and_status_reads_them() {
+    let dir = setup("metrics");
+    std::fs::create_dir_all(dir.0.join("textfile")).unwrap();
+    let path = dir.0.join("textfile/zt-relay.prom");
+    let p = path.display().to_string();
+    let relay = Running::start(&dir, &["--metrics-file", &p, "--metrics-interval", "1"]);
+    let text = wait_metric(&path, "tcn_config_generation 1");
+    assert!(
+        text.contains("tcn_build_info{role=\"relay\",version=\""),
+        "{text}"
+    );
+    relay.signal("-HUP");
+    relay.event("policy_reloaded");
+    wait_metric(&path, "tcn_config_generation 2");
+    let out = status(&path);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("role: relay"), "{stdout}");
+    assert!(stdout.contains("tcn_config_generation 2"), "{stdout}");
+    assert_eq!(listening_sockets(relay.child.id()), 1);
+}
+
+/// Without `--metrics-file`, the metrics go to the runtime directory (0700, readable by root
+/// for `status`), never to an implicit public path.
+#[test]
+fn metrics_default_to_the_runtime_directory() {
+    let dir = setup("metrics-default");
+    let _relay = Running::start(&dir, &["--metrics-interval", "1"]);
+    wait_metric(&dir.0.join("run/metrics.prom"), "tcn_build_info");
+}
+
+/// `status` exits 1 on a missing file and 2 on a stale one.
+#[test]
+fn status_fails_on_a_missing_or_stale_file() {
+    let dir = setup("metrics-stale");
+    let out = status(&dir.0.join("nope.prom"));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let path = dir.0.join("old.prom");
+    std::fs::write(
+        &path,
+        "tcn_build_info{role=\"relay\",version=\"0\"} 1\n\
+         tcn_metrics_interval_seconds 15\n\
+         tcn_metrics_last_write_timestamp_seconds 1000\n",
+    )
+    .unwrap();
+    let out = status(&path);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("stale"),
+        "{out:?}"
+    );
+}
+
+/// An interval of zero or over an hour is a configuration error.
+#[test]
+fn an_invalid_metrics_interval_is_refused() {
+    let dir = setup("metrics-bad");
+    for bad in ["0", "3601"] {
+        let out = command(&dir, "run")
+            .args(["--metrics-interval", bad])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad}: {out:?}");
+    }
+}

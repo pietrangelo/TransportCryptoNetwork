@@ -223,3 +223,62 @@ fn a_missing_key_is_restarted_not_ex_config() {
         assert_eq!(out.status.code(), Some(1), "{sub}: {}", text(&out));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// R-5: the metrics textfile and `status` (resilience.md §5.5, review 0007 AP-21)
+// ---------------------------------------------------------------------------------------------
+
+/// TCP sockets of `pid` in the `LISTEN` state.
+fn listening_sockets(pid: u32) -> usize {
+    let inodes: std::collections::HashSet<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter_map(|t| {
+            let t = t.to_string_lossy().into_owned();
+            Some(t.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+        })
+        .collect();
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|t| t.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
+        .filter(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() > 9 && f.get(3) == Some(&"0A") && f.get(9).is_some_and(|i| inodes.contains(*i))
+        })
+        .count()
+}
+
+/// R5-M5 and AP-21: the agent writes its metrics textfile, `status` reads it, and the agent
+/// still has no listening socket at all.
+#[test]
+fn the_agent_writes_its_metrics_and_never_listens() {
+    let dir = setup("metrics");
+    let path = dir.0.join("run/agent.prom");
+    let p = path.display().to_string();
+    let agent = Running::start(&dir, &["--metrics-file", &p, "--metrics-interval", "1"]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.contains("tcn_agent_relay_session_failures_total{relay=\"0\"} ")
+            && !text.contains("tcn_agent_relay_session_failures_total{relay=\"0\"} 0\n")
+        {
+            break text;
+        }
+        assert!(std::time::Instant::now() < deadline, "no failure counted");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(text.contains("tcn_agent_relay_up{relay=\"0\"} 0"), "{text}");
+    assert!(text.contains("tcn_build_info{role=\"agent\""), "{text}");
+    let out = Command::new(BIN)
+        .args(["status", "--metrics-file", &p])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text_of(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("role: agent"));
+    assert_eq!(listening_sockets(agent.child.id()), 0);
+}
+
+fn text_of(out: &std::process::Output) -> String {
+    text(out)
+}
