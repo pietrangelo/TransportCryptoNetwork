@@ -94,17 +94,24 @@ async fn a_client_that_sends_no_frame_is_closed_at_the_first_frame_deadline() {
 /// established sessions, and new handshakes are admitted again once it drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_preauth_pool_does_not_disturb_established_sessions() {
-    let (lab, client) = lab(with_admission(|a| a.max_preauth = 2)).await;
+    // One source can hold at most half the pool (finding A8-1): two sources fill it.
+    let (lab, client) = lab(with_admission(|a| {
+        a.max_preauth = 2;
+        a.max_pending_per_source = 1;
+        a.max_pending_per_wide = 1;
+    }))
+    .await;
     let (mut app, _task) = lab.session(&client, None).await.unwrap();
-    // Two silent TCP connections fill the pre-authentication pool.
+    // Two silent TCP connections from two addresses fill the pre-authentication pool.
     let mut idle = Vec::new();
-    for _ in 0..2 {
-        idle.push(TcpStream::connect(lab.relays[0].addr).await.unwrap());
+    for host in [2, 3] {
+        idle.push(common::connect_from(lab.relays[0].addr, host).await);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     common::assert_alive(&mut app).await;
-    // A third handshake finds the pool full and is dropped without a reply.
-    let mut third = TcpStream::connect(lab.relays[0].addr).await.unwrap();
+    // A third handshake, from a third address, finds the pool full and is dropped without a
+    // reply.
+    let mut third = common::connect_from(lab.relays[0].addr, 4).await;
     let mut buf = [0_u8; 1];
     let read = tokio::time::timeout(Duration::from_secs(1), third.read(&mut buf)).await;
     assert!(

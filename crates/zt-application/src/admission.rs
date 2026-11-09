@@ -1,6 +1,8 @@
-//! Admission of relay connections (R-1, PROTOCOL §10.1): pre-authentication pool, per-source
-//! budget refunded only after key confirmation, established pool, per-identity concurrency
-//! and aggregated pre-authentication logging.
+//! Admission of relay connections (R-1, PROTOCOL §10.1): pre-authentication pool with
+//! per-source and per-/48 concurrency caps, per-source budget refunded only after key
+//! confirmation (and at most at the identity's refund rate), established pool with a share
+//! reserved for agents, per-identity concurrency, aggregated pre-authentication logging and
+//! per-identity rate limiting of the audit lines about known identities.
 //!
 //! ```text
 //! accept ──(per-source token, pre-auth slot)──▶ pending ──first authentic frame──▶ established
@@ -15,12 +17,21 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use zt_domain::{AccessPolicy, AuthFailureReason, CertRejection, Fingerprint};
+use zt_domain::{
+    AccessPolicy, AuthFailureReason, CertRejection, Fingerprint, HandshakeSuite, InitiatorRole,
+};
 
-use crate::ratelimit::{HandshakeGate, source_key};
+use crate::ratelimit::{HandshakeGate, KeyedRateLimiter, source_key, wide_source_key};
 
 /// The shortest accepted `msg1_deadline` (finding AP-20).
 pub const MIN_MSG1_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The fastest accepted `source_refill` (finding AP-16: the unauthenticated refill is not
+/// loosened; finding A8-8: enforced, not only documented).
+pub const MIN_SOURCE_REFILL: Duration = Duration::from_secs(3);
+
+/// The most `agent_reserve_percent` may be.
+pub const MAX_AGENT_RESERVE_PERCENT: u8 = 50;
 
 /// Admission limits of a relay. The defaults are documented in PROTOCOL §10.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +60,20 @@ pub struct AdmissionConfig {
     pub handshake_timeout: Duration,
     /// Time from message 2 to the first authentic transport frame (key confirmation).
     pub first_frame_deadline: Duration,
-    /// Interval of the aggregated `preauth_summary` audit event.
+    /// Interval of the aggregated `preauth_summary` audit event, and of the per-identity
+    /// rate limit of audit lines (finding A8-2).
     pub summary_interval: Duration,
+    /// Unconfirmed handshakes in flight at once per IPv4 address or IPv6 /64 (finding A8-1).
+    pub max_pending_per_source: usize,
+    /// Unconfirmed handshakes in flight at once per IPv6 /48, all its /64s together
+    /// (finding A8-1).
+    pub max_pending_per_wide: usize,
+    /// Refunds of the source token per identity in a burst (finding A8-3).
+    pub identity_refund_burst: u32,
+    /// One more refund per identity every `identity_refund_refill`.
+    pub identity_refund_refill: Duration,
+    /// Percentage of `max_established` that only agents may use (finding A8-5).
+    pub agent_reserve_percent: u8,
 }
 
 impl Default for AdmissionConfig {
@@ -69,6 +92,11 @@ impl Default for AdmissionConfig {
             handshake_timeout: Duration::from_secs(10),
             first_frame_deadline: Duration::from_secs(5),
             summary_interval: Duration::from_secs(10),
+            max_pending_per_source: 50,
+            max_pending_per_wide: 100,
+            identity_refund_burst: 512,
+            identity_refund_refill: Duration::from_millis(100),
+            agent_reserve_percent: 10,
         }
     }
 }
@@ -85,6 +113,13 @@ pub enum AdmissionConfigError {
     Msg1DeadlineTooShort,
     /// `msg1_deadline` after `handshake_timeout`.
     Msg1DeadlineAfterHandshake,
+    /// `source_refill` faster than [`MIN_SOURCE_REFILL`].
+    SourceRefillTooFast,
+    /// `max_per_identity` over `max_established`.
+    PerIdentityAbovePool,
+    /// `max_pending_per_source` over `max_pending_per_wide`, or `max_pending_per_wide` over
+    /// half of `max_preauth`: one source or one /48 could take most of the pool.
+    PendingCapsInconsistent,
 }
 
 impl core::fmt::Display for AdmissionConfigError {
@@ -122,14 +157,26 @@ impl AdmissionConfig {
             ("max_per_identity", self.max_per_identity, MAX_PER_IDENTITY),
             ("max_tracked_sources", self.max_tracked_sources, MAX_POOL),
             ("max_tracked_wide", self.max_tracked_wide, MAX_POOL),
+            (
+                "max_pending_per_source",
+                self.max_pending_per_source,
+                MAX_POOL,
+            ),
+            ("max_pending_per_wide", self.max_pending_per_wide, MAX_POOL),
         ];
         let bursts = [
             ("source_burst", self.source_burst),
             ("wide_burst", self.wide_burst),
+            ("identity_refund_burst", self.identity_refund_burst),
         ];
         let durations = [
             ("source_refill", self.source_refill, MAX_REFILL),
             ("wide_refill", self.wide_refill, MAX_REFILL),
+            (
+                "identity_refund_refill",
+                self.identity_refund_refill,
+                MAX_REFILL,
+            ),
             ("msg1_deadline", self.msg1_deadline, MAX_DURATION),
             ("handshake_timeout", self.handshake_timeout, MAX_DURATION),
             (
@@ -173,13 +220,35 @@ impl AdmissionConfig {
                 return Err(TooLarge(name));
             }
         }
+        if self.agent_reserve_percent > MAX_AGENT_RESERVE_PERCENT {
+            return Err(TooLarge("agent_reserve_percent"));
+        }
         if self.msg1_deadline < MIN_MSG1_DEADLINE {
             return Err(AdmissionConfigError::Msg1DeadlineTooShort);
         }
         if self.msg1_deadline > self.handshake_timeout {
             return Err(AdmissionConfigError::Msg1DeadlineAfterHandshake);
         }
+        if self.source_refill < MIN_SOURCE_REFILL {
+            return Err(AdmissionConfigError::SourceRefillTooFast);
+        }
+        if self.max_per_identity > self.max_established {
+            return Err(AdmissionConfigError::PerIdentityAbovePool);
+        }
+        if self.max_pending_per_source > self.max_pending_per_wide
+            || self.max_pending_per_wide > self.max_preauth / 2
+        {
+            return Err(AdmissionConfigError::PendingCapsInconsistent);
+        }
         Ok(())
+    }
+
+    /// Established slots that only agents may use (finding A8-5).
+    #[must_use]
+    pub fn agent_reserve(&self) -> usize {
+        self.max_established
+            .saturating_mul(usize::from(self.agent_reserve_percent))
+            / 100
     }
 }
 
@@ -188,13 +257,15 @@ impl AdmissionConfig {
 pub struct Ticket(u64);
 
 /// Why a connection was not admitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Refusal {
     /// The pre-authentication pool is full.
     PreauthPoolFull,
     /// The source used up its budget of unconfirmed handshakes.
     SourceRateLimited,
+    /// The source (or its IPv6 /48) already has its maximum of handshakes in flight.
+    SourceConcurrencyLimit,
     /// The established pool is full.
     EstablishedPoolFull,
     /// The identity already has `max_per_identity` confirmed connections.
@@ -203,12 +274,29 @@ pub enum Refusal {
     UnknownTicket,
 }
 
+impl Refusal {
+    /// Stable name, the `reason` of `admission_refused`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreauthPoolFull => "preauth_pool_full",
+            Self::SourceRateLimited => "rate_limited",
+            Self::SourceConcurrencyLimit => "source_limit",
+            Self::EstablishedPoolFull => "established_pool_full",
+            Self::IdentityLimit => "identity_limit",
+            Self::UnknownTicket => "unknown_ticket",
+        }
+    }
+}
+
 /// A pre-authentication failure, counted in the aggregated summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum PreauthFailure {
     /// Per-source budget used up.
     RateLimited,
+    /// Per-source or per-/48 concurrency cap of unconfirmed handshakes reached.
+    SourceLimit,
     /// Pre-authentication pool full.
     PreauthPoolFull,
     /// Established pool full at key confirmation.
@@ -217,10 +305,11 @@ pub enum PreauthFailure {
     IdentityLimit,
     /// Message 1 invalid for every accepted suite and key.
     HandshakeFailed,
-    /// Message 1 not complete within `msg1_deadline`, or the handshake not within
-    /// `handshake_timeout`.
+    /// Message 1 not complete within `msg1_deadline`, or message 2 not sent within
+    /// `handshake_timeout` or the write timeout.
     Timeout,
-    /// A length prefix over the largest legitimate message 1.
+    /// A length prefix over the largest legitimate message 1, or, before key confirmation,
+    /// over the largest legitimate first transport frame.
     Oversized,
     /// A valid message 1 from a key the configuration does not know.
     UnknownPeer,
@@ -229,7 +318,7 @@ pub enum PreauthFailure {
     /// Message 2 sent, but no authentic transport frame followed (for example a replayed
     /// message 1).
     Unconfirmed,
-    /// Closed before message 1 was complete.
+    /// Closed, or an I/O error, before message 1 was complete or while message 2 was sent.
     Aborted,
 }
 
@@ -239,6 +328,7 @@ impl PreauthFailure {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RateLimited => "rate_limited",
+            Self::SourceLimit => "source_limit",
             Self::PreauthPoolFull => "preauth_pool_full",
             Self::EstablishedPoolFull => "established_pool_full",
             Self::IdentityLimit => "identity_limit",
@@ -265,10 +355,55 @@ pub struct PreauthSummary {
     pub distinct_keys: usize,
     /// `true` if a distinct count reached [`MAX_DISTINCT`] (the real value is larger).
     pub saturated: bool,
+    /// The audit events about known identities that were not logged in full in the interval
+    /// (finding A8-2): one entry per identity and event, at most [`MAX_LOGGED_IDENTITIES`].
+    pub repeated: Vec<RepeatedEvent>,
+    /// Audit events about identities beyond [`MAX_LOGGED_IDENTITIES`] in the interval: only
+    /// counted.
+    pub suppressed_identities: u64,
+}
+
+impl PreauthSummary {
+    /// `true` if there are pre-authentication failures to report (the `preauth_summary`
+    /// line), as opposed to only repeated identity events.
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        !self.counts.is_empty() || self.suppressed_identities > 0
+    }
 }
 
 /// The most distinct sources or keys a summary counts.
 pub const MAX_DISTINCT: usize = 4_096;
+
+/// The most identities whose audit events are logged per interval (finding A8-2): at most
+/// two lines (the first event in full, then a `_repeated` count) for each, per interval.
+pub const MAX_LOGGED_IDENTITIES: usize = 256;
+
+/// An audit event about an identity the configuration knows (finding AP-3), logged in full
+/// once per identity and interval, then counted (finding A8-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IdentityEvent {
+    /// `authentication_failed` (for example a revoked key or an expired certificate, which a
+    /// replayed message 1 can produce at will).
+    AuthenticationFailed(AuthFailureReason),
+    /// `handshake_suite_rejected`: the suite is not accepted for the identity's role.
+    SuiteRejected(HandshakeSuite),
+    /// `admission_refused`: a confirmed identity refused at its concurrency limit or because
+    /// the established pool is full (finding A8-10).
+    AdmissionRefused(Refusal),
+}
+
+/// The events about one identity that were counted instead of logged in an interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatedEvent {
+    /// The identity.
+    pub peer: Fingerprint,
+    /// The event.
+    pub event: IdentityEvent,
+    /// How many times it happened after the logged one.
+    pub count: u64,
+}
 
 /// The admission state of a relay. See the module documentation.
 #[derive(Debug)]
@@ -278,9 +413,17 @@ pub struct Admission {
     next_ticket: u64,
     /// Unconfirmed connections and their source (needed for the refund).
     pending: HashMap<Ticket, IpAddr>,
-    /// Confirmed connections and their identity.
-    established: HashMap<Ticket, Fingerprint>,
+    /// Unconfirmed connections per source (finding A8-1).
+    pending_per_source: HashMap<[u8; 9], usize>,
+    /// Unconfirmed connections per IPv6 /48 (finding A8-1).
+    pending_per_wide: HashMap<[u8; 7], usize>,
+    /// Confirmed connections, their identity and role.
+    established: HashMap<Ticket, (Fingerprint, InitiatorRole)>,
+    /// Confirmed client connections (finding A8-5).
+    established_clients: usize,
     per_identity: HashMap<Fingerprint, usize>,
+    /// Refunds per identity (finding A8-3).
+    refunds: KeyedRateLimiter<Fingerprint>,
     interval: Interval,
 }
 
@@ -292,6 +435,9 @@ struct Interval {
     sources: HashSet<[u8; 9]>,
     keys: HashSet<Fingerprint>,
     saturated: bool,
+    /// Identity events of the interval: how many after the first, which was logged.
+    identities: HashMap<(Fingerprint, IdentityEvent), u64>,
+    suppressed_identities: u64,
 }
 
 impl Interval {
@@ -302,7 +448,24 @@ impl Interval {
             sources: HashSet::new(),
             keys: HashSet::new(),
             saturated: false,
+            identities: HashMap::new(),
+            suppressed_identities: 0,
         }
+    }
+}
+
+/// Adds one to (`up`) or takes one from the counter of `key`; a counter at zero is removed.
+fn bump<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: K, up: bool) {
+    let n = map.get(&key).copied().unwrap_or(0);
+    let n = if up {
+        n.saturating_add(1)
+    } else {
+        n.saturating_sub(1)
+    };
+    if n == 0 {
+        map.remove(&key);
+    } else {
+        map.insert(key, n);
     }
 }
 
@@ -329,13 +492,22 @@ impl Admission {
             config.wide_refill,
             config.max_tracked_wide,
         );
+        let refunds = KeyedRateLimiter::new(
+            config.max_tracked_sources,
+            config.identity_refund_burst,
+            config.identity_refund_refill,
+        );
         Self {
             config,
             gate,
             next_ticket: 0,
             pending: HashMap::new(),
+            pending_per_source: HashMap::new(),
+            pending_per_wide: HashMap::new(),
             established: HashMap::new(),
+            established_clients: 0,
             per_identity: HashMap::new(),
+            refunds,
             interval: Interval::new(now),
         }
     }
@@ -350,12 +522,25 @@ impl Admission {
     /// the source's budget. A refusal is counted in the summary.
     ///
     /// # Errors
-    /// [`Refusal::PreauthPoolFull`] or [`Refusal::SourceRateLimited`]. The pool is checked
-    /// first, so a full pool does not spend the source's tokens.
+    /// [`Refusal::PreauthPoolFull`], [`Refusal::SourceConcurrencyLimit`] or
+    /// [`Refusal::SourceRateLimited`]. The pool and the concurrency caps are checked first, so
+    /// a refusal for them does not spend the source's tokens.
     pub fn on_accept(&mut self, source: IpAddr, now: Instant) -> Result<Ticket, Refusal> {
         if self.pending.len() >= self.config.max_preauth {
             self.record(PreauthFailure::PreauthPoolFull, source, None);
             return Err(Refusal::PreauthPoolFull);
+        }
+        let narrow = source_key(source);
+        let wide = wide_source_key(source);
+        let narrow_held = self.pending_per_source.get(&narrow).copied().unwrap_or(0);
+        let wide_held = wide
+            .and_then(|w| self.pending_per_wide.get(&w).copied())
+            .unwrap_or(0);
+        if narrow_held >= self.config.max_pending_per_source
+            || wide_held >= self.config.max_pending_per_wide
+        {
+            self.record(PreauthFailure::SourceLimit, source, None);
+            return Err(Refusal::SourceConcurrencyLimit);
         }
         if !self.gate.admit(source, now) {
             self.record(PreauthFailure::RateLimited, source, None);
@@ -364,13 +549,32 @@ impl Admission {
         let ticket = Ticket(self.next_ticket);
         self.next_ticket = self.next_ticket.wrapping_add(1);
         self.pending.insert(ticket, source);
+        bump(&mut self.pending_per_source, narrow, true);
+        if let Some(wide) = wide {
+            bump(&mut self.pending_per_wide, wide, true);
+        }
         Ok(ticket)
     }
 
-    /// Key confirmation of `ticket` by `peer`: the first authentic transport frame arrived.
-    /// The connection moves to the established pool, the identity is charged and the source's
-    /// token is given back (finding AP-1). A refusal ends the pre-authentication of the
-    /// ticket without a refund: the caller closes the connection.
+    /// Removes `ticket` from the pending set and its per-source counters.
+    fn take_pending(&mut self, ticket: Ticket) -> Option<IpAddr> {
+        let source = self.pending.remove(&ticket)?;
+        bump(&mut self.pending_per_source, source_key(source), false);
+        if let Some(wide) = wide_source_key(source) {
+            bump(&mut self.pending_per_wide, wide, false);
+        }
+        Some(source)
+    }
+
+    /// Key confirmation of `ticket` by `peer` in `role`: the first authentic transport frame
+    /// arrived. The connection moves to the established pool and the identity is charged. The
+    /// source's token is given back (finding AP-1) if the identity still has refunds
+    /// (finding A8-3); otherwise the confirmation succeeds and the token stays spent. A
+    /// refusal ends the pre-authentication of the ticket without a refund: the caller closes
+    /// the connection.
+    ///
+    /// Clients may use the established pool up to `max_established` minus the agents'
+    /// reserve; agents may use all of it (finding A8-5).
     ///
     /// # Errors
     /// [`Refusal::UnknownTicket`] if `ticket` is not pending (already confirmed or released),
@@ -379,10 +583,22 @@ impl Admission {
         &mut self,
         ticket: Ticket,
         peer: Fingerprint,
+        role: InitiatorRole,
         now: Instant,
     ) -> Result<(), Refusal> {
-        let source = self.pending.remove(&ticket).ok_or(Refusal::UnknownTicket)?;
-        if self.established.len() >= self.config.max_established {
+        let source = self.take_pending(ticket).ok_or(Refusal::UnknownTicket)?;
+        let client_limit = self
+            .config
+            .max_established
+            .saturating_sub(self.config.agent_reserve());
+        let full = match role {
+            InitiatorRole::Agent => self.established.len() >= self.config.max_established,
+            InitiatorRole::Client => {
+                self.established.len() >= self.config.max_established
+                    || self.established_clients >= client_limit
+            }
+        };
+        if full {
             self.record(PreauthFailure::EstablishedPoolFull, source, None);
             return Err(Refusal::EstablishedPoolFull);
         }
@@ -392,27 +608,85 @@ impl Admission {
             return Err(Refusal::IdentityLimit);
         }
         self.per_identity.insert(peer, held.saturating_add(1));
-        self.established.insert(ticket, peer);
-        self.gate.refund(source, now);
+        self.established.insert(ticket, (peer, role));
+        if role == InitiatorRole::Client {
+            self.established_clients = self.established_clients.saturating_add(1);
+        }
+        if self.refunds.check(&peer, now) {
+            self.gate.refund(source, now);
+        }
         Ok(())
     }
 
     /// The connection of `ticket` closed. Releasing an unknown ticket, or twice, does nothing.
     pub fn release(&mut self, ticket: Ticket) {
-        if self.pending.remove(&ticket).is_some() {
+        if self.take_pending(ticket).is_some() {
             return;
         }
-        let Some(peer) = self.established.remove(&ticket) else {
+        let Some((peer, role)) = self.established.remove(&ticket) else {
             return;
         };
-        match self.per_identity.get(&peer).copied() {
-            Some(n) if n > 1 => {
-                self.per_identity.insert(peer, n.saturating_sub(1));
-            }
-            _ => {
-                self.per_identity.remove(&peer);
+        if role == InitiatorRole::Client {
+            self.established_clients = self.established_clients.saturating_sub(1);
+        }
+        bump(&mut self.per_identity, peer, false);
+    }
+
+    /// Checks the bookkeeping (for property tests and fuzzing, finding A8-7): the per-source,
+    /// per-/48, per-identity and per-role counters match the pending and established sets,
+    /// and no limit is exceeded.
+    ///
+    /// # Errors
+    /// The name of the first broken invariant.
+    pub fn check_invariants(&self) -> Result<(), &'static str> {
+        let c = &self.config;
+        if self.pending.len() > c.max_preauth {
+            return Err("preauth pool over max_preauth");
+        }
+        if self.established.len() > c.max_established {
+            return Err("established pool over max_established");
+        }
+        if self
+            .pending
+            .keys()
+            .any(|t| self.established.contains_key(t))
+        {
+            return Err("a ticket both pending and established");
+        }
+        let mut per_source: HashMap<[u8; 9], usize> = HashMap::new();
+        let mut per_wide: HashMap<[u8; 7], usize> = HashMap::new();
+        for source in self.pending.values() {
+            bump(&mut per_source, source_key(*source), true);
+            if let Some(wide) = wide_source_key(*source) {
+                bump(&mut per_wide, wide, true);
             }
         }
+        if per_source != self.pending_per_source || per_wide != self.pending_per_wide {
+            return Err("per-source counters do not match the pending set");
+        }
+        if per_source.values().any(|n| *n > c.max_pending_per_source)
+            || per_wide.values().any(|n| *n > c.max_pending_per_wide)
+        {
+            return Err("a source over its concurrency cap");
+        }
+        let mut per_identity: HashMap<Fingerprint, usize> = HashMap::new();
+        let mut clients = 0_usize;
+        for (peer, role) in self.established.values() {
+            bump(&mut per_identity, *peer, true);
+            if *role == InitiatorRole::Client {
+                clients = clients.saturating_add(1);
+            }
+        }
+        if per_identity != self.per_identity || clients != self.established_clients {
+            return Err("per-identity or per-role counters do not match the established set");
+        }
+        if per_identity.values().any(|n| *n > c.max_per_identity) {
+            return Err("an identity over max_per_identity");
+        }
+        if clients > c.max_established.saturating_sub(c.agent_reserve()) {
+            return Err("clients inside the agents' reserve");
+        }
+        Ok(())
     }
 
     /// Connections in the pre-authentication pool.
@@ -449,8 +723,28 @@ impl Admission {
         }
     }
 
-    /// The summary of the interval that ended, if it had failures. An interval ends
-    /// `summary_interval` after it started; the next one starts at `now`.
+    /// An audit event about a known identity (finding A8-2): `true` if the caller should log
+    /// it in full now, which is the case for the first such event of the identity in the
+    /// interval. The others are counted and reported in [`PreauthSummary::repeated`]; events
+    /// beyond [`MAX_LOGGED_IDENTITIES`] identities only in
+    /// [`PreauthSummary::suppressed_identities`].
+    pub fn note_identity_event(&mut self, peer: Fingerprint, event: IdentityEvent) -> bool {
+        let interval = &mut self.interval;
+        if let Some(count) = interval.identities.get_mut(&(peer, event)) {
+            *count = count.saturating_add(1);
+            return false;
+        }
+        if interval.identities.len() >= MAX_LOGGED_IDENTITIES {
+            interval.suppressed_identities = interval.suppressed_identities.saturating_add(1);
+            return false;
+        }
+        interval.identities.insert((peer, event), 0);
+        true
+    }
+
+    /// The summary of the interval that ended, if it had failures or repeated identity
+    /// events. An interval ends `summary_interval` after it started; the next one starts at
+    /// `now`.
     pub fn poll_summary(&mut self, now: Instant) -> Option<PreauthSummary> {
         let end = self
             .interval
@@ -460,7 +754,17 @@ impl Admission {
             return None;
         }
         let ended = core::mem::replace(&mut self.interval, Interval::new(now));
-        if ended.counts.is_empty() {
+        let repeated: Vec<RepeatedEvent> = ended
+            .identities
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|((peer, event), count)| RepeatedEvent {
+                peer: *peer,
+                event: *event,
+                count: *count,
+            })
+            .collect();
+        if ended.counts.is_empty() && repeated.is_empty() && ended.suppressed_identities == 0 {
             return None;
         }
         let saturated = ended.saturated
@@ -471,6 +775,8 @@ impl Admission {
             distinct_sources: ended.sources.len(),
             distinct_keys: ended.keys.len(),
             saturated,
+            repeated,
+            suppressed_identities: ended.suppressed_identities,
         })
     }
 }

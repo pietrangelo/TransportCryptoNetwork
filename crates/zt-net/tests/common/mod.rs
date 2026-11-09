@@ -102,6 +102,19 @@ pub fn raw_msg1(seed: [u8; 32], responder: &PublicKey, ch: Channel, payload: &[u
 
 /// Sends a raw `msg1` to the relay (2-byte big-endian length, like the codec) and returns
 /// message 2, if it arrives. `None`: the relay closed without replying.
+/// A TCP connection to `relay` from the loopback address `127.0.0.<host>`, for tests that need
+/// several sources.
+pub async fn connect_from(relay: SocketAddr, host: u8) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, host)),
+            0,
+        ))
+        .unwrap();
+    socket.connect(relay).await.unwrap()
+}
+
 pub async fn probe_relay(relay: SocketAddr, msg1: &[u8]) -> Option<Vec<u8>> {
     let mut tcp = TcpStream::connect(relay).await.unwrap();
     let len = u16::try_from(msg1.len()).unwrap().to_be_bytes();

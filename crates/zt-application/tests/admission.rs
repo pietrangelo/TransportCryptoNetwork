@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use zt_application::admission::{
     Admission, AdmissionConfig, AdmissionConfigError, MIN_MSG1_DEADLINE, PreauthFailure, Refusal,
 };
-use zt_domain::Fingerprint;
+use zt_domain::{Fingerprint, InitiatorRole};
 
 fn ip(n: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(192, 0, 2, n))
@@ -69,7 +69,8 @@ fn a_connection_moves_from_the_preauth_pool_to_the_established_pool_at_confirmat
     let mut a = Admission::new(small(), t0);
     let ticket = a.on_accept(ip(1), t0).unwrap();
     assert_eq!((a.preauth_count(), a.established_count()), (1, 0));
-    a.on_confirmed(ticket, key(1), t0).unwrap();
+    a.on_confirmed(ticket, key(1), InitiatorRole::Client, t0)
+        .unwrap();
     assert_eq!((a.preauth_count(), a.established_count()), (0, 1));
     assert_eq!(a.identity_count(&key(1)), 1);
     a.release(ticket);
@@ -107,7 +108,8 @@ fn authenticated_bursts_from_one_ip_are_not_throttled() {
             .map(|_| a.on_accept(ip(10), now).expect("fork admitted"))
             .collect();
         for t in tickets {
-            a.on_confirmed(t, controller, now).expect("fork confirmed");
+            a.on_confirmed(t, controller, InitiatorRole::Client, now)
+                .expect("fork confirmed");
             confirmed.push(t);
         }
     }
@@ -143,21 +145,28 @@ fn an_identity_is_limited_in_concurrency_not_in_rate() {
     let mut held = Vec::new();
     for n in 0..4 {
         let t = a.on_accept(ip(n), t0).unwrap();
-        a.on_confirmed(t, key(1), t0).unwrap();
+        a.on_confirmed(t, key(1), InitiatorRole::Client, t0)
+            .unwrap();
         held.push(t);
     }
     let fifth = a.on_accept(ip(5), t0).unwrap();
     assert_eq!(
-        a.on_confirmed(fifth, key(1), t0),
+        a.on_confirmed(fifth, key(1), InitiatorRole::Client, t0),
         Err(Refusal::IdentityLimit)
     );
     // Another identity is not affected.
     let other = a.on_accept(ip(6), t0).unwrap();
-    assert!(a.on_confirmed(other, key(2), t0).is_ok());
+    assert!(
+        a.on_confirmed(other, key(2), InitiatorRole::Client, t0)
+            .is_ok()
+    );
     // As soon as one closes, the identity can connect again: no rate, only concurrency.
     a.release(held.pop().unwrap());
     let again = a.on_accept(ip(7), t0).unwrap();
-    assert!(a.on_confirmed(again, key(1), t0).is_ok());
+    assert!(
+        a.on_confirmed(again, key(1), InitiatorRole::Client, t0)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -170,11 +179,12 @@ fn the_established_pool_is_bounded_at_confirmation() {
     let mut a = Admission::new(config, t0);
     for n in 0..2 {
         let t = a.on_accept(ip(n), t0).unwrap();
-        a.on_confirmed(t, key(n), t0).unwrap();
+        a.on_confirmed(t, key(n), InitiatorRole::Client, t0)
+            .unwrap();
     }
     let t = a.on_accept(ip(3), t0).unwrap();
     assert_eq!(
-        a.on_confirmed(t, key(3), t0),
+        a.on_confirmed(t, key(3), InitiatorRole::Client, t0),
         Err(Refusal::EstablishedPoolFull)
     );
     // The refused ticket left the preauth pool too.

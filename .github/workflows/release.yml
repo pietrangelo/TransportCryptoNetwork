@@ -79,6 +79,12 @@ jobs:
       - run: cargo build --release --locked --target "$TARGET" -p zt-relay -p zt-agent -p zt-client -p zt-ca
         env:
           TARGET: ${{ matrix.target }}
+      - name: libcrux portable backend (finding A8-6)
+        # The NEON backend of libcrux-ml-kem is not verified: no libcrux build script of this
+        # build may have enabled `simd128`. Their output is checked, not only the setting.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./.github/scripts/check-libcrux-backend.sh "target/${TARGET}/release/build"
       - name: package
         env:
           TARGET: ${{ matrix.target }}

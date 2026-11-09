@@ -20,7 +20,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, timeout_at};
 use zt_application::admission::{
-    Admission, AdmissionConfig, PreauthFailure, PreauthSummary, Ticket, is_known_identity,
+    Admission, AdmissionConfig, IdentityEvent, PreauthFailure, PreauthSummary, Refusal,
+    RepeatedEvent, Ticket, is_known_identity,
 };
 use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
@@ -28,7 +29,7 @@ use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
     AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
-    InitiatorRole, PeerRole, SessionId, SuitePolicy,
+    InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
 };
 
 use crate::{NetError, Timeouts, channel};
@@ -368,6 +369,7 @@ impl RelayServer {
             client_suites = config.suites.clients.names(),
             "handshake suites in use"
         );
+        admission_limits_in_use(&config.admission);
         let admission = Arc::new(Mutex::new(Admission::new(
             config.admission.clone(),
             std::time::Instant::now(),
@@ -446,11 +448,15 @@ impl Admitted {
         lock(&self.admission).record(failure, self.source, key);
     }
 
-    /// Key confirmation: `true` if the connection may join the established pool.
-    fn confirm(&self, peer: Fingerprint) -> bool {
-        lock(&self.admission)
-            .on_confirmed(self.ticket, peer, std::time::Instant::now())
-            .is_ok()
+    /// Key confirmation: `Ok` if the connection may join the established pool.
+    fn confirm(&self, peer: Fingerprint, role: InitiatorRole) -> Result<(), Refusal> {
+        lock(&self.admission).on_confirmed(self.ticket, peer, role, std::time::Instant::now())
+    }
+
+    /// `true` if an audit event about the known identity `peer` is to be logged in full now
+    /// (finding A8-2); otherwise it is counted for the `_repeated` line of the interval.
+    fn log_identity(&self, peer: Fingerprint, event: IdentityEvent) -> bool {
+        lock(&self.admission).note_identity_event(peer, event)
     }
 }
 
@@ -489,7 +495,90 @@ async fn summaries(admission: std::sync::Weak<Mutex<Admission>>) {
         };
         let summary = lock(&admission).poll_summary(std::time::Instant::now());
         if let Some(summary) = summary {
-            preauth_summary(&summary);
+            if summary.has_failures() {
+                preauth_summary(&summary);
+            }
+            for repeated in &summary.repeated {
+                repeated_line(repeated);
+            }
+        }
+    }
+}
+
+/// The admission limits in force, once at startup (finding A8-8), like
+/// `handshake_suites_in_use`.
+fn admission_limits_in_use(c: &AdmissionConfig) {
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "admission_limits_in_use",
+        max_preauth = c.max_preauth,
+        max_pending_per_source = c.max_pending_per_source,
+        max_pending_per_wide = c.max_pending_per_wide,
+        max_established = c.max_established,
+        agent_reserve_percent = c.agent_reserve_percent,
+        max_per_identity = c.max_per_identity,
+        source_burst = c.source_burst,
+        source_refill_secs = c.source_refill.as_secs(),
+        wide_burst = c.wide_burst,
+        wide_refill_secs = c.wide_refill.as_secs(),
+        identity_refund_burst = c.identity_refund_burst,
+        identity_refund_refill_ms = u64::try_from(c.identity_refund_refill.as_millis())
+            .unwrap_or(u64::MAX),
+        msg1_deadline_secs = c.msg1_deadline.as_secs(),
+        handshake_timeout_secs = c.handshake_timeout.as_secs(),
+        first_frame_deadline_secs = c.first_frame_deadline.as_secs(),
+        summary_interval_secs = c.summary_interval.as_secs(),
+        "admission limits in use"
+    );
+}
+
+/// The `_repeated` line of an identity event (finding A8-2): who, what, and how many times
+/// after the line logged in full during the interval.
+fn repeated_line(r: &RepeatedEvent) {
+    let peer = r.peer.to_string();
+    match r.event {
+        IdentityEvent::AuthenticationFailed(reason) => {
+            let (reason, cert_check) = failure_fields(reason);
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "authentication_failed_repeated",
+                peer = %peer,
+                reason = reason.as_str(),
+                cert_check,
+                count = r.count,
+                "authentication failed, repeated"
+            );
+        }
+        IdentityEvent::SuiteRejected(suite) => {
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "handshake_suite_rejected_repeated",
+                peer = %peer,
+                suite = suite.protocol_name(),
+                count = r.count,
+                "handshake suite rejected, repeated"
+            );
+        }
+        IdentityEvent::AdmissionRefused(refusal) => {
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "admission_refused_repeated",
+                peer = %peer,
+                reason = refusal.as_str(),
+                count = r.count,
+                "admission refused, repeated"
+            );
+        }
+        // `IdentityEvent` is `non_exhaustive`: a new event at least stays readable.
+        other => {
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "identity_event_repeated",
+                peer = %peer,
+                event = ?other,
+                count = r.count,
+                "identity event, repeated"
+            );
         }
     }
 }
@@ -507,6 +596,7 @@ fn preauth_summary(s: &PreauthSummary) {
         target: "zt_audit",
         event_kind = "preauth_summary",
         rate_limited = n(PreauthFailure::RateLimited),
+        source_limit = n(PreauthFailure::SourceLimit),
         preauth_pool_full = n(PreauthFailure::PreauthPoolFull),
         established_pool_full = n(PreauthFailure::EstablishedPoolFull),
         identity_limit = n(PreauthFailure::IdentityLimit),
@@ -520,6 +610,7 @@ fn preauth_summary(s: &PreauthSummary) {
         distinct_sources = s.distinct_sources,
         distinct_keys = s.distinct_keys,
         saturated = s.saturated,
+        suppressed_identities = s.suppressed_identities,
         "pre-authentication failures"
     );
 }
@@ -577,11 +668,14 @@ impl Connection {
             Ok(certificate) => certificate,
             Err((reason, certificate)) => {
                 if is_known_identity(&policy, &peer, reason) {
-                    audit(&DomainEvent::AuthenticationFailed {
-                        peer: Some(peer),
-                        reason,
-                        certificate,
-                    });
+                    // Known, but a recorded message 1 replays it at will (finding A8-2).
+                    if admitted.log_identity(peer, IdentityEvent::AuthenticationFailed(reason)) {
+                        audit(&DomainEvent::AuthenticationFailed {
+                            peer: Some(peer),
+                            reason,
+                            certificate,
+                        });
+                    }
                 } else if matches!(reason, AuthFailureReason::Certificate(_)) {
                     admitted.record(PreauthFailure::UnverifiedCertificate, Some(peer));
                 } else {
@@ -592,33 +686,77 @@ impl Connection {
         };
         // The suite must be accepted for the role, not only for some role (PROTOCOL §7.5).
         let suite = pending.suite();
-        if self
-            .suites
-            .check(initiator_role(&policy, &peer), suite)
-            .is_err()
-        {
-            audit(&DomainEvent::HandshakeSuiteRejected { peer, suite });
+        let role = initiator_role(&policy, &peer);
+        if self.suites.check(role, suite).is_err() {
+            if admitted.log_identity(peer, IdentityEvent::SuiteRejected(suite)) {
+                audit(&DomainEvent::HandshakeSuiteRejected { peer, suite });
+            }
             return None;
         }
-        let Ok(Ok(mut ch)) =
-            timeout_at(handshake_deadline, pending.establish(&self.timeouts)).await
-        else {
-            admitted.record(PreauthFailure::Aborted, None);
-            return None;
+        let mut ch = match timeout_at(handshake_deadline, pending.establish(&self.timeouts)).await {
+            Ok(Ok(ch)) => ch,
+            // Message 2 not written in time is a timeout, not a cut-off (finding A8-10).
+            Ok(Err(NetError::Timeout(_))) | Err(_) => {
+                admitted.record(PreauthFailure::Timeout, None);
+                return None;
+            }
+            Ok(Err(_)) => {
+                admitted.record(PreauthFailure::Aborted, None);
+                return None;
+            }
         };
         // Key confirmation (finding AP-1): message 2 proves nothing about the initiator, whose
-        // message 1 may be a recording. Only an authentic transport frame does.
-        let Ok(Ok(Some(first))) = timeout(self.admission.first_frame_deadline, ch.recv()).await
-        else {
-            admitted.record(PreauthFailure::Unconfirmed, None);
-            return None;
+        // message 1 may be a recording. Only an authentic transport frame does, and until then
+        // the channel buffers no more than the largest legitimate first frame (finding A8-4).
+        let first = match timeout(self.admission.first_frame_deadline, ch.recv()).await {
+            Ok(Ok(Some(first))) => first,
+            Ok(Err(NetError::Oversized)) => {
+                admitted.record(PreauthFailure::Oversized, None);
+                return None;
+            }
+            _ => {
+                admitted.record(PreauthFailure::Unconfirmed, None);
+                return None;
+            }
         };
-        if !admitted.confirm(peer) {
+        if let Err(refusal) = admitted.confirm(peer, role) {
             tracing::debug!(%addr, %peer, "established pool or identity limit reached");
+            self.refuse_confirmed(&mut ch, admitted, peer, refusal, &first)
+                .await;
             return None;
         }
+        ch.confirmed();
         tracing::debug!(%addr, %peer, conn = self.conn.0, "peer connected");
         Some((ch, peer, certificate, first))
+    }
+
+    /// A confirmed identity refused at admission (finding A8-10): one rate-limited audit line
+    /// that names it, and an answer to its `Open` (`Reject RateLimited`, which lets a client
+    /// try the next relay) instead of a bare close.
+    async fn refuse_confirmed(
+        &self,
+        ch: &mut channel::Established<TcpStream>,
+        admitted: &Admitted,
+        peer: Fingerprint,
+        refusal: Refusal,
+        first: &Frame,
+    ) {
+        if admitted.log_identity(peer, IdentityEvent::AdmissionRefused(refusal)) {
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "admission_refused",
+                peer = %peer,
+                reason = refusal.as_str(),
+                "admission refused"
+            );
+        }
+        if let Frame::Open { stream, .. } = first {
+            let reject = Frame::Reject {
+                stream: *stream,
+                reason: RejectReason::RateLimited,
+            };
+            let _ = ch.send(&reject, &self.timeouts).await;
+        }
     }
 
     async fn run(

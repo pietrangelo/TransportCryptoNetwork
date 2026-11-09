@@ -7,6 +7,7 @@
     clippy::panic,
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
     missing_docs
 )]
 
@@ -291,7 +292,7 @@ fn per_event_lines_of_a_known_identity_are_rate_limited() {
     assert_eq!(full, 2, "one full line per identity");
     let summary = a.poll_summary(t0 + Duration::from_secs(10)).unwrap();
     let mut repeated = summary.repeated.clone();
-    repeated.sort_by_key(|r| r.peer);
+    repeated.sort_by_key(|r| *r.peer.as_bytes());
     assert_eq!(repeated.len(), 2);
     assert_eq!(
         (repeated[0].peer, repeated[0].event, repeated[0].count),

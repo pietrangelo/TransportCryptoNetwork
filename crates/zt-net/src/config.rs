@@ -1168,6 +1168,16 @@ struct AdmissionSection {
     msg1_deadline_secs: Option<u64>,
     handshake_timeout_secs: Option<u64>,
     first_frame_deadline_secs: Option<u64>,
+    max_pending_per_source: Option<usize>,
+    max_pending_per_wide: Option<usize>,
+    wide_burst: Option<u32>,
+    wide_refill_secs: Option<u64>,
+    max_tracked_sources: Option<usize>,
+    max_tracked_wide: Option<usize>,
+    identity_refund_burst: Option<u32>,
+    identity_refund_refill_ms: Option<u64>,
+    agent_reserve_percent: Option<u8>,
+    summary_interval_secs: Option<u64>,
 }
 
 /// Parses `relay.toml` (OPERATIONS §4.1). An empty file gives the defaults: the classical
@@ -1180,6 +1190,8 @@ struct AdmissionSection {
 ///
 /// [admission]
 /// max_preauth = 1024
+/// max_pending_per_source = 50
+/// max_pending_per_wide = 100
 /// source_burst = 64
 /// msg1_deadline_secs = 5
 /// ```
@@ -1213,6 +1225,31 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
     admission.first_frame_deadline = a
         .first_frame_deadline_secs
         .map_or(admission.first_frame_deadline, secs);
+    admission.max_pending_per_source = a
+        .max_pending_per_source
+        .unwrap_or(admission.max_pending_per_source);
+    admission.max_pending_per_wide = a
+        .max_pending_per_wide
+        .unwrap_or(admission.max_pending_per_wide);
+    admission.wide_burst = a.wide_burst.unwrap_or(admission.wide_burst);
+    admission.wide_refill = a.wide_refill_secs.map_or(admission.wide_refill, secs);
+    admission.max_tracked_sources = a
+        .max_tracked_sources
+        .unwrap_or(admission.max_tracked_sources);
+    admission.max_tracked_wide = a.max_tracked_wide.unwrap_or(admission.max_tracked_wide);
+    admission.identity_refund_burst = a
+        .identity_refund_burst
+        .unwrap_or(admission.identity_refund_burst);
+    admission.identity_refund_refill = a.identity_refund_refill_ms.map_or(
+        admission.identity_refund_refill,
+        std::time::Duration::from_millis,
+    );
+    admission.agent_reserve_percent = a
+        .agent_reserve_percent
+        .unwrap_or(admission.agent_reserve_percent);
+    admission.summary_interval = a
+        .summary_interval_secs
+        .map_or(admission.summary_interval, secs);
     admission
         .validate()
         .map_err(|source| ConfigError::Admission {

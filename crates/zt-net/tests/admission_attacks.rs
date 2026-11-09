@@ -189,6 +189,7 @@ async fn replayed_msg1_does_not_enter_the_established_pool() {
     let lab = lab(
         with_admission(|a| {
             a.max_established = 2;
+            a.max_per_identity = 1;
             a.first_frame_deadline = Duration::from_secs(5);
         }),
         &[&victim, &client],

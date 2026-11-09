@@ -19,6 +19,22 @@ use zt_proto::FrameDecoder;
 
 use crate::{NetError, Timeouts};
 
+/// The longest legitimate first transport message of an initiator, before its key is
+/// confirmed (PROTOCOL §10.1, finding A8-4): the AEAD tag and the largest of `Register` with
+/// the longest node name, `Open` with the longest target, and `Ping`. Until key confirmation
+/// a responder buffers no more than this.
+pub const MAX_FIRST_MESSAGE_LEN: usize = zt_domain::limits::NOISE_TAG_LEN
+    + zt_domain::limits::FRAME_HEADER_LEN
+    + zt_domain::limits::MAX_NODE_ID_LEN;
+
+// `Register` and `Open` carry one node name; `Ping` an 8-byte nonce. Nothing larger may be a
+// first frame, and the cap stays far below the Noise maximum.
+const _: () = {
+    assert!(8 <= zt_domain::limits::MAX_NODE_ID_LEN);
+    assert!(MAX_FIRST_MESSAGE_LEN < 128);
+    assert!(MAX_FIRST_MESSAGE_LEN <= MAX_MESSAGE_LEN);
+};
+
 fn codec() -> LengthDelimitedCodec {
     codec_capped(MAX_MESSAGE_LEN)
 }
@@ -146,7 +162,7 @@ pub async fn accept<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    accept_suites(
+    let mut pending = accept_suites(
         io,
         local,
         channel,
@@ -155,7 +171,10 @@ where
             msg1: timeouts.handshake,
         },
     )
-    .await
+    .await?;
+    // No admission here: the channel is confirmed as soon as it is established.
+    pending.confirm_on_establish = true;
+    Ok(pending)
 }
 
 /// Deadlines of a responder handshake (PROTOCOL §10.1).
@@ -194,9 +213,16 @@ where
         Ok(Some(Ok(msg1))) => msg1,
     };
     let pending = noise::respond_suites(local, &msg1, channel, accepted)?;
-    // After the handshake the messages are transport messages again, up to the Noise maximum.
-    framed.codec_mut().set_max_frame_length(MAX_MESSAGE_LEN);
-    Ok(Pending { framed, pending })
+    // Until the key is confirmed, at most the largest legitimate first frame (finding A8-4);
+    // `Established::confirmed` lifts the cap to the Noise maximum.
+    framed
+        .codec_mut()
+        .set_max_frame_length(MAX_FIRST_MESSAGE_LEN);
+    Ok(Pending {
+        framed,
+        handshake: pending,
+        confirm_on_establish: false,
+    })
 }
 
 /// `true` if `err` is the codec's refusal of a length prefix over its maximum.
@@ -211,46 +237,55 @@ fn is_too_long(err: &std::io::Error) -> bool {
 #[must_use = "drop to reject, or call `establish`"]
 pub struct Pending<IO> {
     framed: Framed<IO, LengthDelimitedCodec>,
-    pending: noise::AuthorizationPending,
+    handshake: noise::AuthorizationPending,
+    /// `true` if [`Pending::establish`] lifts the first-frame cap at once ([`accept`], which
+    /// has no admission).
+    confirm_on_establish: bool,
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
     /// The identity proven by the peer.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
-        self.pending.peer()
+        self.handshake.peer()
     }
 
     /// The suite the peer used (PROTOCOL §7.5).
     #[must_use]
     pub fn suite(&self) -> HandshakeSuite {
-        self.pending.suite()
+        self.handshake.suite()
     }
 
     /// The payload of message 1 (empty without a certificate).
     #[must_use]
     pub fn payload(&self) -> &[u8] {
-        self.pending.payload()
+        self.handshake.payload()
     }
 
-    /// Accepts the peer and completes the handshake.
+    /// Accepts the peer and completes the handshake. After [`accept_suites`] the channel still
+    /// refuses a message over [`MAX_FIRST_MESSAGE_LEN`] until [`Established::confirmed`].
     ///
     /// # Errors
     /// I/O or timeout errors while sending the response.
     pub async fn establish(self, timeouts: &Timeouts) -> Result<Established<IO>, NetError> {
         let Self {
             mut framed,
-            pending,
+            handshake,
+            confirm_on_establish,
         } = self;
-        let (msg2, transport) = pending.accept()?;
+        let (msg2, transport) = handshake.accept()?;
         timeout(timeouts.write, framed.send(Bytes::from(msg2)))
             .await
             .map_err(|_| NetError::Timeout("handshake write"))??;
-        Ok(Established {
+        let mut established = Established {
             framed,
             transport,
             decoder: FrameDecoder::new(),
-        })
+        };
+        if confirm_on_establish {
+            established.confirmed();
+        }
+        Ok(established)
     }
 }
 
@@ -268,15 +303,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
         self.transport.peer()
     }
 
+    /// The peer's key is confirmed (PROTOCOL §10.1): messages up to the Noise maximum are
+    /// accepted from now on (finding A8-4).
+    pub fn confirmed(&mut self) {
+        self.framed
+            .codec_mut()
+            .set_max_frame_length(MAX_MESSAGE_LEN);
+    }
+
     /// Receives the next frame. `Ok(None)` on a clean close between two messages.
     ///
     /// It is cancellation-safe: it can be used in `tokio::select!`.
     ///
     /// # Errors
-    /// Inauthentic message, malformed frame or frame with excess bytes, I/O error.
+    /// Inauthentic message, malformed frame or frame with excess bytes, I/O error,
+    /// [`NetError::Oversized`] for a length prefix over the current cap.
     pub async fn recv(&mut self) -> Result<Option<Frame>, NetError> {
         let message = match self.framed.next().await {
             Some(Ok(message)) => message,
+            Some(Err(err)) if is_too_long(&err) => return Err(NetError::Oversized),
             Some(Err(err)) => return Err(NetError::Io(err)),
             None => return Ok(None),
         };

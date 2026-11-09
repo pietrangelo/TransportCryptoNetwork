@@ -47,7 +47,7 @@ fn op() -> impl Strategy<Value = Op> {
 
 /// Sources in few IPv4 addresses and few IPv6 /48s, so that every cap is reached.
 fn source(n: u8) -> IpAddr {
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, n % 8))
     } else {
         IpAddr::V6(Ipv6Addr::new(

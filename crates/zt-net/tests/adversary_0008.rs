@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use common::{
     seeded, timeouts, trust,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 use zt_application::admission::AdmissionConfigError;
 use zt_crypto::Identity;
 use zt_crypto::noise::Channel;
@@ -30,21 +30,9 @@ use zt_domain::{AllowedNodes, Frame, NodeId, RejectReason, StreamId};
 use zt_net::channel;
 use zt_net::config::{ConfigError, parse_relay_settings};
 
-/// A TCP connection to `relay` from the loopback address `127.0.0.<host>`.
-async fn connect_from(relay: SocketAddr, host: u8) -> TcpStream {
-    let socket = TcpSocket::new_v4().unwrap();
-    socket
-        .bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, host)),
-            0,
-        ))
-        .unwrap();
-    socket.connect(relay).await.unwrap()
-}
-
 /// Sends `msg1` from `127.0.0.<host>`; `true` if message 2 came back.
 async fn replay_from(relay: SocketAddr, host: u8, msg1: &[u8]) -> bool {
-    let mut tcp = connect_from(relay, host).await;
+    let mut tcp = common::connect_from(relay, host).await;
     tcp.write_all(&u16::try_from(msg1.len()).unwrap().to_be_bytes())
         .await
         .unwrap();
@@ -79,7 +67,8 @@ fn lines_and_repeats(logs: &Captured, kind: &str, peer: &str) -> (usize, u64) {
 /// A8-2: replays of a revoked key's recorded message 1, from several addresses, give one
 /// full `authentication_failed` line per identity and interval; the others are counted in
 /// one `authentication_failed_repeated{peer, reason, count}` line per interval.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread runtime: the captured logs are those of this thread.
+#[tokio::test]
 async fn replays_of_a_revoked_keys_msg1_are_rate_limited_per_identity() {
     let logs = Captured::default();
     let _guard = logs.install();
@@ -120,7 +109,8 @@ async fn replays_of_a_revoked_keys_msg1_are_rate_limited_per_identity() {
 }
 
 /// A8-2: the same with a recorded message 1 whose certificate has since expired.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread runtime: the captured logs are those of this thread.
+#[tokio::test]
 async fn replays_of_an_expired_certificate_are_rate_limited_per_identity() {
     let logs = Captured::default();
     let _guard = logs.install();
@@ -169,7 +159,8 @@ async fn replays_of_an_expired_certificate_are_rate_limited_per_identity() {
 /// A8-4: until the key is confirmed, the codec cap is the largest legitimate first frame,
 /// not the Noise maximum: an announced 64 KiB frame after message 2 is refused on sight and
 /// counted as `oversized`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread runtime: the captured logs are those of this thread.
+#[tokio::test]
 async fn an_unconfirmed_connection_cannot_announce_a_large_first_frame() {
     let logs = Captured::default();
     let _guard = logs.install();
@@ -241,13 +232,14 @@ fn the_first_frame_cap_fits_the_largest_legitimate_first_frames() {
         let len = zt_proto::encoded_len(&frame) + zt_domain::limits::NOISE_TAG_LEN;
         assert!(len <= channel::MAX_FIRST_MESSAGE_LEN, "{frame:?}");
     }
-    assert!(channel::MAX_FIRST_MESSAGE_LEN < 128);
+    const { assert!(channel::MAX_FIRST_MESSAGE_LEN < 128) };
 }
 
 /// A8-10: a confirmed identity refused at its concurrency limit gets one rate-limited audit
 /// line that names it, and its `Open` an answer (`Reject RateLimited`) instead of a bare
 /// close.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread runtime: the captured logs are those of this thread.
+#[tokio::test]
 async fn a_confirmed_identity_over_its_limit_is_named_and_answered() {
     let logs = Captured::default();
     let _guard = logs.install();

@@ -18,7 +18,8 @@ use zt_application::admission::{
 };
 use zt_domain::trust::{CertTrust, Revocations};
 use zt_domain::{
-    AccessPolicy, AllowedNodes, AuthFailureReason, CertRejection, ClientGrant, Fingerprint, NodeId,
+    AccessPolicy, AllowedNodes, AuthFailureReason, CertRejection, ClientGrant, Fingerprint,
+    InitiatorRole, NodeId,
 };
 
 fn ip(n: u8) -> IpAddr {
@@ -74,7 +75,8 @@ fn replayed_msg1_does_not_enter_the_authenticated_pool() {
     // The real peers still get both established slots.
     for n in 0..2 {
         let t = a.on_accept(ip(200 + n), t0).unwrap();
-        a.on_confirmed(t, key(n), t0).unwrap();
+        a.on_confirmed(t, key(n), InitiatorRole::Client, t0)
+            .unwrap();
     }
     assert_eq!(a.established_count(), 2);
 }
@@ -99,7 +101,7 @@ fn replayed_msg1_cannot_drain_the_victims_identity_budget() {
     }
     assert_eq!(a.identity_count(&victim), 0);
     let t = a.on_accept(ip(250), t0).unwrap();
-    assert!(a.on_confirmed(t, victim, t0).is_ok());
+    assert!(a.on_confirmed(t, victim, InitiatorRole::Client, t0).is_ok());
 }
 
 /// R1-A5: slow message-1 senders fill only the pre-authentication pool; confirmations of
@@ -121,7 +123,10 @@ fn slow_handshakes_cannot_starve_established_or_reconnecting_peers() {
     let _slow: Vec<_> = (2..5).map(|n| a.on_accept(ip(n), t0).unwrap()).collect();
     assert_eq!(a.on_accept(ip(9), t0), Err(Refusal::PreauthPoolFull));
     // The agent completes and confirms: its slot moves to the established pool.
-    assert!(a.on_confirmed(agent, key(1), t0).is_ok());
+    assert!(
+        a.on_confirmed(agent, key(1), InitiatorRole::Agent, t0)
+            .is_ok()
+    );
     // That frees one pre-authentication slot for the next peer.
     assert!(a.on_accept(ip(10), t0).is_ok());
 }
@@ -142,14 +147,14 @@ fn one_identity_cannot_monopolise_the_established_pool() {
     let mut admitted = 0;
     for n in 0..100_u8 {
         let t = a.on_accept(ip(n), t0).unwrap();
-        if a.on_confirmed(t, thief, t0).is_ok() {
+        if a.on_confirmed(t, thief, InitiatorRole::Client, t0).is_ok() {
             admitted += 1;
         }
     }
     assert_eq!(admitted, 8);
     // Neighbours on the same addresses are unaffected.
     let t = a.on_accept(ip(0), t0 + Duration::from_secs(3)).unwrap();
-    assert!(a.on_confirmed(t, key(1), t0).is_ok());
+    assert!(a.on_confirmed(t, key(1), InitiatorRole::Client, t0).is_ok());
 }
 
 /// R1-A7: a refused confirmation (identity limit, full pool) is not a refund; a ticket is
@@ -165,16 +170,17 @@ fn refund_only_after_a_successful_confirmation_and_only_once() {
         t0,
     );
     let first = a.on_accept(ip(1), t0).unwrap();
-    a.on_confirmed(first, key(1), t0).unwrap();
+    a.on_confirmed(first, key(1), InitiatorRole::Client, t0)
+        .unwrap();
     // Refused at confirmation: the token stays spent.
     let second = a.on_accept(ip(1), t0).unwrap();
     assert_eq!(
-        a.on_confirmed(second, key(1), t0),
+        a.on_confirmed(second, key(1), InitiatorRole::Client, t0),
         Err(Refusal::IdentityLimit)
     );
     // Double confirmation: refused, and no second refund.
     assert_eq!(
-        a.on_confirmed(first, key(2), t0),
+        a.on_confirmed(first, key(2), InitiatorRole::Client, t0),
         Err(Refusal::UnknownTicket)
     );
     // Burst 3: one refunded (first), one spent (second); so two more, then refused.
@@ -184,7 +190,7 @@ fn refund_only_after_a_successful_confirmation_and_only_once() {
     // After release a ticket cannot be confirmed.
     a.release(second);
     assert_eq!(
-        a.on_confirmed(second, key(3), t0),
+        a.on_confirmed(second, key(3), InitiatorRole::Client, t0),
         Err(Refusal::UnknownTicket)
     );
 }
@@ -198,7 +204,8 @@ fn refunds_never_exceed_the_burst() {
     // Long after: the bucket refilled on its own, then three refunds arrive.
     let later = t0 + Duration::from_secs(3_600);
     for (i, t) in tickets.into_iter().enumerate() {
-        a.on_confirmed(t, key(i as u8), later).unwrap();
+        a.on_confirmed(t, key(i as u8), InitiatorRole::Client, later)
+            .unwrap();
     }
     let ok = (0..10)
         .filter(|_| a.on_accept(ip(1), later).is_ok())
