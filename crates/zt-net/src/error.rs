@@ -3,32 +3,32 @@ use zt_crypto::CryptoError;
 use zt_domain::{CloseReason, RejectReason};
 use zt_proto::DecodeError;
 
-/// Errore degli adapter di rete.
+/// Error of the network adapters.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NetError {
-    /// Errore di I/O.
+    /// I/O error.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    /// Un'operazione ha superato il suo timeout.
+    /// An operation exceeded its timeout.
     #[error("timed out: {0}")]
     Timeout(&'static str),
-    /// Handshake o cifratura falliti.
+    /// Handshake or encryption failed.
     #[error("crypto: {0}")]
     Crypto(#[from] CryptoError),
-    /// Frame malformato.
+    /// Malformed frame.
     #[error("protocol: {0}")]
     Decode(#[from] DecodeError),
-    /// Il peer ha violato il protocollo.
+    /// The peer violated the protocol.
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
-    /// La connessione si è chiusa.
+    /// The connection was closed.
     #[error("connection closed")]
     Closed,
-    /// Il relay o l'agent hanno rifiutato lo stream.
+    /// The relay or the agent rejected the stream.
     #[error("stream rejected: {0:?}")]
     Rejected(RejectReason),
-    /// Lo stream è stato chiuso dall'altra parte.
+    /// The stream was closed by the other side.
     #[error("stream closed: {0:?}")]
     StreamClosed(CloseReason),
 }

@@ -3,7 +3,7 @@ use zt_domain::Frame;
 
 use crate::wire::{HEADER_LEN, VERSION};
 
-/// Il corpo di un frame, prima della serializzazione.
+/// The body of a frame, before serialization.
 enum Body<'a> {
     Empty,
     Byte(u8),
@@ -36,19 +36,19 @@ fn body(frame: &Frame) -> Body<'_> {
     }
 }
 
-/// Numero di byte che [`encode`] scriverà per `frame` (sempre ≤ `MAX_FRAME_LEN`).
+/// Number of bytes that [`encode`] will write for `frame` (always ≤ `MAX_FRAME_LEN`).
 #[must_use]
 pub fn encoded_len(frame: &Frame) -> usize {
     HEADER_LEN.saturating_add(body(frame).len())
 }
 
-/// Serializza `frame` in coda a `dst`.
+/// Serializes `frame` onto the end of `dst`.
 ///
-/// È infallibile: un [`Frame`] di dominio rispetta per costruzione tutti i limiti del filo
-/// (lunghezze provate a compile-time in `zt_domain::limits`).
+/// It is infallible: a domain [`Frame`] respects all the wire limits by construction
+/// (lengths proven at compile time in `zt_domain::limits`).
 pub fn encode(frame: &Frame, dst: &mut BytesMut) {
     let body = body(frame);
-    // Non può saturare: la lunghezza massima di un corpo è MAX_PAYLOAD_LEN ≤ u16::MAX.
+    // Cannot saturate: the maximum length of a body is MAX_PAYLOAD_LEN ≤ u16::MAX.
     let len = u16::try_from(body.len()).unwrap_or(u16::MAX);
     dst.reserve(encoded_len(frame));
     dst.put_u8(VERSION);

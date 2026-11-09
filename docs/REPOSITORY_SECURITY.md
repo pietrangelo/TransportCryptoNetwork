@@ -1,75 +1,75 @@
-# Sicurezza del repository GitHub
+# GitHub repository security
 
-Il codice di TCN finisce come root-of-trust sui server di una flotta: chi riesce a far entrare
-un commit in `main`, o a pubblicare un binario a nome del progetto, ottiene SSH ovunque. Questo
-documento descrive le difese del repository, quelle già nel codice e quelle che vanno attivate
-dalle impostazioni di GitHub (solo il proprietario può farlo).
+TCN's code ends up as the root of trust on a fleet's servers: anyone who manages to get a commit
+into `main`, or to publish a binary in the project's name, gets SSH everywhere. This document
+describes the repository's defences, those already in the code and those that must be enabled
+in the GitHub settings (only the owner can do that).
 
-## Modello di minaccia
+## Threat model
 
-| Minaccia | Difesa |
+| Threat | Defence |
 | --- | --- |
-| Push diretto o force-push su `main`, anche da un token rubato | ruleset `main`: niente push diretti, niente force-push né cancellazione, solo PR |
-| PR che passa senza test o fuzzing | check obbligatori, ramo aggiornato prima del merge |
-| Commit con autore falsificato | commit firmati obbligatori su `main`, *vigilant mode* sull'account |
-| Dipendenza compromessa (crates.io) | `cargo-deny`, `Cargo.lock` con `--locked`, Dependabot con *cooldown* di 7 giorni, CODEOWNERS su `Cargo.lock` |
-| Action compromessa o tag di un'action spostato | action fissate a un commit SHA, zizmor in CI, Dependabot per gli aggiornamenti, whitelist delle action ammesse |
-| Script injection nei workflow | nessuna espressione `${{ }}` dentro `run:`, verificato da zizmor |
-| Token di CI usato per scrivere sul repository | `permissions: contents: read` come default, credenziali di checkout non persistite |
-| Release da codice non revisionato | il tag deve puntare a un commit su `main` (`verify-tag`), solo l'admin crea tag `v*` |
-| Tag di release spostato dopo la pubblicazione | ruleset `release-tags-immutable`, release immutabili |
-| Firma o pubblicazione non autorizzata | job `attest` e `release` nell'environment protetto `release`, con approvazione manuale |
-| Segreti nel repository | secret scanning e push protection; la configurazione di Claude è cifrata con `cc` (`cc check` in CI) |
-| Vulnerabilità divulgata in pubblico | `SECURITY.md` e segnalazione privata di GitHub |
+| Direct push or force-push to `main`, even from a stolen token | `main` ruleset: no direct pushes, no force-push or deletion, PRs only |
+| PR that gets through without tests or fuzzing | required checks, branch up to date before merge |
+| Commit with a forged author | signed commits required on `main`, *vigilant mode* on the account |
+| Compromised dependency (crates.io) | `cargo-deny`, `Cargo.lock` with `--locked`, Dependabot with a 7-day *cooldown*, CODEOWNERS on `Cargo.lock` |
+| Compromised action or moved action tag | actions pinned to a commit SHA, zizmor in CI, Dependabot for updates, allow-list of permitted actions |
+| Script injection in workflows | no `${{ }}` expressions inside `run:`, checked by zizmor |
+| CI token used to write to the repository | `permissions: contents: read` as default, checkout credentials not persisted |
+| Release from unreviewed code | the tag must point to a commit on `main` (`verify-tag`), only the admin creates `v*` tags |
+| Release tag moved after publication | `release-tags-immutable` ruleset, immutable releases |
+| Unauthorised signing or publication | `attest` and `release` jobs in the protected `release` environment, with manual approval |
+| Secrets in the repository | secret scanning and push protection; the Claude configuration is encrypted with `cc` (`cc check` in CI) |
+| Vulnerability disclosed in public | `SECURITY.md` and GitHub private reporting |
 
-## Già nel repository
+## Already in the repository
 
-- `.github/workflows/*`: permessi minimi, action fissate a SHA, `persist-credentials: false`,
-  timeout su ogni job, `concurrency`, input della matrice passati via `env`.
-- `ci.yml` → job `zizmor`: analisi statica dei workflow, fallisce su ogni finding.
-- `release.yml`: `verify-tag` (tag su `main`, nome semver), `attest` e `release`
-  nell'environment `release`.
-- `.github/dependabot.yml`: Cargo (`/` e `/fuzz`) e GitHub Actions, settimanale, cooldown 7 giorni.
+- `.github/workflows/*`: minimal permissions, actions pinned to SHA, `persist-credentials: false`,
+  timeout on every job, `concurrency`, matrix inputs passed via `env`.
+- `ci.yml` → `zizmor` job: static analysis of the workflows, fails on any finding.
+- `release.yml`: `verify-tag` (tag on `main`, semver name), `attest` and `release`
+  in the `release` environment.
+- `.github/dependabot.yml`: Cargo (`/` and `/fuzz`) and GitHub Actions, weekly, 7-day cooldown.
 - `.github/CODEOWNERS`, `SECURITY.md`.
-- `.github/rulesets/*.json`: le regole di branch e tag, pronte da importare.
+- `.github/rulesets/*.json`: the branch and tag rules, ready to import.
 
-## Da attivare nelle impostazioni (proprietario)
+## To enable in the settings (owner)
 
-L'ordine conta: il ruleset `main` richiede check con i nomi introdotti da questa modifica, quindi
-va attivato **dopo** il merge della PR che li aggiunge.
+Order matters: the `main` ruleset requires checks with the names introduced by this change, so
+it must be enabled **after** the PR that adds them is merged.
 
 ### 1. Account
 
-1. [Autenticazione a due fattori](https://github.com/settings/security) con passkey o chiave
-   hardware, se non è già attiva.
-2. [Chiave di firma](https://github.com/settings/keys): aggiungi una chiave SSH come
-   *Signing key* (o GPG) e configura git in locale:
+1. [Two-factor authentication](https://github.com/settings/security) with a passkey or hardware
+   key, if not already enabled.
+2. [Signing key](https://github.com/settings/keys): add an SSH key as a
+   *Signing key* (or GPG) and configure git locally:
    `git config --global gpg.format ssh`,
    `git config --global user.signingkey ~/.ssh/id_ed25519.pub`,
    `git config --global commit.gpgsign true`, `git config --global tag.gpgsign true`.
-3. Nella stessa pagina attiva **Flag unsigned commits as unverified** (*vigilant mode*).
+3. On the same page enable **Flag unsigned commits as unverified** (*vigilant mode*).
 
 ### 2. Settings → General
 
-- *Pull Requests*: lascia solo **Allow squash merging**; togli merge commit e rebase.
-  Attiva **Always suggest updating pull request branches** e
+- *Pull Requests*: leave only **Allow squash merging**; remove merge commits and rebase.
+  Enable **Always suggest updating pull request branches** and
   **Automatically delete head branches**.
-- *Features*: disattiva **Wikis** e **Projects** se non li usi (meno superficie da sorvegliare).
-- *Releases*: attiva **Enable release immutability**, così asset e tag di una release
-  pubblicata non si possono più cambiare.
+- *Features*: disable **Wikis** and **Projects** if you don't use them (less surface to watch).
+- *Releases*: enable **Enable release immutability**, so that the assets and tag of a published
+  release can no longer be changed.
 
 ### 3. Settings → Rules → Rulesets
 
-Per ogni file, **New ruleset → Import a ruleset** e scegli il JSON:
+For each file, **New ruleset → Import a ruleset** and choose the JSON:
 
-1. `.github/rulesets/release-tags-immutable.json`: nessuno, nemmeno l'admin, può spostare
-   o cancellare un tag `v*`.
-2. `.github/rulesets/release-tags-create.json`: solo l'admin crea tag `v*`.
-3. `.github/rulesets/main.json` (**dopo il merge**): PR obbligatoria con merge squash,
-   conversazioni risolte, check obbligatori con ramo aggiornato, storia lineare, commit
-   firmati, niente force-push né cancellazione. Nessun bypass, nemmeno per l'admin.
+1. `.github/rulesets/release-tags-immutable.json`: nobody, not even the admin, can move
+   or delete a `v*` tag.
+2. `.github/rulesets/release-tags-create.json`: only the admin creates `v*` tags.
+3. `.github/rulesets/main.json` (**after the merge**): PR required with squash merge,
+   conversations resolved, required checks with branch up to date, linear history, signed
+   commits, no force-push or deletion. No bypass, not even for the admin.
 
-In alternativa, da un terminale con `gh` autenticato come proprietario:
+Alternatively, from a terminal with `gh` authenticated as the owner:
 
 ```bash
 for f in release-tags-immutable release-tags-create main; do
@@ -78,42 +78,42 @@ for f in release-tags-immutable release-tags-create main; do
 done
 ```
 
-Nota: con un solo maintainer le approvazioni richieste sono 0, perché GitHub non lascia
-approvare le proprie PR. Le altre regole valgono comunque: niente arriva su `main` senza PR e
-CI verde. Quando entra un secondo maintainer, porta `required_approving_review_count` a 1 e
-`require_code_owner_review` a `true`.
+Note: with a single maintainer the required approvals are 0, because GitHub does not let you
+approve your own PRs. The other rules still apply: nothing reaches `main` without a PR and green
+CI. When a second maintainer joins, set `required_approving_review_count` to 1 and
+`require_code_owner_review` to `true`.
 
 ### 4. Settings → Environments → New environment `release`
 
 - **Required reviewers**: `pietrangelo`.
-- **Deployment branches and tags** → *Selected branches and tags* → aggiungi la regola di
-  tipo *Tag* con il pattern `v*`.
-- Non servono segreti: la firma usa il token OIDC di GitHub (Sigstore). Se in futuro ne
-  servisse uno (per esempio per un registry), va messo qui e non fra i segreti del repository.
+- **Deployment branches and tags** → *Selected branches and tags* → add a rule of
+  type *Tag* with the pattern `v*`.
+- No secrets are needed: signing uses GitHub's OIDC token (Sigstore). If one is ever needed
+  in the future (for example for a registry), it goes here and not among the repository secrets.
 
 ### 5. Settings → Actions → General
 
 - *Actions permissions*: **Allow pietrangelo, and select non-pietrangelo, actions and
-  reusable workflows**, con **Allow actions created by GitHub** e questa lista:
+  reusable workflows**, with **Allow actions created by GitHub** and this list:
   `dtolnay/rust-toolchain@*, Swatinem/rust-cache@*, EmbarkStudios/cargo-deny-action@*,
   zizmorcore/zizmor-action@*`.
-- Attiva **Require actions to be pinned to a full-length commit SHA**.
+- Enable **Require actions to be pinned to a full-length commit SHA**.
 - *Fork pull request workflows*: **Require approval for all external contributors**.
-- *Workflow permissions*: **Read repository contents and packages permissions** e
-  **disattiva** *Allow GitHub Actions to create and approve pull requests*.
+- *Workflow permissions*: **Read repository contents and packages permissions** and
+  **disable** *Allow GitHub Actions to create and approve pull requests*.
 
 ### 6. Settings → Advanced Security (Code security)
 
-- **Private vulnerability reporting**: Enable (oggi è spento; `SECURITY.md` ci rimanda).
+- **Private vulnerability reporting**: Enable (currently off; `SECURITY.md` points to it).
 - **Dependency graph**, **Dependabot alerts**, **Dependabot security updates**: Enable.
-- **Secret Protection** / **Secret scanning** e **Push protection**: Enable.
-- **Code scanning → CodeQL analysis → Set up → Default**: linguaggi Rust e GitHub Actions.
+- **Secret Protection** / **Secret scanning** and **Push protection**: Enable.
+- **Code scanning → CodeQL analysis → Set up → Default**: Rust and GitHub Actions languages.
 
-## Verifica
+## Verification
 
-Dopo aver applicato tutto:
+After applying everything:
 
-- un `git push origin HEAD:main` deve essere rifiutato;
-- un `git push --delete origin vX.Y.Z` deve essere rifiutato;
-- una PR con un check rosso non deve avere il pulsante di merge attivo;
-- la run di `release` su un nuovo tag deve fermarsi su *Waiting for review* prima di `attest`.
+- a `git push origin HEAD:main` must be rejected;
+- a `git push --delete origin vX.Y.Z` must be rejected;
+- a PR with a red check must not have the merge button enabled;
+- the `release` run on a new tag must stop at *Waiting for review* before `attest`.

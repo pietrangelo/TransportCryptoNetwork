@@ -1,6 +1,6 @@
 [package]
 name = "zt-crypto"
-description = "Adapter crittografico di TCN: identità Ed25519, handshake Noise sans-IO con typestate."
+description = "TCN cryptographic adapter: Ed25519 identities, sans-IO Noise handshake with typestate."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,7 @@ getrandom.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
-# Fase 6: test d'attacco (firme con -s, payload di msg2 scritti a mano). Crate già nel grafo.
+# Phase 6: attack tests (signatures with -s, hand-written msg2 payloads). Crate already in graph.
 ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
 snow.workspace = true
 

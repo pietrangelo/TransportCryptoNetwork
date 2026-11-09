@@ -1,6 +1,6 @@
 [package]
 name = "zt-relay"
-description = "Binario zt-relay di TCN."
+description = "TCN zt-relay binary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

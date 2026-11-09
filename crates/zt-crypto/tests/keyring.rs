@@ -1,5 +1,5 @@
-//! Rotazione delle chiavi (Fase 5, PROTOCOL §14): un responder con chiave corrente e
-//! precedente accetta i `msg1` verso entrambe, e nessun altro.
+//! Key rotation (Phase 5, PROTOCOL §14): a responder with a current and a previous key
+//! accepts `msg1`s to both, and no others.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use zt_crypto::noise::{self, Channel};
@@ -12,7 +12,7 @@ fn handshake_with(pinned: &Identity, keys: &Keyring, ch: Channel) -> Result<(), 
     assert_eq!(pending.peer(), initiator.fingerprint());
     let (msg2, mut resp) = pending.accept()?;
     let mut init = waiting.complete(&msg2)?;
-    // Il canale funziona in entrambe le direzioni.
+    // The channel works in both directions.
     let ct = init.encrypt(b"ping")?;
     assert_eq!(resp.decrypt(&ct)?, b"ping");
     let ct = resp.encrypt(b"pong")?;
@@ -31,7 +31,7 @@ fn rotating() -> (Identity, Identity, Keyring) {
     (new, old, keys)
 }
 
-// ---------- specifica ----------
+// ---------- specification ----------
 
 #[test]
 fn a_peer_pinning_the_current_key_completes_the_handshake() {
@@ -57,7 +57,7 @@ fn a_single_key_keyring_behaves_like_respond() {
     assert!(keys.previous().is_none());
 }
 
-// ---------- attacchi ----------
+// ---------- attacks ----------
 
 #[test]
 fn a_key_that_is_neither_current_nor_previous_is_refused() {
@@ -88,7 +88,7 @@ fn rotating_to_the_same_key_is_a_configuration_error() {
 
 #[test]
 fn a_message_for_the_previous_key_on_the_other_channel_is_refused() {
-    // La separazione di dominio dei canali vale anche per la chiave precedente.
+    // The domain separation of channels also holds for the previous key.
     let (_, old, keys) = rotating();
     let initiator = Identity::generate().unwrap();
     let (msg1, _) = noise::initiate(&initiator, &old.public_key(), Channel::Outer).unwrap();

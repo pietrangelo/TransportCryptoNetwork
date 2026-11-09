@@ -1,4 +1,4 @@
-//! Fixture comuni ai test di rete della Fase 6 (certificati client, PROTOCOL §15).
+//! Fixtures shared by the Phase 6 network tests (client certificates, PROTOCOL §15).
 #![allow(
     dead_code,
     unreachable_pub,
@@ -56,7 +56,7 @@ pub fn timeouts() -> Timeouts {
     }
 }
 
-/// L'orologio di sistema, letto qui e non con `zt_net::unix_now` (ancora da implementare).
+/// The system clock, read here and not with `zt_net::unix_now` (not yet implemented).
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -64,7 +64,7 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Un'identità con il seme noto, per costruire messaggi 1 con `snow` senza `zt-crypto`.
+/// An identity with a known seed, to build message 1s with `snow` without `zt-crypto`.
 pub fn seeded(b: u8) -> ([u8; 32], Arc<Identity>) {
     let seed = [b; 32];
     (
@@ -77,8 +77,8 @@ pub fn copy_of(id: &Identity) -> Identity {
     Identity::from_secret_hex(&id.to_secret_hex()).unwrap()
 }
 
-/// Un messaggio 1 Noise IK scritto con `snow`, con `payload` qualsiasi (anche oltre il
-/// massimo che `zt-crypto` accetterebbe di inviare).
+/// A Noise IK message 1 written with `snow`, with an arbitrary `payload` (even beyond the
+/// maximum that `zt-crypto` would agree to send).
 pub fn raw_msg1(seed: [u8; 32], responder: &PublicKey, ch: Channel, payload: &[u8]) -> Vec<u8> {
     let secret = ed25519_dalek::SigningKey::from_bytes(&seed).to_scalar_bytes();
     let prologue: &[u8] = match ch {
@@ -100,8 +100,8 @@ pub fn raw_msg1(seed: [u8; 32], responder: &PublicKey, ch: Channel, payload: &[u
     out
 }
 
-/// Invia `msg1` grezzo al relay (lunghezza a 2 byte big-endian, come il codec) e restituisce
-/// il messaggio 2, se arriva. `None`: il relay ha chiuso senza rispondere.
+/// Sends a raw `msg1` to the relay (2-byte big-endian length, like the codec) and returns
+/// message 2, if it arrives. `None`: the relay closed without replying.
 pub async fn probe_relay(relay: SocketAddr, msg1: &[u8]) -> Option<Vec<u8>> {
     let mut tcp = TcpStream::connect(relay).await.unwrap();
     let len = u16::try_from(msg1.len()).unwrap().to_be_bytes();
@@ -118,7 +118,7 @@ pub async fn probe_relay(relay: SocketAddr, msg1: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Finto sshd che conta le connessioni e fa eco (il «tripwire»).
+/// Fake sshd that counts connections and echoes (the "tripwire").
 pub async fn counting_echo() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -138,7 +138,7 @@ pub async fn counting_echo() -> (SocketAddr, Arc<AtomicUsize>) {
 
 static SERIAL: AtomicU64 = AtomicU64::new(1);
 
-/// Un numero di serie nuovo, mai zero.
+/// A fresh serial number, never zero.
 pub fn next_serial() -> CertSerial {
     let mut b = [0_u8; 16];
     b[..8].copy_from_slice(&SERIAL.fetch_add(1, Ordering::SeqCst).to_be_bytes());
@@ -147,7 +147,7 @@ pub fn next_serial() -> CertSerial {
     CertSerial::try_from(b).unwrap()
 }
 
-/// Una CA offline.
+/// An offline CA.
 pub struct Ca {
     pub key: CaSigningKey,
 }
@@ -161,7 +161,7 @@ impl Ca {
     pub fn trusted(&self) -> TrustedCaKey {
         trusted_ca_key(&self.key.public_key())
     }
-    /// Un certificato per `subject` valido in `[nb, na)`.
+    /// A certificate for `subject` valid in `[nb, na)`.
     pub fn issue_at(
         &self,
         subject: &PublicKey,
@@ -185,14 +185,14 @@ impl Ca {
             serial,
         )
     }
-    /// Un certificato valido da un minuto fa per un'ora.
+    /// A certificate valid from a minute ago for one hour.
     pub fn issue(&self, subject: &PublicKey, scope: CertScope) -> (Arc<[u8]>, CertSerial) {
         let now = now_secs();
         self.issue_at(subject, scope, now - 60, now + 3_540)
     }
 }
 
-/// CA pinnate (ognuna con il proprio `allow`) e denylist.
+/// Pinned CAs (each with its own `allow`) and denylist.
 pub fn trust(
     cas: &[(&Ca, AllowedNodes)],
     serials: &[CertSerial],
@@ -212,7 +212,7 @@ pub fn trust(
     t
 }
 
-/// Policy del relay: l'agent di `web-01`, i client della whitelist (tutti i nodi) e `trust`.
+/// Relay policy: the `web-01` agent, the whitelisted clients (all nodes) and `trust`.
 pub fn relay_policy(
     agent: &Fingerprint,
     whitelist: &[Fingerprint],
@@ -236,7 +236,7 @@ pub fn relay_policy(
     p
 }
 
-/// Client autorizzati dell'agent: la whitelist e `trust`.
+/// Authorized clients of the agent: the whitelist and `trust`.
 pub fn agent_clients(whitelist: &[Fingerprint], trust: CertTrust) -> AuthorizedClients {
     let mut c: AuthorizedClients = whitelist.iter().copied().collect();
     if !trust.is_empty() {
@@ -254,7 +254,7 @@ pub fn relay_config() -> RelayConfig {
     }
 }
 
-/// Un relay vero, in ascolto.
+/// A real relay, listening.
 pub struct Relay {
     pub addr: SocketAddr,
     pub key: PublicKey,
@@ -277,7 +277,7 @@ pub async fn start_relay(policy: AccessPolicy) -> Relay {
     }
 }
 
-/// Relay veri, l'agent di `web-01` (registrato su tutti) e il suo sshd che fa eco.
+/// Real relays, the `web-01` agent (registered on all of them) and its echoing sshd.
 pub struct Lab {
     pub relays: Vec<Relay>,
     pub agent: Arc<Identity>,
@@ -286,7 +286,7 @@ pub struct Lab {
 }
 
 impl Lab {
-    /// `policies` riceve la fingerprint dell'agent e restituisce la policy di ogni relay.
+    /// `policies` receives the agent's fingerprint and returns the policy of each relay.
     pub async fn start(
         policies: impl FnOnce(&Fingerprint) -> Vec<AccessPolicy>,
         clients: AuthorizedClients,
@@ -296,7 +296,7 @@ impl Lab {
         Self::start_with(agent, policies, clients).await
     }
 
-    /// Come [`Lab::start`], con l'identità dell'agent e le policy già pronte.
+    /// Like [`Lab::start`], with the agent's identity and the policies already prepared.
     pub async fn start_with(
         agent: Arc<Identity>,
         policies: Vec<AccessPolicy>,
@@ -351,7 +351,7 @@ impl Lab {
         }
     }
 
-    /// Apre una sessione e verifica l'eco; altrimenti restituisce l'esito del client.
+    /// Opens a session and checks the echo; otherwise returns the client's outcome.
     pub async fn session(
         &self,
         who: &Arc<Identity>,
@@ -371,7 +371,7 @@ impl Lab {
         }
     }
 
-    /// L'esito di un client che non deve ottenere una sessione.
+    /// The outcome of a client that must not get a session.
     pub async fn refused(
         &self,
         who: &Arc<Identity>,
@@ -407,21 +407,21 @@ pub async fn ended(
         .unwrap()
 }
 
-/// Un relay compromesso: accetta l'agent di `web-01` e parla con lui direttamente.
+/// A compromised relay: accepts the `web-01` agent and talks to it directly.
 pub struct FakeRelay {
     pub ch: Established<TcpStream>,
     pub agent: Arc<Identity>,
     pub sshd: Arc<AtomicUsize>,
 }
 
-/// Cosa risponde l'agent al messaggio 1 end-to-end di uno stream.
+/// What the agent replies to the end-to-end message 1 of a stream.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentAnswer {
-    /// Un `Data`: il messaggio 2.
+    /// A `Data`: message 2.
     Msg2,
-    /// Un `Close` senza messaggio 2.
+    /// A `Close` without message 2.
     Closed(CloseReason),
-    /// Nulla entro il tempo.
+    /// Nothing within the time limit.
     Silent,
 }
 
@@ -461,7 +461,7 @@ impl FakeRelay {
         Self { ch, agent, sshd }
     }
 
-    /// `Open web-01` sullo stream `n`, poi `msg1` in un `Data`: che cosa risponde l'agent.
+    /// `Open web-01` on stream `n`, then `msg1` in a `Data`: what the agent replies.
     pub async fn offer(&mut self, n: u32, msg1: Vec<u8>) -> AgentAnswer {
         self.ch
             .send(
@@ -504,8 +504,8 @@ impl FakeRelay {
     }
 }
 
-/// Log JSON catturati (il runtime dei test che li usano è `current_thread`, così ogni task
-/// scrive sul subscriber del test).
+/// Captured JSON logs (the runtime of the tests that use them is `current_thread`, so every
+/// task writes to the test's subscriber).
 #[derive(Clone, Default)]
 pub struct Captured(Arc<Mutex<Vec<u8>>>);
 
@@ -521,10 +521,11 @@ impl Write for Captured {
 
 impl Captured {
     pub fn install(&self) -> tracing::subscriber::DefaultGuard {
-        // tracing-core, con un solo dispatcher registrato, calcola l'interesse dei callsite e il
-        // livello massimo globale dal dispatcher del thread che registra il callsite: un test
-        // parallelo senza subscriber (thread di un runtime multi-thread) spegne allora i log di
-        // questo test (`LevelFilter::OFF`). Un secondo dispatcher sempre vivo evita la scorciatoia.
+        // tracing-core, with a single registered dispatcher, computes the callsite interest and
+        // the global max level from the dispatcher of the thread that registers the callsite: a
+        // parallel test without a subscriber (a thread of a multi-thread runtime) then turns off
+        // this test's logs (`LevelFilter::OFF`). A second, always-alive dispatcher avoids the
+        // shortcut.
         static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
         KEEP.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let writer = self.clone();
@@ -538,11 +539,11 @@ impl Captured {
     pub fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
-    /// Dimentica le righe catturate finora.
+    /// Forgets the lines captured so far.
     pub fn clear(&self) {
         self.0.lock().unwrap().clear();
     }
-    /// Le righe con `"event_kind":"<kind>"`.
+    /// The lines with `"event_kind":"<kind>"`.
     pub fn events(&self, kind: &str) -> Vec<String> {
         let needle = format!("\"event_kind\":\"{kind}\"");
         self.text()
@@ -553,7 +554,7 @@ impl Captured {
     }
 }
 
-/// `"key":"value"` in una riga JSON.
+/// `"key":"value"` in a JSON line.
 pub fn field(line: &str, key: &str) -> Option<String> {
     let (_, rest) = line.split_once(&format!("\"{key}\":\""))?;
     let (value, _) = rest.split_once('"')?;

@@ -1,12 +1,12 @@
 //! # zt-proto
 //!
-//! Adapter del wire format di TCN: traduce byte ⇄ [`Frame`](zt_domain::Frame) di dominio.
+//! TCN wire format adapter: translates bytes ⇄ domain [`Frame`](zt_domain::Frame).
 //!
-//! Il cuore è **sans-IO** ([`FrameDecoder`], [`encode`]): lavora su buffer in memoria, non
-//! conosce socket né runtime, ed è quindi testabile in modo deterministico. L'adapter per
-//! `tokio-util` (feature `codec`) è un sottile strato sopra di esso.
+//! The core is **sans-IO** ([`FrameDecoder`], [`encode`]): it works on in-memory buffers, knows
+//! nothing of sockets or runtimes, and is therefore deterministically testable. The adapter for
+//! `tokio-util` (feature `codec`) is a thin layer on top of it.
 //!
-//! La specifica del formato è in `docs/PROTOCOL.md`.
+//! The format specification is in `docs/PROTOCOL.md`.
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "codec")]

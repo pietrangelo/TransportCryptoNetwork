@@ -1,38 +1,38 @@
-# Adversary review 0003: `zt-client` come `ProxyCommand` (Fase 3)
+# Adversary review 0003: `zt-client` as `ProxyCommand` (Phase 3)
 
-**Superficie:** `bins/zt-client` (CLI, ricerca della configurazione, wiring di stdin/stdout),
-`zt-net::config` (configurazione del client, controlli sui file di trust), `zt-net::client` e
-`zt-net::stream` (pump verso il processo locale).
-**Revisore:** agente avversario indipendente, a cui è stato dato il codice e non le
-conclusioni dell'autore. Ogni ipotesi è stata verificata con un test eseguito su una copia del
-repository (OpenSSH 9.6p1, Ansible), o smentita da un test esistente.
-**Attaccante:** (a) utente locale con un altro UID; (b) relay compromesso; (c) agent malevolo;
-(d) chi controlla i nomi host che arrivano a `%n`/`%h` (inventario Ansible, nome digitato).
+**Surface:** `bins/zt-client` (CLI, configuration lookup, stdin/stdout wiring),
+`zt-net::config` (client configuration, checks on trust files), `zt-net::client` and
+`zt-net::stream` (pump towards the local process).
+**Reviewer:** independent adversary agent, given the code and not the author's
+conclusions. Every hypothesis was verified with a test executed on a copy of the
+repository (OpenSSH 9.6p1, Ansible), or refuted by an existing test.
+**Attacker:** (a) local user with another UID; (b) compromised relay; (c) malicious agent;
+(d) whoever controls the host names that reach `%n`/`%h` (Ansible inventory, typed name).
 
-Prima della review, i test di specifica avevano già trovato un difetto: lo stdout di
-`zt-client` è bufferizzato a righe e i byte SSH restavano nel buffer, bloccando la sessione.
-Ora ogni messaggio consegnato viene svuotato subito
+Before the review, the specification tests had already found a defect: `zt-client`'s stdout
+is line-buffered and the SSH bytes stayed in the buffer, stalling the session.
+Now every delivered message is flushed immediately
 (`delivered_bytes_are_flushed_to_a_buffered_local_writer`).
 
-## Finding aperti al momento della review, tutti corretti in questa PR
+## Findings open at review time, all fixed in this PR
 
-| # | Ipotesi d'attacco | Gravità | Correzione | Regressione |
+| # | Attack hypothesis | Severity | Fix | Regression |
 | :-: | :- | :-: | :- | :- |
-| 1 | Il controllo sui file di trust guardava solo i bit `0o022` del file. Un altro UID che può scrivere nella directory (`~/.config/tcn` con permessi larghi, o un `TCN_CLIENT_CONFIG` in `/tmp`) mette al suo posto un `client.toml` suo in `0644`, con relay e pin dei nodi dell'attaccante: MITM completo del livello TCN, con la chiave vera della vittima. Varianti: un FIFO bloccava per sempre ogni fork di Ansible; i symlink di altri venivano seguiti. | media | Come `StrictModes` di OpenSSH: file regolare (aperto con `O_NONBLOCK`), proprietario l'utente corrente o root, directory che lo contiene di proprietà dell'utente o di root e non scrivibile da gruppo o altri. Vale per tutti i file di trust (client, policy del relay, client autorizzati dell'agent, nodi noti) e per le chiavi segrete. Un symlink è ammesso solo se il file di destinazione e la sua directory superano i controlli. | `trust_files_owned_by_another_user_are_refused`, `non_regular_trust_and_key_files_are_refused_without_blocking`, `trust_files_in_a_directory_writable_by_others_are_refused` |
-| 2 | Un `ssh` sospeso (`~^Z`, SIGSTOP) smette di leggere: dopo 30 s il timeout di scrittura locale chiudeva la sessione, che su TCP diretto sarebbe sopravvissuta. Il timeout non proteggeva nulla, perché la memoria è già limitata dalla finestra. | media | Il client scrive su stdout senza timeout; l'agent mantiene il timeout verso sshd. | `a_stalled_local_reader_does_not_kill_the_session` |
-| 3 | Una `Close` con motivo d'errore era trattata come chiusura ordinata: con sshd irraggiungibile il client usciva con 0 e senza messaggi; un `Close` iniettato dal relay faceva uscire con 0. Ogni `Closed` veniva descritto come errore di chiavi. | bassa | Solo `Close Normal` è una chiusura ordinata; le altre sono errori (`exit 1`) con un messaggio che nomina il nodo e la causa probabile. Lo stream già chiuso dal peer non viene richiuso. | `unreachable_sshd_is_an_error_with_a_message` |
-| 4 | ssh esegue `sh -c "exec zt-client … %n"`: con un OpenSSH precedente al fix di CVE-2023-51385 un nome host con spazi (`web-01 --config /evil.toml`) diventava un'opzione. | bassa | Il nome del nodo è l'ultimo argomento: tutto ciò che segue viene raccolto e rifiutato; `--config` va prima di `connect`. | `options_after_the_node_name_are_never_parsed` |
+| 1 | The trust file check only looked at the file's `0o022` bits. Another UID that can write to the directory (`~/.config/tcn` with loose permissions, or a `TCN_CLIENT_CONFIG` in `/tmp`) puts its own `client.toml` in its place in `0644`, with the attacker's relay and node pins: full MITM of the TCN layer, with the victim's real key. Variants: a FIFO blocked every Ansible fork forever; other users' symlinks were followed. | medium | Like OpenSSH's `StrictModes`: regular file (opened with `O_NONBLOCK`), owned by the current user or root, containing directory owned by the user or by root and not writable by group or others. Applies to all trust files (client, relay policy, agent's authorised clients, known nodes) and to secret keys. A symlink is allowed only if the target file and its directory pass the checks. | `trust_files_owned_by_another_user_are_refused`, `non_regular_trust_and_key_files_are_refused_without_blocking`, `trust_files_in_a_directory_writable_by_others_are_refused` |
+| 2 | A suspended `ssh` (`~^Z`, SIGSTOP) stops reading: after 30 s the local write timeout closed the session, which over direct TCP would have survived. The timeout protected nothing, because memory is already bounded by the window. | medium | The client writes to stdout without a timeout; the agent keeps the timeout towards sshd. | `a_stalled_local_reader_does_not_kill_the_session` |
+| 3 | A `Close` with an error reason was treated as an orderly close: with sshd unreachable the client exited with 0 and no message; a `Close` injected by the relay made it exit with 0. Every `Closed` was described as a key error. | low | Only `Close Normal` is an orderly close; the others are errors (`exit 1`) with a message naming the node and the likely cause. A stream already closed by the peer is not closed again. | `unreachable_sshd_is_an_error_with_a_message` |
+| 4 | ssh runs `sh -c "exec zt-client … %n"`: with an OpenSSH older than the CVE-2023-51385 fix, a host name with spaces (`web-01 --config /evil.toml`) became an option. | low | The node name is the last argument: everything that follows is collected and rejected; `--config` goes before `connect`. | `options_after_the_node_name_are_never_parsed` |
 
-## Ipotesi smentite o accettate
+## Refuted or accepted hypotheses
 
-| # | Ipotesi d'attacco | Esito |
+| # | Attack hypothesis | Outcome |
 | :-: | :- | :- |
-| 5 | Metacaratteri di shell in `%n` | **Mitigato** da OpenSSH ≥ 9.6 (verificato su 15 nomi); ciò che passa (`%`, `*`, `.` finale, maiuscole) è rifiutato da `NodeId` (`malformed_node_names_are_refused_without_touching_the_network`). |
-| 6 | `--strip-suffix` allarga i nomi accettati | **Mitigato.** `strip_suffix_does_not_widen_the_accepted_names` |
-| 7 | Relay o DNS dirottati, agent impostore | **Mitigato.** `impostor_relay_is_detected_and_nothing_reaches_stdout`, `impostor_agent_is_detected_and_sshd_is_never_dialed` |
-| 8 | Inquinamento di stdout, segreti o payload nei log | **Mitigato.** `trace_logging_never_reaches_stdout_nor_leaks_the_secret` |
-| 9 | Il processo resta vivo e trattiene i fork di Ansible | **Mitigato.** `exits_when_the_node_closes_even_if_stdin_stays_open`; con `ControlPersist` scaduto non restano processi; il test Ansible usa `ControlMaster=auto` e `ControlPersist`. |
-| 10 | Concorrenza di Ansible e pipelining | **Mitigato.** `parallel_ssh_sessions`, `ansible_playbook_runs_through_tcn` |
-| 11 | Dopo l'EOF su stdin si perdono i dati in arrivo | **Accettato.** Non c'è half-close (PROTOCOL §11); ssh chiude stdin solo a fine sessione. |
-| 12 | `XDG_CONFIG_HOME`/`HOME` relativi, `TCN_CLIENT_CONFIG` vuoto o relativo | **Mitigato** (ignorati) / **accettato** (relativo: chi controlla l'ambiente controlla già il processo). |
-| 13 | `ssh WEB-01` corrisponde a `Host web-01` ma il nodo `WEB-01` non esiste | **Accettato**: fallisce in modo chiuso; documentato in OPERATIONS. |
+| 5 | Shell metacharacters in `%n` | **Mitigated** by OpenSSH ≥ 9.6 (verified on 15 names); what gets through (`%`, `*`, trailing `.`, uppercase) is rejected by `NodeId` (`malformed_node_names_are_refused_without_touching_the_network`). |
+| 6 | `--strip-suffix` widens the accepted names | **Mitigated.** `strip_suffix_does_not_widen_the_accepted_names` |
+| 7 | Hijacked relay or DNS, impostor agent | **Mitigated.** `impostor_relay_is_detected_and_nothing_reaches_stdout`, `impostor_agent_is_detected_and_sshd_is_never_dialed` |
+| 8 | Stdout pollution, secrets or payload in logs | **Mitigated.** `trace_logging_never_reaches_stdout_nor_leaks_the_secret` |
+| 9 | The process stays alive and holds Ansible forks | **Mitigated.** `exits_when_the_node_closes_even_if_stdin_stays_open`; with `ControlPersist` expired no processes remain; the Ansible test uses `ControlMaster=auto` and `ControlPersist`. |
+| 10 | Ansible concurrency and pipelining | **Mitigated.** `parallel_ssh_sessions`, `ansible_playbook_runs_through_tcn` |
+| 11 | After EOF on stdin, incoming data is lost | **Accepted.** There is no half-close (PROTOCOL §11); ssh closes stdin only at the end of the session. |
+| 12 | Relative `XDG_CONFIG_HOME`/`HOME`, empty or relative `TCN_CLIENT_CONFIG` | **Mitigated** (ignored) / **accepted** (relative: whoever controls the environment already controls the process). |
+| 13 | `ssh WEB-01` matches `Host web-01` but node `WEB-01` does not exist | **Accepted**: fails closed; documented in OPERATIONS. |

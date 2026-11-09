@@ -1,8 +1,8 @@
-# Relay TCN. Installazione: vedi docs/OPERATIONS.md §9.
-# File attesi (controllati da zt-relay come StrictModes di OpenSSH):
+# TCN relay. Installation: see docs/OPERATIONS.md §9.
+# Expected files (checked by zt-relay like OpenSSH's StrictModes):
 #   /etc/tcn            root:root 0755
 #   /etc/tcn/relay.key  tcn:tcn   0600
-#   /etc/tcn/policy.toml root:root 0644   (systemctl reload zt-relay dopo una modifica)
+#   /etc/tcn/policy.toml root:root 0644   (systemctl reload zt-relay after a change)
 [Unit]
 Description=TCN relay (zt-relay)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
@@ -10,19 +10,19 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# notify: READY=1 arriva solo quando SIGHUP è gestito (systemctl reload sicuro da subito).
+# notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away).
 Type=notify
 NotifyAccess=main
 User=tcn
 Group=tcn
-# Per IPv6 dual-stack: --listen [::]:7443
-# Rotazione della chiave: in un drop-in --key /etc/tcn/relay.next.key
-# --previous-key /etc/tcn/relay.key e un riavvio (OPERATIONS §8). Ogni systemctl reload,
-# anche solo per la policy, rilegge anche le chiavi.
+# For IPv6 dual-stack: --listen [::]:7443
+# Key rotation: in a drop-in --key /etc/tcn/relay.next.key
+# --previous-key /etc/tcn/relay.key and a restart (OPERATIONS §8). Every systemctl reload,
+# even one just for the policy, also rereads the keys.
 ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml
-# Ricarica la policy e revoca a caldo le connessioni non più ammesse.
+# Reloads the policy and live-revokes connections that are no longer allowed.
 ExecReload=/bin/kill -HUP $MAINPID
-# always: anche un segnale (es. SIGHUP fuori tempo) conta come uscita pulita.
+# always: even a signal (e.g. a mistimed SIGHUP) counts as a clean exit.
 Restart=always
 RestartSec=2s
 LimitNOFILE=16384

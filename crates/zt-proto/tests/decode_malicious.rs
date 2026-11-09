@@ -1,7 +1,7 @@
-//! Test TDD del decoder contro input malevoli o fuori limite (OWASP A03/A04).
+//! TDD tests of the decoder against malicious or out-of-bounds input (OWASP A03/A04).
 //!
-//! Regola generale: qualunque violazione è un errore **fatale** per la connessione. Il decoder
-//! non tenta mai di risincronizzarsi su un flusso corrotto.
+//! General rule: any violation is a **fatal** error for the connection. The decoder
+//! never attempts to resynchronize on a corrupted stream.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -31,7 +31,7 @@ fn decode_one(mut buf: BytesMut) -> Result<Option<Frame>, DecodeError> {
     FrameDecoder::new().decode(&mut buf)
 }
 
-// ---------- casi felici e vettori di riferimento (golden) ----------
+// ---------- happy paths and reference (golden) vectors ----------
 
 #[test]
 fn ping_has_a_stable_wire_encoding() {
@@ -68,7 +68,7 @@ fn open_has_a_stable_wire_encoding() {
 #[test]
 fn decodes_exactly_one_frame_and_leaves_the_rest() {
     let mut buf = raw_v1(PING, 0, &[0; 8]);
-    buf.extend_from_slice(&[0x01, 0x20]); // inizio del frame successivo
+    buf.extend_from_slice(&[0x01, 0x20]); // start of the next frame
     let frame = FrameDecoder::new().decode(&mut buf).unwrap();
     assert_eq!(frame, Some(Frame::Ping { nonce: 0 }));
     assert_eq!(&buf[..], &[0x01, 0x20]);
@@ -93,7 +93,7 @@ fn empty_buffer_is_not_an_error() {
     assert_eq!(decode_one(BytesMut::new()), Ok(None));
 }
 
-// ---------- header malevolo ----------
+// ---------- malicious header ----------
 
 #[test]
 fn rejects_unsupported_versions() {
@@ -140,8 +140,8 @@ fn rejects_control_frames_on_a_data_stream() {
     );
 }
 
-/// Il cuore della difesa DoS: una lunghezza dichiarata oltre il limite è rifiutata guardando
-/// il solo header, **prima** di bufferizzare un singolo byte di payload.
+/// The core of the DoS defense: a declared length beyond the limit is rejected by looking at
+/// the header alone, **before** buffering a single byte of payload.
 #[test]
 fn rejects_oversized_length_from_the_header_alone() {
     let oversized = u16::try_from(MAX_PAYLOAD_LEN + 1).unwrap();
@@ -170,7 +170,7 @@ fn rejects_wrong_lengths_for_fixed_size_frames() {
         (OPEN_ACK, 1, 1),
         (REJECT, 1, 0),
         (CLOSE, 1, 2),
-        (REGISTER, 0, 64), // NodeId oltre 63 byte
+        (REGISTER, 0, 64), // NodeId over 63 bytes
     ];
     for (kind, stream, len) in cases {
         let payload = vec![0x61; usize::from(len)];
@@ -196,7 +196,7 @@ fn rejects_empty_data_frames() {
     );
 }
 
-// ---------- payload malevolo ----------
+// ---------- malicious payload ----------
 
 #[test]
 fn rejects_invalid_node_ids() {
@@ -228,7 +228,7 @@ fn rejects_unknown_reason_codes() {
     );
 }
 
-// ---------- politica di errore ----------
+// ---------- error policy ----------
 
 #[test]
 fn decoder_is_poisoned_after_the_first_error() {
@@ -236,7 +236,7 @@ fn decoder_is_poisoned_after_the_first_error() {
     let mut bad = raw(9, PING, 0, 8, &[0; 8]);
     assert!(decoder.decode(&mut bad).is_err());
 
-    // Anche un frame perfettamente valido non viene più accettato: niente risincronizzazione.
+    // Even a perfectly valid frame is no longer accepted: no resynchronization.
     let mut good = raw_v1(PING, 0, &[0; 8]);
     assert_eq!(decoder.decode(&mut good), Err(DecodeError::Poisoned));
     assert!(decoder.is_poisoned());

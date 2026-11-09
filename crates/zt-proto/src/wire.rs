@@ -1,4 +1,4 @@
-//! Costanti e regole del formato sul filo (versione 1).
+//! Constants and rules of the on-the-wire format (version 1).
 //!
 //! ```text
 //!  0        1        2                 6        8
@@ -12,13 +12,13 @@ use zt_domain::limits::{MAX_NODE_ID_LEN, MAX_PAYLOAD_LEN};
 
 pub use zt_domain::limits::FRAME_HEADER_LEN as HEADER_LEN;
 
-/// L'unica versione del protocollo accettata.
+/// The only accepted protocol version.
 pub const VERSION: u8 = 1;
 
-/// Lunghezza ammessa del payload per ogni tipo di frame, come intervallo chiuso `(min, max)`.
+/// Allowed payload length for each frame kind, as a closed interval `(min, max)`.
 ///
-/// Il decoder la applica guardando il solo header, prima di attendere il payload: una
-/// lunghezza dichiarata fuori intervallo non causa mai allocazioni.
+/// The decoder applies it by looking at the header alone, before waiting for the payload: a
+/// declared length outside the interval never causes allocations.
 #[must_use]
 pub const fn length_bounds(kind: FrameKind) -> (usize, usize) {
     match kind {
@@ -31,7 +31,7 @@ pub const fn length_bounds(kind: FrameKind) -> (usize, usize) {
     }
 }
 
-// Nessun tipo può dichiarare più del massimo globale (indice limitato dal `while`).
+// No kind can declare more than the global maximum (index bounded by the `while`).
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 const _: () = {
     let mut i = 0;

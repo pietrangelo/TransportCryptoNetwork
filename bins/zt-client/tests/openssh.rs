@@ -1,8 +1,8 @@
-//! End-to-end con OpenSSH e Ansible veri: `ssh`/`scp`/`ansible-playbook` usano `zt-client`
-//! come `ProxyCommand` verso un `sshd` raggiungibile solo dall'agent.
+//! End-to-end with real OpenSSH and Ansible: `ssh`/`scp`/`ansible-playbook` use `zt-client`
+//! as `ProxyCommand` toward an `sshd` reachable only by the agent.
 //!
-//! Richiedono `sshd`, `ssh`, `scp`, `ssh-keygen` e `ansible-playbook`; sono marcati
-//! `#[ignore]` e girano nel job CI `e2e-openssh` con `cargo test -- --ignored`.
+//! They require `sshd`, `ssh`, `scp`, `ssh-keygen` and `ansible-playbook`; they are marked
+//! `#[ignore]` and run in the `e2e-openssh` CI job with `cargo test -- --ignored`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -46,7 +46,7 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// sshd su 127.0.0.1 (porta libera), relay e agent in-process, configurazione ssh pronta.
+/// sshd on 127.0.0.1 (free port), relay and agent in-process, ssh configuration ready.
 struct Lab {
     fleet: Fleet,
     _client: ClientDir,
@@ -93,7 +93,7 @@ impl Lab {
             ),
         )
         .unwrap();
-        // sshd avviato da root richiede la directory di privilege separation.
+        // sshd started as root requires the privilege separation directory.
         let _ = std::fs::create_dir_all("/run/sshd");
         let sshd = Command::new(sshd_path())
             .args(["-D", "-e", "-f"])
@@ -233,7 +233,7 @@ async fn parallel_ssh_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
 async fn ssh_host_key_verification_still_applies_end_to_end() {
-    // TCN non sostituisce l'autenticazione SSH: un host key diverso da quello noto fa fallire.
+    // TCN does not replace SSH authentication: a host key different from the known one fails.
     let lab = Lab::start().await;
     let other = lab.dir.join("other_key");
     run(Command::new("ssh-keygen")

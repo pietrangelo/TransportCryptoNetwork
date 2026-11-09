@@ -1,7 +1,7 @@
-//! Il decoder dei frame su byte arbitrari, consegnati a pezzi di dimensione arbitraria.
+//! The frame decoder on arbitrary bytes, delivered in chunks of arbitrary size.
 //!
-//! Proprietà: nessun panic; un frame accettato si ricodifica negli stessi identici byte
-//! (codifica canonica, nessuna malleabilità); dopo un errore il decoder resta avvelenato.
+//! Properties: no panic; an accepted frame re-encodes to the very same bytes (canonical
+//! encoding, no malleability); after an error the decoder stays poisoned.
 #![no_main]
 
 use bytes::BytesMut;

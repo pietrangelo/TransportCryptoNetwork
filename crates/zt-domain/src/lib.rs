@@ -1,18 +1,18 @@
 //! # zt-domain
 //!
-//! Il *domain core* di TCN (Transport Crypto Network).
+//! The *domain core* of TCN (Transport Crypto Network).
 //!
-//! Questo crate è volutamente **puro**: nessun runtime async, nessun socket, nessun file.
-//! Contiene soltanto concetti del dominio e le loro invarianti:
+//! This crate is deliberately **pure**: no async runtime, no sockets, no files.
+//! It contains only domain concepts and their invariants:
 //!
-//! - **Value object** ([`NodeId`], [`SessionId`], [`StreamId`], [`Fingerprint`], [`AuthToken`],
-//!   [`FramePayload`], [`Credit`]): si costruiscono solo tramite `TryFrom`/factory che validano
-//!   l'input, quindi un valore esistente è per costruzione un valore valido.
-//! - **Messaggi di protocollo** ([`Frame`]): un enum immutabile in cui ogni variante porta solo
-//!   value object già validati. Un frame malformato non è rappresentabile.
-//! - **Eventi di dominio** ([`DomainEvent`]) ed **errori** ([`DomainError`]).
+//! - **Value objects** ([`NodeId`], [`SessionId`], [`StreamId`], [`Fingerprint`], [`AuthToken`],
+//!   [`FramePayload`], [`Credit`]): constructed only through `TryFrom`/factories that validate
+//!   the input, so any existing value is valid by construction.
+//! - **Protocol messages** ([`Frame`]): an immutable enum in which every variant carries only
+//!   already-validated value objects. A malformed frame is unrepresentable.
+//! - **Domain events** ([`DomainEvent`]) and **errors** ([`DomainError`]).
 //!
-//! La traduzione da/verso byte vive in `zt-proto` (adapter), non qui.
+//! Translation to/from bytes lives in `zt-proto` (the adapter), not here.
 #![forbid(unsafe_code)]
 
 pub mod cert;

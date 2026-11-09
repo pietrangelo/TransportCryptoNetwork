@@ -1,9 +1,9 @@
-//! Rekey periodico dei canali Noise (Fase 4).
+//! Periodic rekey of Noise channels (Phase 4).
 //!
-//! Ogni [`REKEY_INTERVAL`] messaggi per direzione entrambe le parti chiamano `rekey()` di Noise:
-//! la chiave di trasporto avanza a senso unico, così la compromissione della memoria di un
-//! processo non svela il traffico dei periodi precedenti. Il rekey è implicito (deterministico
-//! sul contatore), quindi non cambia il formato sul filo.
+//! Every [`REKEY_INTERVAL`] messages per direction both parties call Noise's `rekey()`: the
+//! transport key advances one-way, so compromising the memory of a process does not reveal
+//! the traffic of previous periods. The rekey is implicit (deterministic on the counter), so
+//! it does not change the wire format.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -61,8 +61,8 @@ fn ciphertext_from_an_old_epoch_is_rejected() {
     assert!(b.decrypt(&old).is_err());
 }
 
-/// Attacco: messaggi falsi o corrotti (un relay o un attaccante sul percorso) non devono far
-/// avanzare il contatore, altrimenti desincronizzerebbero il rekey e ucciderebbero il canale.
+/// Attack: forged or corrupted messages (a relay or an on-path attacker) must not advance the
+/// counter, otherwise they would desynchronize the rekey and kill the channel.
 #[test]
 fn garbage_before_any_message_does_not_shift_the_receiver() {
     let (mut a, mut b) = pair();

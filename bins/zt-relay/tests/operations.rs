@@ -1,5 +1,5 @@
-//! Esercizio del relay (Fase 4): audit log JSON leggibile da una macchina e ricarica della
-//! policy con SIGHUP, che si applica anche alle connessioni già aperte.
+//! Relay operations (Phase 4): machine-readable JSON audit log and policy reload with
+//! SIGHUP, which also applies to connections already open.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -130,8 +130,8 @@ impl Relay {
         }
     }
 
-    /// Le righe "relay listening" e `keys_in_use` dell'avvio, in qualsiasi ordine: le chiavi
-    /// accettate sono dichiarate all'avvio (finding 0005-3).
+    /// The startup "relay listening" and `keys_in_use` lines, in any order: the accepted
+    /// keys are declared at startup (finding 0005-3).
     fn startup(&self) -> (serde_json::Value, serde_json::Value) {
         let (mut listening, mut in_use) = (None, None);
         while listening.is_none() || in_use.is_none() {
@@ -171,7 +171,7 @@ impl Relay {
     }
 }
 
-/// Esito di una connessione: autenticata (il relay risponde, il nodo è offline) o no.
+/// Outcome of a connection: authenticated (the relay replies, the node is offline) or not.
 async fn try_connect(relay: &Relay, who: &Identity) -> Result<(), NetError> {
     let (_app, local) = tokio::io::duplex(1024);
     tokio::time::timeout(
@@ -192,7 +192,7 @@ async fn audit_events_are_json_with_a_stable_kind_and_no_secrets() {
     assert_eq!(event["fields"]["event_kind"], "authentication_failed");
     assert_eq!(event["level"], "WARN");
     assert!(event["timestamp"].is_string());
-    // Campi strutturati, non una stringa `Debug` da analizzare (finding 0004-4).
+    // Structured fields, not a `Debug` string to parse (finding 0004-4).
     assert_eq!(
         event["fields"]["peer"],
         stranger.fingerprint().to_string(),
@@ -209,7 +209,7 @@ async fn sighup_reloads_the_policy_and_revokes_live_connections() {
     let alice = Identity::generate().unwrap();
     let bob = Identity::generate().unwrap();
     let relay = Relay::start("hup", &[&alice]);
-    // alice è autenticata: il nodo è solo offline. bob non è nella policy.
+    // alice is authenticated: the node is just offline. bob is not in the policy.
     assert!(matches!(
         try_connect(&relay, &alice).await,
         Err(NetError::Rejected(_))
@@ -249,7 +249,7 @@ async fn an_invalid_policy_on_reload_keeps_the_previous_one() {
         try_connect(&relay, &alice).await,
         Err(NetError::Rejected(_))
     ));
-    // Anche un file diventato scrivibile da altri viene rifiutato e la policy resta quella.
+    // Even a file that has become writable by others is rejected and the policy stays the same.
     std::fs::write(relay.dir.join("policy.toml"), policy_text(&[])).unwrap();
     set_mode(&relay.dir.join("policy.toml"), 0o666);
     relay.hup();
@@ -260,8 +260,8 @@ async fn an_invalid_policy_on_reload_keeps_the_previous_one() {
     ));
 }
 
-/// Finding 0004-2: con `Type=notify` systemd invia `reload` solo dopo `READY=1`. Da quel momento
-/// un `SIGHUP`, anche immediato, ricarica la policy e non termina il relay.
+/// Finding 0004-2: with `Type=notify` systemd sends `reload` only after `READY=1`. From that
+/// moment a `SIGHUP`, even immediate, reloads the policy and does not terminate the relay.
 #[test]
 fn ready_is_notified_only_once_sighup_is_handled() {
     use std::os::unix::net::UnixDatagram;
@@ -310,8 +310,8 @@ fn ready_is_notified_only_once_sighup_is_handled() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fase 5 (PROTOCOL §14): la chiave del relay ruota con `SIGHUP`, senza riavvio. Dopo la
-/// ricarica valgono la chiave nuova e la precedente; quella ancora più vecchia no.
+/// Phase 5 (PROTOCOL §14): the relay key rotates with `SIGHUP`, without restart. After the
+/// reload the new key and the previous one are valid; the even older one is not.
 fn assert_keys(in_use: &serde_json::Value, current: &Identity, previous: &Identity) {
     let fields = &in_use["fields"];
     assert_eq!(
@@ -401,7 +401,7 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
             )
             .await
             .expect("connect hung");
-            // Autenticato: il relay risponde che il nodo è offline.
+            // Authenticated: the relay replies that the node is offline.
             matches!(r, Err(NetError::Rejected(_)))
         }
     };
@@ -409,7 +409,7 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
     assert!(reaches(&relay, &oldest).await);
     assert!(!reaches(&relay, &new).await);
 
-    // Rotazione: nuova chiave corrente, la vecchia diventa precedente.
+    // Rotation: new current key, the old one becomes the previous one.
     write_key("cur.key", &new);
     write_key("prev.key", &old);
     relay.hup();
@@ -422,15 +422,15 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
         "the retired key must stop working"
     );
 
-    // Un file non valido lascia in vigore le chiavi di prima.
+    // An invalid file leaves the previous keys in force.
     std::fs::write(dir.join("cur.key"), "not a key").unwrap();
     relay.hup();
     relay.wait_for(|v| v["fields"]["event_kind"] == "relay_keys_reload_failed");
     assert!(reaches(&relay, &new).await);
 }
 
-/// Finding 0005b-2: due chiavi di agent per un nodo nella policy (rotazione dell'agent non
-/// completata) sono segnalate alla ricarica con `agent_rotation_pending`.
+/// Finding 0005b-2: two agent keys for one node in the policy (unfinished agent rotation)
+/// are reported on reload with `agent_rotation_pending`.
 #[test]
 fn a_pending_agent_rotation_in_the_policy_is_reported() {
     let relay = Relay::start("agent-rotation", &[]);
@@ -460,7 +460,7 @@ fn a_pending_agent_rotation_in_the_policy_is_reported() {
     );
 }
 
-// ---------- Fase 6, passo 9: CA pinnate e denylist (PROTOCOL §15.8, §15.9; OPERATIONS §10) ----------
+// ---- Phase 6, step 9: pinned CAs and denylist (PROTOCOL §15.8, §15.9; OPERATIONS §10) ----
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -475,7 +475,7 @@ fn authority_text(ca: &zt_crypto::PublicKey) -> String {
 
 const EMPTY_REVOCATIONS: &str = "serials = []\nkeys = []\n";
 
-/// Directory di un relay della Fase 6: `relay.key`, `prev.key`, `policy.toml`, `revoked.toml`.
+/// Directory of a Phase 6 relay: `relay.key`, `prev.key`, `policy.toml`, `revoked.toml`.
 struct CaDir {
     dir: std::path::PathBuf,
     key: Identity,
@@ -529,7 +529,7 @@ impl CaDir {
     fn previous_arg(&self) -> String {
         self.dir.join("prev.key").to_str().unwrap().to_owned()
     }
-    /// Il processo deve terminare da solo, con errore, entro pochi secondi.
+    /// The process must terminate on its own, with an error, within a few seconds.
     fn refuses(&self, extra: &[&str]) -> String {
         let mut child = self.command(extra).spawn().unwrap();
         for _ in 0..50 {
@@ -547,7 +547,7 @@ impl CaDir {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    /// Avvia il relay e attende «relay listening».
+    /// Starts the relay and waits for "relay listening".
     fn start(self, extra: &[&str]) -> Relay {
         let mut child = self.command(extra).spawn().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -601,7 +601,7 @@ fn issue(ca: &zt_crypto::CaSigningKey, subject: &Identity) -> (Vec<u8>, zt_domai
     (zt_crypto::sign_certificate(ca, &body).unwrap(), serial)
 }
 
-/// Autenticato dal relay con il certificato: il relay risponde che il nodo è offline.
+/// Authenticated by the relay with the certificate: the relay replies that the node is offline.
 async fn certified(relay: &Relay, who: &Identity, cert: &[u8]) -> bool {
     let mut config = relay.config();
     config.certificate = Some(std::sync::Arc::from(cert));
@@ -622,7 +622,7 @@ fn authorities_without_revocations_refuse_to_start() {
     );
     let stderr = dir.refuses(&[]);
     assert!(stderr.contains("revocations"), "{stderr}");
-    // Controllo positivo: con la denylist (vuota) il relay parte e annuncia la CA.
+    // Positive control: with the (empty) denylist the relay starts and announces the CA.
     let revocations = dir.revocations_arg();
     let relay = dir.start(&["--revocations", &revocations]);
     let event = relay.wait_for(|v| v["fields"]["event_kind"] == "authorities_in_use");
@@ -637,7 +637,7 @@ fn authorities_without_revocations_refuse_to_start() {
 fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
     let dir = CaDir::new("ca-is-me", &policy_text(&[]), Some(EMPTY_REVOCATIONS));
     let (revocations, previous) = (dir.revocations_arg(), dir.previous_arg());
-    // La CA è la chiave corrente del relay.
+    // The CA is the relay's current key.
     dir.write(
         "policy.toml",
         &format!(
@@ -647,7 +647,7 @@ fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
         ),
     );
     dir.refuses(&["--revocations", &revocations]);
-    // La CA è la chiave precedente del relay.
+    // The CA is the relay's previous key.
     dir.write(
         "policy.toml",
         &format!(
@@ -657,7 +657,7 @@ fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
         ),
     );
     dir.refuses(&["--revocations", &revocations, "--previous-key", &previous]);
-    // Controllo positivo: un'altra CA va bene.
+    // Positive control: another CA is fine.
     let other = Identity::generate().unwrap().public_key();
     dir.write(
         "policy.toml",
@@ -675,13 +675,13 @@ async fn sighup_reloads_revocations_and_cuts_a_revoked_certificate() {
     let dir = CaDir::new("hup-revocations", &policy, Some(EMPTY_REVOCATIONS));
     let revocations = dir.revocations_arg();
     let relay = dir.start(&["--revocations", &revocations]);
-    // L'annuncio dell'avvio (denylist vuota) arriva dopo «relay listening»: va letto qui, o
-    // `wait_all` lo scambierebbe per quello della ricarica.
+    // The startup announcement (empty denylist) arrives after "relay listening": it must be
+    // read here, or `wait_all` would mistake it for the reload one.
     let startup = relay.wait_for(|v| v["fields"]["event_kind"] == "revocations_in_use");
     assert_eq!(startup["fields"]["serials"], 0, "{startup}");
     assert!(certified(&relay, &alice, &cert).await);
 
-    // Una connessione aperta con il certificato.
+    // A connection open with the certificate.
     let tcp = tokio::net::TcpStream::connect(&relay.addr).await.unwrap();
     let mut live = zt_net::channel::connect_with_payload(
         tcp,
@@ -715,7 +715,7 @@ async fn sighup_reloads_revocations_and_cuts_a_revoked_certificate() {
     assert!(!certified(&relay, &alice, &cert).await);
 }
 
-/// Attende un evento per ciascun `event_kind` di `kinds`, in qualsiasi ordine.
+/// Waits for one event for each `event_kind` of `kinds`, in any order.
 fn wait_all(relay: &Relay, kinds: &[&str]) -> std::collections::HashMap<String, serde_json::Value> {
     let mut seen = std::collections::HashMap::new();
     while seen.len() < kinds.len() {
@@ -741,7 +741,7 @@ async fn a_bad_revocation_file_on_reload_keeps_both_previous_files() {
     let relay = dir.start(&["--revocations", &revocations]);
     assert!(certified(&relay, &alice, &cert).await);
 
-    // Policy nuova valida (senza la CA) + denylist non valida: non entra nessuna delle due.
+    // Valid new policy (without the CA) + invalid denylist: neither of the two gets in.
     std::fs::write(relay.dir.join("policy.toml"), policy_text(&[])).unwrap();
     std::fs::write(
         relay.dir.join("revoked.toml"),
@@ -756,7 +756,7 @@ async fn a_bad_revocation_file_on_reload_keeps_both_previous_files() {
         "the new policy entered"
     );
 
-    // Denylist nuova valida (revoca alice) + policy non valida: la revoca non entra.
+    // Valid new denylist (revokes alice) + invalid policy: the revocation does not get in.
     std::fs::write(
         relay.dir.join("policy.toml"),
         "[[agents]]\nnode = \"BAD\"\n",
@@ -775,10 +775,9 @@ async fn a_bad_revocation_file_on_reload_keeps_both_previous_files() {
     );
 }
 
-/// Finding 0006-2: una rotazione con `SIGHUP` verso una chiave del relay uguale a una CA della
-/// policy in vigore è rifiutata come all'avvio (`relay_keys_reload_failed`, messaggio esplicito)
-/// e restano le chiavi precedenti; la policy si ricarica ancora. Controllo positivo: una chiave
-/// nuova qualsiasi entra.
+/// Finding 0006-2: a `SIGHUP` rotation to a relay key equal to a CA of the policy in force is
+/// rejected as at startup (`relay_keys_reload_failed`, explicit message) and the previous keys
+/// remain; the policy still reloads. Positive control: any new key gets in.
 #[tokio::test]
 async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
     let ca = zt_crypto::CaSigningKey::generate().unwrap();
@@ -809,11 +808,11 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
             && error.contains(&ca.public_key().fingerprint().to_string()),
         "{failed}"
     );
-    // Le chiavi precedenti restano: il relay risponde ancora con la sua chiave e ammette il
-    // certificato.
+    // The previous keys remain: the relay still replies with its key and admits the
+    // certificate.
     assert!(certified(&relay, &alice, &cert).await);
-    // La policy si ricarica ancora (prima della correzione falliva da qui in poi); lo stesso
-    // `SIGHUP` rifiuta di nuovo la chiave. Si attendono entrambi prima di cambiare il file.
+    // The policy still reloads (before the fix it failed from here on); the same `SIGHUP`
+    // rejects the key again. Both are awaited before changing the file.
     relay.hup();
     let (mut policy_event, mut keys_event) = (None, None);
     while policy_event.is_none() || keys_event.is_none() {
@@ -830,7 +829,7 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
     }
     assert_eq!(policy_event.unwrap(), "policy_reloaded");
     assert_eq!(keys_event.unwrap(), "relay_keys_reload_failed");
-    // Controllo positivo: una chiave nuova che non è una CA entra.
+    // Positive control: a new key that is not a CA gets in.
     let fresh = Identity::generate().unwrap();
     std::fs::write(&key_file, fresh.to_secret_hex().as_str()).unwrap();
     set_mode(&key_file, 0o600);
@@ -840,8 +839,8 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
             || v["fields"]["event_kind"] == "relay_keys_reload_failed"
     });
     assert_eq!(ok["fields"]["event_kind"], "relay_keys_reloaded", "{ok}");
-    // Nella stessa ricarica, una CA nuova e una chiave del relay uguale: la policy entra (la CA
-    // non è la chiave in vigore), la chiave no (è la CA della policy sul disco).
+    // In the same reload, a new CA and an equal relay key: the policy gets in (the CA is not
+    // the key in force), the key does not (it is the CA of the policy on disk).
     let other = zt_crypto::CaSigningKey::generate().unwrap();
     let policy_file = relay.dir.join("policy.toml");
     std::fs::write(
@@ -889,7 +888,7 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
             .contains("authority key equals the relay key"),
         "{keys_event}"
     );
-    // Il relay risponde ancora con la chiave di prima e ammette un certificato della CA nuova.
+    // The relay still replies with the previous key and admits a certificate from the new CA.
     let (other_cert, _) = issue(&other, &alice);
     let mut config = relay.config();
     config.relays[0].public_key = fresh.public_key();
@@ -904,8 +903,9 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
     assert!(matches!(r, Err(NetError::Rejected(_))), "{r:?}");
 }
 
-/// Finding 0006-3: `authentication_failed` per un certificato firmato da una CA pinnata ma
-/// rifiutato dopo la firma (qui `serial_revoked`) riporta `ca` e `serial` (PROTOCOL §15.11).
+/// Finding 0006-3: `authentication_failed` for a certificate signed by a pinned CA but
+/// rejected after the signature (here `serial_revoked`) reports `ca` and `serial` (PROTOCOL
+/// §15.11).
 #[tokio::test]
 async fn authentication_failed_after_the_signature_names_ca_and_serial_in_json() {
     let ca = zt_crypto::CaSigningKey::generate().unwrap();

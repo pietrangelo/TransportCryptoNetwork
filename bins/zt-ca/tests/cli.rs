@@ -1,4 +1,4 @@
-//! Fase 6, passo 9: la CLI di `zt-ca` (OPERATIONS §10.1, §10.3, §10.5; PROTOCOL §15.1, §15.2).
+//! Phase 6, step 9: the `zt-ca` CLI (OPERATIONS §10.1, §10.3, §10.5; PROTOCOL §15.1, §15.2).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,7 +19,7 @@ use zt_crypto::{CERT_FILE_PREFIX, CaSigningKey, Identity, PublicKey};
 
 const BIN: &str = env!("CARGO_BIN_EXE_zt-ca");
 
-/// Chiavi Ed25519 deboli o non canoniche (come in `zt-net/tests/cert_config.rs`).
+/// Weak or non-canonical Ed25519 keys (as in `zt-net/tests/cert_config.rs`).
 const BAD_KEYS: [&str; 4] = [
     "0100000000000000000000000000000000000000000000000000000000000000",
     "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
@@ -29,7 +29,7 @@ const BAD_KEYS: [&str; 4] = [
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Directory di lavoro `0700` della macchina della CA, cancellata alla fine.
+/// `0700` working directory of the CA machine, deleted at the end.
 struct Dir(PathBuf);
 
 impl Dir {
@@ -76,7 +76,7 @@ fn all(o: &Output) -> String {
     format!("{}{}", stdout(o), stderr(o))
 }
 
-/// Il valore di una riga `name = value` (o `name = "value"`) di stdout.
+/// The value of a `name = value` (or `name = "value"`) line of stdout.
 fn value(text: &str, name: &str) -> Option<String> {
     text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
@@ -84,7 +84,7 @@ fn value(text: &str, name: &str) -> Option<String> {
     })
 }
 
-/// `zt-ca keygen` in `dir/ca.key`: la chiave pubblica stampata.
+/// `zt-ca keygen` into `dir/ca.key`: the printed public key.
 fn keygen(dir: &Dir) -> PublicKey {
     let out = run(&["keygen", "--out", &dir.arg("ca.key")]);
     assert!(out.status.success(), "{}", all(&out));
@@ -98,7 +98,7 @@ fn subject() -> String {
     Identity::generate().unwrap().public_key().to_string()
 }
 
-/// `zt-ca sign` con argomenti di default e `extra` al posto di quelli con lo stesso nome.
+/// `zt-ca sign` with default arguments and `extra` in place of those with the same name.
 fn sign(dir: &Dir, out_name: &str, overrides: &[(&str, Option<&str>)]) -> Output {
     let (ca, log, out) = (dir.arg("ca.key"), dir.arg("issued.tsv"), dir.arg(out_name));
     let subject = subject();
@@ -147,8 +147,8 @@ fn is_hex32(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Spec (§10.1): file nuovo `0600` con il prefisso della CA; stdout con chiave e fingerprint;
-/// un file esistente non è mai sovrascritto.
+/// Spec (§10.1): new `0600` file with the CA prefix; stdout with key and fingerprint; an
+/// existing file is never overwritten.
 #[test]
 fn keygen_creates_a_private_ca_key_and_prints_its_public_key() {
     let dir = Dir::new();
@@ -170,18 +170,18 @@ fn keygen_creates_a_private_ca_key_and_prints_its_public_key() {
     );
     let ca = CaSigningKey::from_secret_text(&secret).unwrap();
     assert_eq!(ca.public_key(), key);
-    // Il segreto non compare mai a terminale.
+    // The secret never appears on the terminal.
     let hex = secret.trim().trim_start_matches(CaSigningKey::FILE_PREFIX);
     assert!(!all(&out).contains(hex));
 
-    // Mai sovrascritto.
+    // Never overwritten.
     let again = run(&["keygen", "--out", &dir.arg("ca.key")]);
     assert!(!again.status.success());
     assert_eq!(std::fs::read_to_string(dir.path("ca.key")).unwrap(), secret);
 }
 
-/// Spec (§10.3, §10.5): `sign` scrive un file di certificato; `inspect --ca-key` ne conferma
-/// la firma e i campi; con un'altra chiave di CA fallisce.
+/// Spec (§10.3, §10.5): `sign` writes a certificate file; `inspect --ca-key` confirms its
+/// signature and fields; with another CA key it fails.
 #[test]
 fn sign_writes_a_certificate_that_inspect_verifies() {
     let dir = Dir::new();
@@ -249,7 +249,7 @@ fn sign_writes_a_certificate_that_inspect_verifies() {
     assert!(!bad.status.success(), "inspect accepted the wrong CA key");
 }
 
-/// Spec (§10.3): una riga TSV per certificato, `0600`, prima di `--out`.
+/// Spec (§10.3): one TSV line per certificate, `0600`, before `--out`.
 #[test]
 fn sign_appends_one_line_per_certificate_to_the_log() {
     let dir = Dir::new();
@@ -283,7 +283,7 @@ fn sign_appends_one_line_per_certificate_to_the_log() {
     assert_ne!(lines[0].split('\t').next(), lines[1].split('\t').next());
 }
 
-/// Spec (§10.5): `inspect` stampa la riga da incollare nella denylist.
+/// Spec (§10.5): `inspect` prints the line to paste into the denylist.
 #[test]
 fn inspect_prints_the_denylist_line() {
     let dir = Dir::new();
@@ -302,8 +302,8 @@ fn inspect_prints_the_denylist_line() {
     );
 }
 
-/// A: `--out` esistente non è mai sovrascritto; soggetti deboli, non esadecimali o non
-/// canonici sono rifiutati senza creare il certificato.
+/// A: an existing `--out` is never overwritten; weak, non-hex or non-canonical subjects are
+/// rejected without creating the certificate.
 #[test]
 fn sign_never_overwrites_and_refuses_bad_subjects() {
     let dir = Dir::new();
@@ -329,11 +329,11 @@ fn sign_never_overwrites_and_refuses_bad_subjects() {
             "certificate written for {subject:?}"
         );
     }
-    // Controllo positivo.
+    // Positive control.
     assert!(sign(&dir, "good.cert", &[]).status.success());
 }
 
-/// A: durate fuori da `1s..=24h` o non nel formato `n{s,m,h}`.
+/// A: lifetimes outside `1s..=24h` or not in the `n{s,m,h}` format.
 #[test]
 fn sign_refuses_bad_durations() {
     let dir = Dir::new();
@@ -373,7 +373,7 @@ fn sign_refuses_bad_durations() {
     }
 }
 
-/// A: il file di una chiave di nodo non è una CA (formati diversi, OPERATIONS §10.1).
+/// A: a node key file is not a CA (different formats, OPERATIONS §10.1).
 #[test]
 fn sign_refuses_a_node_key_as_ca() {
     let dir = Dir::new();
@@ -393,7 +393,7 @@ fn sign_refuses_a_node_key_as_ca() {
     assert!(sign(&dir, "y.cert", &[]).status.success());
 }
 
-/// A: esattamente uno fra `--nodes` e `--all-nodes`; al massimo 64 nodi validi.
+/// A: exactly one of `--nodes` and `--all-nodes`; at most 64 valid nodes.
 #[test]
 fn sign_requires_exactly_one_of_nodes_and_all_nodes() {
     let dir = Dir::new();
@@ -432,12 +432,12 @@ fn sign_requires_exactly_one_of_nodes_and_all_nodes() {
     assert!(out.status.success(), "{}", all(&out));
 }
 
-/// A: se la riga del registro non si scrive, il certificato non esiste.
+/// A: if the log line cannot be written, the certificate does not exist.
 #[test]
 fn a_failed_log_write_creates_no_certificate() {
     let dir = Dir::new();
     keygen(&dir);
-    // Un registro che è una directory, o in una directory inesistente.
+    // A log that is a directory, or in a nonexistent directory.
     std::fs::create_dir(dir.path("log-dir")).unwrap();
     let missing = dir.path("missing").join("issued.tsv");
     for log in [dir.path("log-dir"), missing] {
@@ -452,8 +452,8 @@ fn a_failed_log_write_creates_no_certificate() {
     assert_eq!(log_lines(&dir).len(), 1);
 }
 
-/// A: nessun errore stampa il segreto della CA (nemmeno un file di CA corrotto o una chiave di
-/// CA passata dove si aspetta una chiave pubblica).
+/// A: no error prints the CA secret (not even a corrupted CA file or a CA key passed where a
+/// public key is expected).
 #[test]
 fn errors_never_print_secret_material() {
     let dir = Dir::new();
@@ -479,7 +479,7 @@ fn errors_never_print_secret_material() {
         run(&["inspect", "--cert", &dir.arg("ca.key")]),
         run(&["inspect", "--cert", &dir.arg("missing"), "--ca-key", &hex]),
     ];
-    // Un file di CA corrotto (un carattere in meno) e uno leggibile da tutti.
+    // A corrupted CA file (one character short) and one readable by everyone.
     let corrupt = dir.path("corrupt.key");
     std::fs::write(&corrupt, &secret[..secret.trim_end().len() - 1]).unwrap();
     std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -507,9 +507,9 @@ fn errors_never_print_secret_material() {
     assert!(!Path::new(&dir.path("a.cert")).exists());
 }
 
-/// Finding 0006-5: `--log` uguale a `--ca`, un collegamento simbolico o un hard link al file
-/// della chiave, o una copia della chiave, è rifiutato senza toccare la chiave né creare il
-/// certificato. Controllo positivo: un registro separato funziona e la CA firma ancora.
+/// Finding 0006-5: a `--log` equal to `--ca`, a symbolic link or a hard link to the key file,
+/// or a copy of the key, is rejected without touching the key or creating the certificate.
+/// Positive control: a separate log works and the CA still signs.
 #[test]
 fn an_issuance_log_that_is_the_ca_key_is_refused() {
     let dir = Dir::new();
@@ -520,7 +520,7 @@ fn an_issuance_log_that_is_the_ca_key_is_refused() {
     std::fs::copy(dir.path("ca.key"), dir.path("copy.tsv")).unwrap();
     std::fs::set_permissions(dir.path("copy.tsv"), std::fs::Permissions::from_mode(0o600)).unwrap();
     let copy_before = std::fs::read(dir.path("copy.tsv")).unwrap();
-    // Anche un collegamento simbolico verso un registro vero: il registro non segue link.
+    // Also a symbolic link to a real log: the log does not follow links.
     std::fs::write(dir.path("real.tsv"), "").unwrap();
     std::fs::set_permissions(dir.path("real.tsv"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::os::unix::fs::symlink(dir.path("real.tsv"), dir.path("to-real.tsv")).unwrap();

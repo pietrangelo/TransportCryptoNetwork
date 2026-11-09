@@ -1,6 +1,6 @@
 [package]
 name = "zt-net"
-description = "Adapter di rete tokio di TCN: canale Noise, server relay, agent, libreria client, configurazione."
+description = "TCN tokio network adapter: Noise channel, relay server, agent, client library, configuration."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

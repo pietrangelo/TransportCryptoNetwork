@@ -6,22 +6,22 @@ use zt_domain::{
 use crate::error::DecodeError;
 use crate::wire::{HEADER_LEN, VERSION, length_bounds};
 
-/// Decoder sans-IO dei frame TCN.
+/// Sans-IO decoder for TCN frames.
 ///
-/// Si usa in un ciclo: si accodano i byte ricevuti in un [`BytesMut`] e si chiama
-/// [`decode`](Self::decode) finché restituisce `Ok(Some(frame))`.
+/// It is used in a loop: append the received bytes to a [`BytesMut`] and call
+/// [`decode`](Self::decode) until it returns `Ok(Some(frame))`.
 ///
-/// Garanzie:
-/// - non consuma byte finché un frame non è completo;
-/// - valida l'header (versione, tipo, stream, lunghezza) **prima** di attendere il payload,
-///   quindi non riserva mai più di [`MAX_FRAME_LEN`](zt_domain::limits::MAX_FRAME_LEN) byte;
-/// - dopo il primo errore è avvelenato e rifiuta tutto ([`DecodeError::Poisoned`]).
+/// Guarantees:
+/// - it does not consume bytes until a frame is complete;
+/// - it validates the header (version, kind, stream, length) **before** waiting for the payload,
+///   so it never reserves more than [`MAX_FRAME_LEN`](zt_domain::limits::MAX_FRAME_LEN) bytes;
+/// - after the first error it is poisoned and rejects everything ([`DecodeError::Poisoned`]).
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     poisoned: bool,
 }
 
-/// Header già validato.
+/// Already-validated header.
 #[derive(Debug, Clone, Copy)]
 struct Header {
     kind: FrameKind,
@@ -30,26 +30,26 @@ struct Header {
 }
 
 impl FrameDecoder {
-    /// Un decoder nuovo.
+    /// A new decoder.
     #[must_use]
     pub const fn new() -> Self {
         Self { poisoned: false }
     }
 
-    /// `true` se il decoder ha già rifiutato un frame.
+    /// `true` if the decoder has already rejected a frame.
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// Prova a estrarre il prossimo frame da `src`.
+    /// Tries to extract the next frame from `src`.
     ///
-    /// - `Ok(Some(frame))`: un frame è stato consumato da `src`;
-    /// - `Ok(None)`: servono altri byte, `src` è intatto;
-    /// - `Err(_)`: violazione di protocollo, la connessione va chiusa.
+    /// - `Ok(Some(frame))`: a frame has been consumed from `src`;
+    /// - `Ok(None)`: more bytes are needed, `src` is untouched;
+    /// - `Err(_)`: protocol violation, the connection must be closed.
     ///
     /// # Errors
-    /// Qualsiasi [`DecodeError`]; dopo il primo, sempre [`DecodeError::Poisoned`].
+    /// Any [`DecodeError`]; after the first one, always [`DecodeError::Poisoned`].
     pub fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, DecodeError> {
         if self.poisoned {
             return Err(DecodeError::Poisoned);
@@ -67,7 +67,7 @@ impl FrameDecoder {
         };
         let total = HEADER_LEN.saturating_add(header.len);
         if src.len() < total {
-            // Riserva solo ciò che manca a questo frame, già validato come ≤ MAX_FRAME_LEN.
+            // Reserve only what this frame is missing, already validated as ≤ MAX_FRAME_LEN.
             src.reserve(total.saturating_sub(src.len()));
             return Ok(None);
         }
@@ -77,7 +77,7 @@ impl FrameDecoder {
     }
 }
 
-/// Legge e valida l'header senza consumarlo. `Ok(None)` se non è ancora completo.
+/// Reads and validates the header without consuming it. `Ok(None)` if it is not yet complete.
 fn peek_header(src: &[u8]) -> Result<Option<Header>, DecodeError> {
     let Some(bytes) = src.get(..HEADER_LEN) else {
         return Ok(None);
@@ -108,7 +108,7 @@ fn peek_header(src: &[u8]) -> Result<Option<Header>, DecodeError> {
     Ok(Some(Header { kind, stream, len }))
 }
 
-/// Costruisce il frame di dominio da header validato e payload completo.
+/// Builds the domain frame from a validated header and a complete payload.
 fn parse_body(header: Header, body: Bytes) -> Result<Frame, DecodeError> {
     let Header { kind, stream, .. } = header;
     let stream_id = || StreamId::try_from(stream);
@@ -157,8 +157,8 @@ fn parse_body(header: Header, body: Bytes) -> Result<Frame, DecodeError> {
     })
 }
 
-/// Il payload come array di dimensione fissa. La lunghezza è già stata validata dall'header:
-/// il ramo d'errore esiste solo per non dover mai ricorrere a un panic.
+/// The payload as a fixed-size array. The length has already been validated by the header:
+/// the error branch exists only so that we never have to resort to a panic.
 fn fixed<const N: usize>(body: &[u8], header: Header) -> Result<[u8; N], DecodeError> {
     body.try_into().map_err(|_| {
         let (min, max) = length_bounds(header.kind);

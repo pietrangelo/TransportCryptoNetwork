@@ -1,5 +1,5 @@
-//! Validazione della riga di comando di `zt-agent` (Fase 5): elenco dei relay e chiave
-//! precedente. Gli errori arrivano prima di qualsiasi connessione.
+//! Validation of the `zt-agent` command line (Phase 5): relay list and previous key. Errors
+//! arrive before any connection.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::{Command, Output};
@@ -48,7 +48,7 @@ fn run(dir: &Dir, extra: &[&str]) -> Output {
         .arg(dir.0.join("clients.toml"))
         .args(extra)
         .env_remove("RUST_LOG");
-    // Un agent valido non termina: lo si ferma dopo un attimo.
+    // A valid agent does not terminate: it is stopped after a moment.
     let mut child = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -74,7 +74,7 @@ fn fails_with(out: &Output, needle: &str) {
 fn several_relays_are_accepted_as_repeated_or_comma_separated_options() {
     let dir = setup("ok");
     let (a, b) = (key(), key());
-    // Valida: l'agent parte e resta in esecuzione (relay irraggiungibili, riprova).
+    // Valid: the agent starts and keeps running (relays unreachable, it retries).
     for args in [
         vec![
             "--relay",
@@ -167,7 +167,7 @@ fn the_previous_key_cannot_be_the_current_key() {
         ),
         "previous key",
     );
-    // Una precedente diversa è accettata.
+    // A different previous key is accepted.
     let old = dir.0.join("old.key");
     let out = run(
         &dir,
@@ -181,7 +181,7 @@ fn the_previous_key_cannot_be_the_current_key() {
         ],
     );
     assert!(out.status.code().is_none() || out.status.success());
-    // Finding 0005-3: la chiave precedente ancora accettata è dichiarata nei log.
+    // Finding 0005-3: the previous key still accepted is declared in the logs.
     let stderr = String::from_utf8_lossy(&out.stderr);
     let old_fp = Identity::from_secret_hex(std::fs::read_to_string(&old).unwrap().trim())
         .unwrap()
@@ -191,8 +191,8 @@ fn the_previous_key_cannot_be_the_current_key() {
     assert!(stderr.contains(&old_fp), "{stderr}");
 }
 
-/// Finding 0005b-4: un `--max-streams` enorme faceva andare in panic l'agent (semaforo di
-/// tokio); ora è rifiutato dalla CLI, come lo zero.
+/// Finding 0005b-4: a huge `--max-streams` made the agent panic (tokio semaphore); now it is
+/// rejected by the CLI, like zero.
 #[test]
 fn max_streams_out_of_range_is_refused_without_panic() {
     let dir = setup("maxstreams");
@@ -214,7 +214,7 @@ fn max_streams_out_of_range_is_refused_without_panic() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
-    // I limiti sono accettati.
+    // The limits are accepted.
     for ok in ["1", "4096"] {
         let out = run(
             &dir,
@@ -235,7 +235,7 @@ fn max_streams_out_of_range_is_refused_without_panic() {
     }
 }
 
-// ---------- Fase 6, passo 9: CA pinnate e denylist (PROTOCOL §15.8, §15.9) ----------
+// ---------- Phase 6, step 9: pinned CAs and denylist (PROTOCOL §15.8, §15.9) ----------
 
 fn authority_text(ca: &str) -> String {
     format!("[[authorities]]\nname = \"ops-ca\"\npublic_key = \"{ca}\"\nallow = [\"web-01\"]\n")
@@ -255,8 +255,8 @@ fn public_of(file: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Un agent valido resta in esecuzione: `run` lo ferma (nessun codice d'uscita) o è uscito
-/// con successo.
+/// A valid agent keeps running: `run` stops it (no exit code) or it has exited
+/// successfully.
 fn keeps_running(out: &Output) {
     assert!(
         out.status.code().is_none() || out.status.success(),
@@ -272,7 +272,7 @@ fn authorities_without_revocations_refuse_to_start() {
     write(&dir, "clients.toml", &authority_text(&key()));
     let out = run(&dir, &["--relay", "127.0.0.1:9", "--relay-key", &relay]);
     fails_with(&out, "revocations");
-    // Controllo positivo: con la denylist (vuota) l'agent parte e annuncia la CA.
+    // Positive control: with the (empty) denylist the agent starts and announces the CA.
     let revoked = write(&dir, "revoked.toml", "serials = []\nkeys = []\n");
     let out = run(
         &dir,
@@ -304,14 +304,14 @@ fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
         "--revocations",
         revoked.as_str(),
     ];
-    // La CA è la chiave dell'agent.
+    // The CA is the agent's key.
     write(&dir, "clients.toml", &authority_text(&public_of(&current)));
     let out = run(&dir, &base);
     assert!(
         out.status.code().is_some_and(|c| c != 0),
         "the agent started"
     );
-    // La CA è la chiave precedente dell'agent.
+    // The CA is the agent's previous key.
     write(&dir, "clients.toml", &authority_text(&public_of(&old)));
     let mut with_previous = base.to_vec();
     with_previous.extend(["--previous-key", old.to_str().unwrap()]);
@@ -320,14 +320,14 @@ fn a_ca_key_equal_to_the_process_key_refuses_to_start() {
         out.status.code().is_some_and(|c| c != 0),
         "the agent started"
     );
-    // Controllo positivo: un'altra CA va bene.
+    // Positive control: another CA is fine.
     write(&dir, "clients.toml", &authority_text(&key()));
     keeps_running(&run(&dir, &with_previous));
 }
 
-/// Finding 0006-1: una CA uguale a un `--relay-key` pinnato è rifiutata all'avvio e a ogni
-/// `SIGHUP`. Altrimenti un relay compromesso, con il proprio seme di nodo trasformato in file di
-/// CA, firmerebbe certificati che l'agent ammette.
+/// Finding 0006-1: a CA equal to a pinned `--relay-key` is rejected at startup and on every
+/// `SIGHUP`. Otherwise a compromised relay, with its own node seed turned into a CA file,
+/// would sign certificates that the agent admits.
 #[test]
 fn a_ca_key_equal_to_a_pinned_relay_key_is_refused_at_start_and_on_reload() {
     let dir = setup("ca-is-relay");
@@ -342,12 +342,12 @@ fn a_ca_key_equal_to_a_pinned_relay_key_is_refused_at_start_and_on_reload() {
         "--revocations",
         revoked.as_str(),
     ];
-    // All'avvio: la CA è uno qualsiasi dei relay pinnati.
+    // At startup: the CA is any one of the pinned relays.
     for relay in [&first, &second] {
         write(&dir, "clients.toml", &authority_text(relay));
         fails_with(&run(&dir, &base), "authority key equals the relay key");
     }
-    // Alla ricarica: l'agent parte con un'altra CA, poi `clients.toml` pinna la chiave di un relay.
+    // On reload: the agent starts with another CA, then `clients.toml` pins a relay's key.
     write(&dir, "clients.toml", &authority_text(&key()));
     let mut child = Command::new(BIN)
         .args(["run", "--node", "web-01", "--key"])

@@ -1,7 +1,8 @@
-//! Fase 6, passo 1: formato binario dei certificati client (PROTOCOL §15.1, §15.12, §15.13).
+//! Phase 6, step 1: binary format of client certificates (PROTOCOL §15.1, §15.12, §15.13).
 //!
-//! Test RED (Adversarial TDD): specifica («S») e attacco («A») del decoder e dell'encoder del
-//! TBS. I byte si scrivono a mano con `common::Raw`, indipendente dal codice sotto test.
+//! RED tests (Adversarial TDD): specification ("S") and attack ("A") of the decoder and of the
+//! TBS encoder. The bytes are written by hand with `common::Raw`, independent of the code under
+//! test.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -40,13 +41,13 @@ fn assert_accepted(raw: &Raw) {
     assert_eq!(parsed.body, raw.body());
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[test]
 fn reference_vector_layout_decodes() {
     let cert = reference_cert();
     assert_eq!(cert.len(), 187);
-    // Il codificatore dei test riproduce il documento: la trascrizione è coerente.
+    // The test encoder reproduces the document: the transcription is consistent.
     assert_eq!(Raw::reference().bytes(), cert);
 
     let parsed = decode_certificate(&cert).unwrap();
@@ -72,7 +73,7 @@ fn reference_vector_layout_decodes() {
         body.scope(),
         &CertScope::Only([node("db-01"), node("web-01")].into_iter().collect())
     );
-    // L'encoder del dominio produce esattamente gli stessi 123 byte.
+    // The domain encoder produces exactly the same 123 bytes.
     assert_eq!(body.encode_tbs(), &cert[..123]);
 }
 
@@ -87,7 +88,7 @@ fn a_certificate_body_round_trips_canonically() {
         assert_eq!(parsed.body, body);
         assert_eq!(parsed.tbs, body.encode_tbs().as_slice());
         assert_eq!(parsed.signature, &[0x77; CERT_SIGNATURE_LEN]);
-        // Stessi byte dopo un secondo giro.
+        // Same bytes after a second round trip.
         let mut again = parsed.body.encode_tbs();
         again.extend_from_slice(parsed.signature);
         assert_eq!(again, bytes);
@@ -117,14 +118,14 @@ fn scope_all_carries_no_nodes() {
         ..Raw::valid()
     };
     assert_eq!(decode(&raw).unwrap().scope(), &CertScope::All);
-    // E l'encoder scrive `0x01` seguito da `node_count = 0`.
+    // And the encoder writes `0x01` followed by `node_count = 0`.
     let tbs = raw.body().encode_tbs();
     assert_eq!(&tbs[tbs.len() - 2..], &[0x01, 0x00]);
 }
 
 #[test]
 fn limits_are_consistent() {
-    // Valori normativi di PROTOCOL §15.12.
+    // Normative values of PROTOCOL §15.12.
     assert_eq!(MAX_CERT_LEN, 4_328);
     assert_eq!(MIN_CERT_LEN, 170);
     assert_eq!(MAX_CERT_NODES, 64);
@@ -137,7 +138,8 @@ fn limits_are_consistent() {
     assert_eq!(MAX_REVOKED_SERIALS, 16_384);
     assert_eq!(MAX_REVOKED_KEYS, 4_096);
     assert_eq!(NOISE_MSG1_OVERHEAD, 32 + 32 + 16 + 16);
-    // I limiti derivano dal layout: header fisso 102 byte + name_len + scope + node_count + firma.
+    // The limits derive from the layout: fixed 102-byte header + name_len + scope + node_count
+    // + signature.
     let fixed = 4 + 1 + 1 + 32 + 32 + 16 + 8 + 8;
     assert_eq!(fixed, 102);
     assert_eq!(MIN_CERT_LEN, fixed + 1 + 1 + 1 + 1 + CERT_SIGNATURE_LEN);
@@ -145,12 +147,12 @@ fn limits_are_consistent() {
         MAX_CERT_LEN,
         fixed + 1 + 63 + 1 + 1 + MAX_CERT_NODES * (1 + 63) + CERT_SIGNATURE_LEN
     );
-    // Il messaggio 1 con il certificato più grande sta in un `Data` e in un messaggio Noise.
+    // Message 1 carrying the largest certificate fits in a `Data` frame and in a Noise message.
     assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= MAX_PAYLOAD_LEN);
     assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= NOISE_MAX_MESSAGE_LEN);
     assert!(DEFAULT_AUTHORITY_LIFETIME_SECS <= MAX_CERT_LIFETIME_SECS);
     assert!(MIN_AUTHORITY_LIFETIME_SECS <= DEFAULT_AUTHORITY_LIFETIME_SECS);
-    // Costanti del formato.
+    // Format constants.
     assert_eq!(&CERT_MAGIC, b"TCNC");
     assert_eq!(CERT_VERSION, 1);
     assert_eq!(CERT_SIG_ED25519, 1);
@@ -158,15 +160,15 @@ fn limits_are_consistent() {
     assert_eq!(CERT_SIGNATURE_CONTEXT.len(), 26);
 }
 
-// ======================= attacchi =======================
+// ======================= attacks =======================
 
 #[test]
 fn lengths_outside_the_bounds_are_rejected_before_parsing() {
-    // Controllo positivo: i due estremi sono accettati.
+    // Positive control: both extremes are accepted.
     assert_accepted(&Raw::smallest());
     assert_accepted(&Raw::largest());
-    // Fuori dai limiti l'errore è `Length` anche con magic e versione sbagliati: la lunghezza è
-    // controllata prima di leggere qualsiasi campo.
+    // Outside the limits the error is `Length` even with wrong magic and version: the length is
+    // checked before reading any field.
     for len in [0, 1, MIN_CERT_LEN - 1, MAX_CERT_LEN + 1, 65_535] {
         let bytes = vec![0xff_u8; len];
         assert_eq!(
@@ -175,7 +177,7 @@ fn lengths_outside_the_bounds_are_rejected_before_parsing() {
             "len {len}"
         );
     }
-    // Un prefisso valido non cambia l'esito.
+    // A valid prefix does not change the outcome.
     let mut long = Raw::largest().bytes();
     long.push(0);
     assert_eq!(
@@ -210,7 +212,7 @@ fn every_other_magic_version_and_algorithm_is_rejected() {
         };
         assert_eq!(decode(&raw), Err(CertFormatError::Magic), "{magic:?}");
     }
-    // Ogni singolo bit del magic.
+    // Every single bit of the magic.
     for i in 0..4 {
         for bit in 0..8 {
             let mut magic = *b"TCNC";
@@ -236,7 +238,7 @@ fn a_zero_serial_is_rejected() {
         CertSerial::try_from([0_u8; 16]),
         Err(CertFormatError::SerialZero)
     );
-    // Un solo bit acceso basta.
+    // A single set bit is enough.
     let mut one = [0_u8; 16];
     one[15] = 1;
     assert!(CertSerial::try_from(one).is_ok());
@@ -248,8 +250,8 @@ fn a_zero_serial_is_rejected() {
 
 #[test]
 fn a_self_certified_body_is_rejected() {
-    // PROTOCOL §15.1 regola 3: `ca_key` e `subject_key` non coincidono. (Test aggiunto: la
-    // regola non ha una riga propria nel piano, che la copre solo in `zt-crypto`.)
+    // PROTOCOL §15.1 rule 3: `ca_key` and `subject_key` do not coincide. (Added test: the
+    // rule has no row of its own in the plan, which covers it only in `zt-crypto`.)
     assert_accepted(&Raw::valid());
     let raw = Raw {
         subject_key: [0xca; 32],
@@ -293,7 +295,7 @@ fn empty_or_inverted_validity_is_rejected() {
             Err(CertFormatError::Validity)
         );
     }
-    // Un secondo di validità è ammesso.
+    // One second of validity is allowed.
     assert_accepted(&Raw {
         not_before: 1_000,
         not_after: 1_001,
@@ -330,7 +332,7 @@ fn a_lifetime_over_24_hours_is_rejected() {
 
 #[test]
 fn extreme_times_never_overflow() {
-    // Ai bordi di u64: un errore, mai un panic né un risultato che si avvolge.
+    // At the edges of u64: an error, never a panic or a result that wraps around.
     let cases = [
         (
             0,
@@ -357,7 +359,7 @@ fn extreme_times_never_overflow() {
         let got = decode(&raw).map(|b| b.lifetime_secs());
         assert_eq!(got, expected, "{nb}..{na}");
     }
-    // L'aritmetica di `UnixTime` è controllata.
+    // `UnixTime` arithmetic is checked.
     assert_eq!(UnixTime::from_secs(u64::MAX).checked_add(1), None);
     assert_eq!(UnixTime::from_secs(0).checked_sub(1), None);
     assert_eq!(
@@ -399,7 +401,7 @@ fn invalid_names_and_node_ids_are_rejected() {
             nodes: vec![b"db-01".to_vec(), name.clone()],
             ..Raw::valid()
         };
-        // L'ordine conta poco qui: un nodo non valido è un errore di nome o d'ordine, mai Ok.
+        // Order matters little here: an invalid node is a name or order error, never Ok.
         assert!(
             matches!(
                 decode(&raw),
@@ -418,7 +420,7 @@ fn invalid_names_and_node_ids_are_rejected() {
             decode(&raw)
         );
     }
-    // Lunghezza zero: `name_len = 0`, e un nodo con `len = 0`.
+    // Zero length: `name_len = 0`, and a node with `len = 0`.
     let empty_name = Raw {
         name: Vec::new(),
         ..Raw::valid()
@@ -429,7 +431,7 @@ fn invalid_names_and_node_ids_are_rejected() {
         ..Raw::valid()
     };
     assert!(matches!(decode(&empty_node), Err(CertFormatError::Name(_))));
-    // 63 byte sono il massimo, e sono ammessi.
+    // 63 bytes is the maximum, and it is allowed.
     assert_accepted(&Raw {
         name: vec![b'z'; 63],
         nodes: vec![vec![b'y'; 63]],
@@ -445,7 +447,7 @@ fn unsorted_or_duplicate_nodes_are_rejected() {
         (vec![b"db-01", b"db-01"], 1),
         (vec![b"a", b"b", b"c", b"b"], 3),
         (vec![b"a", b"c", b"b"], 2),
-        // Ordine di byte, non di lunghezza: "ab" < "b".
+        // Byte order, not length order: "ab" < "b".
         (vec![b"b", b"ab"], 1),
     ];
     for (nodes, index) in cases {
@@ -459,7 +461,7 @@ fn unsorted_or_duplicate_nodes_are_rejected() {
             "{nodes:?}"
         );
     }
-    // Una sola codifica per ogni insieme: quella in ordine crescente.
+    // A single encoding for each set: the one in increasing order.
     assert_accepted(&Raw {
         nodes: vec![b"ab".to_vec(), b"b".to_vec()],
         ..Raw::valid()
@@ -481,7 +483,7 @@ fn an_empty_list_or_nodes_with_scope_all_are_rejected() {
         ..Raw::valid()
     };
     assert_eq!(decode(&all_with_nodes), Err(CertFormatError::NodeCount(1)));
-    // Anche il costruttore rifiuta un elenco vuoto.
+    // The constructor also rejects an empty list.
     assert!(
         CertBody::new(
             CertKey::from_bytes([0xca; 32]),
@@ -521,13 +523,13 @@ fn more_than_64_nodes_are_rejected() {
         ..Raw::valid()
     };
     assert_eq!(decode(&raw), Err(CertFormatError::NodeCount(65)));
-    // `node_count` 255 con pochi nodi: rifiutato per il conteggio, prima di leggere i nodi.
+    // `node_count` 255 with few nodes: rejected on the count, before reading the nodes.
     let raw = Raw {
         node_count: Some(255),
         ..Raw::valid()
     };
     assert_eq!(decode(&raw), Err(CertFormatError::NodeCount(255)));
-    // Il costruttore rifiuta 65 nodi.
+    // The constructor rejects 65 nodes.
     let nodes: std::collections::BTreeSet<NodeId> = short_nodes(65)
         .iter()
         .map(|n| NodeId::try_from(n.as_slice()).unwrap())
@@ -549,7 +551,7 @@ fn more_than_64_nodes_are_rejected() {
 #[test]
 fn length_fields_past_the_end_are_rejected() {
     assert_accepted(&Raw::valid());
-    // L'ultimo nodo dichiara 63 byte ma il certificato finisce dopo 10: `Truncated`.
+    // The last node declares 63 bytes but the certificate ends after 10: `Truncated`.
     let mut raw = Raw {
         name: vec![b'n'; 63],
         signature: Vec::new(),
@@ -569,9 +571,9 @@ fn length_fields_past_the_end_are_rejected() {
         "{:?}",
         decode_certificate(&bytes).map(|p| p.body)
     );
-    // `name_len` oltre la fine (255 su un certificato minimo). Il piano indica `Truncated`;
-    // un decoder che controlla prima l'intervallo `1..=63` risponde `Name`: entrambi
-    // rifiutano senza leggere oltre il buffer.
+    // `name_len` past the end (255 on a minimal certificate). The plan says `Truncated`;
+    // a decoder that checks the `1..=63` range first answers `Name`: both
+    // reject without reading past the buffer.
     let raw = Raw {
         name_len: Some(255),
         ..Raw::smallest()
@@ -584,7 +586,7 @@ fn length_fields_past_the_end_are_rejected() {
         "{:?}",
         decode(&raw)
     );
-    // `node_count` che fa leggere i nodi dentro la firma e oltre la fine.
+    // `node_count` that makes the nodes be read inside the signature and past the end.
     let raw = Raw {
         node_count: Some(64),
         nodes: largest_nodes(2),

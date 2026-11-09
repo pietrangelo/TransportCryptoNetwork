@@ -1,15 +1,15 @@
-//! Il core del relay su sequenze arbitrarie di eventi: connessioni di peer noti e sconosciuti,
-//! frame di ogni tipo, disconnessioni, scatti dell'orologio e **ricariche della policy**.
+//! The relay core on arbitrary sequences of events: connections of known and unknown peers,
+//! frames of every type, disconnections, clock ticks and **policy reloads**.
 //!
-//! Proprietà: nessun panic; il core non scrive mai su una connessione che non esiste o che ha
-//! già chiuso; dopo una ricarica non resta aperta nessuna connessione di un peer senza ruolo
-//! nella policy nuova (revoca a caldo, finding 0004-6).
+//! Properties: no panic; the core never writes to a connection that does not exist or that it
+//! has already closed; after a reload no connection stays open for a peer without a role in
+//! the new policy (hot revocation, finding 0004-6).
 //!
-//! Fase 6 (PROTOCOL §15.4, §15.7, §15.8): anche connessioni con certificato (claims già
-//! verificati), un orologio Unix che avanza e salta, e ricariche che tolgono la CA o
-//! aggiungono serie e chiavi alla denylist. Nessuna connessione con certificato sopravvive
-//! oltre `not_after`, a una serie o chiave revocata, o alla CA tolta; nessuna connessione per
-//! chiave sopravvive alla revoca della chiave.
+//! Phase 6 (PROTOCOL §15.4, §15.7, §15.8): also connections with a certificate (claims already
+//! verified), a Unix clock that advances and jumps, and reloads that remove the CA or add
+//! serials and keys to the denylist. No certificate connection survives past `not_after`, a
+//! revoked serial or key, or the removed CA; no per-key connection survives the revocation of
+//! the key.
 #![no_main]
 
 use std::collections::HashMap;
@@ -26,11 +26,12 @@ use zt_domain::{
 };
 
 const NODES: [&str; 4] = ["web-01", "db-01", "app-01", "ghost"];
-/// Agent 1..=3 (uno per nodo), client 10 e 11, 99 mai in policy, 20 e 21 con certificato.
+/// Agents 1..=3 (one per node), clients 10 and 11, 99 never in the policy, 20 and 21 with a
+/// certificate.
 const PEERS: [u8; 8] = [1, 2, 3, 10, 11, 99, 20, 21];
-/// La CA (byte della chiave e della fingerprint).
+/// The CA (bytes of the key and of the fingerprint).
 const CA: u8 = 0xca;
-/// L'orologio Unix all'inizio.
+/// The Unix clock at the start.
 const START: u64 = 1_800_000_000;
 
 fn fp(b: u8) -> Fingerprint {
@@ -51,12 +52,12 @@ impl SessionIds for Counter {
     }
 }
 
-/// Serie del certificato di `peer`.
+/// Serial of the certificate of `peer`.
 fn serial(peer: u8) -> CertSerial {
     CertSerial::try_from([peer; 16]).expect("non-zero")
 }
 
-/// Claims verificati di un certificato della CA per `peer`, valido in `[nb, na)`.
+/// Verified claims of a certificate from the CA for `peer`, valid in `[nb, na)`.
 fn claims(peer: u8, nb: u64, na: u64, all: bool) -> Arc<CertClaims> {
     let scope = if all {
         CertScope::All
@@ -76,9 +77,9 @@ fn claims(peer: u8, nb: u64, na: u64, all: bool) -> Arc<CertClaims> {
     Arc::new(CertClaims::from_verified(body, fp(CA), fp(peer)))
 }
 
-/// Trust scelto da un byte: bit 0 la CA è pinnata (bit 1: solo per `web-01`; bit 2:
-/// `max_lifetime` di 60 s), bit 3 la serie di 20 è revocata, bit 4 la chiave 20, bit 5 la
-/// chiave 10, bit 6 la serie di 21.
+/// Trust chosen by a byte: bit 0 the CA is pinned (bit 1: only for `web-01`; bit 2:
+/// `max_lifetime` of 60 s), bit 3 the serial of 20 is revoked, bit 4 the key of 20, bit 5 the
+/// key of 10, bit 6 the serial of 21.
 fn trust(bits: u8) -> CertTrust {
     let mut t = CertTrust::new();
     if bits & 0x01 != 0 {
@@ -118,13 +119,14 @@ fn trust(bits: u8) -> CertTrust {
     t
 }
 
-/// Policy scelta da due byte: un bit per agent e per client, più il nodo assegnato all'agent 1
-/// e l'ampiezza dei permessi del client 10; `ca` sceglie il trust ([`trust`]).
+/// Policy chosen by two bytes: one bit per agent and per client, plus the node assigned to
+/// agent 1 and the breadth of the permissions of client 10; `ca` chooses the trust
+/// ([`trust`]).
 fn policy(bits: u8, ca: u8) -> Arc<AccessPolicy> {
     let mut p = AccessPolicy::new();
     for (i, agent) in [1_u8, 2, 3].into_iter().enumerate() {
         if bits & (1 << i) != 0 {
-            // Con il bit 6 l'agent 1 passa al nodo di un altro (cambio di nome).
+            // With bit 6 agent 1 moves to another agent's node (name change).
             let n = if agent == 1 && bits & 0x40 != 0 {
                 2
             } else {
@@ -160,7 +162,7 @@ fn policy(bits: u8, ca: u8) -> Arc<AccessPolicy> {
     Arc::new(p)
 }
 
-/// La connessione di `peer` (con `cert`) può restare aperta con `policy` all'istante `unix`?
+/// Can the connection of `peer` (with `cert`) stay open with `policy` at instant `unix`?
 fn may_stay(
     policy: &AccessPolicy,
     peer: &Fingerprint,
@@ -172,9 +174,9 @@ fn may_stay(
         return policy.role(peer).is_some() && !trust.is_key_revoked(peer);
     };
     match policy.role(peer) {
-        // Una chiave ha un solo ruolo: un agent con certificato è rifiutato (§15.4 passo 11).
+        // A key has a single role: an agent with a certificate is rejected (§15.4 step 11).
         Some(PeerRole::Agent { .. }) => return false,
-        // Whitelist: il certificato è stato verificato all'ingresso, poi conta la chiave.
+        // Whitelist: the certificate was verified on entry, then the key counts.
         Some(_) => return !trust.is_key_revoked(peer),
         None => {}
     }
@@ -241,7 +243,7 @@ fuzz_target!(|data: &[u8]| {
     let mut core = RelayCore::new(Arc::clone(&current), RelayLimits::default(), Counter(0));
     let mut now = Instant::now();
     let mut unix = START;
-    // Il modello dell'adapter: connessioni vive, il loro peer e il certificato.
+    // The adapter model: live connections, their peer and the certificate.
     let mut live: HashMap<u64, (Fingerprint, Option<Arc<CertClaims>>)> = HashMap::new();
     let mut bytes = rest.iter().copied();
     let mut steps = 0;
@@ -261,8 +263,8 @@ fuzz_target!(|data: &[u8]| {
                 }
                 let b = PEERS[usize::from(p) % PEERS.len()];
                 let peer = fp(b);
-                // Il certificato (già verificato dall'adapter): bit 0 presente; gli altri ne
-                // scelgono la finestra rispetto all'orologio, anche scaduta o futura.
+                // The certificate (already verified by the adapter): bit 0 present; the others
+                // choose its window relative to the clock, even expired or in the future.
                 let certificate = (shape & 1 != 0).then(|| {
                     let nb = unix.saturating_sub(u64::from(shape >> 4) * 600);
                     let na = nb.saturating_add(u64::from((shape >> 1) & 0x07) * 300 + 1);
@@ -304,8 +306,8 @@ fuzz_target!(|data: &[u8]| {
                 Input::Tick
             }
             4 => {
-                // L'orologio di sistema salta (NTP, VM sospesa) avanti o indietro; quello
-                // monotono no.
+                // The system clock jumps (NTP, suspended VM) forward or backward; the monotonic
+                // one does not.
                 let Some(jump) = bytes.next() else { return };
                 let delta = u64::from(jump & 0x7f) * 3_600;
                 unix = if jump & 0x80 != 0 {
@@ -341,7 +343,7 @@ fuzz_target!(|data: &[u8]| {
                         );
                     }
                     Output::Close { conn } => {
-                        // Come l'adapter: la connessione chiusa viene poi segnalata come caduta.
+                        // Like the adapter: the closed connection is then reported as dropped.
                         if live.remove(&conn.0).is_some() {
                             pending.push(Input::Disconnected { conn });
                         }
@@ -358,7 +360,7 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
         }
-        // Dopo ogni input (scatti compresi): nessuna connessione oltre il suo diritto.
+        // After every input (ticks included): no connection beyond its entitlement.
         for (conn, (peer, cert)) in &live {
             assert!(
                 may_stay(&current, peer, cert.as_deref(), unix),

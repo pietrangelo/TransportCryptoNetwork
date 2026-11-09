@@ -1,12 +1,13 @@
-//! Il relay core: chi può fare cosa, e dove va ogni frame.
+//! The relay core: who can do what, and where each frame goes.
 //!
-//! Invarianti mantenute (e coperte da `tests/relay_core.rs`):
-//! - un peer sconosciuto non ottiene nulla; un agent registra solo il proprio nome;
-//! - un client raggiunge solo i nodi concessi, e non distingue «negato» da «inesistente»;
-//! - ogni `Data` inoltrato rientra nel credito concesso dal destinatario, quindi la memoria
-//!   in coda verso un peer è limitata a `stream × finestra`;
-//! - ogni violazione chiude la connessione del colpevole e libera tutte le sue risorse;
-//! - nessuna tabella cresce oltre i limiti configurati.
+//! Invariants maintained (and covered by `tests/relay_core.rs`):
+//! - an unknown peer gets nothing; an agent registers only its own name;
+//! - a client reaches only the nodes it is granted, and cannot tell "denied" from
+//!   "nonexistent";
+//! - every forwarded `Data` falls within the credit granted by the recipient, so the memory
+//!   queued toward a peer is bounded by `streams × window`;
+//! - every violation closes the offender's connection and frees all its resources;
+//! - no table grows beyond the configured limits.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -20,95 +21,95 @@ use zt_domain::{
 
 use crate::ratelimit::TokenBucket;
 
-/// Identificativo di una connessione autenticata, assegnato dall'adapter di rete.
+/// Identifier of an authenticated connection, assigned by the network adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnId(pub u64);
 
-/// L'orologio visto dal core: monotono per i timeout, di sistema (UTC) per i certificati
+/// The clock as seen by the core: monotonic for timeouts, system (UTC) for certificates
 /// (PROTOCOL §15.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Now {
-    /// Tempo monotono.
+    /// Monotonic time.
     pub instant: Instant,
-    /// Tempo di sistema, in secondi Unix.
+    /// System time, in Unix seconds.
     pub unix: UnixTime,
 }
 
-/// Eventi in ingresso al relay core.
+/// Input events to the relay core.
 #[derive(Debug)]
 pub enum Input {
-    /// Handshake completato: `peer` è l'identità provata da Noise.
+    /// Handshake completed: `peer` is the identity proven by Noise.
     Connected {
-        /// La connessione.
+        /// The connection.
         conn: ConnId,
-        /// L'identità del peer.
+        /// The peer's identity.
         peer: Fingerprint,
-        /// Il certificato presentato nel messaggio 1, già verificato (passi 3–6 di
-        /// PROTOCOL §15.4); `None` senza certificato.
+        /// The certificate presented in message 1, already verified (steps 3–6 of
+        /// PROTOCOL §15.4); `None` without a certificate.
         certificate: Option<Arc<CertClaims>>,
     },
-    /// Frame ben formato ricevuto su una connessione.
+    /// Well-formed frame received on a connection.
     Received {
-        /// La connessione.
+        /// The connection.
         conn: ConnId,
-        /// Il frame.
+        /// The frame.
         frame: Frame,
     },
-    /// La connessione è caduta.
+    /// The connection dropped.
     Disconnected {
-        /// La connessione.
+        /// The connection.
         conn: ConnId,
     },
-    /// Scatto periodico dell'orologio, per le scadenze.
+    /// Periodic clock tick, for deadlines.
     Tick,
-    /// È stata caricata una nuova policy: si applica anche alle connessioni già aperte.
+    /// A new policy was loaded: it also applies to connections already open.
     PolicyUpdated {
-        /// La nuova policy.
+        /// The new policy.
         policy: Arc<AccessPolicy>,
     },
 }
 
-/// Azioni che l'adapter di rete deve eseguire.
+/// Actions the network adapter must execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
-    /// Invia un frame.
+    /// Send a frame.
     Send {
-        /// La connessione di destinazione.
+        /// The destination connection.
         conn: ConnId,
-        /// Il frame.
+        /// The frame.
         frame: Frame,
     },
-    /// Chiudi la connessione. Il core ha già liberato le sue risorse.
+    /// Close the connection. The core has already freed its resources.
     Close {
-        /// La connessione.
+        /// The connection.
         conn: ConnId,
     },
-    /// Registra un evento di audit.
+    /// Record an audit event.
     Audit(DomainEvent),
 }
 
-/// Porta verso una sorgente di identificativi di sessione (CSPRNG nell'adapter).
+/// Port to a source of session identifiers (CSPRNG in the adapter).
 pub trait SessionIds {
-    /// Un nuovo identificativo, unico con probabilità schiacciante.
+    /// A new identifier, unique with overwhelming probability.
     fn next_session_id(&mut self) -> SessionId;
 }
 
-/// Limiti del relay. I default sono pensati per una flotta Ansible.
+/// Relay limits. The defaults are designed for an Ansible fleet.
 #[derive(Debug, Clone)]
 pub struct RelayLimits {
-    /// Stream contemporanei per connessione client.
+    /// Concurrent streams per client connection.
     pub max_streams_per_client: usize,
-    /// Stream contemporanei per agent.
+    /// Concurrent streams per agent.
     pub max_streams_per_agent: usize,
-    /// Tempo concesso a un agent per inviare `Register`.
+    /// Time granted to an agent to send `Register`.
     pub register_timeout: Duration,
-    /// `Ping` ammessi a raffica.
+    /// `Ping`s allowed in a burst.
     pub ping_burst: u32,
-    /// Un `Ping` in più ogni `ping_refill`.
+    /// One more `Ping` every `ping_refill`.
     pub ping_refill: Duration,
-    /// `Open` ammessi a raffica per connessione client.
+    /// `Open`s allowed in a burst per client connection.
     pub open_burst: u32,
-    /// Un `Open` in più ogni `open_refill`.
+    /// One more `Open` every `open_refill`.
     pub open_refill: Duration,
 }
 
@@ -135,13 +136,13 @@ enum Role {
         next_stream: u32,
     },
     Client {
-        /// La credenziale con cui il client è stato ammesso: una connessione con certificato
-        /// tiene solo i dati verificati, mai i byte del certificato.
+        /// The credential with which the client was admitted: a connection with a certificate
+        /// keeps only the verified data, never the certificate bytes.
         credential: ClientCredential,
     },
 }
 
-/// Il riferimento di audit di una credenziale: `None` per la whitelist.
+/// The audit reference of a credential: `None` for the whitelist.
 fn cert_ref(credential: &ClientCredential) -> Option<CertRef> {
     match credential {
         ClientCredential::Key => None,
@@ -149,10 +150,11 @@ fn cert_ref(credential: &ClientCredential) -> Option<CertRef> {
     }
 }
 
-/// Stream chiusi di recente da un client, per cui frame in volo vanno scartati in silenzio.
+/// Streams recently closed by a client, for which in-flight frames are to be silently
+/// discarded.
 ///
-/// Gli stream lato agent non ne hanno bisogno: i loro id crescono e non vengono riusati, quindi
-/// ogni id sotto `next_stream` non più aperto è per forza uno stream chiuso.
+/// Agent-side streams do not need this: their ids increase and are never reused, so every id
+/// below `next_stream` that is no longer open is necessarily a closed stream.
 #[derive(Debug, Default)]
 struct RecentlyClosed {
     order: VecDeque<StreamId>,
@@ -160,7 +162,8 @@ struct RecentlyClosed {
 }
 
 impl RecentlyClosed {
-    /// Quanti id ricordare. Un client che ne chiude di più in volo perde solo il proprio stream.
+    /// How many ids to remember. A client that closes more while in flight only loses its own
+    /// stream.
     const CAPACITY: usize = 256;
 
     fn insert(&mut self, stream: StreamId) {
@@ -197,8 +200,8 @@ struct Conn {
 }
 
 impl Conn {
-    /// `true` se `stream` è esistito su questa connessione ed è stato chiuso: un frame su di esso
-    /// è un normale frame in volo, non una violazione (finding 0002-1, -2, -6).
+    /// `true` if `stream` existed on this connection and was closed: a frame on it is a
+    /// normal in-flight frame, not a violation (finding 0002-1, -2, -6).
     fn is_stale(&self, stream: StreamId) -> bool {
         match &self.role {
             Role::Agent { next_stream, .. } => stream.get() < *next_stream,
@@ -218,7 +221,7 @@ enum StreamState {
     Open,
 }
 
-/// Una direzione di una rotta: dal lato `(conn, stream)` verso `peer`.
+/// One direction of a route: from side `(conn, stream)` toward `peer`.
 #[derive(Debug)]
 struct Route {
     peer: (ConnId, StreamId),
@@ -226,15 +229,15 @@ struct Route {
     session: SessionId,
     client: Fingerprint,
     target: NodeId,
-    /// Il certificato del client, per l'audit (`None` per la whitelist).
+    /// The client's certificate, for audit (`None` for the whitelist).
     certificate: Option<CertRef>,
-    /// Credito che questo lato ha per inviare `Data` verso `peer`.
+    /// Credit this side has to send `Data` toward `peer`.
     send: Window,
 }
 
 type Violation = &'static str;
 
-/// Macchina a stati del relay. Vedi la documentazione del modulo.
+/// Relay state machine. See the module documentation.
 #[derive(Debug)]
 pub struct RelayCore<S> {
     policy: Arc<AccessPolicy>,
@@ -246,7 +249,7 @@ pub struct RelayCore<S> {
 }
 
 impl<S: SessionIds> RelayCore<S> {
-    /// Un relay senza connessioni.
+    /// A relay with no connections.
     pub fn new(policy: Arc<AccessPolicy>, limits: RelayLimits, ids: S) -> Self {
         Self {
             policy,
@@ -258,19 +261,19 @@ impl<S: SessionIds> RelayCore<S> {
         }
     }
 
-    /// Numero di direzioni di rotta attive (due per stream).
+    /// Number of active route directions (two per stream).
     #[must_use]
     pub fn route_count(&self) -> usize {
         self.routes.len()
     }
 
-    /// Numero di connessioni tracciate.
+    /// Number of tracked connections.
     #[must_use]
     pub fn connection_count(&self) -> usize {
         self.conns.len()
     }
 
-    /// Elabora un evento e restituisce le azioni da eseguire, in ordine.
+    /// Processes an event and returns the actions to execute, in order.
     pub fn handle(&mut self, input: Input, now: Now) -> Vec<Output> {
         let mut out = Vec::new();
         match input {
@@ -304,14 +307,14 @@ impl<S: SessionIds> RelayCore<S> {
         if self.conns.contains_key(&conn) {
             return;
         }
-        // Passi 1, 5 e 7–11 di PROTOCOL §15.4 ricontrollati con la policy e l'orologio del
-        // momento in cui la connessione arriva al core: una ricarica nel frattempo non si perde.
+        // Steps 1, 5 and 7–11 of PROTOCOL §15.4 rechecked with the policy and clock at the
+        // moment the connection reaches the core: a reload in the meantime is not lost.
         let role = match self.policy.admit(&peer, certificate, now.unix) {
             Err(reason) => {
                 out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                     peer: Some(peer),
                     reason,
-                    // Le claims vengono dalla verifica della firma in `zt-crypto`.
+                    // The claims come from the signature verification in `zt-crypto`.
                     certificate: reason.certificate_ref(certificate.map(AsRef::as_ref)),
                 }));
                 out.push(Output::Close { conn });
@@ -356,8 +359,8 @@ impl<S: SessionIds> RelayCore<S> {
         for conn in expired {
             self.violation(conn, "agent did not register in time", out);
         }
-        // PROTOCOL §15.7: una sessione autorizzata da un certificato finisce alla scadenza,
-        // secondo l'orologio di sistema (non quello monotono).
+        // PROTOCOL §15.7: a session authorized by a certificate ends at expiry, according to
+        // the system clock (not the monotonic one).
         let mut lapsed: Vec<(ConnId, Fingerprint, CertRef)> = self
             .conns
             .iter()
@@ -380,8 +383,8 @@ impl<S: SessionIds> RelayCore<S> {
         }
     }
 
-    /// Chiude con `Close Unauthorized`, a entrambi i lati, ogni stream di `conn` verso un nodo
-    /// per cui `keep` è falso; restituisce i nodi persi.
+    /// Closes with `Close Unauthorized`, on both sides, every stream of `conn` toward a node
+    /// for which `keep` is false; returns the lost nodes.
     fn close_streams_where(
         &mut self,
         conn: ConnId,
@@ -452,7 +455,7 @@ impl<S: SessionIds> RelayCore<S> {
                     && !self.routes.contains_key(&(conn, stream))
                     && c.is_stale(stream)
                 {
-                    // Frame in volo su uno stream già chiuso: si scarta.
+                    // In-flight frame on an already closed stream: discard it.
                     return Ok(());
                 }
                 let is_agent = match &c.role {
@@ -489,7 +492,7 @@ impl<S: SessionIds> RelayCore<S> {
                     }
                     Frame::WindowUpdate { stream, credit } => {
                         let (peer, peer_stream) = self.open_route_mut(conn, stream)?.peer;
-                        // Il credito concesso da questo lato abilita l'invio del lato opposto.
+                        // The credit granted by this side enables sending on the opposite side.
                         self.routes
                             .get_mut(&(peer, peer_stream))
                             .ok_or("route without peer")?
@@ -563,7 +566,7 @@ impl<S: SessionIds> RelayCore<S> {
         if let Some(old) = self.agents.insert(node.clone(), conn)
             && old != conn
         {
-            // Nuova connessione dello stesso agent (riconnessione): la vecchia viene drenata.
+            // New connection from the same agent (reconnection): the old one is drained.
             self.teardown_except_agent_entry(old, out);
             out.push(Output::Close { conn: old });
         }
@@ -596,14 +599,14 @@ impl<S: SessionIds> RelayCore<S> {
             conn,
             frame: Frame::Reject { stream, reason },
         };
-        // Ogni `Open` costa lavoro all'agent e una riga di audit: se ne limita la frequenza,
-        // prima di qualsiasi altro controllo (finding 0002-4).
+        // Every `Open` costs the agent work and an audit line: its rate is limited, before
+        // any other check (finding 0002-4).
         if !c.opens.try_take(now.instant) {
             out.push(reject(RejectReason::RateLimited));
             return Ok(());
         }
         c.closed.reopen(stream);
-        // Prima l'autorizzazione: «negato» e «inesistente» devono essere indistinguibili.
+        // Authorization first: "denied" and "nonexistent" must be indistinguishable.
         if !self
             .policy
             .may_open_with(&client, &credential, &target, now.unix)
@@ -728,7 +731,7 @@ impl<S: SessionIds> RelayCore<S> {
         }
     }
 
-    /// Rimuove entrambe le direzioni di una rotta e la restituisce (lato `conn`).
+    /// Removes both directions of a route and returns it (`conn` side).
     fn remove_route(&mut self, conn: ConnId, stream: StreamId) -> Option<Route> {
         let route = self.routes.remove(&(conn, stream))?;
         let (peer, peer_stream) = route.peer;
@@ -742,7 +745,7 @@ impl<S: SessionIds> RelayCore<S> {
         Some(route)
     }
 
-    /// Applica una nuova policy alle connessioni aperte (revoca a caldo, PROTOCOL §12 e §15.8).
+    /// Applies a new policy to the open connections (hot revocation, PROTOCOL §12 and §15.8).
     fn on_policy(&mut self, policy: Arc<AccessPolicy>, now: UnixTime, out: &mut Vec<Output>) {
         self.policy = policy;
         let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
@@ -752,8 +755,8 @@ impl<S: SessionIds> RelayCore<S> {
                 continue;
             };
             let peer = c.peer;
-            // La credenziale salvata vale ancora con la policy nuova? (denylist, CA ancora
-            // pinnata per chiave, durata massima, ruolo.)
+            // Is the saved credential still valid with the new policy? (denylist, CA still
+            // pinned per key, maximum lifetime, role.)
             let (keeps, credential) = match &c.role {
                 Role::Agent { node, .. } => (
                     matches!(
@@ -772,10 +775,10 @@ impl<S: SessionIds> RelayCore<S> {
                         ),
                         Some(ClientCredential::Key),
                     ),
-                    // La whitelist ha la precedenza anche sulle connessioni aperte (PROTOCOL
-                    // §15.5, finding 0006-4): se la chiave è entrata nella whitelist la
-                    // connessione passa alla credenziale `Key` e ai suoi permessi, anche se più
-                    // stretti del certificato.
+                    // The whitelist takes precedence over open connections too (PROTOCOL §15.5,
+                    // finding 0006-4): if the key has entered the whitelist the connection switches
+                    // to the `Key` credential and its permissions, even if they are narrower than
+                    // the certificate's.
                     ClientCredential::Certificate(claims) => {
                         match self.policy.admit(&peer, Some(claims), now) {
                             Ok(Admission::Client { credential }) => (true, Some(credential)),
@@ -784,7 +787,7 @@ impl<S: SessionIds> RelayCore<S> {
                     }
                 },
             };
-            // I campi del certificato con cui la connessione è stata autorizzata finora.
+            // The certificate fields with which the connection has been authorized so far.
             let certificate = match &c.role {
                 Role::Client { credential } => cert_ref(credential),
                 Role::Agent { .. } => None,
@@ -795,8 +798,8 @@ impl<S: SessionIds> RelayCore<S> {
                     target: None,
                     certificate,
                 }));
-                // Un certificato revocato chiude i suoi stream con `Close Unauthorized` (PROTOCOL
-                // §15.8); un peer che perde la voce della whitelist li chiude come prima (§12).
+                // A revoked certificate closes its streams with `Close Unauthorized` (PROTOCOL
+                // §15.8); a peer that loses its whitelist entry closes them as before (§12).
                 if matches!(credential, Some(ClientCredential::Certificate(_))) {
                     self.close_streams_unauthorized(conn, out);
                 }
@@ -812,7 +815,7 @@ impl<S: SessionIds> RelayCore<S> {
                 ..
             }) = self.conns.get_mut(&conn)
             {
-                // Una connessione passata alla whitelist non scade più con il certificato.
+                // A connection switched to the whitelist no longer expires with the certificate.
                 held.clone_from(&credential);
             }
             let policy = Arc::clone(&self.policy);
@@ -842,7 +845,7 @@ impl<S: SessionIds> RelayCore<S> {
         out.push(Output::Close { conn });
     }
 
-    /// Libera tutte le risorse di una connessione e avvisa le controparti dei suoi stream.
+    /// Frees all resources of a connection and notifies the counterparts of its streams.
     fn teardown(&mut self, conn: ConnId, out: &mut Vec<Output>) {
         if let Some(Conn {
             role:
@@ -889,7 +892,7 @@ impl<S: SessionIds> RelayCore<S> {
     }
 }
 
-/// Assegna un nuovo stream sulla connessione di un agent, se c'è posto.
+/// Allocates a new stream on an agent's connection, if there is room.
 fn allocate_stream(agent: &mut Conn, max_streams: usize) -> Option<StreamId> {
     if agent.streams.len() >= max_streams {
         return None;
@@ -897,8 +900,8 @@ fn allocate_stream(agent: &mut Conn, max_streams: usize) -> Option<StreamId> {
     let Role::Agent { next_stream, .. } = &mut agent.role else {
         return None;
     };
-    // Gli id crescono e non vengono riusati: nessuna confusione con frame in ritardo di uno
-    // stream chiuso. A 2^32 stream la connessione va ricreata.
+    // Ids increase and are never reused: no confusion with late frames from a closed
+    // stream. At 2^32 streams the connection must be recreated.
     let id = StreamId::try_from(*next_stream).ok()?;
     *next_stream = next_stream.checked_add(1)?;
     agent.streams.insert(id);

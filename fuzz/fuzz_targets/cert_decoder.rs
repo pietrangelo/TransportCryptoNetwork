@@ -1,16 +1,16 @@
-//! Il decoder dei certificati client (PROTOCOL §15.1) su byte arbitrari: è il primo codice che
-//! legge il payload del messaggio 1, prima di qualsiasi firma.
+//! The client certificate decoder (PROTOCOL §15.1) on arbitrary bytes: it is the first code
+//! that reads the payload of message 1, before any signature.
 //!
-//! Proprietà: nessun panic; un certificato accettato si ricodifica identico (`encode_tbs` più
-//! la firma: una sola codifica per contenuto); un errore riporta solo metadati, mai byte
-//! dell'input.
+//! Properties: no panic; an accepted certificate re-encodes identically (`encode_tbs` plus the
+//! signature: a single encoding per content); an error reports only metadata, never bytes of
+//! the input.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use zt_domain::{CertFormatError, decode_certificate};
 use zt_domain::limits::{MAX_CERT_LEN, MIN_CERT_LEN};
 
-/// Le sequenze esadecimali di almeno 16 caratteri.
+/// Hex sequences of at least 16 characters.
 fn hex_runs(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_ascii_hexdigit())
         .filter(|run| run.len() >= 16)
@@ -38,8 +38,8 @@ fuzz_target!(|data: &[u8]| {
         }
         Err(e) => {
             let mut message = format!("{e} {e:?}");
-            // La durata è un metadato ammesso (piano §2, `Lifetime{secs}`) e può avere 20 cifre
-            // decimali: si toglie solo quel numero, il resto del messaggio resta controllato.
+            // The lifetime is allowed metadata (plan §2, `Lifetime{secs}`) and can have 20 decimal
+            // digits: only that number is removed, the rest of the message stays checked.
             if let CertFormatError::Lifetime { secs } = e {
                 message = message.replace(&secs.to_string(), "<secs>");
             }

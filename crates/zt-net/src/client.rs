@@ -1,5 +1,5 @@
-//! Libreria client: apre uno stream verso un nodo attraverso il relay e lo collega a un
-//! flusso locale (in `zt-client`, stdin/stdout di OpenSSH).
+//! Client library: opens a stream to a node through the relay and connects it to a local
+//! stream (in `zt-client`, the stdin/stdout of OpenSSH).
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -14,29 +14,30 @@ use crate::channel::Established;
 use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
-/// Configurazione di una connessione client.
+/// Configuration of a client connection.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Relay da provare, nell'ordine (al massimo [`crate::MAX_RELAYS`], PROTOCOL §13).
+    /// Relays to try, in order (at most [`crate::MAX_RELAYS`], PROTOCOL §13).
     pub relays: Vec<crate::RelayEndpoint>,
-    /// Nodo di destinazione.
+    /// Destination node.
     pub node: NodeId,
-    /// Chiave pubblica dell'agent del nodo, pinnata per il canale end-to-end.
+    /// Public key of the node's agent, pinned for the end-to-end channel.
     pub node_key: PublicKey,
-    /// Certificato del client (PROTOCOL §15), inviato nel messaggio 1 di entrambi i canali.
+    /// Client certificate (PROTOCOL §15), sent in message 1 of both channels.
     pub certificate: Option<std::sync::Arc<[u8]>>,
-    /// Timeout di rete.
+    /// Network timeouts.
     pub timeouts: Timeouts,
 }
 
-/// Si connette al nodo e inoltra `local` finché una delle due parti chiude.
+/// Connects to the node and forwards `local` until either side closes.
 ///
-/// Prova i relay nell'ordine di `config.relays` e passa al successivo solo per i guasti che
-/// precedono l'`OpenAck` e non dicono nulla sul diritto d'accesso (PROTOCOL §13).
+/// Tries the relays in the order of `config.relays` and moves on to the next one only for
+/// failures that precede the `OpenAck` and say nothing about the right of access (PROTOCOL §13).
 ///
 /// # Errors
-/// [`NetError::Rejected`] se il relay nega lo stream, [`NetError::StreamClosed`] se l'agent
-/// rifiuta il client, oltre agli errori di rete e di handshake (dell'ultimo relay provato).
+/// [`NetError::Rejected`] if the relay denies the stream, [`NetError::StreamClosed`] if the
+/// agent rejects the client, in addition to network and handshake errors (of the last relay
+/// tried).
 pub async fn connect<L>(
     identity: &Identity,
     config: &ClientConfig,
@@ -51,8 +52,8 @@ where
             "the client needs between 1 and 8 relays",
         ));
     }
-    // Lo stesso certificato nel messaggio 1 di entrambi i canali (PROTOCOL §15.3): relay e
-    // agent lo verificano ciascuno con le proprie CA.
+    // The same certificate in message 1 of both channels (PROTOCOL §15.3): relay and agent each
+    // verify it against their own CAs.
     let certificate: &[u8] = config.certificate.as_deref().unwrap_or(&[]);
     let stream = StreamId::try_from(1).map_err(|_| NetError::Protocol("stream id"))?;
     let mut last = NetError::Closed;
@@ -97,7 +98,7 @@ where
     session.and(link)
 }
 
-/// Connessione, handshake esterno e apertura dello stream su un relay.
+/// Connection, outer handshake and stream opening on one relay.
 async fn open(
     identity: &Identity,
     relay: &crate::RelayEndpoint,
@@ -133,9 +134,8 @@ async fn open(
     Ok(ch)
 }
 
-/// `true` per un guasto, prima dell'`OpenAck`, che giustifica il relay successivo. Una
-/// risposta della policy è definitiva (fail closed): il client non cerca un relay più
-/// permissivo.
+/// `true` for a failure, before the `OpenAck`, that justifies trying the next relay. A policy
+/// response is final (fail closed): the client does not look for a more permissive relay.
 const fn may_try_next_relay(err: &NetError) -> bool {
     match err {
         NetError::Rejected(reason) => matches!(
@@ -165,7 +165,7 @@ async fn await_ack(ch: &mut Established<TcpStream>, stream: StreamId) -> Result<
     }
 }
 
-/// Inoltra frame tra la connessione con il relay e lo stream, finché lo stream non termina.
+/// Forwards frames between the relay connection and the stream, until the stream ends.
 async fn drive(
     mut ch: Established<TcpStream>,
     stream: StreamId,
@@ -177,7 +177,7 @@ async fn drive(
     keepalive.tick().await;
     let mut deadline = crate::deadline(t.idle);
     let mut nonce: u64 = 0;
-    // Credito del relay verso lo stream, applicato prima di accodare (finding 0002-14).
+    // Relay credit towards the stream, enforced before enqueuing (finding 0002-14).
     let mut recv = Window::initial();
     loop {
         tokio::select! {

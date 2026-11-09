@@ -1,11 +1,11 @@
-//! `zt-ca`: la CA offline dei certificati client (PROTOCOL §15, OPERATIONS §10).
+//! `zt-ca`: the offline CA for client certificates (PROTOCOL §15, OPERATIONS §10).
 //!
-//! Gira solo sulla macchina della CA, senza rete: genera la chiave della CA, firma certificati
-//! brevi e li ispeziona. Nessun runtime tokio.
+//! It runs only on the CA machine, without network: it generates the CA key, signs
+//! short-lived certificates and inspects them. No tokio runtime.
 //!
-//! Nessun messaggio d'errore riporta i valori passati sulla riga di comando o il contenuto di un
-//! file: un operatore che incolla per sbaglio il segreto della CA al posto di una chiave pubblica
-//! non lo ritrova a terminale (né nella cronologia di un terminale condiviso).
+//! No error message reports the values passed on the command line or the content of a file:
+//! an operator who pastes the CA secret by mistake in place of a public key does not find it
+//! on the terminal (nor in the history of a shared terminal).
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
@@ -25,7 +25,7 @@ use zt_domain::{
 };
 use zt_net::config;
 
-/// CA offline di TCN.
+/// TCN offline CA.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -35,49 +35,49 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Genera la chiave della CA (file nuovo, permessi 0600) e stampa la chiave pubblica.
+    /// Generates the CA key (new file, 0600 permissions) and prints the public key.
     Keygen {
-        /// File da creare.
+        /// File to create.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Firma un certificato per la chiave pubblica di un client.
+    /// Signs a certificate for a client's public key.
     #[command(group(ArgGroup::new("scope").required(true).multiple(false).args(["nodes", "all_nodes"])))]
     Sign {
-        /// Chiave segreta della CA (`tcn-ca-secret-v1:`).
+        /// Secret key of the CA (`tcn-ca-secret-v1:`).
         #[arg(long)]
         ca: PathBuf,
-        /// Registro delle emissioni (TSV, in append, 0600). Obbligatorio.
+        /// Issuance log (TSV, append-only, 0600). Mandatory.
         #[arg(long)]
         log: PathBuf,
-        /// Chiave pubblica del client (64 caratteri esadecimali).
+        /// Public key of the client (64 hex characters).
         #[arg(long)]
         subject: String,
-        /// Nome del client, per gli audit log (`[a-z0-9-]`, 1..=63).
+        /// Name of the client, for audit logs (`[a-z0-9-]`, 1..=63).
         #[arg(long)]
         name: String,
-        /// Nodi concessi (al massimo 64), separati da virgole.
+        /// Granted nodes (at most 64), comma-separated.
         #[arg(long, value_delimiter = ',')]
         nodes: Vec<String>,
-        /// Tutti i nodi in `allow` della CA.
+        /// All the nodes in the CA's `allow`.
         #[arg(long)]
         all_nodes: bool,
-        /// Durata: `<n>s`, `<n>m` o `<n>h`, al massimo 24 ore.
+        /// Lifetime: `<n>s`, `<n>m` or `<n>h`, at most 24 hours.
         #[arg(long)]
         validity: String,
-        /// Inizio della validità in secondi Unix (default: adesso).
+        /// Start of validity in Unix seconds (default: now).
         #[arg(long)]
         not_before: Option<u64>,
-        /// File del certificato da creare (mai sovrascritto).
+        /// Certificate file to create (never overwritten).
         #[arg(long)]
         out: PathBuf,
     },
-    /// Mostra i campi di un certificato e la riga per la denylist.
+    /// Shows the fields of a certificate and the line for the denylist.
     Inspect {
-        /// File del certificato.
+        /// Certificate file.
         #[arg(long)]
         cert: PathBuf,
-        /// Chiave pubblica della CA con cui verificare la firma (64 caratteri esadecimali).
+        /// Public key of the CA to verify the signature with (64 hex characters).
         #[arg(long)]
         ca_key: Option<String>,
     },
@@ -122,8 +122,8 @@ fn run(command: &Command) -> Result<(), String> {
     }
 }
 
-/// Un errore di configurazione di `zt-net`: riporta il percorso e il tipo di errore, mai il
-/// contenuto del file.
+/// A `zt-net` configuration error: reports the path and the error kind, never the file
+/// content.
 fn config_error(error: &config::ConfigError) -> String {
     error.to_string()
 }
@@ -150,7 +150,7 @@ struct SignArgs<'a> {
 }
 
 fn sign(args: &SignArgs<'_>) -> Result<(), String> {
-    // Tutti i controlli sugli argomenti prima di toccare un file.
+    // All argument checks before touching a file.
     let lifetime = parse_validity(args.validity)?;
     let subject = parse_public_key(args.subject)
         .ok_or("--subject: not a valid Ed25519 public key (64 lowercase hexadecimal characters)")?;
@@ -166,8 +166,8 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
         .ok_or("--not-before: the validity ends after the end of time")?;
 
     let ca = config::load_ca_key(args.ca).map_err(|e| config_error(&e))?;
-    // Il segreto della CA incollato al posto della chiave del client: rifiutato, perché il
-    // certificato e il registro lo renderebbero pubblico.
+    // The CA secret pasted in place of the client key: rejected, because the certificate
+    // and the log would make it public.
     if is_ca_secret(&ca, args.subject) {
         return Err("--subject: this is a secret key, not a public key".into());
     }
@@ -190,8 +190,8 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     let cert = sign_certificate(&ca, &body).map_err(|e| format!("signing failed: {e}"))?;
     let text = encode_certificate_text(&cert);
 
-    // `--out` non si sovrascrive mai (`create_new` lo garantisce comunque): controllarlo prima
-    // evita una riga nel registro per un certificato che non verrà creato.
+    // `--out` is never overwritten (`create_new` guarantees it anyway): checking it first
+    // avoids a log line for a certificate that will not be created.
     if args.out.symlink_metadata().is_ok() {
         return Err(format!("{}: already exists", args.out.display()));
     }
@@ -202,8 +202,8 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
         not_after.as_secs(),
         scope_column(body.scope()),
     );
-    // Prima il registro, sincronizzato; poi il certificato. Un certificato senza riga nel
-    // registro non deve esistere (OPERATIONS §10.3).
+    // The log first, synced; then the certificate. A certificate without a line in the
+    // log must not exist (OPERATIONS §10.3).
     append_log(args.log, args.ca, line.as_bytes())?;
     write_public_new(args.out, text.as_bytes())?;
 
@@ -301,7 +301,7 @@ fn inspect(cert: &Path, ca_key: Option<&str>) -> Result<(), String> {
     verdict
 }
 
-/// Verifica la firma con `ca` come unica CA pinnata (passi 3–6 di PROTOCOL §15.4).
+/// Verifies the signature with `ca` as the only pinned CA (steps 3–6 of PROTOCOL §15.4).
 fn verify_signature(
     bytes: &[u8],
     subject: Option<PublicKey>,
@@ -330,15 +330,15 @@ fn verify_signature(
         })
 }
 
-/// Scrive l'output di un comando su stdout, in una volta.
+/// Writes the output of a command to stdout, in one go.
 fn emit(text: &str) -> Result<(), String> {
     std::io::stdout()
         .write_all(text.as_bytes())
         .map_err(|e| format!("stdout: {e}"))
 }
 
-/// `<n>s`, `<n>m` o `<n>h`: cifre ASCII e un suffisso minuscolo, niente segni o spazi;
-/// `1..=86400` secondi.
+/// `<n>s`, `<n>m` or `<n>h`: ASCII digits and a lowercase suffix, no signs or spaces;
+/// `1..=86400` seconds.
 fn parse_validity(text: &str) -> Result<u64, String> {
     const MESSAGE: &str = "--validity: expected <n>s, <n>m or <n>h, at most 24h";
     let (digits, unit) = match text.as_bytes().split_last() {
@@ -361,8 +361,8 @@ fn parse_validity(text: &str) -> Result<u64, String> {
     Ok(secs)
 }
 
-/// Una chiave pubblica Ed25519: esattamente 64 caratteri esadecimali minuscoli, punto canonico
-/// e non di ordine piccolo (PROTOCOL §15.1 regola 8).
+/// An Ed25519 public key: exactly 64 lowercase hex characters, a canonical point not of
+/// small order (PROTOCOL §15.1 rule 8).
 fn parse_public_key(text: &str) -> Option<PublicKey> {
     let bytes = decode_hex32(text)?;
     PublicKey::from_canonical_bytes(&bytes).ok()
@@ -400,7 +400,7 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
-/// `true` se `text` è il segreto della CA (con o senza prefisso).
+/// `true` if `text` is the CA secret (with or without prefix).
 fn is_ca_secret(ca: &CaSigningKey, text: &str) -> bool {
     let secret = ca.to_secret_text();
     let Some(hex) = secret
@@ -417,7 +417,7 @@ fn is_ca_secret(ca: &CaSigningKey, text: &str) -> bool {
 }
 
 fn parse_scope(nodes: &[String], all_nodes: bool) -> Result<CertScope, String> {
-    // `clap` garantisce già esattamente uno dei due; il controllo resta per difesa.
+    // `clap` already guarantees exactly one of the two; the check stays for defense in depth.
     match (nodes.is_empty(), all_nodes) {
         (true, true) => return Ok(CertScope::All),
         (false, false) => {}
@@ -451,7 +451,7 @@ fn scope_column(scope: &CertScope) -> String {
     }
 }
 
-/// 16 byte casuali, mai tutti a zero (PROTOCOL §15.2).
+/// 16 random bytes, never all zero (PROTOCOL §15.2).
 fn random_serial() -> Result<CertSerial, String> {
     for _ in 0..4 {
         let mut bytes = [0_u8; CertSerial::LEN];
@@ -463,13 +463,13 @@ fn random_serial() -> Result<CertSerial, String> {
     Err("random number generator returned zeros".into())
 }
 
-/// Aggiunge una riga al registro: file regolare, creato `0600`, mai accessibile da gruppo o
-/// altri; scritto con una sola `write` e sincronizzato prima di tornare.
+/// Appends a line to the log: regular file, created `0600`, never accessible by group or
+/// others; written with a single `write` and synced before returning.
 ///
-/// Il registro non è mai il file della chiave della CA (finding 0006-5): un `--log` uguale a
-/// `--ca` aggiungerebbe una riga alla chiave e la renderebbe illeggibile. Si rifiutano quindi un
-/// collegamento simbolico (`O_NOFOLLOW`), lo stesso file di `--ca` (stesso dispositivo e
-/// inode, anche con un hard link) e un file che inizia come una chiave di CA (una copia).
+/// The log is never the CA key file (finding 0006-5): a `--log` equal to `--ca` would append
+/// a line to the key and make it unreadable. Therefore a symbolic link (`O_NOFOLLOW`), the
+/// same file as `--ca` (same device and inode, even with a hard link) and a file that starts
+/// like a CA key (a copy) are rejected.
 fn append_log(path: &Path, ca: &Path, line: &[u8]) -> Result<(), String> {
     let io = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut options = std::fs::OpenOptions::new();
@@ -512,7 +512,7 @@ fn append_log(path: &Path, ca: &Path, line: &[u8]) -> Result<(), String> {
             ));
         }
     }
-    // Il file è aperto in lettura dall'inizio: i primi byte dicono se è una chiave di CA.
+    // The file is open for reading from the start: the first bytes tell whether it is a CA key.
     let prefix = CaSigningKey::FILE_PREFIX.as_bytes();
     let mut head = Vec::with_capacity(prefix.len());
     (&mut file)
@@ -530,7 +530,7 @@ fn append_log(path: &Path, ca: &Path, line: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// `true` se `open` ha rifiutato un collegamento simbolico (`O_NOFOLLOW`).
+/// `true` if `open` rejected a symbolic link (`O_NOFOLLOW`).
 #[cfg(unix)]
 fn is_symlink_refusal(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
@@ -541,7 +541,7 @@ const fn is_symlink_refusal(_: &std::io::Error) -> bool {
     false
 }
 
-/// Crea il file del certificato (`0644`, mai sovrascritto).
+/// Creates the certificate file (`0644`, never overwritten).
 fn write_public_new(path: &Path, contents: &[u8]) -> Result<(), String> {
     let io = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut options = std::fs::OpenOptions::new();

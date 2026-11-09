@@ -1,8 +1,8 @@
-//! Revoca a caldo (Fase 4): una nuova policy si applica alle connessioni già aperte.
+//! Hot revocation (Phase 4): a new policy applies to connections already open.
 //!
-//! Regola: chi perde il proprio ruolo, o un agent la cui chiave ora appartiene a un altro nodo,
-//! viene disconnesso; un client che perde l'accesso a un nodo perde gli stream verso quel nodo
-//! (`Close Unauthorized` da entrambi i lati) e conserva gli altri. Ogni revoca è registrata.
+//! Rule: whoever loses their role, or an agent whose key now belongs to another node, is
+//! disconnected; a client that loses access to a node loses the streams toward that node
+//! (`Close Unauthorized` on both sides) and keeps the others. Every revocation is recorded.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -43,7 +43,7 @@ impl SessionIds for Counter {
     }
 }
 
-/// Policy di partenza: web-01, db-01; ansible → web-01, db-01; admin → tutti.
+/// Starting policy: web-01, db-01; ansible → web-01, db-01; admin → all.
 fn policy(edit: impl FnOnce(&mut Spec)) -> Arc<AccessPolicy> {
     let mut spec = Spec {
         agents: vec![(WEB, "web-01"), (DB, "db-01")],
@@ -85,8 +85,8 @@ struct H {
 }
 
 impl H {
-    /// web-01 (conn 1), db-01 (conn 3); ansible (conn 2) con stream 7 → web-01 e 9 → db-01;
-    /// admin (conn 4) con stream 5 → web-01.
+    /// web-01 (conn 1), db-01 (conn 3); ansible (conn 2) with stream 7 → web-01 and 9 → db-01;
+    /// admin (conn 4) with stream 5 → web-01.
     fn fleet() -> (Self, Sessions) {
         let mut h = Self {
             core: RelayCore::new(policy(|_| {}), RelayLimits::default(), Counter(0)),
@@ -140,8 +140,8 @@ impl H {
     fn update(&mut self, p: Arc<AccessPolicy>) -> Vec<Output> {
         self.input(Input::PolicyUpdated { policy: p })
     }
-    /// Apre `stream` dal client `conn` verso `target` servito da `agent`; restituisce lo
-    /// stream lato agent.
+    /// Opens `stream` from client `conn` toward `target` served by `agent`; returns the
+    /// agent-side stream.
     fn open(&mut self, conn: u64, stream: u32, target: &str, agent: u64) -> StreamId {
         let out = self.recv(
             conn,
@@ -215,7 +215,7 @@ fn a_client_removed_from_the_policy_is_disconnected_with_all_its_sessions() {
     let out = h.update(policy(|p| p.clients.retain(|c| c.0 != ANSIBLE)));
     assert_eq!(closed(&out), vec![2]);
     assert_eq!(revoked(&out), vec![(fp(ANSIBLE), None)]);
-    // Gli agent vedono chiudersi gli stream di ansible, non quelli di admin.
+    // The agents see ansible's streams close, not admin's.
     assert!(sent_to(&out, 1).contains(&Frame::Close {
         stream: s.ansible_web,
         reason: CloseReason::PeerGone
@@ -231,7 +231,7 @@ fn a_client_removed_from_the_policy_is_disconnected_with_all_its_sessions() {
     );
     assert_eq!(h.core.route_count(), 2);
     assert_eq!(h.core.connection_count(), 3);
-    // E non può riconnettersi.
+    // And it cannot reconnect.
     let out = h.connect(20, ANSIBLE);
     assert_eq!(closed(&out), vec![20]);
     assert!(out.iter().any(|o| matches!(
@@ -265,7 +265,7 @@ fn a_narrowed_grant_closes_only_the_streams_it_no_longer_allows() {
     );
     assert!(sent_to(&out, 1).is_empty());
     assert_eq!(h.core.route_count(), 4);
-    // Lo stream verso web-01 funziona ancora; uno nuovo verso db-01 è negato.
+    // The stream toward web-01 still works; a new one toward db-01 is denied.
     let out = h.recv(
         2,
         Frame::Data {
@@ -285,7 +285,7 @@ fn a_narrowed_grant_closes_only_the_streams_it_no_longer_allows() {
         sent_to(&out, 2).as_slice(),
         [Frame::Reject { .. }]
     ));
-    // I frame in volo sullo stream revocato non sono violazioni.
+    // In-flight frames on the revoked stream are not violations.
     let out = h.recv(
         2,
         Frame::Data {
@@ -319,7 +319,7 @@ fn a_removed_agent_is_disconnected_and_its_clients_see_peer_gone() {
         reason: CloseReason::PeerGone
     }));
     let _ = s;
-    // web-01 non è più raggiungibile; db-01 sì.
+    // web-01 is no longer reachable; db-01 is.
     let out = h.recv(
         4,
         Frame::Open {
@@ -335,12 +335,12 @@ fn a_removed_agent_is_disconnected_and_its_clients_see_peer_gone() {
 
 #[test]
 fn an_agent_key_moved_to_another_node_is_disconnected() {
-    // La stessa chiave ora è db-02: la connessione registrata come web-01 non vale più.
+    // The same key is now db-02: the connection registered as web-01 is no longer valid.
     let (mut h, _) = H::fleet();
     let out = h.update(policy(|p| p.agents[0] = (WEB, "web-02")));
     assert_eq!(closed(&out), vec![1]);
     assert_eq!(revoked(&out), vec![(fp(WEB), None)]);
-    // Può ricollegarsi e registrarsi con il nuovo nome.
+    // It can reconnect and register with the new name.
     assert!(h.connect(30, WEB).is_empty());
     let out = h.recv(
         30,
@@ -373,10 +373,10 @@ fn a_key_added_by_the_update_can_connect() {
 #[test]
 fn an_unregistered_agent_is_checked_against_the_new_policy_too() {
     let (mut h, _) = H::fleet();
-    h.connect(50, 55); // chiave sconosciuta: rifiutata
+    h.connect(50, 55); // unknown key: rejected
     h.update(policy(|p| p.agents.push((55, "new-01"))));
     assert!(h.connect(51, 55).is_empty());
-    // Revocata prima di registrarsi.
+    // Revoked before registering.
     let out = h.update(policy(|_| {}));
     assert_eq!(closed(&out), vec![51]);
     let out = h.recv(

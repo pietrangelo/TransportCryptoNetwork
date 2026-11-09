@@ -1,4 +1,4 @@
-//! Regressioni dell'adversary review 0002 su TCP reale.
+//! Regressions from adversary review 0002 over real TCP.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -43,7 +43,7 @@ fn timeouts() -> Timeouts {
     }
 }
 
-/// Finto sshd che conta le connessioni e fa eco.
+/// Fake sshd that counts connections and echoes.
 async fn counting_echo() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -64,9 +64,9 @@ async fn counting_echo() -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, count)
 }
 
-/// Finding 0002-1: un client autorizzato dal relay ma rifiutato dall'agent apre e chiude
-/// stream. Prima l'agent rispondeva al `Close` con un `Close` e il relay lo disconnetteva,
-/// uccidendo tutte le sessioni del nodo.
+/// Finding 0002-1: a client authorized by the relay but rejected by the agent opens and closes
+/// streams. Previously the agent answered the `Close` with a `Close` and the relay disconnected
+/// it, killing all of the node's sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
     let relay_id = Identity::generate().unwrap();
@@ -134,7 +134,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
         timeouts: timeouts(),
     };
 
-    // Sessione innocente, attesa finché l'agent non è registrato.
+    // Innocent session, waited for until the agent is registered.
     let mut app = None;
     for _ in 0..100 {
         let (mut a, local) = tokio::io::duplex(1024);
@@ -155,7 +155,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
     }
     let mut app = app.expect("innocent session");
 
-    // L'attaccante: Open, attende OpenAck, Close — più volte.
+    // The attacker: Open, waits for OpenAck, Close — several times.
     let tcp = TcpStream::connect(relay).await.unwrap();
     let mut ch = channel::connect(tcp, &admin, &relay_key, Channel::Outer, &timeouts())
         .await
@@ -187,7 +187,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // La sessione innocente funziona ancora.
+    // The innocent session still works.
     app.write_all(b"still alive").await.unwrap();
     let mut buf = [0_u8; 11];
     tokio::time::timeout(Duration::from_secs(3), app.read_exact(&mut buf))
@@ -197,8 +197,8 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
     assert_eq!(&buf, b"still alive");
 }
 
-/// Finding 0002-3: un relay compromesso rigioca il messaggio 1 end-to-end di un client vero.
-/// L'agent non deve contattare sshd né registrare una sessione senza la conferma del client.
+/// Finding 0002-3: a compromised relay replays a real client's end-to-end message 1.
+/// The agent must not contact sshd nor register a session without the client's confirmation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replayed_end_to_end_handshake_never_reaches_sshd() {
     let relay_id = Identity::generate().unwrap();
@@ -230,7 +230,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
         },
     ));
 
-    // Il relay malevolo accetta l'agent.
+    // The malicious relay accepts the agent.
     let (tcp, _) = listener.accept().await.unwrap();
     let pending = channel::accept(tcp, &relay_keys, Channel::Outer, &timeouts())
         .await
@@ -241,7 +241,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
         Some(Frame::Register { .. })
     ));
 
-    // Messaggio 1 catturato da una sessione vera del client.
+    // Message 1 captured from a real client session.
     let (msg1, _) = noise::initiate(&client_id, &agent_id.public_key(), Channel::EndToEnd).unwrap();
     for n in 1..=3 {
         agent_ch
@@ -266,8 +266,8 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
             .await
             .unwrap();
     }
-    // L'agent risponde (OpenAck, msg2), poi attende una conferma che il relay non sa forgiare
-    // e chiude lo stream per timeout.
+    // The agent replies (OpenAck, msg2), then waits for a confirmation the relay cannot forge
+    // and closes the stream on timeout.
     let mut closes = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while closes < 3 {
@@ -287,8 +287,8 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
     );
 }
 
-/// Finding 0002-14 (completamento): un relay che non rispetta il credito non riempie la coda di
-/// uno stream dell'agent: lo stream viene chiuso appena il credito è superato.
+/// Finding 0002-14 (completion): a relay that does not respect the credit does not fill an
+/// agent stream's queue: the stream is closed as soon as the credit is exceeded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
     let relay_id = Identity::generate().unwrap();
@@ -300,7 +300,7 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
     let relay_addr = listener.local_addr().unwrap();
     let (ssh, _) = counting_echo().await;
     let mut slow = timeouts();
-    slow.open = Duration::from_secs(30); // il task dello stream resta in attesa della conferma
+    slow.open = Duration::from_secs(30); // the stream task keeps waiting for the confirmation
     tokio::spawn(agent::run(
         Arc::new(zt_crypto::Keyring::single(
             zt_crypto::Identity::from_secret_hex(&agent_id.to_secret_hex()).unwrap(),
@@ -353,7 +353,8 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
         )
         .await
         .unwrap();
-    // Il task ora attende la conferma: il relay inonda lo stream di dati oltre la finestra.
+    // The task now waits for the confirmation: the relay floods the stream with data beyond
+    // the window.
     let chunk = FramePayload::try_from(vec![0_u8; 60 * 1024]).unwrap();
     let flood = async {
         for _ in 0..64 {

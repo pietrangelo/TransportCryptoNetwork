@@ -1,5 +1,5 @@
-//! Test end-to-end e d'attacco su TCP reale: relay, agent e client nello stesso processo,
-//! un finto demone SSH (echo) su localhost.
+//! End-to-end and attack tests over real TCP: relay, agent and client in the same process,
+//! a fake SSH daemon (echo) on localhost.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -38,7 +38,7 @@ fn fast_timeouts() -> Timeouts {
     }
 }
 
-/// Finto sshd: rimanda indietro ciò che riceve.
+/// Fake sshd: sends back whatever it receives.
 async fn echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -121,7 +121,7 @@ impl Fleet {
         }
     }
 
-    /// Avvia l'agent di web-01. Accetta end-to-end solo `ansible` (non `admin`).
+    /// Starts the web-01 agent. Accepts only `ansible` end-to-end (not `admin`).
     async fn start_agent(&self) {
         let ssh = echo_server().await;
         let config = AgentConfig {
@@ -145,7 +145,7 @@ impl Fleet {
             )),
             config,
         ));
-        // Attende la registrazione: finché il nodo risulta offline si riprova.
+        // Waits for registration: retries while the node is reported offline.
         for _ in 0..100 {
             let (app, local) = tokio::io::duplex(1024);
             drop(app);
@@ -180,7 +180,7 @@ fn test_relay_config() -> RelayConfig {
     }
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ssh_bytes_round_trip_through_the_relay() {
@@ -207,8 +207,8 @@ async fn ssh_bytes_round_trip_through_the_relay() {
     assert!(result.is_ok(), "{result:?}");
 }
 
-/// Regressione 0003-1: lo stdout di `zt-client` è bufferizzato; senza flush i byte di SSH
-/// (che non terminano a fine riga) restano nel buffer e la sessione si blocca.
+/// Regression 0003-1: the stdout of `zt-client` is buffered; without a flush the SSH bytes
+/// (which do not end at a line end) stay in the buffer and the session hangs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delivered_bytes_are_flushed_to_a_buffered_local_writer() {
     let fleet = Fleet::start(test_relay_config()).await;
@@ -229,7 +229,7 @@ async fn delivered_bytes_are_flushed_to_a_buffered_local_writer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_transfer_is_flow_controlled_and_intact() {
-    // 8 MiB: 32 volte la finestra iniziale, quindi servono molti WindowUpdate.
+    // 8 MiB: 32 times the initial window, so many WindowUpdates are needed.
     let fleet = Fleet::start(test_relay_config()).await;
     fleet.start_agent().await;
     let (app, local) = tokio::io::duplex(64 * 1024);
@@ -264,7 +264,7 @@ async fn offline_node_is_reported() {
     );
 }
 
-// ======================= attacchi =======================
+// ======================= attacks =======================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_client_key_gets_no_answer() {
@@ -274,7 +274,7 @@ async fn unknown_client_key_gets_no_answer() {
     let err = client::connect(&fleet.stranger, &fleet.client_config("web-01"), local)
         .await
         .unwrap_err();
-    // Il relay chiude senza inviare msg2: il client non completa l'handshake.
+    // The relay closes without sending msg2: the client does not complete the handshake.
     assert!(matches!(err, NetError::Closed | NetError::Io(_)), "{err:?}");
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -314,7 +314,8 @@ async fn unauthorized_and_unknown_nodes_are_rejected_alike() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_enforces_its_own_client_list_even_if_the_relay_allows() {
-    // `admin` ha accesso a tutto secondo il relay, ma l'agent di web-01 non lo conosce.
+    // `admin` has access to everything according to the relay, but the web-01 agent does not
+    // know it.
     let fleet = Fleet::start(test_relay_config()).await;
     fleet.start_agent().await;
     let (_app, local) = tokio::io::duplex(1024);
@@ -366,7 +367,7 @@ async fn silent_connections_are_dropped_after_the_handshake_timeout() {
     config.timeouts.handshake = Duration::from_millis(300);
     let fleet = Fleet::start(config).await;
     let mut tcp = TcpStream::connect(fleet.relay).await.unwrap();
-    // Slowloris: metà prefisso di lunghezza e poi silenzio.
+    // Slowloris: half a length prefix and then silence.
     tcp.write_all(&[0x00]).await.unwrap();
     let mut buf = [0_u8; 8];
     let read = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf)).await;
@@ -382,8 +383,8 @@ async fn handshake_floods_from_one_address_are_rate_limited() {
     config.handshake_burst = 3;
     config.handshake_refill = Duration::from_secs(3600);
     let fleet = Fleet::start(config).await;
-    // Le prime 3 connessioni passano il limiter (e poi falliscono l'handshake per timeout o
-    // chiusura); la quarta viene chiusa subito.
+    // The first 3 connections pass the limiter (and then fail the handshake by timeout or
+    // close); the fourth is closed immediately.
     let mut held = Vec::new();
     for _ in 0..3 {
         held.push(TcpStream::connect(fleet.relay).await.unwrap());
@@ -395,7 +396,7 @@ async fn handshake_floods_from_one_address_are_rate_limited() {
         matches!(read, Ok(Ok(0) | Err(_))),
         "fourth connection must be dropped, got {read:?}"
     );
-    // Anche un peer legittimo dallo stesso IP è respinto finché il bucket non si riempie.
+    // Even a legitimate peer from the same IP is turned away until the bucket refills.
     let (_app, local) = tokio::io::duplex(1024);
     assert!(
         client::connect(&fleet.ansible, &fleet.client_config("web-01"), local)
@@ -404,9 +405,9 @@ async fn handshake_floods_from_one_address_are_rate_limited() {
     );
 }
 
-/// Regressione 0003-2: un `ssh` sospeso (`~^Z`, SIGSTOP) smette di leggere. La sessione deve
-/// sopravvivere: la memoria è già limitata dalla finestra, un timeout di scrittura locale
-/// non protegge nulla e uccide sessioni legittime.
+/// Regression 0003-2: a suspended `ssh` (`~^Z`, SIGSTOP) stops reading. The session must
+/// survive: memory is already bounded by the window, a local write timeout protects nothing
+/// and kills legitimate sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stalled_local_reader_does_not_kill_the_session() {
     let fleet = Fleet::start(test_relay_config()).await;
@@ -422,7 +423,7 @@ async fn a_stalled_local_reader_does_not_kill_the_session() {
         wr.write_all(&data).await.unwrap();
         wr
     });
-    // Più del timeout di scrittura (5 s) senza leggere nulla.
+    // Longer than the write timeout (5 s) without reading anything.
     tokio::time::sleep(Duration::from_secs(7)).await;
     assert!(
         !session.is_finished(),

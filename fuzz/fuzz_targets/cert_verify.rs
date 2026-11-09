@@ -1,11 +1,11 @@
-//! La verifica dei certificati (PROTOCOL §15.4 passi 3–6) con trust e chiave del peer fissi.
+//! Certificate verification (PROTOCOL §15.4 steps 3–6) with fixed trust and peer key.
 //!
-//! Metà degli input sono byte arbitrari; l'altra metà è un certificato **autentico** (firmato
-//! dalla CA pinnata per il peer) con byte modificati, così il fuzzer raggiunge anche i rami
-//! della firma e dell'accettazione.
-//! Proprietà: nessun panic; un input accettato è, byte per byte, il certificato autentico, e i
-//! claims sono i suoi (nessuna malleabilità della codifica o della firma); il certificato
-//! intatto è accettato; lo stesso certificato per un altro peer è rifiutato.
+//! Half of the inputs are arbitrary bytes; the other half is a **genuine** certificate (signed
+//! by the CA pinned for the peer) with modified bytes, so the fuzzer also reaches the signature
+//! and acceptance branches.
+//! Properties: no panic; an accepted input is, byte for byte, the genuine certificate, and the
+//! claims are its own (no malleability of the encoding or of the signature); the intact
+//! certificate is accepted; the same certificate for another peer is rejected.
 #![no_main]
 
 use std::sync::OnceLock;
@@ -72,8 +72,8 @@ fuzz_target!(|data: &[u8]| {
     let input = if mode & 1 == 0 {
         rest.to_vec()
     } else {
-        // Coppie (posizione, xor) sul certificato autentico; un byte finale dispari tronca o,
-        // con il bit 1 del modo, allunga.
+        // (position, xor) pairs on the genuine certificate; an odd trailing byte truncates or,
+        // with bit 1 of the mode, extends.
         let mut cert = f.genuine.clone();
         for pair in rest.chunks(2) {
             match *pair {

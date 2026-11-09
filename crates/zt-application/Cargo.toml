@@ -1,6 +1,6 @@
 [package]
 name = "zt-application"
-description = "Application layer di TCN: casi d'uso sans-IO del relay (autorizzazione, routing, credito, rate limit)."
+description = "TCN application layer: sans-IO relay use cases (authorization, routing, credit, rate limiting)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

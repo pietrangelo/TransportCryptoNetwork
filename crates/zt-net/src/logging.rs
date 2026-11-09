@@ -1,20 +1,20 @@
-//! Inizializzazione dei log dei binari: sempre su stderr, testo o JSON (una riga per evento).
+//! Log initialization for the binaries: always to stderr, text or JSON (one line per event).
 //!
-//! Gli eventi di audit hanno target `zt_audit` e il campo `event_kind`; in JSON si filtrano con
-//! `jq 'select(.target == "zt_audit")'` o si inoltrano così come sono a un SIEM.
+//! Audit events have target `zt_audit` and the `event_kind` field; in JSON they can be filtered
+//! with `jq 'select(.target == "zt_audit")'` or forwarded as-is to a SIEM.
 
 use tracing_subscriber::EnvFilter;
 
-/// Formato dei log.
+/// Log format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
-    /// Testo leggibile.
+    /// Human-readable text.
     Text,
-    /// Una riga JSON per evento, con `timestamp`, `level`, `target` e `fields`.
+    /// One JSON line per event, with `timestamp`, `level`, `target` and `fields`.
     Json,
 }
 
-/// Installa il subscriber globale. Il livello viene da `RUST_LOG`, altrimenti `default_level`.
+/// Installs the global subscriber. The level comes from `RUST_LOG`, otherwise `default_level`.
 pub fn init(format: LogFormat, default_level: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));

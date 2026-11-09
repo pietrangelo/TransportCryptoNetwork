@@ -1,5 +1,5 @@
-//! Codificatore indipendente dei certificati per i test (PROTOCOL §15.1): scrive i byte a mano,
-//! campo per campo, così i test non dipendono dall'encoder che stanno verificando.
+//! Independent certificate encoder for the tests (PROTOCOL §15.1): it writes the bytes by hand,
+//! field by field, so the tests do not depend on the encoder they are verifying.
 #![allow(
     dead_code,
     unreachable_pub,
@@ -12,7 +12,7 @@
 
 use zt_domain::{CertBody, CertKey, CertScope, CertSerial, NodeId, UnixTime};
 
-/// Il vettore di riferimento di PROTOCOL §15.13 (187 byte), trascritto dal documento.
+/// The reference vector of PROTOCOL §15.13 (187 bytes), transcribed from the document.
 pub const REFERENCE_CERT_HEX: &str = concat!(
     "54434e4301018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf374",
     "8801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df6",
@@ -22,7 +22,7 @@ pub const REFERENCE_CERT_HEX: &str = concat!(
     "203e4a03a87dd2cffca22d964126ae7d5b26a9d16067697e5b530f",
 );
 
-/// I byte del vettore di riferimento.
+/// The bytes of the reference vector.
 pub fn reference_cert() -> Vec<u8> {
     hex_decode(REFERENCE_CERT_HEX)
 }
@@ -50,8 +50,8 @@ pub fn node(n: &str) -> NodeId {
     NodeId::try_from(n).unwrap()
 }
 
-/// Un certificato scritto a mano. I campi sono byte grezzi, così si possono rendere
-/// incoerenti a piacere.
+/// A hand-written certificate. The fields are raw bytes, so they can be made
+/// inconsistent at will.
 #[derive(Debug, Clone)]
 pub struct Raw {
     pub magic: [u8; 4],
@@ -62,18 +62,18 @@ pub struct Raw {
     pub serial: [u8; 16],
     pub not_before: u64,
     pub not_after: u64,
-    /// `None`: la lunghezza vera di `name`.
+    /// `None`: the actual length of `name`.
     pub name_len: Option<u8>,
     pub name: Vec<u8>,
     pub scope: u8,
-    /// `None`: il numero vero di `nodes`.
+    /// `None`: the actual number of `nodes`.
     pub node_count: Option<u8>,
     pub nodes: Vec<Vec<u8>>,
     pub signature: Vec<u8>,
 }
 
 impl Raw {
-    /// Il vettore di riferimento di PROTOCOL §15.13, firma compresa.
+    /// The reference vector of PROTOCOL §15.13, signature included.
     pub fn reference() -> Self {
         let cert = reference_cert();
         Self {
@@ -94,7 +94,7 @@ impl Raw {
         }
     }
 
-    /// Un certificato valido per il formato (chiavi e firma arbitrarie).
+    /// A certificate valid for the format (arbitrary keys and signature).
     pub fn valid() -> Self {
         Self {
             ca_key: [0xca; 32],
@@ -104,7 +104,7 @@ impl Raw {
         }
     }
 
-    /// Il più corto: `scope = 0x01`, nome di 1 byte (170 byte).
+    /// The shortest: `scope = 0x01`, a 1-byte name (170 bytes).
     pub fn smallest() -> Self {
         Self {
             name: b"a".to_vec(),
@@ -114,7 +114,7 @@ impl Raw {
         }
     }
 
-    /// Il più lungo: nome di 63 byte e 64 nodi da 63 byte (4 328 byte).
+    /// The longest: a 63-byte name and 64 nodes of 63 bytes (4,328 bytes).
     pub fn largest() -> Self {
         Self {
             name: vec![b'n'; 63],
@@ -150,7 +150,7 @@ impl Raw {
         b
     }
 
-    /// Il `CertBody` atteso per questo certificato (solo per certificati validi).
+    /// The expected `CertBody` for this certificate (valid certificates only).
     pub fn body(&self) -> CertBody {
         let scope = if self.scope == 1 {
             CertScope::All
@@ -175,7 +175,7 @@ impl Raw {
     }
 }
 
-/// `count` nodi distinti da 63 byte, in ordine crescente di byte.
+/// `count` distinct 63-byte nodes, in increasing byte order.
 pub fn largest_nodes(count: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|i| {
@@ -186,7 +186,7 @@ pub fn largest_nodes(count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// `count` nodi distinti corti, in ordine crescente di byte.
+/// `count` distinct short nodes, in increasing byte order.
 pub fn short_nodes(count: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|i| format!("n{i:03}").into_bytes())

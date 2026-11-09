@@ -1,8 +1,8 @@
-//! Un singolo stream end-to-end (client ↔ agent) sopra la connessione con il relay.
+//! A single end-to-end stream (client ↔ agent) on top of the connection with the relay.
 //!
-//! Lo stesso codice gira ai due capi: legge byte locali (SSH), li cifra con il canale
-//! end-to-end e li invia come `Data` nei limiti del credito; all'arrivo decifra, consegna e
-//! restituisce credito con `WindowUpdate`.
+//! The same code runs at both ends: it reads local bytes (SSH), encrypts them with the
+//! end-to-end channel and sends them as `Data` within the credit limits; on arrival it
+//! decrypts, delivers and returns credit with `WindowUpdate`.
 
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,38 +15,38 @@ use zt_domain::{CloseReason, Credit, Frame, FramePayload, StreamId};
 
 use crate::{NetError, Timeouts};
 
-/// Plaintext del primo messaggio di trasporto end-to-end, inviato dal client per provare di
-/// aver completato l'handshake (un relay che rigioca il messaggio 1 non sa produrlo).
+/// Plaintext of the first end-to-end transport message, sent by the client to prove that it
+/// completed the handshake (a relay replaying message 1 cannot produce it).
 pub(crate) const CONFIRM: &[u8] = b"TCN/1 ready";
 
-/// Byte locali letti per ogni `Data`.
+/// Local bytes read for each `Data`.
 pub(crate) const CHUNK: usize = 16 * 1024;
 
-/// Credito restituito quando se ne è consumato almeno questo.
+/// Credit is returned once at least this much has been consumed.
 const UPDATE_THRESHOLD: u32 = INITIAL_WINDOW / 4;
 
-/// Frame in coda per uno stream: il massimo che un peer corretto può inviare entro il credito.
+/// Frames queued for a stream: the most a well-behaved peer can send within the credit.
 pub(crate) const STREAM_QUEUE: usize = {
     let frames = MAX_WINDOW / MIN_CHARGE + MAX_WINDOW / MIN_WINDOW_UPDATE + 8;
     frames as usize
 };
 
-/// Cosa è arrivato su uno stream.
+/// What arrived on a stream.
 enum Inbound {
     Data(bytes::Bytes),
     Closed(CloseReason),
 }
 
-/// Le code e il credito di uno stream.
+/// The queues and credit of a stream.
 pub(crate) struct StreamIo {
     stream: StreamId,
     rx: mpsc::Receiver<Frame>,
     tx: mpsc::Sender<Frame>,
-    /// Credito che abbiamo per inviare.
+    /// Credit we have for sending.
     send: Window,
-    /// Credito che il peer ha verso di noi (per accorgersi di un relay che non lo applica).
+    /// Credit the peer has towards us (to notice a relay that does not enforce it).
     recv: Window,
-    /// Byte consegnati e non ancora restituiti come credito.
+    /// Bytes delivered and not yet returned as credit.
     consumed: u32,
 }
 
@@ -70,8 +70,8 @@ impl StreamIo {
         self.tx.send(frame).await.map_err(|_| NetError::Closed)
     }
 
-    /// Un handle che può chiudere lo stream anche dopo che `self` è passato al pump.
-    /// L'identificativo dello stream sulla connessione con il relay.
+    /// A handle that can close the stream even after `self` has been moved into the pump.
+    /// The stream identifier on the connection with the relay.
     pub(crate) const fn id(&self) -> StreamId {
         self.stream
     }
@@ -84,7 +84,7 @@ impl StreamIo {
     }
 
     pub(crate) async fn close(&self, reason: CloseReason) {
-        // Best effort: se la connessione è già caduta non c'è nessuno da avvisare.
+        // Best effort: if the connection is already down there is nobody to notify.
         let _ = self
             .send_frame(Frame::Close {
                 stream: self.stream,
@@ -93,7 +93,7 @@ impl StreamIo {
             .await;
     }
 
-    /// Invia un messaggio cifrato come `Data`, consumando credito.
+    /// Sends an encrypted message as `Data`, consuming credit.
     pub(crate) async fn send_data(&mut self, ciphertext: Vec<u8>) -> Result<(), NetError> {
         self.send
             .consume(ciphertext.len())
@@ -107,7 +107,7 @@ impl StreamIo {
         .await
     }
 
-    /// Elabora frame di controllo finché arriva un `Data` o una chiusura.
+    /// Processes control frames until a `Data` or a close arrives.
     async fn next_inbound(&mut self) -> Result<Inbound, NetError> {
         loop {
             match self.rx.recv().await {
@@ -127,7 +127,7 @@ impl StreamIo {
         }
     }
 
-    /// Attende il prossimo messaggio end-to-end (usato durante l'handshake).
+    /// Waits for the next end-to-end message (used during the handshake).
     pub(crate) async fn recv_message(
         &mut self,
         timeouts: &Timeouts,
@@ -143,7 +143,7 @@ impl StreamIo {
         Ok(message)
     }
 
-    /// Registra la consegna di `len` byte e, oltre la soglia, restituisce credito.
+    /// Records the delivery of `len` bytes and, past the threshold, returns credit.
     async fn delivered(&mut self, len: usize) -> Result<(), NetError> {
         self.consumed = self.consumed.saturating_add(charge(len));
         if self.consumed >= UPDATE_THRESHOLD {
@@ -161,16 +161,16 @@ impl StreamIo {
     }
 }
 
-/// Collega uno stream già autenticato end-to-end a un flusso locale, fino alla chiusura.
+/// Connects a stream already authenticated end-to-end to a local stream, until it closes.
 ///
-/// Le due direzioni girano in parallelo: se fossero sequenziali, un demone SSH che non legge
-/// finché non può scrivere bloccherebbe entrambe (deadlock classico dei proxy). Il credito
-/// di invio è un semaforo in byte: la direzione in uscita lo consuma, i `WindowUpdate` della
-/// direzione in entrata lo ricaricano.
+/// The two directions run in parallel: if they were sequential, an SSH daemon that does not
+/// read until it can write would block both (the classic proxy deadlock). The send credit is
+/// a semaphore in bytes: the outbound direction consumes it, the `WindowUpdate`s of the
+/// inbound direction replenish it.
 ///
-/// `local_write` limita il tempo di una scrittura verso `local`. L'agent lo usa verso sshd;
-/// il client no: un `ssh` sospeso (`~^Z`) smette di leggere e la sessione deve sopravvivere,
-/// mentre la memoria è comunque limitata dalla finestra (finding 0003-2).
+/// `local_write` bounds the time of a write to `local`. The agent uses it towards sshd; the
+/// client does not: a suspended `ssh` (`~^Z`) stops reading and the session must survive,
+/// while memory is bounded by the window anyway (finding 0003-2).
 pub(crate) async fn pump<L>(
     io: StreamIo,
     transport: Transport,
@@ -206,7 +206,7 @@ where
         r = down.run(&mut writer, local_write) => r,
     };
     let _ = writer.shutdown().await;
-    // Uno stream già chiuso dal peer non si richiude.
+    // A stream already closed by the peer is not closed again.
     if result.is_err() && !matches!(result, Err(NetError::StreamClosed(_))) {
         let _ = tx
             .send(Frame::Close {
@@ -224,7 +224,7 @@ fn lock(transport: &Mutex<Transport>) -> Result<std::sync::MutexGuard<'_, Transp
         .map_err(|_| NetError::Protocol("transport lock poisoned"))
 }
 
-/// Locale → peer: legge, cifra, invia entro il credito.
+/// Local → peer: reads, encrypts, sends within the credit.
 async fn uplink<R: AsyncRead + Unpin>(
     stream: StreamId,
     mut reader: R,
@@ -234,7 +234,7 @@ async fn uplink<R: AsyncRead + Unpin>(
 ) -> Result<(), NetError> {
     let mut buf = vec![0_u8; CHUNK];
     loop {
-        // Attende credito per almeno un frame minimo prima di leggere.
+        // Waits for credit for at least a minimal frame before reading.
         drop(
             credit
                 .acquire_many(MIN_CHARGE)
@@ -260,7 +260,7 @@ async fn uplink<R: AsyncRead + Unpin>(
         }
         let chunk = buf.get(..n).ok_or(NetError::Protocol("read overflow"))?;
         let ciphertext = lock(transport)?.encrypt(chunk)?;
-        // Solo questa direzione consuma credito: i permessi sono già disponibili.
+        // Only this direction consumes credit: the permits are already available.
         credit
             .acquire_many(charge(ciphertext.len()))
             .await
@@ -274,7 +274,7 @@ async fn uplink<R: AsyncRead + Unpin>(
     }
 }
 
-/// Peer → locale: decifra, consegna, restituisce credito; applica i `WindowUpdate` ricevuti.
+/// Peer → local: decrypts, delivers, returns credit; applies the received `WindowUpdate`s.
 struct Downlink<'a> {
     stream: StreamId,
     rx: mpsc::Receiver<Frame>,
@@ -298,15 +298,15 @@ impl Downlink<'_> {
                     reason: CloseReason::Normal,
                     ..
                 }) => return Ok(()),
-                // Una chiusura per errore del peer è un errore anche qui (finding 0003-3).
+                // A close due to a peer error is an error here too (finding 0003-3).
                 Some(Frame::Close { reason, .. }) => return Err(NetError::StreamClosed(reason)),
                 Some(Frame::Data { payload, .. }) => {
                     self.recv
                         .consume(payload.len())
                         .map_err(NetError::Protocol)?;
                     let plaintext = lock(self.transport)?.decrypt(payload.as_bytes())?;
-                    // Flush a ogni messaggio: lo stdout di `zt-client` è bufferizzato a righe e
-                    // SSH non manda righe (finding 0003-1).
+                    // Flush on every message: the stdout of `zt-client` is line-buffered and
+                    // SSH does not send lines (finding 0003-1).
                     let write = async {
                         writer.write_all(&plaintext).await?;
                         writer.flush().await
@@ -351,14 +351,14 @@ impl Downlink<'_> {
     }
 }
 
-/// Chiude uno stream dall'esterno del pump (per esempio alla revoca del client).
+/// Closes a stream from outside the pump (for example when the client is revoked).
 pub(crate) struct Closer {
     stream: StreamId,
     tx: mpsc::Sender<Frame>,
 }
 
 impl Closer {
-    /// Invia `Close` con il motivo dato. Best effort.
+    /// Sends `Close` with the given reason. Best effort.
     pub(crate) async fn close(&self, reason: CloseReason) {
         let _ = self
             .tx

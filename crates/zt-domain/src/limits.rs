@@ -1,77 +1,77 @@
-//! Limiti del protocollo, fissati a compile-time.
+//! Protocol limits, fixed at compile time.
 //!
-//! Ogni limite ha una motivazione di sicurezza (OWASP A03/A04): un peer non può mai
-//! costringerci ad allocare più di [`MAX_FRAME_LEN`] byte per frame, qualunque cosa dichiari.
+//! Every limit has a security rationale (OWASP A03/A04): a peer can never force us to
+//! allocate more than [`MAX_FRAME_LEN`] bytes per frame, whatever it declares.
 
-/// Lunghezza massima di un messaggio di trasporto Noise (specifica Noise, §3).
+/// Maximum length of a Noise transport message (Noise specification, §3).
 pub const NOISE_MAX_MESSAGE_LEN: usize = 65_535;
 
-/// Lunghezza del tag AEAD aggiunto da Noise a ogni messaggio cifrato.
+/// Length of the AEAD tag that Noise appends to every encrypted message.
 pub const NOISE_TAG_LEN: usize = 16;
 
-/// Lunghezza fissa dell'header di un frame sul filo (vedi `docs/PROTOCOL.md`).
+/// Fixed length of a frame header on the wire (see `docs/PROTOCOL.md`).
 pub const FRAME_HEADER_LEN: usize = 8;
 
-/// Strati di cifratura annidati che un frame `Data` deve attraversare:
-/// tunnel end-to-end client↔agent dentro il canale peer↔relay.
+/// Nested encryption layers a `Data` frame must traverse:
+/// the client↔agent end-to-end tunnel inside the peer↔relay channel.
 pub const ENCRYPTION_LAYERS: usize = 2;
 
-/// Dimensione massima del payload di un singolo frame: 60 KiB.
+/// Maximum payload size of a single frame: 60 KiB.
 pub const MAX_PAYLOAD_LEN: usize = 60 * 1024;
 
-/// Dimensione massima di un frame completo (header + payload).
+/// Maximum size of a complete frame (header + payload).
 pub const MAX_FRAME_LEN: usize = FRAME_HEADER_LEN + MAX_PAYLOAD_LEN;
 
-/// Lunghezza massima di un [`NodeId`](crate::NodeId) (un'etichetta DNS, RFC 1035 §2.3.4).
+/// Maximum length of a [`NodeId`](crate::NodeId) (a DNS label, RFC 1035 §2.3.4).
 pub const MAX_NODE_ID_LEN: usize = 63;
 
-/// Lunghezza massima di un certificato client (PROTOCOL §15.12): 64 nodi da 63 byte e un nome
-/// da 63 byte.
+/// Maximum length of a client certificate (PROTOCOL §15.12): 64 nodes of 63 bytes and a name
+/// of 63 bytes.
 pub const MAX_CERT_LEN: usize = 4_328;
 
-/// Lunghezza minima di un certificato client: `scope = 0x01` e nome di 1 byte.
+/// Minimum length of a client certificate: `scope = 0x01` and a 1-byte name.
 pub const MIN_CERT_LEN: usize = 170;
 
-/// Nodi al massimo in un certificato con `scope = 0x00`.
+/// Maximum number of nodes in a certificate with `scope = 0x00`.
 pub const MAX_CERT_NODES: usize = 64;
 
-/// Durata massima di un certificato, regola del formato (24 ore).
+/// Maximum lifetime of a certificate, a format rule (24 hours).
 pub const MAX_CERT_LIFETIME_SECS: u64 = 86_400;
 
-/// Tolleranza sull'orologio, solo su `not_before` (PROTOCOL §15.6).
+/// Clock skew tolerance, on `not_before` only (PROTOCOL §15.6).
 pub const CERT_CLOCK_SKEW_SECS: u64 = 120;
 
-/// `max_lifetime` minimo di una CA.
+/// Minimum `max_lifetime` of a CA.
 pub const MIN_AUTHORITY_LIFETIME_SECS: u64 = 60;
 
-/// `max_lifetime` di default di una CA (8 ore).
+/// Default `max_lifetime` of a CA (8 hours).
 pub const DEFAULT_AUTHORITY_LIFETIME_SECS: u64 = 28_800;
 
-/// Voci `[[authorities]]` al massimo per file.
+/// Maximum number of `[[authorities]]` entries per file.
 pub const MAX_AUTHORITIES: usize = 16;
 
-/// Chiavi per CA: la corrente e, durante una rotazione, la nuova.
+/// Keys per CA: the current one and, during a rotation, the new one.
 pub const MAX_AUTHORITY_KEYS: usize = 2;
 
-/// Numeri di serie al massimo nella denylist.
+/// Maximum number of serial numbers in the denylist.
 pub const MAX_REVOKED_SERIALS: usize = 16_384;
 
-/// Chiavi al massimo nella denylist.
+/// Maximum number of keys in the denylist.
 pub const MAX_REVOKED_KEYS: usize = 4_096;
 
-/// Byte del messaggio 1 di Noise IK oltre il payload: `e` (32) + `s` cifrata (32 + 16) + tag
-/// del payload (16).
+/// Bytes of Noise IK message 1 beyond the payload: `e` (32) + encrypted `s` (32 + 16) + payload
+/// tag (16).
 pub const NOISE_MSG1_OVERHEAD: usize = 96;
 
-// Prove a compile-time: se qualcuno alza un limite in modo incoerente, il build fallisce.
+// Compile-time proofs: if someone raises a limit inconsistently, the build fails.
 const _: () = {
-    // Un payload massimo, incapsulato due volte (header + tag per strato), sta in un messaggio Noise.
+    // A maximum payload, encapsulated twice (header + tag per layer), fits in a Noise message.
     let overhead = ENCRYPTION_LAYERS * (FRAME_HEADER_LEN + NOISE_TAG_LEN);
     assert!(MAX_PAYLOAD_LEN + overhead <= NOISE_MAX_MESSAGE_LEN);
-    // Il campo `length` dell'header è un u16: il limite deve essere esprimibile sul filo.
+    // The header's `length` field is a u16: the limit must be expressible on the wire.
     assert!(MAX_PAYLOAD_LEN <= u16::MAX as usize);
     assert!(MAX_NODE_ID_LEN <= MAX_PAYLOAD_LEN);
-    // Il messaggio 1 con il certificato più grande sta in un `Data` e in un messaggio Noise
+    // Message 1 carrying the largest certificate fits in a `Data` frame and in a Noise message
     // (PROTOCOL §15.3).
     assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= MAX_PAYLOAD_LEN);
     assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= NOISE_MAX_MESSAGE_LEN);

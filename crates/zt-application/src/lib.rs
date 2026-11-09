@@ -1,14 +1,14 @@
 //! # zt-application
 //!
-//! Application layer di TCN: i casi d'uso, come macchine a stati **sans-IO**.
+//! Application layer of TCN: the use cases, as **sans-IO** state machines.
 //!
-//! - [`relay::RelayCore`]: autorizzazione, routing degli stream, controllo di flusso e limiti
-//!   del relay. Riceve eventi ([`relay::Input`]) e produce azioni ([`relay::Output`]); gli
-//!   adapter di rete eseguono le azioni.
-//! - [`ratelimit`]: token bucket con orologio iniettato.
+//! - [`relay::RelayCore`]: authorization, stream routing, flow control and limits of the
+//!   relay. It receives events ([`relay::Input`]) and produces actions ([`relay::Output`]);
+//!   the network adapters execute the actions.
+//! - [`ratelimit`]: token bucket with an injected clock.
 //!
-//! Il tempo entra solo come parametro `now: Instant`; la casualità solo tramite la porta
-//! [`relay::SessionIds`]. Tutto è quindi deterministico nei test.
+//! Time enters only as a `now: Instant` parameter; randomness only through the
+//! [`relay::SessionIds`] port. Everything is therefore deterministic in tests.
 #![forbid(unsafe_code)]
 
 pub mod ratelimit;

@@ -1,11 +1,11 @@
-# Agent TCN sui server target: nessuna porta in ascolto, solo connessioni in uscita verso il
-# relay e verso sshd su 127.0.0.1:22. Installazione: vedi docs/OPERATIONS.md §9.
-# File attesi:
+# TCN agent on the target servers: no listening ports, only outbound connections to the
+# relay and to sshd on 127.0.0.1:22. Installation: see docs/OPERATIONS.md §9.
+# Expected files:
 #   /etc/tcn               root:root 0755
 #   /etc/tcn/agent.key     tcn:tcn   0600
-#   /etc/tcn/clients.toml  root:root 0644   (systemctl reload zt-agent dopo una modifica)
-#   /etc/tcn/agent.env     root:root 0644   con TCN_RELAY, TCN_RELAY_KEY, TCN_NODE
-#                          (più relay: TCN_RELAY=r1:7443,r2:7443 e TCN_RELAY_KEY=k1,k2)
+#   /etc/tcn/clients.toml  root:root 0644   (systemctl reload zt-agent after a change)
+#   /etc/tcn/agent.env     root:root 0644   with TCN_RELAY, TCN_RELAY_KEY, TCN_NODE
+#                          (multiple relays: TCN_RELAY=r1:7443,r2:7443 and TCN_RELAY_KEY=k1,k2)
 [Unit]
 Description=TCN agent (zt-agent)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
@@ -13,14 +13,14 @@ After=network-online.target sshd.service
 Wants=network-online.target
 
 [Service]
-# notify: READY=1 arriva solo quando SIGHUP è gestito (systemctl reload sicuro da subito).
+# notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away).
 Type=notify
 NotifyAccess=main
 User=tcn
 Group=tcn
 EnvironmentFile=/etc/tcn/agent.env
 ExecStart=/usr/local/bin/zt-agent --log-format json run --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
-# Ricarica i client autorizzati e chiude subito le sessioni di quelli rimossi.
+# Reloads the authorized clients and immediately closes the sessions of those removed.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2s
@@ -55,9 +55,9 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 UMask=0077
 ReadOnlyPaths=/etc/tcn
-# Facoltativo, se l'IP del relay è fisso: l'agent può parlare solo con il relay e con sshd.
+# Optional, if the relay's IP is fixed: the agent can talk only to the relay and to sshd.
 #IPAddressDeny=any
-#IPAddressAllow=localhost <IP del relay>
+#IPAddressAllow=localhost <relay IP>
 
 [Install]
 WantedBy=multi-user.target

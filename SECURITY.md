@@ -1,61 +1,61 @@
-# Politica di sicurezza
+# Security policy
 
-TCN è un sistema di accesso remoto: una vulnerabilità può aprire SSH su un'intera flotta di
-server. Le segnalazioni sono benvenute e vengono trattate con priorità.
+TCN is a remote access system: a vulnerability can open SSH on an entire fleet of
+servers. Reports are welcome and are handled with priority.
 
 > **English:** please report vulnerabilities privately through GitHub's
 > [private vulnerability reporting](https://github.com/pietrangelo/TransportCryptoNetwork/security/advisories/new).
 > Do not open a public issue. Reports in English or Italian are both fine.
 
-## Come segnalare
+## How to report
 
-Usa la **segnalazione privata di GitHub**:
+Use **GitHub's private reporting**:
 [Security → Report a vulnerability](https://github.com/pietrangelo/TransportCryptoNetwork/security/advisories/new).
 
-**Non** aprire una issue pubblica, una PR o una discussione per un problema di sicurezza.
+Do **not** open a public issue, a PR or a discussion for a security problem.
 
-Una buona segnalazione contiene:
+A good report contains:
 
-- la versione (tag o commit) e il binario coinvolto (`zt-agent`, `zt-relay`, `zt-client`);
-- il modello d'attacco: chi è l'attaccante (rete, relay compromesso, client autorizzato,
-  utente locale) e che cosa ottiene;
-- i passi per riprodurre o un proof of concept minimale;
-- l'impatto stimato.
+- the version (tag or commit) and the binary involved (`zt-agent`, `zt-relay`, `zt-client`);
+- the attack model: who the attacker is (network, compromised relay, authorized client,
+  local user) and what they gain;
+- the steps to reproduce or a minimal proof of concept;
+- the estimated impact.
 
-Non includere chiavi private, token o dati reali di produzione.
+Do not include private keys, tokens or real production data.
 
-## Che cosa aspettarsi
+## What to expect
 
-| Fase | Tempo indicativo |
+| Stage | Indicative time |
 | --- | --- |
-| Conferma di ricezione | entro 3 giorni lavorativi |
-| Prima valutazione (validità, gravità) | entro 10 giorni lavorativi |
-| Correzione dei problemi critici | il prima possibile, di norma entro 30 giorni |
+| Acknowledgement of receipt | within 3 working days |
+| Initial assessment (validity, severity) | within 10 working days |
+| Fix for critical issues | as soon as possible, normally within 30 days |
 
-La correzione viene pubblicata con un GitHub Security Advisory (con CVE quando serve), e chi
-ha segnalato viene citato, se lo desidera. Chiediamo di non divulgare il problema finché la
-correzione non è disponibile o finché non sono passati 90 giorni dalla segnalazione.
+The fix is published with a GitHub Security Advisory (with a CVE when appropriate), and the
+reporter is credited, if they wish. We ask you not to disclose the problem until the
+fix is available or until 90 days have passed since the report.
 
-## Versioni supportate
+## Supported versions
 
-Il progetto è prima della 1.0: viene corretta solo l'ultima release e il ramo `main`.
+The project is pre-1.0: only the latest release and the `main` branch receive fixes.
 
-## Ambito
+## Scope
 
-Rientrano nell'ambito, fra l'altro:
+In scope are, among other things:
 
-- bypass dell'autenticazione mutua o delle policy di autorizzazione del relay e dell'agent;
-- un relay che riesce a leggere, alterare o reindirizzare il traffico end-to-end;
-- crash, panic, esaurimento di memoria o CPU provocati da input remoto;
-- segreti o payload SSH che finiscono nei log;
-- debolezze del processo di rilascio (binari, attestazioni SLSA, workflow GitHub Actions).
+- bypasses of the mutual authentication or of the authorization policies of the relay and the agent;
+- a relay that manages to read, alter or redirect the end-to-end traffic;
+- crashes, panics, memory or CPU exhaustion caused by remote input;
+- secrets or SSH payloads that end up in the logs;
+- weaknesses in the release process (binaries, SLSA attestations, GitHub Actions workflows).
 
-Il modello di minaccia e le difese sono descritti in `docs/PROTOCOL.md` e nelle review in
+The threat model and the defences are described in `docs/PROTOCOL.md` and in the reviews in
 `docs/adversary/`.
 
-## Verificare un binario rilasciato
+## Verifying a released binary
 
-Ogni archivio di release ha un'attestazione di provenienza SLSA firmata da GitHub Actions:
+Every release archive has an SLSA provenance attestation signed by GitHub Actions:
 
 ```bash
 sha256sum -c SHA256SUMS

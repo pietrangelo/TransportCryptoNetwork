@@ -1,15 +1,15 @@
 //! # zt-net
 //!
-//! Adapter di rete di TCN, basati su tokio. Collegano i casi d'uso sans-IO
-//! (`zt-application`) e l'handshake (`zt-crypto`) a socket reali.
+//! TCN network adapters, based on tokio. They connect the sans-IO use cases
+//! (`zt-application`) and the handshake (`zt-crypto`) to real sockets.
 //!
-//! - [`channel`]: messaggi Noise su TCP, con typestate `Pending` → `Established`;
-//! - [`relay`]: server del relay (hub single-thread attorno a `RelayCore`);
-//! - [`agent`]: agent outbound-only con riconnessione;
-//! - [`client`]: libreria client (usata dai test e da `zt-client`);
-//! - [`config`]: file di chiavi e policy.
+//! - [`channel`]: Noise messages over TCP, with `Pending` → `Established` typestate;
+//! - [`relay`]: relay server (single-threaded hub around `RelayCore`);
+//! - [`agent`]: outbound-only agent with reconnection;
+//! - [`client`]: client library (used by the tests and by `zt-client`);
+//! - [`config`]: key and policy files.
 //!
-//! Ogni operazione di I/O ha un timeout; ogni coda è limitata.
+//! Every I/O operation has a timeout; every queue is bounded.
 #![forbid(unsafe_code)]
 
 pub mod agent;
@@ -32,32 +32,32 @@ use std::time::Duration;
 
 use zt_crypto::PublicKey;
 
-/// Relay al massimo in un elenco di un agent o di un client (PROTOCOL §13).
+/// Maximum number of relays in an agent's or a client's list (PROTOCOL §13).
 pub const MAX_RELAYS: usize = 8;
 
-/// Un relay: indirizzo e chiave pinnata.
+/// A relay: address and pinned key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayEndpoint {
-    /// Indirizzo (`host:porta`).
+    /// Address (`host:port`).
     pub address: String,
-    /// Chiave pubblica del relay, pinnata.
+    /// Public key of the relay, pinned.
     pub public_key: PublicKey,
 }
 
-/// Timeout di tutte le operazioni di rete.
+/// Timeouts of all network operations.
 #[derive(Debug, Clone)]
 pub struct Timeouts {
-    /// Handshake Noise completo.
+    /// Complete Noise handshake.
     pub handshake: Duration,
-    /// Silenzio massimo su una connessione (nessun frame completo ricevuto).
+    /// Maximum silence on a connection (no complete frame received).
     pub idle: Duration,
-    /// Scrittura di un singolo messaggio.
+    /// Writing a single message.
     pub write: Duration,
-    /// Risposta a un `Open` e handshake end-to-end.
+    /// Response to an `Open` and end-to-end handshake.
     pub open: Duration,
-    /// Connessione al demone SSH locale.
+    /// Connection to the local SSH daemon.
     pub ssh_connect: Duration,
-    /// Intervallo dei `Ping` di keepalive.
+    /// Interval of keepalive `Ping`s.
     pub keepalive: Duration,
 }
 
@@ -74,8 +74,8 @@ impl Default for Timeouts {
     }
 }
 
-/// L'orologio di sistema in secondi Unix; prima del 1970 vale 0 (fail closed: nessun
-/// certificato è ancora valido, PROTOCOL §15.6).
+/// The system clock in Unix seconds; before 1970 it is 0 (fail closed: no certificate is yet
+/// valid, PROTOCOL §15.6).
 #[must_use]
 pub fn unix_now() -> zt_domain::UnixTime {
     let secs = std::time::SystemTime::now()
@@ -84,15 +84,15 @@ pub fn unix_now() -> zt_domain::UnixTime {
     zt_domain::UnixTime::from_secs(secs)
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` (calendario gregoriano prolettico, UTC), per le date dei certificati
-/// mostrate a un operatore.
+/// `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian calendar, UTC), for certificate dates shown to
+/// an operator.
 #[must_use]
 pub fn utc_text(time: zt_domain::UnixTime) -> String {
     civil(time.as_secs()).unwrap_or_else(|| format!("@{}", time.as_secs()))
 }
 
-/// Da secondi Unix a data civile (H. Hinnant, `civil_from_days`), solo con aritmetica
-/// controllata.
+/// From Unix seconds to a civil date (H. Hinnant, `civil_from_days`), using only checked
+/// arithmetic.
 fn civil(secs: u64) -> Option<String> {
     let days = secs.checked_div(86_400)?;
     let rem = secs.checked_rem(86_400)?;
@@ -132,8 +132,8 @@ fn civil(secs: u64) -> Option<String> {
     ))
 }
 
-/// Scadenza a `after` da adesso. Una durata assurda che manderebbe in overflow l'orologio
-/// scade subito (fail closed) invece di non scadere mai.
+/// Deadline `after` from now. An absurd duration that would overflow the clock expires
+/// immediately (fail closed) instead of never expiring.
 pub(crate) fn deadline(after: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(after).unwrap_or(now)
@@ -159,7 +159,7 @@ mod tests {
             utc_text(UnixTime::from_secs(4_102_444_799)),
             "2099-12-31T23:59:59Z"
         );
-        // Nessun overflow nemmeno all'estremo.
+        // No overflow even at the extreme.
         assert!(utc_text(UnixTime::from_secs(u64::MAX)).ends_with('Z'));
     }
 }

@@ -1,4 +1,4 @@
-//! Helper condivisi dai test di integrazione di `zt-proto`.
+//! Helpers shared by the `zt-proto` integration tests.
 #![allow(
     dead_code,
     unreachable_pub,
@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use zt_domain::limits::MAX_PAYLOAD_LEN;
 use zt_domain::{CloseReason, Credit, Frame, FramePayload, NodeId, RejectReason, StreamId};
 
-/// Costruisce un frame grezzo sul filo, anche invalido: è lo strumento dell'attaccante.
+/// Builds a raw frame on the wire, even an invalid one: it is the attacker's tool.
 pub fn raw(version: u8, kind: u8, stream: u32, len: u16, payload: &[u8]) -> BytesMut {
     let mut buf = BytesMut::with_capacity(8 + payload.len());
     buf.put_u8(version);
@@ -25,7 +25,7 @@ pub fn raw(version: u8, kind: u8, stream: u32, len: u16, payload: &[u8]) -> Byte
     buf
 }
 
-/// Come [`raw`], con `len` coerente con il payload.
+/// Like [`raw`], with `len` consistent with the payload.
 pub fn raw_v1(kind: u8, stream: u32, payload: &[u8]) -> BytesMut {
     raw(
         1,
@@ -44,7 +44,7 @@ pub fn stream(id: u32) -> StreamId {
     StreamId::try_from(id).unwrap()
 }
 
-// ---------- strategie proptest ----------
+// ---------- proptest strategies ----------
 
 pub fn arb_node_id() -> impl Strategy<Value = NodeId> {
     "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?".prop_map(|s| NodeId::try_from(s.as_str()).unwrap())
@@ -55,7 +55,7 @@ pub fn arb_stream() -> impl Strategy<Value = StreamId> {
 }
 
 pub fn arb_payload() -> impl Strategy<Value = FramePayload> {
-    // Lunghezze piccole spesso, più i bordi esatti 1 e MAX_PAYLOAD_LEN.
+    // Small lengths often, plus the exact edges 1 and MAX_PAYLOAD_LEN.
     prop_oneof![
         8 => proptest::collection::vec(any::<u8>(), 1..=512),
         1 => Just(vec![0xa5; 1]),

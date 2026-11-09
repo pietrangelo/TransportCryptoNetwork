@@ -3,33 +3,33 @@ use crate::crypto::Fingerprint;
 use crate::frame::CloseReason;
 use crate::ids::{NodeId, SessionId};
 
-/// Perché un tentativo di autenticazione è fallito.
+/// Why an authentication attempt failed.
 ///
-/// Usato negli audit log: abbastanza dettagliato per l'investigazione, mai il materiale
-/// crittografico in sé.
+/// Used in audit logs: detailed enough for investigation, never the cryptographic material
+/// itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AuthFailureReason {
-    /// Handshake Noise non completato (chiave errata, messaggio corrotto, timeout).
+    /// Noise handshake not completed (wrong key, corrupted message, timeout).
     HandshakeFailed,
-    /// Chiave valida ma assente dalla whitelist.
+    /// Valid key but absent from the whitelist.
     UnknownPeer,
-    /// L'agent ha dichiarato un `NodeId` non associato alla sua chiave.
+    /// The agent declared a `NodeId` not associated with its key.
     NodeIdMismatch,
-    /// Troppi tentativi dallo stesso indirizzo.
+    /// Too many attempts from the same address.
     RateLimited,
-    /// La chiave è nella denylist (`keys`, PROTOCOL §15.8), con qualsiasi credenziale.
+    /// The key is in the denylist (`keys`, PROTOCOL §15.8), with any credential.
     KeyRevoked,
-    /// Il certificato presentato non è stato accettato (PROTOCOL §15.4).
+    /// The presented certificate was not accepted (PROTOCOL §15.4).
     Certificate(CertRejection),
 }
 
 impl AuthFailureReason {
-    /// Il certificato da riportare in un `authentication_failed` (PROTOCOL §15.11, finding
-    /// 0006-3): solo se la firma è stata verificata (`verified` viene da `zt-crypto`) e il
-    /// rifiuto viene da un controllo successivo (passi 7–12 di §15.4). Prima della firma i campi
-    /// del certificato non sono di nessuno: un evento che nomina una serie riguarda sempre un
-    /// certificato davvero firmato da una CA pinnata.
+    /// The certificate to report in an `authentication_failed` (PROTOCOL §15.11, finding
+    /// 0006-3): only if the signature was verified (`verified` comes from `zt-crypto`) and the
+    /// rejection comes from a later check (steps 7–12 of §15.4). Before the signature, the
+    /// certificate's fields belong to no one: an event naming a serial always concerns a
+    /// certificate truly signed by a pinned CA.
     #[must_use]
     pub fn certificate_ref(self, verified: Option<&CertClaims>) -> Option<CertRef> {
         match self {
@@ -41,88 +41,88 @@ impl AuthFailureReason {
     }
 }
 
-/// Fatti significativi del dominio, emessi dai casi d'uso e consumati dagli adapter
-/// (audit log via `tracing`, metriche).
+/// Significant domain facts, emitted by the use cases and consumed by the adapters
+/// (audit log via `tracing`, metrics).
 ///
-/// Gli eventi non contengono timestamp né indirizzi di rete: li aggiunge l'adapter che li
-/// registra, perché il dominio non ha orologio né I/O.
+/// Events contain neither timestamps nor network addresses: the adapter that records them adds
+/// those, because the domain has no clock and no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DomainEvent {
-    /// Un agent si è autenticato e registrato presso il relay.
+    /// An agent authenticated and registered with the relay.
     AgentRegistered {
-        /// Il nome logico del nodo.
+        /// The logical name of the node.
         node: NodeId,
-        /// L'identità crittografica dell'agent.
+        /// The cryptographic identity of the agent.
         fingerprint: Fingerprint,
     },
-    /// Una sessione client→nodo è stata autorizzata e aperta.
+    /// A client→node session was authorized and opened.
     SessionEstablished {
-        /// La sessione.
+        /// The session.
         session: SessionId,
-        /// L'identità del client.
+        /// The identity of the client.
         client: Fingerprint,
-        /// Il nodo di destinazione.
+        /// The destination node.
         target: NodeId,
-        /// Il certificato che ha autorizzato il client, se non è la whitelist.
+        /// The certificate that authorized the client, if it is not the whitelist.
         certificate: Option<CertRef>,
     },
-    /// Un tentativo di autenticazione è fallito.
+    /// An authentication attempt failed.
     AuthenticationFailed {
-        /// L'impronta del peer, se l'handshake è arrivato abbastanza avanti da conoscerla.
+        /// The peer's fingerprint, if the handshake got far enough to know it.
         peer: Option<Fingerprint>,
-        /// Il motivo.
+        /// The reason.
         reason: AuthFailureReason,
-        /// Il certificato rifiutato, solo dopo la verifica della firma
+        /// The rejected certificate, only after the signature has been verified
         /// ([`AuthFailureReason::certificate_ref`]).
         certificate: Option<CertRef>,
     },
-    /// Un client autenticato ha chiesto un nodo che la policy non gli concede.
+    /// An authenticated client requested a node that the policy does not grant it.
     AccessDenied {
-        /// L'identità del client.
+        /// The identity of the client.
         client: Fingerprint,
-        /// Il nodo richiesto.
+        /// The requested node.
         target: NodeId,
-        /// Il certificato del client, se non è la whitelist.
+        /// The client's certificate, if it is not the whitelist.
         certificate: Option<CertRef>,
     },
-    /// Un peer ha violato il protocollo e la sua connessione è stata chiusa.
+    /// A peer violated the protocol and its connection was closed.
     ProtocolViolation {
-        /// L'identità del peer.
+        /// The identity of the peer.
         peer: Fingerprint,
-        /// Che cosa ha violato (testo statico, mai dati ricevuti).
+        /// What it violated (static text, never received data).
         rule: &'static str,
     },
-    /// Una sessione è terminata e le sue risorse sono state rilasciate.
+    /// A session ended and its resources were released.
     ConnectionDrained {
-        /// La sessione.
+        /// The session.
         session: SessionId,
-        /// Il motivo.
+        /// The reason.
         reason: CloseReason,
     },
-    /// Una nuova policy ha tolto a un peer il ruolo o l'accesso a un nodo: le sue sessioni
-    /// (tutte, o solo quelle verso `target`) sono state chiuse.
+    /// A new policy removed a peer's role or its access to a node: its sessions
+    /// (all of them, or only those towards `target`) were closed.
     AccessRevoked {
-        /// L'identità revocata.
+        /// The revoked identity.
         peer: Fingerprint,
-        /// Il nodo non più concesso; `None` se il peer ha perso il proprio ruolo.
+        /// The node no longer granted; `None` if the peer lost its role.
         target: Option<NodeId>,
-        /// Il certificato del client, se non è la whitelist.
+        /// The client's certificate, if it is not the whitelist.
         certificate: Option<CertRef>,
     },
-    /// Una connessione autorizzata da un certificato è stata chiusa alla scadenza
+    /// A connection authorized by a certificate was closed on expiry
     /// (PROTOCOL §15.7).
     CertificateExpired {
-        /// L'identità del client.
+        /// The identity of the client.
         peer: Fingerprint,
-        /// Il certificato scaduto.
+        /// The expired certificate.
         certificate: CertRef,
     },
 }
 
 impl DomainEvent {
-    /// Nome stabile dell'evento, in `snake_case`: è il campo `event_kind` dell'audit log e non
-    /// dipende dal formato `Debug`.
+    /// Stable name of the event, in `snake_case`: it is the `event_kind` field of the audit log and
+    /// does not depend on the `Debug` format.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -137,7 +137,7 @@ impl DomainEvent {
         }
     }
 
-    /// `true` per gli eventi che meritano attenzione (livello `WARN` nell'audit log).
+    /// `true` for events that deserve attention (`WARN` level in the audit log).
     #[must_use]
     pub const fn is_security_alert(&self) -> bool {
         matches!(

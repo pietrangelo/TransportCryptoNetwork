@@ -1,4 +1,4 @@
-//! Firma e verifica dei certificati client (PROTOCOL §15.2, §15.4 passi 3–6).
+//! Signing and verification of client certificates (PROTOCOL §15.2, §15.4 steps 3–6).
 
 use core::fmt;
 
@@ -14,22 +14,22 @@ use zt_domain::{
 use crate::error::CryptoError;
 use crate::identity::PublicKey;
 
-/// Prefisso della riga di un file di certificato.
+/// Line prefix of a certificate file.
 pub const CERT_FILE_PREFIX: &str = "tcn-client-cert-v1:";
 
-/// Chiave segreta di una CA. Niente `Clone`, azzerata al drop, `Debug` redatto.
+/// Secret key of a CA. No `Clone`, zeroized on drop, redacted `Debug`.
 pub struct CaSigningKey {
     key: SigningKey,
 }
 
 impl CaSigningKey {
-    /// Prefisso del file della chiave segreta della CA (diverso da quello delle chiavi di nodo).
+    /// File prefix of the CA secret key (different from the one of node keys).
     pub const FILE_PREFIX: &'static str = "tcn-ca-secret-v1:";
 
-    /// Una nuova CA dal CSPRNG del sistema.
+    /// A new CA from the system CSPRNG.
     ///
     /// # Errors
-    /// [`CryptoError::Random`] senza casualità.
+    /// [`CryptoError::Random`] without randomness.
     pub fn generate() -> Result<Self, CryptoError> {
         let mut seed = Zeroizing::new([0_u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(|_| CryptoError::Random)?;
@@ -38,10 +38,10 @@ impl CaSigningKey {
         })
     }
 
-    /// Dal testo del file (`tcn-ca-secret-v1:<64 hex>`, a capo finale facoltativo).
+    /// From the file text (`tcn-ca-secret-v1:<64 hex>`, optional trailing newline).
     ///
     /// # Errors
-    /// [`CryptoError::InvalidKey`] senza il prefisso o con un esadecimale non valido.
+    /// [`CryptoError::InvalidKey`] without the prefix or with invalid hex.
     pub fn from_secret_text(text: &str) -> Result<Self, CryptoError> {
         let line = text.strip_suffix('\n').unwrap_or(text);
         let hex_part = line
@@ -57,7 +57,7 @@ impl CaSigningKey {
         })
     }
 
-    /// Il testo del file, da scrivere con permessi `0600`.
+    /// The file text, to be written with `0600` permissions.
     #[must_use]
     pub fn to_secret_text(&self) -> Zeroizing<String> {
         let hex_part = Zeroizing::new(hex::encode(self.key.as_bytes()));
@@ -70,7 +70,7 @@ impl CaSigningKey {
         text
     }
 
-    /// La chiave pubblica della CA.
+    /// The public key of the CA.
     #[must_use]
     pub fn public_key(&self) -> PublicKey {
         PublicKey::from_verifying_key(self.key.verifying_key())
@@ -83,7 +83,7 @@ impl fmt::Debug for CaSigningKey {
     }
 }
 
-/// La chiave pinnata per una CA.
+/// The pinned key for a CA.
 #[must_use]
 pub fn trusted_ca_key(key: &PublicKey) -> TrustedCaKey {
     TrustedCaKey {
@@ -92,13 +92,13 @@ pub fn trusted_ca_key(key: &PublicKey) -> TrustedCaKey {
     }
 }
 
-/// I 32 byte Ed25519 di una chiave, come compaiono in un certificato.
+/// The 32 Ed25519 bytes of a key, as they appear in a certificate.
 #[must_use]
 pub fn cert_key(key: &PublicKey) -> CertKey {
     CertKey::from_bytes(key.to_bytes())
 }
 
-/// Il messaggio firmato: `CTX || TBS` (PROTOCOL §15.2).
+/// The signed message: `CTX || TBS` (PROTOCOL §15.2).
 fn signed_message(tbs: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(CERT_SIGNATURE_CONTEXT.len().saturating_add(tbs.len()));
     message.extend_from_slice(CERT_SIGNATURE_CONTEXT);
@@ -106,10 +106,10 @@ fn signed_message(tbs: &[u8]) -> Vec<u8> {
     message
 }
 
-/// Firma `body`.
+/// Signs `body`.
 ///
 /// # Errors
-/// Se `body.ca_key()` non è la chiave pubblica di `ca`.
+/// If `body.ca_key()` is not the public key of `ca`.
 pub fn sign_certificate(ca: &CaSigningKey, body: &CertBody) -> Result<Vec<u8>, CryptoError> {
     if body.ca_key() != &cert_key(&ca.public_key()) {
         return Err(CryptoError::InvalidKey);
@@ -124,29 +124,30 @@ pub fn sign_certificate(ca: &CaSigningKey, body: &CertBody) -> Result<Vec<u8>, C
     Ok(cert)
 }
 
-/// Passi 3–6 di PROTOCOL §15.4, nell'ordine: formato, binding a `peer` (prima della firma),
-/// CA pinnata byte per byte, firma stretta. Il resto lo decide il dominio.
+/// Steps 3–6 of PROTOCOL §15.4, in order: format, binding to `peer` (before the signature),
+/// CA pinned byte for byte, strict signature. The rest is decided by the domain.
 ///
 /// # Errors
-/// Il primo controllo che fallisce.
+/// The first check that fails.
 pub fn verify_certificate(
     bytes: &[u8],
     peer: &Fingerprint,
     trust: &CertTrust,
 ) -> Result<CertClaims, CertRejection> {
-    // Passo 3: lunghezza (prima di tutto) e formato, regole 1–7.
+    // Step 3: length (first of all) and format, rules 1–7.
     let parsed = decode_certificate(bytes).map_err(|_| CertRejection::Malformed)?;
-    // Passo 4: `subject_key` canonica e non debole, e legata alla chiave che Noise ha
-    // autenticato. Viene prima della firma: un certificato rubato non costa una verifica.
+    // Step 4: `subject_key` canonical and not weak, and bound to the key that Noise has
+    // authenticated. It comes before the signature: a stolen certificate does not cost a
+    // verification.
     let subject = PublicKey::from_canonical_bytes(parsed.body.subject_key().as_bytes())
         .map_err(|_| CertRejection::KeyMismatch)?;
     let subject_fp = subject.fingerprint();
-    // `Fingerprint::eq` è a tempo costante (`subtle`).
+    // `Fingerprint::eq` is constant-time (`subtle`).
     if subject_fp != *peer {
         return Err(CertRejection::KeyMismatch);
     }
-    // Passo 5: `ca_key` uguale byte per byte a una chiave pinnata. Si verifica con il pin, mai
-    // con la chiave scritta nel certificato.
+    // Step 5: `ca_key` equal byte for byte to a pinned key. Verification uses the pin, never
+    // the key written in the certificate.
     let authority = trust
         .authority_for_key(parsed.body.ca_key())
         .ok_or(CertRejection::UnknownAuthority)?;
@@ -157,7 +158,7 @@ pub fn verify_certificate(
         .ok_or(CertRejection::UnknownAuthority)?;
     let ca = PublicKey::from_canonical_bytes(pin.key.as_bytes())
         .map_err(|_| CertRejection::UnknownAuthority)?;
-    // Passo 6: firma stretta (`S` canonico, `R` e chiave non di ordine piccolo).
+    // Step 6: strict signature (canonical `S`, `R` and key not of small order).
     let signature_bytes: [u8; CERT_SIGNATURE_LEN] = *parsed.signature;
     let signature = Signature::from_bytes(&signature_bytes);
     ca.verifying_key()
@@ -170,7 +171,7 @@ pub fn verify_certificate(
     ))
 }
 
-/// La riga di un file di certificato: [`CERT_FILE_PREFIX`] + esadecimale + a capo.
+/// The line of a certificate file: [`CERT_FILE_PREFIX`] + hex + newline.
 #[must_use]
 pub fn encode_certificate_text(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(
@@ -185,13 +186,13 @@ pub fn encode_certificate_text(bytes: &[u8]) -> String {
     text
 }
 
-/// I byte di un file di certificato. Non controlla il formato del certificato.
+/// The bytes of a certificate file. Does not check the certificate format.
 ///
-/// Una sola forma è accettata: il prefisso, l'esadecimale minuscolo, al più un a capo finale.
+/// Only one form is accepted: the prefix, lowercase hex, at most one trailing newline.
 ///
 /// # Errors
-/// [`CertFormatError::Magic`] senza il prefisso, con spazi, più righe o esadecimale non valido;
-/// [`CertFormatError::Length`] oltre `MAX_CERT_LEN` byte.
+/// [`CertFormatError::Magic`] without the prefix, with spaces, multiple lines or invalid hex;
+/// [`CertFormatError::Length`] over `MAX_CERT_LEN` bytes.
 pub fn decode_certificate_text(text: &str) -> Result<Vec<u8>, CertFormatError> {
     let line = text.strip_suffix('\n').unwrap_or(text);
     let hex_part = line

@@ -1,4 +1,4 @@
-//! Finding 0002-5: un singolo /64 IPv6 non deve poter riempire la tabella del rate limiter.
+//! Finding 0002-5: a single IPv6 /64 must not be able to fill the rate limiter table.
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
 use std::net::{IpAddr, Ipv6Addr};
@@ -25,7 +25,7 @@ fn ipv4_and_ipv4_mapped_addresses_are_keyed_per_address() {
     assert_eq!(a, mapped, "an IPv4-mapped address is the same IPv4 host");
 }
 
-// ======================= Fase 4: residuo di 0002-5 =======================
+// ======================= Phase 4: residue of 0002-5 =======================
 
 use std::time::{Duration, Instant};
 use zt_application::ratelimit::{HandshakeGate, wide_source_key};
@@ -36,7 +36,7 @@ fn ipv6_addresses_share_a_wide_key_per_slash48_and_ipv4_has_none() {
     let first = wide_source_key(IpAddr::V6(Ipv6Addr::from(base)));
     assert!(first.is_some());
     for sub in [1_u128, 0xffff] {
-        // /64 diversi dentro lo stesso /48
+        // different /64s within the same /48
         assert_eq!(
             wide_source_key(IpAddr::V6(Ipv6Addr::from(base | (sub << 64)))),
             first
@@ -49,8 +49,8 @@ fn ipv6_addresses_share_a_wide_key_per_slash48_and_ipv4_has_none() {
     assert_eq!(wide_source_key("192.0.2.1".parse().unwrap()), None);
 }
 
-/// Un attaccante con un intero /48 (65 536 prefissi /64) non riempie più la tabella dei /64 e
-/// non blocca gli indirizzi nuovi di altre reti.
+/// An attacker with a whole /48 (65,536 /64 prefixes) no longer fills the /64 table and does
+/// not block new addresses from other networks.
 #[test]
 fn a_whole_slash48_cannot_lock_out_other_networks() {
     let now = Instant::now();
@@ -64,7 +64,7 @@ fn a_whole_slash48_cannot_lock_out_other_networks() {
     );
     let attacker = 0x2001_0db8_6666_u128 << 80;
     let mut admitted = 0;
-    // Ogni /64 del /48 compare una volta: il bucket /48 limita i /64 nuovi.
+    // Each /64 of the /48 appears once: the /48 bucket limits new /64s.
     for sub in 0..65_536_u128 {
         if gate.admit(
             IpAddr::V6(Ipv6Addr::from(attacker | (sub << 64) | sub)),
@@ -77,7 +77,7 @@ fn a_whole_slash48_cannot_lock_out_other_networks() {
         admitted <= 64,
         "the /48 got {admitted} handshakes in one burst"
     );
-    // Reti estranee all'attacco: nuove, mai viste.
+    // Networks unrelated to the attack: new, never seen.
     for i in 0..1000_u32 {
         let v4 = std::net::Ipv4Addr::from(0x0a00_0000_u32 + i);
         assert!(gate.admit(IpAddr::V4(v4), now), "IPv4 host {i} locked out");
@@ -103,8 +103,8 @@ fn the_wide_bucket_refills() {
     assert!(gate.admit(addr(100), now + Duration::from_secs(1)));
 }
 
-/// Finding 0004-1: un solo host che si riconnette di continuo non deve esaurire il bucket del
-/// suo /48 e bloccare gli altri /64 dello stesso /48 (un /56 domestico vicino, una VPC cloud).
+/// Finding 0004-1: a single host that keeps reconnecting must not exhaust the bucket of its
+/// /48 and block the other /64s of the same /48 (a neighboring home /56, a cloud VPC).
 #[test]
 fn one_busy_host_cannot_lock_out_its_slash48_neighbours() {
     let t0 = Instant::now();
@@ -118,7 +118,7 @@ fn one_busy_host_cannot_lock_out_its_slash48_neighbours() {
     );
     let net = 0x2001_0db8_4242_u128 << 80;
     let busy = IpAddr::V6(Ipv6Addr::from(net | (1 << 64) | 7));
-    // 2 handshake al secondo per 100 secondi.
+    // 2 handshakes per second for 100 seconds.
     for tick in 0..200_u64 {
         let _ = gate.admit(busy, t0 + Duration::from_millis(tick * 500));
     }

@@ -1,17 +1,17 @@
-# Fuzzing di TCN
+# Fuzzing TCN
 
-Target di [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) sulle superfici
-che leggono input non fidato. Richiedono nightly; il crate è escluso dal workspace.
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) targets on the surfaces
+that read untrusted input. They require nightly; the crate is excluded from the workspace.
 
-| Target | Superficie | Proprietà verificate |
+| Target | Surface | Verified properties |
 | :- | :- | :- |
-| `frame_decoder` | decoder dei frame, byte arbitrari a pezzi arbitrari | nessun panic; codifica canonica (un frame accettato si ricodifica negli stessi byte); nessun byte consumato senza frame; decoder avvelenato dopo un errore |
-| `noise_responder` | primo messaggio IK da rete non autenticata, canale esterno ed end-to-end; metà degli input sono un msg1 autentico modificato, anche con payload (certificato) | nessun panic; un msg1 accettato rivela solo l'identità vera dell'iniziatore; il msg1 intatto è accettato; il payload restituito è quello inviato; un payload oltre `MAX_CERT_LEN` non è mai accettato |
-| `transport_decrypt` | messaggi di trasporto falsi intercalati ad autentici, anche oltre un rekey | nessun falso accettato; un falso non desincronizza il canale |
-| `config_parsers` | policy e client autorizzati (con `[[authorities]]`), nodi noti, configurazione del client, denylist `revoked.toml`, file del certificato | nessun panic; un errore non riporta sequenze esadecimali lunghe del file (chiavi incollate per sbaglio) |
-| `relay_core` | sequenze di connessioni (anche con claims di certificato), frame, disconnessioni, scatti dell'orologio monotono e di quello Unix (che avanza e salta), ricariche della policy con CA e denylist | nessun panic; nessun invio a una connessione chiusa; dopo una ricarica nessun peer senza ruolo resta connesso; nessuna connessione con certificato sopravvive oltre `not_after`, a una serie o chiave revocata o alla CA tolta |
-| `cert_decoder` | decoder dei certificati client (PROTOCOL §15.1), byte arbitrari | nessun panic; un certificato accettato si ricodifica identico (`encode_tbs` + firma); nessun errore riporta byte dell'input |
-| `cert_verify` | `verify_certificate` con trust e peer fissi; metà degli input sono un certificato autentico modificato | nessun panic; un input accettato è byte per byte il certificato autentico, e i claims sono i suoi; mai accettato per un altro peer |
+| `frame_decoder` | frame decoder, arbitrary bytes in arbitrary chunks | no panic; canonical encoding (an accepted frame re-encodes to the same bytes); no bytes consumed without a frame; decoder poisoned after an error |
+| `noise_responder` | first IK message from an unauthenticated network, outer and end-to-end channel; half of the inputs are a modified authentic msg1, including with a payload (certificate) | no panic; an accepted msg1 reveals only the true identity of the initiator; the intact msg1 is accepted; the returned payload is the one sent; a payload beyond `MAX_CERT_LEN` is never accepted |
+| `transport_decrypt` | forged transport messages interleaved with authentic ones, including across a rekey | no forgery accepted; a forgery does not desynchronise the channel |
+| `config_parsers` | policy and authorized clients (with `[[authorities]]`), known nodes, client configuration, `revoked.toml` denylist, certificate file | no panic; an error does not echo long hexadecimal sequences from the file (keys pasted by mistake) |
+| `relay_core` | sequences of connections (including with certificate claims), frames, disconnections, jumps of the monotonic clock and of the Unix clock (which advances and jumps), policy reloads with CA and denylist | no panic; nothing sent to a closed connection; after a reload no peer without a role stays connected; no connection with a certificate survives beyond `not_after`, a revoked serial or key, or the removal of the CA |
+| `cert_decoder` | client certificate decoder (PROTOCOL §15.1), arbitrary bytes | no panic; an accepted certificate re-encodes identically (`encode_tbs` + signature); no error echoes bytes of the input |
+| `cert_verify` | `verify_certificate` with fixed trust and peer; half of the inputs are a modified authentic certificate | no panic; an accepted input is byte for byte the authentic certificate, and the claims are its own; never accepted for another peer |
 
 ```bash
 cargo +nightly install cargo-fuzz --version 0.13.2 --locked
@@ -19,7 +19,7 @@ cd fuzz
 cargo +nightly fuzz run frame_decoder -- -max_total_time=600
 ```
 
-La CI esegue ogni target per 60 secondi a ogni pull request (job `fuzz`). Un crash va
-trasformato in un test di regressione nel crate interessato prima della correzione, come
-richiede l'Adversarial TDD (`docs/METHODOLOGY.md`). Le dipendenze di `fuzz/Cargo.lock` passano
-anche da `cargo deny` (job `deny`).
+CI runs each target for 60 seconds on every pull request (job `fuzz`). A crash must be
+turned into a regression test in the affected crate before the fix, as
+Adversarial TDD requires (`docs/METHODOLOGY.md`). The dependencies in `fuzz/Cargo.lock` also go
+through `cargo deny` (job `deny`).

@@ -1,9 +1,10 @@
-//! Messaggi di trasporto arbitrari dopo un handshake vero, intercalati a messaggi autentici.
-//! Proprietà: nessun panic; un messaggio falso non viene mai accettato e non desincronizza il
-//! canale (i messaggi autentici successivi, anche oltre un rekey, si decifrano ancora).
+//! Arbitrary transport messages after a real handshake, interleaved with genuine messages.
+//! Properties: no panic; a forged message is never accepted and does not desynchronize the
+//! channel (subsequent genuine messages, even past a rekey, still decrypt).
 //!
-//! Le identità sono fisse: per input resta un solo handshake, il minimo per avere uno stato di
-//! trasporto nuovo (finding 0004-6). Il salto oltre il rekey si fa solo se l'input lo chiede.
+//! The identities are fixed: per input only one handshake remains, the minimum to get a fresh
+//! transport state (finding 0004-6). The jump past the rekey happens only if the input asks
+//! for it.
 #![no_main]
 
 use std::sync::OnceLock;
@@ -35,8 +36,8 @@ fuzz_target!(|data: &[u8]| {
     let mut tx = waiting.complete(&msg2).expect("complete");
     for (i, forged) in data.split(|b| *b == 0xff).take(64).enumerate() {
         assert!(rx.decrypt(forged).is_err(), "forged message accepted");
-        // Un messaggio autentico dopo ogni falso; con `mode` dispari, al quarto falso si
-        // attraversa un rekey.
+        // A genuine message after each forged one; with an odd `mode`, at the fourth forged one
+        // a rekey is crossed.
         let n = if i == 3 && mode & 1 == 1 { REKEY_INTERVAL } else { 1 };
         for _ in 0..n {
             let ct = tx.encrypt(forged).expect("encrypt");

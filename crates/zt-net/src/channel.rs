@@ -1,11 +1,11 @@
-//! Canale Noise su un trasporto a byte (TCP).
+//! Noise channel over a byte transport (TCP).
 //!
-//! Sul filo ogni messaggio Noise è preceduto dalla sua lunghezza (`u16` big-endian), come
-//! raccomanda la specifica Noise. Dopo l'handshake ogni messaggio contiene **esattamente un**
-//! frame TCN: byte in eccesso sono una violazione.
+//! On the wire every Noise message is preceded by its length (big-endian `u16`), as the Noise
+//! specification recommends. After the handshake every message contains **exactly one** TCN
+//! frame: excess bytes are a violation.
 //!
-//! Typestate: l'unico modo di ottenere un [`Established`] è completare un handshake; il
-//! responder passa per [`Pending`], dove deve decidere se accettare il peer.
+//! Typestate: the only way to obtain an [`Established`] is to complete a handshake; the
+//! responder goes through [`Pending`], where it must decide whether to accept the peer.
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -39,11 +39,11 @@ where
     }
 }
 
-/// Handshake lato initiator (agent, client): pinna la chiave del responder.
+/// Initiator-side handshake (agent, client): pins the responder's key.
 ///
 /// # Errors
-/// [`NetError::Timeout`] oltre `timeouts.handshake`, [`NetError::Crypto`] se il responder non
-/// prova di possedere `remote`.
+/// [`NetError::Timeout`] past `timeouts.handshake`, [`NetError::Crypto`] if the responder does
+/// not prove possession of `remote`.
 pub async fn connect<IO>(
     io: IO,
     local: &Identity,
@@ -57,10 +57,10 @@ where
     connect_with_payload(io, local, remote, channel, &[], timeouts).await
 }
 
-/// Come [`connect`], con `payload` nel messaggio 1 (il certificato del client, PROTOCOL §15.3).
+/// Like [`connect`], with `payload` in message 1 (the client certificate, PROTOCOL §15.3).
 ///
 /// # Errors
-/// Come [`connect`]; [`NetError::Crypto`] per un payload oltre il massimo.
+/// Like [`connect`]; [`NetError::Crypto`] for a payload over the maximum.
 pub async fn connect_with_payload<IO>(
     io: IO,
     local: &Identity,
@@ -89,10 +89,10 @@ where
     })
 }
 
-/// Handshake lato responder (relay): legge il primo messaggio e si ferma prima di rispondere.
+/// Responder-side handshake (relay): reads the first message and stops before replying.
 ///
 /// # Errors
-/// [`NetError::Timeout`] oltre `timeouts.handshake`, [`NetError::Crypto`] su messaggi non validi.
+/// [`NetError::Timeout`] past `timeouts.handshake`, [`NetError::Crypto`] on invalid messages.
 pub async fn accept<IO>(
     io: IO,
     local: &Keyring,
@@ -110,9 +110,9 @@ where
     Ok(Pending { framed, pending })
 }
 
-/// Handshake a metà: il responder conosce il peer e deve decidere.
+/// Half-completed handshake: the responder knows the peer and must decide.
 ///
-/// Scartare questo valore chiude la connessione senza aver risposto: il peer non impara nulla.
+/// Dropping this value closes the connection without replying: the peer learns nothing.
 #[must_use = "drop to reject, or call `establish`"]
 pub struct Pending<IO> {
     framed: Framed<IO, LengthDelimitedCodec>,
@@ -120,22 +120,22 @@ pub struct Pending<IO> {
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
-    /// L'identità provata dal peer.
+    /// The identity proven by the peer.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.pending.peer()
     }
 
-    /// Il payload del messaggio 1 (vuoto senza certificato).
+    /// The payload of message 1 (empty without a certificate).
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         self.pending.payload()
     }
 
-    /// Accetta il peer e completa l'handshake.
+    /// Accepts the peer and completes the handshake.
     ///
     /// # Errors
-    /// Errori di I/O o di timeout nell'invio della risposta.
+    /// I/O or timeout errors while sending the response.
     pub async fn establish(self, timeouts: &Timeouts) -> Result<Established<IO>, NetError> {
         let Self {
             mut framed,
@@ -153,7 +153,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
     }
 }
 
-/// Canale autenticato: l'unico stato in cui si possono scambiare frame.
+/// Authenticated channel: the only state in which frames can be exchanged.
 pub struct Established<IO> {
     framed: Framed<IO, LengthDelimitedCodec>,
     transport: noise::Transport,
@@ -161,18 +161,18 @@ pub struct Established<IO> {
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
-    /// L'identità autenticata del peer.
+    /// The authenticated identity of the peer.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.transport.peer()
     }
 
-    /// Riceve il prossimo frame. `Ok(None)` su chiusura pulita tra un messaggio e l'altro.
+    /// Receives the next frame. `Ok(None)` on a clean close between two messages.
     ///
-    /// È cancellation-safe: può essere usato in `tokio::select!`.
+    /// It is cancellation-safe: it can be used in `tokio::select!`.
     ///
     /// # Errors
-    /// Messaggio non autentico, frame malformato o con byte in eccesso, errore di I/O.
+    /// Inauthentic message, malformed frame or frame with excess bytes, I/O error.
     pub async fn recv(&mut self) -> Result<Option<Frame>, NetError> {
         let message = match self.framed.next().await {
             Some(Ok(message)) => message,
@@ -191,10 +191,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
         Ok(Some(frame))
     }
 
-    /// Invia un frame, entro `timeouts.write`.
+    /// Sends a frame, within `timeouts.write`.
     ///
     /// # Errors
-    /// Errori di I/O o timeout.
+    /// I/O errors or timeout.
     pub async fn send(&mut self, frame: &Frame, timeouts: &Timeouts) -> Result<(), NetError> {
         let mut plaintext = BytesMut::with_capacity(zt_proto::encoded_len(frame));
         zt_proto::encode(frame, &mut plaintext);

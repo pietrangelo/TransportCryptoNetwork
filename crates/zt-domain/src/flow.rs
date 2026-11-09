@@ -1,61 +1,61 @@
-//! Controllo di flusso a credito (stile HTTP/2), regole condivise da relay, agent e client.
+//! Credit-based flow control (HTTP/2 style), rules shared by relay, agent and client.
 //!
-//! Ogni direzione di ogni stream ha una finestra di credito in byte. Chi invia un `Data`
-//! consuma credito pari a [`charge`] della lunghezza del payload; chi riceve restituisce
-//! credito con `WindowUpdate` dopo aver consegnato i dati. Il relay applica le stesse regole
-//! e chiude chi le viola: così la memoria in coda verso un peer è limitata per costruzione a
-//! `stream × finestra`, qualunque cosa facciano gli altri peer.
+//! Each direction of each stream has a credit window in bytes. The sender of a `Data` frame
+//! consumes credit equal to [`charge`] of the payload length; the receiver returns credit
+//! with `WindowUpdate` after delivering the data. The relay enforces the same rules and
+//! closes whoever violates them: so the memory queued towards a peer is bounded by
+//! construction to `streams × window`, whatever the other peers do.
 
-/// Credito iniziale di ogni direzione di ogni stream: 256 KiB.
+/// Initial credit of each direction of each stream: 256 KiB.
 pub const INITIAL_WINDOW: u32 = 256 * 1024;
 
-/// Credito massimo accumulabile: 1 MiB. Concederne di più è una violazione.
+/// Maximum credit that can accumulate: 1 MiB. Granting more is a violation.
 ///
-/// Limita la memoria che un destinatario può farsi accodare dal relay a
-/// `stream × MAX_WINDOW` (64 MiB per un agent con i limiti di default).
+/// Bounds the memory a receiver can get the relay to queue for it to
+/// `streams × MAX_WINDOW` (64 MiB for an agent with the default limits).
 pub const MAX_WINDOW: u32 = 1024 * 1024;
 
-/// Costo minimo di un frame `Data`, anche se più corto.
+/// Minimum cost of a `Data` frame, even if it is shorter.
 ///
-/// Senza costo minimo, `INITIAL_WINDOW` frame da un byte riempirebbero le code con
-/// centinaia di migliaia di allocazioni (finding 10 della review 0001). Con 512 byte il numero
-/// di frame in volo per stream è al più `INITIAL_WINDOW / MIN_CHARGE = 512`.
+/// Without a minimum cost, `INITIAL_WINDOW` one-byte frames would fill the queues with
+/// hundreds of thousands of allocations (finding 10 of review 0001). With 512 bytes the number
+/// of in-flight frames per stream is at most `INITIAL_WINDOW / MIN_CHARGE = 512`.
 pub const MIN_CHARGE: u32 = 512;
 
-/// Credito minimo concedibile con un singolo `WindowUpdate`.
+/// Minimum credit that can be granted with a single `WindowUpdate`.
 ///
-/// Impedisce il flood di `WindowUpdate` da un credito ciascuno (finding 11).
+/// Prevents a flood of `WindowUpdate` frames of one credit each (finding 11).
 pub const MIN_WINDOW_UPDATE: u32 = MIN_CHARGE;
 
-/// Credito consumato da un payload `Data` lungo `len` byte.
+/// Credit consumed by a `Data` payload of `len` bytes.
 #[must_use]
 pub fn charge(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX).max(MIN_CHARGE)
 }
 
-/// Il credito di una direzione di uno stream.
+/// The credit of one direction of a stream.
 ///
-/// Tutte le operazioni sono controllate: niente overflow, niente valori oltre [`MAX_WINDOW`].
+/// All operations are checked: no overflow, no values beyond [`MAX_WINDOW`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window(u32);
 
 impl Window {
-    /// La finestra iniziale.
+    /// The initial window.
     #[must_use]
     pub const fn initial() -> Self {
         Self(INITIAL_WINDOW)
     }
 
-    /// Byte ancora disponibili.
+    /// Bytes still available.
     #[must_use]
     pub const fn available(self) -> u32 {
         self.0
     }
 
-    /// Consuma il credito di un frame `Data` da `len` byte.
+    /// Consumes the credit of a `Data` frame of `len` bytes.
     ///
     /// # Errors
-    /// Il nome della regola violata se il credito non basta.
+    /// The name of the violated rule if the credit is insufficient.
     pub fn consume(&mut self, len: usize) -> Result<(), &'static str> {
         self.0 = self
             .0
@@ -64,11 +64,11 @@ impl Window {
         Ok(())
     }
 
-    /// Aggiunge credito ricevuto con un `WindowUpdate`.
+    /// Adds credit received with a `WindowUpdate`.
     ///
     /// # Errors
-    /// Il nome della regola violata se l'aggiornamento è troppo piccolo o porta la finestra
-    /// oltre [`MAX_WINDOW`].
+    /// The name of the violated rule if the update is too small or takes the window
+    /// beyond [`MAX_WINDOW`].
     pub fn grant(&mut self, credit: u32) -> Result<(), &'static str> {
         if credit < MIN_WINDOW_UPDATE {
             return Err("window update below minimum");

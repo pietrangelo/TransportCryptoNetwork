@@ -1,17 +1,17 @@
-//! Valori di configurazione sostituibili a caldo (revoca senza riavvio).
+//! Hot-swappable configuration values (revocation without restart).
 
 use std::sync::Arc;
 
 use tokio::sync::watch;
 
-/// Lato di lettura di un valore che può essere sostituito mentre il processo gira (policy del
-/// relay, client autorizzati di un agent). Clonabile; ogni copia vede l'ultimo valore.
+/// Read side of a value that can be replaced while the process is running (relay policy,
+/// authorized clients of an agent). Cloneable; every copy sees the latest value.
 #[derive(Debug)]
 pub struct Revocable<T> {
     rx: watch::Receiver<Arc<T>>,
 }
 
-// A mano: la copia condivide il valore, quindi `T` non deve essere `Clone` (es. `Keyring`).
+// Implemented by hand: the copy shares the value, so `T` need not be `Clone` (e.g. `Keyring`).
 impl<T> Clone for Revocable<T> {
     fn clone(&self) -> Self {
         Self {
@@ -20,7 +20,7 @@ impl<T> Clone for Revocable<T> {
     }
 }
 
-/// Lato di scrittura: sostituisce il valore e sveglia chi lo osserva.
+/// Write side: replaces the value and wakes up whoever is watching it.
 #[derive(Debug)]
 pub struct Updater<T> {
     tx: watch::Sender<Arc<T>>,
@@ -33,34 +33,34 @@ impl From<zt_crypto::Identity> for Revocable<zt_crypto::Keyring> {
 }
 
 impl<T> Revocable<T> {
-    /// Un valore sostituibile e il suo [`Updater`].
+    /// A replaceable value and its [`Updater`].
     #[must_use]
     pub fn new(value: T) -> (Self, Updater<T>) {
         let (tx, rx) = watch::channel(Arc::new(value));
         (Self { rx }, Updater { tx })
     }
 
-    /// Un valore che non cambierà mai.
+    /// A value that will never change.
     #[must_use]
     pub fn fixed(value: T) -> Self {
         Self::new(value).0
     }
 
-    /// Un valore già condiviso che non cambierà mai.
+    /// An already shared value that will never change.
     #[must_use]
     pub fn fixed_shared(value: Arc<T>) -> Self {
         let (_tx, rx) = watch::channel(value);
         Self { rx }
     }
 
-    /// Il valore attuale.
+    /// The current value.
     #[must_use]
     pub fn current(&self) -> Arc<T> {
         Arc::clone(&self.rx.borrow())
     }
 
-    /// Attende la prossima sostituzione. Per un valore fisso (o se l'[`Updater`] è stato
-    /// eliminato) non ritorna mai.
+    /// Waits for the next replacement. For a fixed value (or if the [`Updater`] has been
+    /// dropped) it never returns.
     pub async fn changed(&mut self) {
         if self.rx.changed().await.is_err() {
             std::future::pending::<()>().await;
@@ -75,7 +75,7 @@ impl<T> From<T> for Revocable<T> {
 }
 
 impl<T> Updater<T> {
-    /// Sostituisce il valore.
+    /// Replaces the value.
     pub fn replace(&self, value: T) {
         self.tx.send_replace(Arc::new(value));
     }

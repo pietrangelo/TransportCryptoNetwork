@@ -1,6 +1,6 @@
 [package]
 name = "zt-domain"
-description = "Domain core di TCN: value object, eventi ed errori. Puro: niente async, niente I/O."
+description = "TCN domain core: value objects, events and errors. Pure: no async, no I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

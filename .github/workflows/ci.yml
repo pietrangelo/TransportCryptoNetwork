@@ -5,12 +5,12 @@ on:
     branches: [main]
   pull_request:
 
-# Solo lettura: nessun job di CI scrive sul repository. I job eseguono codice delle dipendenze
-# (build script, proc macro) e non devono avere un token capace di modificare nulla.
+# Read-only: no CI job writes to the repository. The jobs run dependency code
+# (build scripts, proc macros) and must not have a token capable of modifying anything.
 permissions:
   contents: read
 
-# Un nuovo push sulla stessa PR annulla la run precedente.
+# A new push to the same PR cancels the previous run.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -41,7 +41,7 @@ jobs:
       - run: cargo build --release --workspace --locked
 
   e2e-openssh:
-    # ssh, scp e ansible-playbook veri attraverso relay, agent e zt-client (ProxyCommand).
+    # Real ssh, scp and ansible-playbook through relay, agent and zt-client (ProxyCommand).
     name: e2e-openssh
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -58,7 +58,7 @@ jobs:
       - run: cargo test -p zt-client --test openssh -- --ignored
 
   fuzz:
-    # Fuzzing breve a ogni PR: 60 s per target. Le campagne lunghe si lanciano a mano.
+    # Short fuzzing on every PR: 60 s per target. Long campaigns are launched by hand.
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -88,7 +88,7 @@ jobs:
           path: fuzz/artifacts
 
   deny:
-    # Supply chain: advisories RustSec, licenze ammesse, sorgenti solo da crates.io.
+    # Supply chain: RustSec advisories, allowed licences, sources only from crates.io.
     name: deny
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -97,14 +97,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-      # Anche le dipendenze dei target di fuzzing, che hanno un Cargo.lock proprio.
+      # Also the dependencies of the fuzzing targets, which have their own Cargo.lock.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: fuzz/Cargo.toml
 
   zizmor:
-    # Analisi statica dei workflow: injection nei template, permessi eccessivi, credenziali
-    # persistite, action non fissate a un commit. Fallisce la PR su ogni finding.
+    # Static analysis of the workflows: template injection, excessive permissions, persisted
+    # credentials, actions not pinned to a commit. Fails the PR on any finding.
     name: zizmor
     runs-on: ubuntu-latest
     timeout-minutes: 10

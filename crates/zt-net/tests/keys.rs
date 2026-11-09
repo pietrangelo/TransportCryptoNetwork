@@ -1,5 +1,5 @@
-//! Finding 0005-3: le chiavi accettate sono visibili nei log, e una chiave precedente rimasta
-//! attiva viene ricordata finché non la si toglie.
+//! Finding 0005-3: the accepted keys are visible in the logs, and a previous key left active
+//! is reminded about until it is removed.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -41,7 +41,7 @@ impl Captured {
     }
 }
 
-/// Estrae `"key":"value"` da una riga JSON senza dipendere da `serde_json`.
+/// Extracts `"key":"value"` from a JSON line without depending on `serde_json`.
 fn serde_json_lite(line: &str, key: &str) -> Option<String> {
     let (_, rest) = line.split_once(&format!("\"{key}\":\""))?;
     let (value, _) = rest.split_once('"')?;
@@ -82,7 +82,7 @@ async fn a_previous_key_is_announced_and_reminded_until_it_is_removed() {
         ]
     );
 
-    // Rotazione completata: la precedente sparisce, e con lei i promemoria.
+    // Rotation completed: the previous key disappears, and with it the reminders.
     let only = id();
     let only_fp = only.fingerprint();
     updater.replace(Keyring::single(only));
@@ -115,8 +115,8 @@ async fn a_single_key_is_announced_once_and_never_reminded() {
     task.abort();
 }
 
-/// Finding 0005b-2: un nodo con due chiavi di agent nella policy del relay (rotazione non
-/// completata) è segnalato al caricamento, a ogni ricarica e ogni `every` finché resta.
+/// Finding 0005b-2: a node with two agent keys in the relay policy (incomplete rotation) is
+/// reported on load, on every reload and every `every` while it remains.
 #[tokio::test(start_paused = true)]
 async fn an_agent_rotation_left_in_the_policy_is_reported_until_it_is_completed() {
     use zt_domain::{AccessPolicy, NodeId};
@@ -145,7 +145,7 @@ async fn an_agent_rotation_left_in_the_policy_is_reported_until_it_is_completed(
     let (current, updater) = Revocable::new(policy(true));
     let task = tokio::spawn(watch_agent_rotations(current, Duration::from_secs(60)));
 
-    // Al caricamento: solo il nodo con due chiavi, con entrambe le fingerprint.
+    // On load: only the node with two keys, with both fingerprints.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(log.kinds(), ["agent_rotation_pending"]);
     let text = log.text();
@@ -155,23 +155,23 @@ async fn an_agent_rotation_left_in_the_policy_is_reported_until_it_is_completed(
     assert!(text.contains(&old.fingerprint().to_string()), "{text}");
     assert!(text.contains("\"level\":\"WARN\""), "{text}");
 
-    // Promemoria periodico.
+    // Periodic reminder.
     tokio::time::sleep(Duration::from_secs(120)).await;
     assert_eq!(log.kinds().len(), 3);
 
-    // Ricarica ancora in rotazione: subito un altro avviso.
+    // Reload still in rotation: another warning immediately.
     updater.replace(policy(true));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(log.kinds().len(), 4);
 
-    // Rotazione completata: niente più avvisi.
+    // Rotation completed: no more warnings.
     updater.replace(policy(false));
     tokio::time::sleep(Duration::from_secs(3600)).await;
     assert_eq!(log.kinds().len(), 4, "{:?}", log.kinds());
     task.abort();
 }
 
-// ---------- Fase 6, passo 8: CA pinnate e denylist (PROTOCOL §15.9, §15.11) ----------
+// ---------- Phase 6, step 8: pinned CAs and denylist (PROTOCOL §15.9, §15.11) ----------
 
 use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
 use zt_domain::trust::{CertTrust, Revocations, TrustedCaKey};
@@ -202,7 +202,7 @@ fn lines_of<'a>(text: &'a str, kind: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// `ops-ca` con `keys`, `lab-ca` con una chiave, e una denylist di 2 serie e 1 chiave.
+/// `ops-ca` with `keys`, `lab-ca` with one key, and a denylist of 2 serials and 1 key.
 fn trust(ops: &[TrustedCaKey], lab: &TrustedCaKey) -> CertTrust {
     let mut t = CertTrust::new();
     t.add_authority(
@@ -271,7 +271,7 @@ fn authorities_and_revocations_are_announced() {
     assert!(revocations[0].contains("\"keys\":1"), "{}", revocations[0]);
     assert!(lines_of(&text, "ca_rotation_pending").is_empty(), "{text}");
 
-    // Una CA con due chiavi è annunciata come WARN, con entrambe le fingerprint.
+    // A CA with two keys is announced as WARN, with both fingerprints.
     let (log, _guard2) = capture();
     let (new, old) = (ca_key(), ca_key());
     announce_authorities("agent", &trust(&[new, old], &lab));
@@ -303,7 +303,7 @@ async fn a_ca_rotation_is_reported_until_it_is_completed() {
     ));
     let pending = |log: &Captured| lines_of(&log.text(), "ca_rotation_pending").len();
 
-    // All'avvio: annunci e un avviso per la sola CA in rotazione.
+    // At startup: announcements and a warning for the only CA in rotation.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let text = log.text();
     assert_eq!(lines_of(&text, "authorities_in_use").len(), 2, "{text}");
@@ -316,18 +316,18 @@ async fn a_ca_rotation_is_reported_until_it_is_completed() {
     assert!(warn[0].contains(&old.fingerprint.to_string()));
     assert!(warn[0].contains("\"level\":\"WARN\""));
 
-    // Ogni ora.
+    // Every hour.
     tokio::time::sleep(Duration::from_secs(2 * 3_600)).await;
     assert_eq!(pending(&log), 3, "{}", log.text());
 
-    // Ricarica ancora in rotazione: annunci e avviso subito.
+    // Reload still in rotation: announcements and warning immediately.
     updater.replace(trust(&[new, old], &lab));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(pending(&log), 4, "{}", log.text());
     assert_eq!(lines_of(&log.text(), "authorities_in_use").len(), 4);
     assert_eq!(lines_of(&log.text(), "revocations_in_use").len(), 2);
 
-    // Rotazione completata: annunci nuovi, niente più avvisi.
+    // Rotation completed: new announcements, no more warnings.
     updater.replace(trust(&[new], &lab));
     tokio::time::sleep(Duration::from_secs(10 * 3_600)).await;
     assert_eq!(pending(&log), 4, "{}", log.text());
@@ -353,10 +353,10 @@ fn announcements_never_contain_certificate_bytes_or_secrets() {
     t.set_revocations(Revocations::new([serial], [revoked_key]).unwrap());
     announce_authorities("relay", &t);
     let text = log.text();
-    // Controllo positivo: gli annunci ci sono, con la fingerprint della CA.
+    // Positive check: the announcements are there, with the CA fingerprint.
     assert!(text.contains(&trusted.fingerprint.to_string()), "{text}");
     assert_eq!(lines_of(&text, "revocations_in_use").len(), 1, "{text}");
-    // Solo fingerprint e conteggi.
+    // Only fingerprints and counts.
     let secret = ca.to_secret_text();
     assert!(!secret.is_empty());
     assert!(!text.contains(secret.trim()), "{text}");

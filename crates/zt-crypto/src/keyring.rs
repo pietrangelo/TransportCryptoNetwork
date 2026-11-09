@@ -1,12 +1,12 @@
-//! Le chiavi di un responder durante una rotazione: la corrente e, facoltativa, la precedente.
+//! The keys of a responder during a rotation: the current one and, optionally, the previous one.
 
 use crate::error::CryptoError;
 use crate::identity::Identity;
 
-/// Chiave corrente e chiave precedente di un responder (PROTOCOL §14).
+/// Current key and previous key of a responder (PROTOCOL §14).
 ///
-/// Come initiator si usa sempre la corrente; come responder si accetta un `msg1` cifrato
-/// verso l'una o l'altra. Non è `Clone`: contiene segreti.
+/// As initiator the current one is always used; as responder a `msg1` encrypted to either
+/// one is accepted. It is not `Clone`: it contains secrets.
 #[derive(Debug)]
 pub struct Keyring {
     current: Identity,
@@ -14,7 +14,7 @@ pub struct Keyring {
 }
 
 impl Keyring {
-    /// Un keyring con una sola chiave.
+    /// A keyring with a single key.
     #[must_use]
     pub const fn single(current: Identity) -> Self {
         Self {
@@ -23,11 +23,11 @@ impl Keyring {
         }
     }
 
-    /// Chiave corrente più quella precedente.
+    /// Current key plus the previous one.
     ///
     /// # Errors
-    /// [`CryptoError::InvalidKey`] se le due chiavi coincidono: una rotazione verso la stessa
-    /// chiave è quasi sempre un errore di configurazione (file sbagliato).
+    /// [`CryptoError::InvalidKey`] if the two keys are the same: a rotation to the same key
+    /// is almost always a configuration error (wrong file).
     pub fn rotating(current: Identity, previous: Identity) -> Result<Self, CryptoError> {
         if current.fingerprint() == previous.fingerprint() {
             return Err(CryptoError::InvalidKey);
@@ -38,13 +38,13 @@ impl Keyring {
         })
     }
 
-    /// La chiave corrente.
+    /// The current key.
     #[must_use]
     pub const fn current(&self) -> &Identity {
         &self.current
     }
 
-    /// La chiave precedente, se c'è una rotazione in corso.
+    /// The previous key, if a rotation is in progress.
     #[must_use]
     pub const fn previous(&self) -> Option<&Identity> {
         self.previous.as_ref()
