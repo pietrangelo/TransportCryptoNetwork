@@ -288,25 +288,14 @@ pub fn write_report(
 /// of `classical_paths`, then one `classical_paths_accepted` line per path of `report` (none
 /// under the profile, whose checks refuse every one of them).
 pub fn log_profile(role: &'static str, pq_only: bool, report: &[String]) {
-    if pq_only {
-        tracing::info!(
-            target: "zt_audit",
-            event_kind = "pq_only_profile",
-            role,
-            pq_only,
-            classical_paths = report.len(),
-            "pq-only profile in force (OPERATIONS §19)"
-        );
-    } else {
-        tracing::info!(
-            target: "zt_audit",
-            event_kind = "pq_only_profile",
-            role,
-            pq_only,
-            classical_paths = report.len(),
-            "pq-only profile not in force"
-        );
-    }
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "pq_only_profile",
+        role,
+        pq_only,
+        classical_paths = report.len(),
+        "pq-only profile (OPERATIONS §19)"
+    );
     for path in report {
         tracing::info!(
             target: "zt_audit",
