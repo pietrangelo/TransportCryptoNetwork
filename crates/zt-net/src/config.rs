@@ -1125,7 +1125,21 @@ pub struct RelaySettings {
     pub admission: zt_application::admission::AdmissionConfig,
     /// Suites accepted per role.
     pub suites: zt_domain::SuitePolicy,
+    /// Idle timeout of agent connections (`[liveness] agent_idle_secs`, resilience R-2).
+    pub agent_idle: std::time::Duration,
+    /// Idle timeout of client connections (`[liveness] client_idle_secs`).
+    pub client_idle: std::time::Duration,
 }
+
+/// The default idle timeout of both roles: three times the keepalive of agents older than
+/// R-2 (30 s), so that they survive a relay upgrade (catalogue R2-L3).
+pub const DEFAULT_RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The shortest idle timeout `relay.toml` accepts: above the agent's dead-peer window of
+/// 3 × 10 s plus one keepalive of slack.
+const MIN_RELAY_IDLE_SECS: u64 = 15;
+/// The longest: one hour.
+const MAX_RELAY_IDLE_SECS: u64 = 3_600;
 
 impl Default for RelaySettings {
     /// What an empty `relay.toml` gives.
@@ -1133,6 +1147,8 @@ impl Default for RelaySettings {
         Self {
             admission: zt_application::admission::AdmissionConfig::default(),
             suites: zt_domain::SuitePolicy::classical(),
+            agent_idle: DEFAULT_RELAY_IDLE,
+            client_idle: DEFAULT_RELAY_IDLE,
         }
     }
 }
@@ -1145,6 +1161,18 @@ struct RelayFile {
     handshake: HandshakeSection,
     #[serde(default)]
     admission: AdmissionSection,
+    #[serde(default)]
+    liveness: LivenessSection,
+}
+
+/// `[liveness]` of `relay.toml`: the idle timeout per role (resilience R-2).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LivenessSection {
+    #[serde(default)]
+    agent_idle_secs: Option<u64>,
+    #[serde(default)]
+    client_idle_secs: Option<u64>,
 }
 
 /// `[handshake]` of `relay.toml`: the accepted suites per role (finding AP-7). There is no
@@ -1258,7 +1286,28 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
             path: origin.into(),
             source,
         })?;
-    Ok(RelaySettings { admission, suites })
+    let idle = |value: Option<u64>, key: &str| -> Result<std::time::Duration, ConfigError> {
+        match value {
+            None => Ok(DEFAULT_RELAY_IDLE),
+            Some(s) if (MIN_RELAY_IDLE_SECS..=MAX_RELAY_IDLE_SECS).contains(&s) => {
+                Ok(std::time::Duration::from_secs(s))
+            }
+            Some(_) => Err(ConfigError::Syntax {
+                path: origin.into(),
+                message: format!(
+                    "[liveness] {key} must be between {MIN_RELAY_IDLE_SECS} and {MAX_RELAY_IDLE_SECS}"
+                ),
+            }),
+        }
+    };
+    let agent_idle = idle(file.liveness.agent_idle_secs, "agent_idle_secs")?;
+    let client_idle = idle(file.liveness.client_idle_secs, "client_idle_secs")?;
+    Ok(RelaySettings {
+        admission,
+        suites,
+        agent_idle,
+        client_idle,
+    })
 }
 
 /// Reads and parses `relay.toml`.

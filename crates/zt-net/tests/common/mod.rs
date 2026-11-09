@@ -393,6 +393,7 @@ impl Lab {
                 max_streams: 16,
                 client_suites,
                 identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+                reconnect: zt_application::reconnect::ReconnectConfig::default(),
             },
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -580,6 +581,7 @@ impl FakeRelay {
                 max_streams: 16,
                 client_suites,
                 identity_log_interval,
+                reconnect: zt_application::reconnect::ReconnectConfig::default(),
             },
         ));
         let (tcp, _) = listener.accept().await.unwrap();

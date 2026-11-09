@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout};
 use zt_application::identity_lines::{IdentityEvent, IdentityLines};
+use zt_application::liveness::{Liveness, LivenessAction, LivenessConfig};
+pub use zt_application::reconnect::ReconnectConfig;
+use zt_application::reconnect::{ReconnectPolicy, SessionEnd};
 use zt_crypto::noise::{self, Channel, Responded};
 use zt_crypto::{CryptoError, Keyring};
 use zt_domain::flow::Window;
@@ -21,6 +23,7 @@ use zt_domain::{
     HandshakeSuite, NodeId, RejectReason, StreamId,
 };
 
+use crate::net::{Dialer, TcpDialer};
 use crate::relay::{CertFields, audit, repeated_line};
 use crate::stream::{STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
@@ -46,7 +49,13 @@ pub struct AgentConfig {
     /// logged in full once per client and interval, the repeats are counted in one
     /// `<event>_repeated` line. Normally [`IDENTITY_LOG_INTERVAL`]; at least one second.
     pub identity_log_interval: Duration,
+    /// When to reconnect to a relay (full jitter, cap, spread window; resilience R-2).
+    pub reconnect: ReconnectConfig,
 }
+
+/// Silent keepalive intervals after which the link to a relay is dead: no inbound frame at
+/// all for `KEEPALIVE_MISSES × timeouts.keepalive` (resilience R-2, review 0007 D-3).
+pub const KEEPALIVE_MISSES: u32 = 3;
 
 /// The default [`AgentConfig::identity_log_interval`], the relay's `summary_interval`.
 pub const IDENTITY_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -139,6 +148,11 @@ pub const MAX_STREAMS: usize = 4096;
 /// forge: a compromised relay exhausts only its own quota and does not block the sessions
 /// that go through the others (finding 0005-1).
 pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
+    run_with(keys, config, TcpDialer).await;
+}
+
+/// Like [`run`], dialing relays and sshd through `dialer` (the network port, `crate::net`).
+pub async fn run_with<D: Dialer>(keys: Arc<Keyring>, config: AgentConfig, dialer: D) {
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         tracing::error!(
             relays = config.relays.len(),
@@ -152,6 +166,14 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
             max_streams = config.max_streams,
             "the agent needs between 1 and 4096 concurrent streams"
         );
+        return;
+    }
+    if let Err(err) = config.reconnect.validate() {
+        tracing::error!(error = err, "invalid reconnect settings");
+        return;
+    }
+    if liveness_config(&config.timeouts).validate().is_err() {
+        tracing::error!("invalid keepalive interval");
         return;
     }
     if config.identity_log_interval < Duration::from_secs(1) {
@@ -187,36 +209,51 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
             relay,
             config.clone(),
             shared.clone(),
+            dialer.clone(),
         ));
     }
     // The loops never terminate; if one panicked the others would keep going.
     while sessions.join_next().await.is_some() {}
 }
 
-async fn run_one(
+fn liveness_config(t: &Timeouts) -> LivenessConfig {
+    LivenessConfig {
+        interval: t.keepalive,
+        misses: KEEPALIVE_MISSES,
+    }
+}
+
+/// One relay, forever: a session, then the delay of [`ReconnectPolicy`] (full jitter after a
+/// failure, the spread window after a session that lived), then the next session.
+async fn run_one<D: Dialer>(
     identity: Arc<Keyring>,
     relay: crate::RelayEndpoint,
     config: AgentConfig,
     shared: Shared,
+    dialer: D,
 ) {
-    const MAX_DELAY: Duration = Duration::from_secs(60);
-    let mut delay = Duration::from_secs(1);
+    let mut policy = ReconnectPolicy::new(config.reconnect);
     loop {
-        let started = Instant::now();
-        match run_session(&identity, &relay, &config, &shared).await {
+        let mut registered = None;
+        let result = run_session(
+            &identity,
+            &relay,
+            &config,
+            &shared,
+            &dialer,
+            &mut registered,
+        )
+        .await;
+        match &result {
             Ok(()) => tracing::info!(relay = %relay.address, "relay closed the connection"),
             Err(err) => tracing::warn!(relay = %relay.address, error = %err, "relay session ended"),
         }
-        if started.elapsed() > MAX_DELAY {
-            delay = Duration::from_secs(1);
-        }
-        // Jitter up to half the delay, so that a whole fleet does not reconnect at once.
-        let half = u64::try_from(delay.as_millis() / 2)
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let jitter = getrandom::u64().unwrap_or(0).checked_rem(half).unwrap_or(0);
-        tokio::time::sleep(delay.saturating_add(Duration::from_millis(jitter))).await;
-        delay = delay.saturating_mul(2).min(MAX_DELAY);
+        // A session counts from its registration; anything before it is a failure.
+        let end = registered.map_or(SessionEnd::Failed, |at: Instant| SessionEnd::Ended {
+            lived: at.elapsed(),
+        });
+        let delay = policy.next(end, getrandom::u64().unwrap_or(0));
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -225,17 +262,18 @@ async fn run_one(
 ///
 /// # Errors
 /// Any network, handshake or protocol error from the relay.
-async fn run_session(
+async fn run_session<D: Dialer>(
     identity: &Arc<Keyring>,
     relay: &crate::RelayEndpoint,
     config: &AgentConfig,
     shared: &Shared,
+    dialer: &D,
+    registered: &mut Option<Instant>,
 ) -> Result<(), NetError> {
     let t = &config.timeouts;
-    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
+    let tcp = timeout(t.handshake, dialer.connect(&relay.address))
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
-    let _ = tcp.set_nodelay(true);
     let mut ch = channel::connect_suite(
         tcp,
         identity.current(),
@@ -261,20 +299,22 @@ async fn run_session(
         suite = relay.suite.protocol_name(),
         "registered with relay"
     );
+    *registered = Some(Instant::now());
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(1024);
     let (done_tx, mut done_rx) = mpsc::channel::<StreamId>(config.max_streams.saturating_add(1));
     let mut streams = Streams::default();
-    let mut keepalive = tokio::time::interval(t.keepalive);
-    keepalive.tick().await;
-    let mut deadline = crate::deadline(t.idle);
+    // Dead-peer detection (resilience R-2): a `Ping` every keepalive interval, and the link is
+    // dead when no frame at all arrived for three of them.
+    let mut liveness = Liveness::new(liveness_config(t), Instant::now().into_std());
     let mut nonce: u64 = 0;
     loop {
+        let wake = Instant::from_std(liveness.next_deadline());
         tokio::select! {
-            inbound = timeout_at(deadline, ch.recv()) => {
-                let frame = inbound.map_err(|_| NetError::Timeout("relay idle"))??.ok_or(NetError::Closed)?;
-                deadline = crate::deadline(t.idle);
-                if let Some(reply) = on_relay_frame(frame, identity, config, shared, &mut streams, &out_tx, &done_tx)? {
+            inbound = ch.recv() => {
+                let frame = inbound?.ok_or(NetError::Closed)?;
+                liveness.on_inbound(Instant::now().into_std());
+                if let Some(reply) = on_relay_frame(frame, identity, config, shared, &mut streams, &out_tx, &done_tx, dialer)? {
                     ch.send(&reply, t).await?;
                 }
             }
@@ -287,9 +327,15 @@ async fn run_session(
                 // `done` belongs to this session: it cannot remove the slot of a newer stream.
                 streams.slots.remove(&stream);
             }
-            _ = keepalive.tick() => {
-                nonce = nonce.wrapping_add(1);
-                ch.send(&Frame::Ping { nonce }, t).await?;
+            () = tokio::time::sleep_until(wake) => {
+                match liveness.poll(Instant::now().into_std()) {
+                    Some(LivenessAction::Dead) => return Err(NetError::Timeout("relay silent")),
+                    Some(LivenessAction::SendPing) => {
+                        nonce = nonce.wrapping_add(1);
+                        ch.send(&Frame::Ping { nonce }, t).await?;
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -330,7 +376,8 @@ impl Streams {
     }
 }
 
-fn on_relay_frame(
+#[allow(clippy::too_many_arguments)] // the state of one relay session, passed by reference
+fn on_relay_frame<D: Dialer>(
     frame: Frame,
     identity: &Arc<Keyring>,
     config: &AgentConfig,
@@ -338,6 +385,7 @@ fn on_relay_frame(
     streams: &mut Streams,
     out_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<StreamId>,
+    dialer: &D,
 ) -> Result<Option<Frame>, NetError> {
     match frame {
         Frame::Open { stream, target } => {
@@ -375,6 +423,7 @@ fn on_relay_frame(
                 ssh_target: config.ssh_target.clone(),
                 timeouts: config.timeouts.clone(),
                 client_suites: config.client_suites,
+                dialer: dialer.clone(),
             };
             let done = done_tx.clone();
             tokio::spawn(async move {
@@ -435,7 +484,7 @@ fn on_relay_frame(
     }
 }
 
-struct StreamTask {
+struct StreamTask<D> {
     io: StreamIo,
     identity: Arc<Keyring>,
     /// Sessions to sshd and audit lines, for the whole agent (all relays).
@@ -447,6 +496,8 @@ struct StreamTask {
     timeouts: Timeouts,
     /// Suites accepted from clients (PROTOCOL §7.5).
     client_suites: AcceptedSuites,
+    /// How sshd is reached.
+    dialer: D,
 }
 
 /// Steps 1–10 and 12 of PROTOCOL §15.4 on the end-to-end channel, with this agent's CAs,
@@ -529,7 +580,7 @@ async fn read_msg1(
     Some(responded)
 }
 
-impl StreamTask {
+impl<D: Dialer> StreamTask<D> {
     async fn serve(self) {
         let Self {
             mut io,
@@ -540,6 +591,7 @@ impl StreamTask {
             ssh_target,
             timeouts,
             client_suites,
+            dialer,
         } = self;
         let Some(responded) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
             return;
@@ -624,13 +676,11 @@ impl StreamTask {
             io.close(CloseReason::Drained).await;
             return;
         };
-        let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, TcpStream::connect(&ssh_target)).await
-        else {
+        let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, dialer.connect(&ssh_target)).await else {
             tracing::warn!(target = %ssh_target, "cannot reach local ssh daemon");
             io.close(CloseReason::PeerGone).await;
             return;
         };
-        let _ = ssh.set_nodelay(true);
         let session = Session {
             client,
             credential,
@@ -687,14 +737,16 @@ async fn until_cut(session: &Session, authorized: &mut crate::Revocable<Authoriz
 }
 
 /// Connects the end-to-end session to sshd until the end, or until the client is revoked.
-async fn bridge(
+async fn bridge<S>(
     io: StreamIo,
     transport: zt_crypto::noise::Transport,
-    ssh: TcpStream,
+    ssh: S,
     session: Session,
     mut authorized: crate::Revocable<AuthorizedClients>,
     timeouts: &Timeouts,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let stream = io.id();
     let client = session.client;
     let certificate = match &session.credential {

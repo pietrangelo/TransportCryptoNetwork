@@ -39,6 +39,8 @@ fn an_empty_relay_toml_gives_the_documented_defaults() {
         RelaySettings {
             admission: AdmissionConfig::default(),
             suites: SuitePolicy::classical(),
+            agent_idle: std::time::Duration::from_secs(90),
+            client_idle: std::time::Duration::from_secs(90),
         }
     );
 }

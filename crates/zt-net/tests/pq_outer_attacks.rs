@@ -216,6 +216,7 @@ async fn a_hybrid_pinned_agent_never_falls_back() {
             max_streams: 4,
             client_suites: AcceptedSuites::only(CLASSIC),
             identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
     tokio::time::sleep(Duration::from_secs(5)).await;

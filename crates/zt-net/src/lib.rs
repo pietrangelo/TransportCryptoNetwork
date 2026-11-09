@@ -19,6 +19,7 @@ pub mod config;
 mod error;
 pub mod keys;
 pub mod logging;
+pub mod net;
 pub mod relay;
 pub mod reload;
 mod revocable;
@@ -71,7 +72,7 @@ impl Default for Timeouts {
             write: Duration::from_secs(30),
             open: Duration::from_secs(15),
             ssh_connect: Duration::from_secs(5),
-            keepalive: Duration::from_secs(30),
+            keepalive: Duration::from_secs(10),
         }
     }
 }

@@ -145,6 +145,8 @@ fn run(command: Command) -> Result<(), String> {
             let relay_config = RelayConfig {
                 admission: settings.admission,
                 suites: settings.suites,
+                agent_idle: Some(settings.agent_idle),
+                client_idle: Some(settings.client_idle),
                 ..RelayConfig::default()
             };
             let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -133,7 +133,7 @@ async fn unanswered_pings_end_the_session() {
         ),
     ));
     // 3 × 0.5 s of silence, then a reconnect within the first backoff (at most 1 s).
-    tokio::time::sleep(Duration::from_millis(4_000)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
     task.abort();
     let n = sessions.load(Ordering::SeqCst);
     assert!(n >= 2, "the agent kept a silent relay link: {n} session(s)");

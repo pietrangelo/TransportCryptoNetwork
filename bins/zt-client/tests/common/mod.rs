@@ -188,6 +188,7 @@ impl Fleet {
             max_streams: 16,
             client_suites,
             identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_net::agent::ReconnectConfig::default(),
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(

@@ -124,6 +124,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
             max_streams: 16,
             client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
             identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
     let config = ClientConfig {
@@ -235,6 +236,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
             max_streams: 16,
             client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
             identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
 
@@ -330,6 +332,7 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
             max_streams: 16,
             client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
             identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
     let (tcp, _) = listener.accept().await.unwrap();

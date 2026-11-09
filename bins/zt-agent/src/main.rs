@@ -88,6 +88,11 @@ enum Command {
         /// Local SSH daemon.
         #[arg(long, default_value = "127.0.0.1:22")]
         ssh_target: String,
+        /// Spread window, in seconds, of the first reconnect to a relay after a session that
+        /// lived (a relay restart or drain): the fleet comes back over this window instead of
+        /// in one wave. 0 reconnects at once (a single relay); at most 3600.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=3600))]
+        reconnect_spread: u64,
         /// Concurrent sessions (from 1 to 4096).
         #[arg(long, default_value_t = 16, value_parser = parse_max_streams)]
         max_streams: usize,
@@ -179,6 +184,7 @@ fn run(command: Command) -> Result<(), String> {
             authorized_clients,
             revocations,
             ssh_target,
+            reconnect_spread,
             max_streams,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -237,6 +243,10 @@ fn run(command: Command) -> Result<(), String> {
                     max_streams,
                     client_suites,
                     identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+                    reconnect: zt_net::agent::ReconnectConfig {
+                        spread: std::time::Duration::from_secs(reconnect_spread),
+                        ..zt_net::agent::ReconnectConfig::default()
+                    },
                 };
                 let events = ReloadEvents {
                     reloaded: "authorized_clients_reloaded",

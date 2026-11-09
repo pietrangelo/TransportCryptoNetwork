@@ -2,7 +2,6 @@
 //! stream (in `zt-client`, the stdin/stdout of OpenSSH).
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, timeout_at};
 use zt_crypto::noise::{self, Channel};
@@ -48,6 +47,23 @@ pub async fn connect<L>(
 where
     L: AsyncRead + AsyncWrite + Unpin,
 {
+    connect_with(identity, config, local, crate::net::TcpDialer).await
+}
+
+/// Like [`connect`], dialing the relays through `dialer` (the network port, [`crate::net`]).
+///
+/// # Errors
+/// Like [`connect`].
+pub async fn connect_with<L, D>(
+    identity: &Identity,
+    config: &ClientConfig,
+    local: L,
+    dialer: D,
+) -> Result<(), NetError>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    D: crate::net::Dialer,
+{
     let t = &config.timeouts;
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         return Err(NetError::Protocol(
@@ -61,7 +77,17 @@ where
     let mut last = NetError::Closed;
     let mut opened = None;
     for (i, relay) in config.relays.iter().enumerate() {
-        match open(identity, relay, &config.node, stream, certificate, t).await {
+        match open(
+            identity,
+            relay,
+            &config.node,
+            stream,
+            certificate,
+            t,
+            &dialer,
+        )
+        .await
+        {
             Ok(ch) => {
                 opened = Some(ch);
                 break;
@@ -105,18 +131,18 @@ where
 }
 
 /// Connection, outer handshake and stream opening on one relay.
-async fn open(
+async fn open<D: crate::net::Dialer>(
     identity: &Identity,
     relay: &crate::RelayEndpoint,
     node: &NodeId,
     stream: StreamId,
     certificate: &[u8],
     t: &Timeouts,
-) -> Result<Established<TcpStream>, NetError> {
-    let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
+    dialer: &D,
+) -> Result<Established<D::Stream>, NetError> {
+    let tcp = timeout(t.handshake, dialer.connect(&relay.address))
         .await
         .map_err(|_| NetError::Timeout("connect"))??;
-    let _ = tcp.set_nodelay(true);
     let mut ch = channel::connect_suite(
         tcp,
         identity,
@@ -159,7 +185,10 @@ const fn may_try_next_relay(err: &NetError) -> bool {
     }
 }
 
-async fn await_ack(ch: &mut Established<TcpStream>, stream: StreamId) -> Result<(), NetError> {
+async fn await_ack<IO>(ch: &mut Established<IO>, stream: StreamId) -> Result<(), NetError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         match ch.recv().await?.ok_or(NetError::Closed)? {
             Frame::OpenAck { stream: s } if s == stream => return Ok(()),
@@ -173,13 +202,16 @@ async fn await_ack(ch: &mut Established<TcpStream>, stream: StreamId) -> Result<
 }
 
 /// Forwards frames between the relay connection and the stream, until the stream ends.
-async fn drive(
-    mut ch: Established<TcpStream>,
+async fn drive<IO>(
+    mut ch: Established<IO>,
     stream: StreamId,
     to_stream: mpsc::Sender<Frame>,
     mut out_rx: mpsc::Receiver<Frame>,
     t: &Timeouts,
-) -> Result<(), NetError> {
+) -> Result<(), NetError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
     let mut keepalive = tokio::time::interval(t.keepalive);
     keepalive.tick().await;
     let mut deadline = crate::deadline(t.idle);

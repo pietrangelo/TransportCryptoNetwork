@@ -127,6 +127,16 @@ pub enum DomainEvent {
         /// The suite it used.
         suite: HandshakeSuite,
     },
+    /// Registrations for one node keep replacing each other: two agents with the same key (a
+    /// cloned machine). Reported, never blocked (resilience R-2).
+    AgentFlapping {
+        /// The node.
+        node: NodeId,
+        /// The agent key both connections use.
+        fingerprint: Fingerprint,
+        /// Takeovers within the detection window.
+        count: u32,
+    },
 }
 
 impl DomainEvent {
@@ -144,6 +154,7 @@ impl DomainEvent {
             Self::AccessRevoked { .. } => "access_revoked",
             Self::CertificateExpired { .. } => "certificate_expired",
             Self::HandshakeSuiteRejected { .. } => "handshake_suite_rejected",
+            Self::AgentFlapping { .. } => "agent_flapping",
         }
     }
 
@@ -157,6 +168,7 @@ impl DomainEvent {
                 | Self::ProtocolViolation { .. }
                 | Self::AccessRevoked { .. }
                 | Self::HandshakeSuiteRejected { .. }
+                | Self::AgentFlapping { .. }
         )
     }
 }

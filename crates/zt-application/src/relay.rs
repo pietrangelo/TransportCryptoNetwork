@@ -19,6 +19,7 @@ use zt_domain::{
     DomainEvent, Fingerprint, Frame, NodeId, RejectReason, SessionId, StreamId, UnixTime,
 };
 
+use crate::flapping::{FlapConfig, FlapDetector};
 use crate::ratelimit::TokenBucket;
 
 /// Identifier of an authenticated connection, assigned by the network adapter.
@@ -111,6 +112,8 @@ pub struct RelayLimits {
     pub open_burst: u32,
     /// One more `Open` every `open_refill`.
     pub open_refill: Duration,
+    /// When registration takeovers of one node are reported as `agent_flapping`.
+    pub flapping: FlapConfig,
 }
 
 impl Default for RelayLimits {
@@ -123,6 +126,7 @@ impl Default for RelayLimits {
             ping_refill: Duration::from_secs(5),
             open_burst: 64,
             open_refill: Duration::from_millis(100),
+            flapping: FlapConfig::default(),
         }
     }
 }
@@ -246,11 +250,13 @@ pub struct RelayCore<S> {
     conns: HashMap<ConnId, Conn>,
     agents: HashMap<NodeId, ConnId>,
     routes: HashMap<(ConnId, StreamId), Route>,
+    flapping: FlapDetector,
 }
 
 impl<S: SessionIds> RelayCore<S> {
     /// A relay with no connections.
     pub fn new(policy: Arc<AccessPolicy>, limits: RelayLimits, ids: S) -> Self {
+        let limits_flapping = limits.flapping;
         Self {
             policy,
             limits,
@@ -258,6 +264,7 @@ impl<S: SessionIds> RelayCore<S> {
             conns: HashMap::new(),
             agents: HashMap::new(),
             routes: HashMap::new(),
+            flapping: FlapDetector::new(limits_flapping),
         }
     }
 
@@ -448,7 +455,7 @@ impl<S: SessionIds> RelayCore<S> {
                 Ok(())
             }
             Frame::Pong { .. } => Err("unsolicited pong"),
-            Frame::Register { node } => self.on_register(conn, node, out),
+            Frame::Register { node } => self.on_register(conn, node, now.instant, out),
             other => {
                 if let Some(stream) = other.stream()
                     && !matches!(other, Frame::Open { .. })
@@ -537,6 +544,7 @@ impl<S: SessionIds> RelayCore<S> {
         &mut self,
         conn: ConnId,
         node: NodeId,
+        now: Instant,
         out: &mut Vec<Output>,
     ) -> Result<(), Violation> {
         let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
@@ -569,6 +577,15 @@ impl<S: SessionIds> RelayCore<S> {
             // New connection from the same agent (reconnection): the old one is drained.
             self.teardown_except_agent_entry(old, out);
             out.push(Output::Close { conn: old });
+            // A reconnection is normal; the same node taken over again and again is two
+            // agents with one key. Reported, never blocked (resilience R-2).
+            if let Some(count) = self.flapping.on_takeover(&node, now) {
+                out.push(Output::Audit(DomainEvent::AgentFlapping {
+                    node: node.clone(),
+                    fingerprint: peer,
+                    count,
+                }));
+            }
         }
         out.push(Output::Audit(DomainEvent::AgentRegistered {
             node,

@@ -13,7 +13,8 @@
     clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::cast_possible_truncation,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
 )]
 
 use std::net::SocketAddr;
@@ -161,6 +162,7 @@ fn reconnects_are_spread_after_a_relay_restart() {
     const AGENTS: usize = 40;
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(120))
+        .tick_duration(Duration::from_millis(10))
         .rng_seed(7)
         .build();
     let relay = Identity::generate().unwrap();
@@ -236,6 +238,7 @@ fn reconnects_are_spread_after_a_relay_restart() {
 fn half_open_agent_link_is_detected() {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(300))
+        .tick_duration(Duration::from_millis(10))
         .rng_seed(11)
         .build();
     let relay = Identity::generate().unwrap();

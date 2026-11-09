@@ -16,7 +16,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, timeout_at};
 use zt_application::admission::{
@@ -32,6 +32,7 @@ use zt_domain::{
     HandshakeSuite, InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
 };
 
+use crate::net::Acceptor;
 use crate::{NetError, Timeouts, channel, lock};
 
 /// Relay configuration.
@@ -45,6 +46,10 @@ pub struct RelayConfig {
     pub admission: AdmissionConfig,
     /// Handshake suites accepted per role (PROTOCOL §7.5).
     pub suites: SuitePolicy,
+    /// Idle timeout of agent connections; `None`: `timeouts.idle` (resilience R-2).
+    pub agent_idle: Option<Duration>,
+    /// Idle timeout of client connections; `None`: `timeouts.idle`.
+    pub client_idle: Option<Duration>,
 }
 
 impl Default for RelayConfig {
@@ -54,8 +59,17 @@ impl Default for RelayConfig {
             timeouts: Timeouts::default(),
             admission: AdmissionConfig::default(),
             suites: SuitePolicy::classical(),
+            agent_idle: None,
+            client_idle: None,
         }
     }
+}
+
+/// The monotonic clock of the runtime, as `std`: the real clock in production, the simulated
+/// one under `turmoil` or paused tokio time, so that every deadline of the relay follows the
+/// same clock.
+fn mono_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
 }
 
 /// An audit line (`target: "zt_audit"`), at WARN level for an alarm and INFO otherwise.
@@ -100,6 +114,7 @@ fn authentication_failed(
 /// `event_kind` is the stable name of the event ([`DomainEvent::kind`]), for a SIEM to filter
 /// on; the other data are separate fields (`peer`, `node`, `session`, `reason`, `rule`), not a
 /// `Debug` string to be parsed (finding 0004-4).
+#[allow(clippy::too_many_lines)] // one flat arm per event kind
 pub(crate) fn audit(event: &DomainEvent) {
     let kind = event.kind();
     let alert = event.is_security_alert();
@@ -196,6 +211,13 @@ pub(crate) fn audit(event: &DomainEvent) {
                 confirmed = false,
                 "handshake suite rejected"
             );
+        }
+        DomainEvent::AgentFlapping {
+            node,
+            fingerprint,
+            count,
+        } => {
+            emit!(peer = %fingerprint, %node, count = *count, "agent flapping");
         }
         other => emit!(event = ?other, "audit event"),
     }
@@ -301,15 +323,15 @@ fn outbound_capacity(limits: &RelayLimits) -> usize {
         .saturating_add(1024)
 }
 
-/// The relay, ready to accept connections.
-pub struct RelayServer {
-    listener: TcpListener,
+/// The relay, ready to accept connections from `A` (TCP in production, see [`crate::net`]).
+pub struct RelayServer<A = TcpListener> {
+    listener: A,
     keys: crate::Revocable<Keyring>,
     policy: crate::Revocable<AccessPolicy>,
     config: RelayConfig,
 }
 
-impl RelayServer {
+impl RelayServer<TcpListener> {
     /// Opens the listening socket.
     ///
     /// # Errors
@@ -320,15 +342,47 @@ impl RelayServer {
         policy: impl Into<crate::Revocable<AccessPolicy>>,
         config: RelayConfig,
     ) -> Result<Self, NetError> {
-        config.admission.validate()?;
-        for set in [config.suites.agents, config.suites.clients] {
-            if !set.all_supported(zt_domain::HandshakeChannel::Outer) {
-                return Err(NetError::Suite(zt_domain::SuiteError::Unsupported));
-            }
+        validate(&config)?;
+        let listener = TcpListener::bind(addr).await?;
+        RelayServer::with_acceptor(listener, keys, policy, config)
+    }
+}
+
+/// The relay configuration checks of [`RelayServer::bind`].
+fn validate(config: &RelayConfig) -> Result<(), NetError> {
+    config.admission.validate()?;
+    for set in [config.suites.agents, config.suites.clients] {
+        if !set.all_supported(zt_domain::HandshakeChannel::Outer) {
+            return Err(NetError::Suite(zt_domain::SuiteError::Unsupported));
         }
+    }
+    for idle in [config.agent_idle, config.client_idle]
+        .into_iter()
+        .flatten()
+        .chain([config.timeouts.idle])
+    {
+        if idle.is_zero() {
+            return Err(NetError::Protocol("an idle timeout must not be zero"));
+        }
+    }
+    Ok(())
+}
+
+impl<A: Acceptor> RelayServer<A> {
+    /// A relay on an already listening `acceptor` (the network port: TCP in production, a
+    /// simulated network in tests).
+    ///
+    /// # Errors
+    /// An invalid configuration.
+    pub fn with_acceptor(
+        listener: A,
+        keys: impl Into<crate::Revocable<Keyring>>,
+        policy: impl Into<crate::Revocable<AccessPolicy>>,
+        config: RelayConfig,
+    ) -> Result<Self, NetError> {
+        validate(&config)?;
         let policy = policy.into();
         let keys = keys.into();
-        let listener = TcpListener::bind(addr).await?;
         // The socket already accepts connections (queued until `run`): it is announced here,
         // so whatever the process logs after `bind` always comes after this line.
         if let Ok(addr) = listener.local_addr() {
@@ -356,7 +410,7 @@ impl RelayServer {
     /// Only fatal errors of the listening socket.
     pub async fn run(self) -> Result<(), NetError> {
         let Self {
-            listener,
+            mut listener,
             keys,
             policy,
             config,
@@ -379,7 +433,7 @@ impl RelayServer {
         admission_limits_in_use(&config.admission);
         let admission = Arc::new(Mutex::new(Admission::new(
             config.admission.clone(),
-            std::time::Instant::now(),
+            mono_now(),
         )));
         let confirmed = Arc::new(ConfirmedSuites::default());
         tokio::spawn(summaries(
@@ -400,7 +454,7 @@ impl RelayServer {
                 }
             };
             // A refusal is counted in the summary; the connection is dropped without a reply.
-            let admitted = lock(&admission).on_accept(addr.ip(), std::time::Instant::now());
+            let admitted = lock(&admission).on_accept(addr.ip(), mono_now());
             let Ok(ticket) = admitted else {
                 tracing::debug!(%addr, "connection not admitted");
                 continue;
@@ -410,7 +464,6 @@ impl RelayServer {
                 ticket,
                 source: addr.ip(),
             };
-            let _ = tcp.set_nodelay(true);
             next_conn = next_conn.wrapping_add(1);
             let conn = ConnId(next_conn);
             let task = Connection {
@@ -423,6 +476,8 @@ impl RelayServer {
                 timeouts: config.timeouts.clone(),
                 admission: config.admission.clone(),
                 suites: config.suites,
+                agent_idle: config.agent_idle.unwrap_or(config.timeouts.idle),
+                client_idle: config.client_idle.unwrap_or(config.timeouts.idle),
                 confirmed: Arc::clone(&confirmed),
                 capacity,
             };
@@ -439,6 +494,8 @@ struct Connection {
     timeouts: Timeouts,
     admission: AdmissionConfig,
     suites: SuitePolicy,
+    agent_idle: Duration,
+    client_idle: Duration,
     confirmed: Arc<ConfirmedSuites>,
     capacity: usize,
 }
@@ -497,7 +554,7 @@ impl Admitted {
 
     /// Key confirmation: `Ok` if the connection may join the established pool.
     fn confirm(&self, peer: Fingerprint, role: InitiatorRole) -> Result<(), Refusal> {
-        lock(&self.admission).on_confirmed(self.ticket, peer, role, std::time::Instant::now())
+        lock(&self.admission).on_confirmed(self.ticket, peer, role, mono_now())
     }
 
     /// `true` if an audit event about the known identity `peer` is to be logged in full now
@@ -549,7 +606,7 @@ async fn summaries(
         let Some(admission) = admission.upgrade() else {
             return;
         };
-        let summary = lock(&admission).poll_summary(std::time::Instant::now());
+        let summary = lock(&admission).poll_summary(mono_now());
         if let Some(summary) = summary {
             if summary.has_failures() {
                 preauth_summary(&summary);
@@ -673,28 +730,41 @@ fn preauth_summary(s: &PreauthSummary) {
 }
 
 impl Connection {
-    async fn serve(self, tcp: TcpStream, addr: SocketAddr, admitted: Admitted) {
-        let Some((ch, peer, certificate, first)) = self.handshake(tcp, addr, &admitted).await
+    async fn serve<IO>(self, tcp: IO, addr: SocketAddr, admitted: Admitted)
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let Some((ch, peer, certificate, first, role)) = self.handshake(tcp, addr, &admitted).await
         else {
             return;
         };
-        self.run(ch, peer, certificate, first).await;
+        // The idle timeout of the role (resilience R-2): agents ping every 10 s since R-2,
+        // older ones every 30 s, so the agents' value is lowered only after the fleet upgrade.
+        let idle = match role {
+            InitiatorRole::Agent => self.agent_idle,
+            InitiatorRole::Client => self.client_idle,
+        };
+        self.run(ch, peer, certificate, first, idle).await;
         drop(admitted);
     }
 
     /// Message 1 to key confirmation (PROTOCOL §10.1). Failures of unknown identities are only
     /// counted; a known identity gets its own audit line (finding AP-3).
-    async fn handshake(
+    async fn handshake<IO>(
         &self,
-        tcp: TcpStream,
+        tcp: IO,
         addr: SocketAddr,
         admitted: &Admitted,
     ) -> Option<(
-        channel::Established<TcpStream>,
+        channel::Established<IO>,
         Fingerprint,
         Option<Arc<CertClaims>>,
         Frame,
-    )> {
+        InitiatorRole,
+    )>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let handshake_deadline = crate::deadline(self.admission.handshake_timeout);
         let deadlines = channel::AcceptDeadlines {
             msg1: self.admission.msg1_deadline,
@@ -785,20 +855,22 @@ impl Connection {
         ch.confirmed();
         self.confirmed.note(role, suite);
         tracing::debug!(%addr, %peer, conn = self.conn.0, ?suite, "peer connected");
-        Some((ch, peer, certificate, first))
+        Some((ch, peer, certificate, first, role))
     }
 
     /// A confirmed identity refused at admission (finding A8-10): one rate-limited audit line
     /// that names it, and an answer to its `Open` (`Reject RateLimited`, which lets a client
     /// try the next relay) instead of a bare close.
-    async fn refuse_confirmed(
+    async fn refuse_confirmed<IO>(
         &self,
-        ch: &mut channel::Established<TcpStream>,
+        ch: &mut channel::Established<IO>,
         admitted: &Admitted,
         peer: Fingerprint,
         refusal: Refusal,
         first: &Frame,
-    ) {
+    ) where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         if admitted.log_identity(peer, IdentityEvent::AdmissionRefused(refusal)) {
             tracing::warn!(
                 target: "zt_audit",
@@ -817,13 +889,16 @@ impl Connection {
         }
     }
 
-    async fn run(
+    async fn run<IO>(
         self,
-        mut ch: channel::Established<TcpStream>,
+        mut ch: channel::Established<IO>,
         peer: Fingerprint,
         certificate: Option<Arc<CertClaims>>,
         first: Frame,
-    ) {
+        idle: Duration,
+    ) where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (tx, mut rx) = mpsc::channel(self.capacity);
         let conn = self.conn;
         if self
@@ -847,7 +922,7 @@ impl Connection {
         {
             return;
         }
-        let mut deadline = crate::deadline(self.timeouts.idle);
+        let mut deadline = crate::deadline(idle);
         loop {
             tokio::select! {
                 inbound = timeout_at(deadline, ch.recv()) => {
@@ -863,7 +938,7 @@ impl Connection {
                             break;
                         }
                     };
-                    deadline = crate::deadline(self.timeouts.idle);
+                    deadline = crate::deadline(idle);
                     if self.hub.send(HubEvent::Core(Input::Received { conn, frame })).await.is_err() {
                         break;
                     }
@@ -947,7 +1022,7 @@ async fn hub(
         let mut pending = vec![input];
         while let Some(input) = pending.pop() {
             let now = Now {
-                instant: std::time::Instant::now(),
+                instant: mono_now(),
                 unix: crate::unix_now(),
             };
             for output in core.handle(input, now) {
