@@ -81,11 +81,11 @@ two options:
   `TCN_ACCEPT_CLIENT_SUITES`, same syntax): the suites accepted from clients on the end-to-end
   channel. Without it, the classical suite alone.
 
-This release adds the hybrid suite `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (ML-KEM-768
-+ X25519) on the **end-to-end channel only**: in `--accept-client-suites` and in a client's
-`[[nodes]] suite`. Relays need no upgrade, option or restart for it. On the outer channel
-(`--relay-suite`, `relay.toml`, a client's relay pins) it is refused at startup. The agent logs
-the suites in force at startup (`handshake_suites_in_use`). To introduce it, follow §12.
+The hybrid suite `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (ML-KEM-768 + X25519) runs on
+both channels. End to end (`--accept-client-suites`, a client's `[[nodes]] suite`) relays need
+no upgrade, option or restart: follow §12. On the relay hops (`--relay-suite`, `relay.toml`, a
+client's relay pins) the relays must accept it first: follow §13. The agent logs the suites in
+force at startup (`handshake_suites_in_use`).
 
 ### 4.1 `relay.toml`: suites and admission limits
 
@@ -93,13 +93,14 @@ the suites in force at startup (`handshake_suites_in_use`). To introduce it, fol
 admission limits (PROTOCOL §10.1). Without the option, or with an empty file, the defaults
 below apply. The file is read at startup only: `SIGHUP` does not reload it, so change it with a
 restart. Unknown keys, a zero, absurd or inconsistent limit (PROTOCOL §10), or an
-unsupported suite stop the relay at startup. The relay logs the limits in force at startup
+unknown suite stop the relay at startup. The relay logs the limits in force at startup
 (`admission_limits_in_use`).
 
 ```toml
 [handshake]
 # Explicit sets, not ordered; there is no "minimum suite". Agents and clients are separate
-# because laptops upgrade last.
+# because laptops upgrade last. The hybrid suite (§13) is
+# "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s".
 agent_suites  = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
 client_suites = ["Noise_IK_25519_ChaChaPoly_BLAKE2s"]
 
@@ -279,6 +280,8 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `admission_limits_in_use` | INFO | (relay) at startup: every admission limit in force (§4.1) |
 | `admission_refused` | WARN | (relay) a peer that confirmed its key was refused by `max_per_identity` (`reason = identity_limit`) or a full established pool (`established_pool_full`): `peer`. Its `Open` got `Reject RateLimited` |
 | `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay; agent: the first two) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
+| `outer_suites_confirmed` | INFO | (relay) every summary interval, if any outer handshake confirmed its key: `agents_classical`, `agents_hybrid`, `clients_classical`, `clients_hybrid` (absent when zero). No identities; replays never count. The sunset signal of §13 |
+| `relay_registered` | INFO | (agent) registered with a relay: `node`, `relay` (address), `suite` (the pinned outer suite) |
 | `identity_events_suppressed` | WARN | (agent) once per 10 s interval, if events about more than 256 identities occurred: `count` of the events not logged per identity (the relay reports them as `suppressed_identities` in `preauth_summary`) |
 
 The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex),
@@ -676,8 +679,8 @@ every signing session; `zt-ca sign` prints the dates in UTC precisely so that yo
 
 ## 11. SSH key exchange: post-quantum today
 
-TCN's end-to-end handshake can be post-quantum (hybrid) since PQ-1 (§12); the relay channel and
-all authentication stay classical (PROTOCOL §7.5.1). The SSH session
+TCN's handshakes can be post-quantum (hybrid): end to end since PQ-1 (§12), on the relay hops
+since Phase 3 (§13); all authentication stays classical (PROTOCOL §7.5.1, §7.5.2). The SSH session
 that runs inside the tunnel can be protected **now**: it is end-to-end between `ssh` and `sshd`,
 and a recorded tunnel (harvest now, decrypt later) still has the SSH key exchange inside it.
 OpenSSH supports two hybrid key exchanges:
@@ -777,3 +780,44 @@ Rollback is the reverse order:
 Cost: the hybrid handshake adds about 1.2 KiB to each end-to-end message and roughly 0.1–0.2 ms
 of CPU per side (docs/pq-snow.md §5). The relay sees larger `Data` frames during the handshake
 and nothing else.
+
+## 13. Hybrid suite on the relay hops: rollout and rollback
+
+The same hybrid suite also protects the hops client ↔ relay and agent ↔ relay (PROTOCOL
+§7.5.2): the routing metadata (who reaches which node, when) and the certificates in later
+frames stop being "harvest now, decrypt later" material. Unlike §12 this involves the relays,
+so every step that changes a relay is a **rolling restart** (§14): one relay at a time, the
+next one only after the previous one is back and its agents have re-registered.
+
+Rollout, in this order (pq.md §6.3):
+
+1. **Upgrade every binary** (relays with a rolling restart, agents, clients) without changing
+   any pin or set. Nothing changes on the wire.
+2. **Relays, one by one: accept both suites for both roles** in `relay.toml` (§4.1), then
+   restart that relay (`relay.toml` is read at startup only). Check `handshake_suites_in_use`:
+   both sets name both suites. With HA (§8) clients and agents use the other relays while one
+   drains and restarts.
+3. **Agents: pin the hybrid suite per relay** (`--relay-suite`, one name for all relays or one
+   per `--relay`) only towards relays that completed step 2, then restart the agent (with
+   `--no-block` if you do it through TCN, §14). Check `relay_registered` with the hybrid
+   `suite` for each relay. An agent pinned to the hybrid suite towards a relay that does not
+   accept it for agents **fails closed** for that relay: it keeps retrying with the same suite
+   (no fallback), the relay writes `handshake_suite_rejected` for it, and the other relays keep
+   serving the node.
+4. **Clients: pin the hybrid suite per relay** (`suite` in `[[relays]]`, or `relay_suite`).
+   A client pinned to the hybrid suite at a relay that does not accept it moves on to the next
+   relay with that relay's own pin, and fails if none accepts it. Distribute such a
+   configuration only to upgraded clients: an older `zt-client` refuses it as a whole.
+5. **Sunset, per role (optional, PQ-SUNSET).** When `outer_suites_confirmed` shows no
+   `agents_classical` (or `clients_classical`) for a period you choose on every relay, remove
+   the classical suite from that role's set, relay by relay. Agents usually get there first;
+   laptops last.
+
+As in §12, act on `outer_suites_confirmed` (written only after key confirmation, so a replay
+never counts) and on your inventory, never on `handshake_suite_rejected` alone (it is
+unconfirmed and replayable).
+
+Rollback is the reverse order: put the classical suite back into the relays' sets (step 5,
+rolling restart), remove the clients' and then the agents' hybrid pins (steps 4 and 3), and only
+then remove the hybrid suite from the relays (step 2). Removing it from a relay first cuts off
+every peer that pins it towards that relay.

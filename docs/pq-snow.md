@@ -74,8 +74,8 @@ What PQ-1 actually landed (`vendor/snow/PATCHES.md`): patches 1 (`MLKEM768`) and
 `unwrap()`, as `Error::Kem`) as decided, plus three found while writing them: 2, KEM sizes
 checked against snow's buffers (the declared sizes indexed fixed stack arrays); 3, a public key
 of the wrong length after `generate` is an error (an RNG failure would otherwise send a short
-`e1`); 5, the KEM shared secret buffer is `Zeroizing` (A8-12). In TCN the hybrid suite is
-supported on the end-to-end channel only; the outer channel still refuses it.
+`e1`); 5, the KEM shared secret buffer is `Zeroizing` (A8-12). In TCN the hybrid suite ran on the
+end-to-end channel only in Phase 2; Phase 3 enables it on the outer channel too (PROTOCOL §7.5.2).
 
 ## 5. Baseline (classical and hybrid suites, ML-KEM-768)
 

@@ -116,8 +116,8 @@ Small-order public keys are rejected at load time.
 
 ### 7.3 Handshake
 The suite pinned by the initiator (§7.5): `Noise_IK_25519_ChaChaPoly_BLAKE2s` (the classical
-suite, the default) on both channels, or `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the
-hybrid suite) on the end-to-end channel only. Each channel and suite has its own prologue. The
+suite, the default) or `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the hybrid suite), on
+either channel. Each channel and suite has its own prologue. The
 payload of
 message 2 MUST be empty (the initiator rejects a message 2 with a payload); the payload of
 message 1 is either empty or contains a client certificate (§15.3), and a responder rejects a
@@ -125,7 +125,7 @@ payload that is neither empty nor a valid certificate.
 
 | Channel | Initiator | Responder | Prologue |
 | :- | :- | :- | :- |
-| outer | agent or client | relay | `TCN/1 outer` (classical suite only) |
+| outer | agent or client | relay | classical: `TCN/1 outer`; hybrid: `TCN/2 outer` ‖ `0x01` |
 | end-to-end | client | agent (inside `Data` frames) | classical: `TCN/1 end-to-end`; hybrid: `TCN/2 end-to-end` ‖ `0x01` |
 
 The initiator pins the responder's key. The responder learns the initiator's identity from the
@@ -155,7 +155,7 @@ configuration: exact, with no case folding, trimming or aliases.
 | Suite | Id | Message 1 | Message 2 | This release |
 | :- | :- | -: | -: | :- |
 | `Noise_IK_25519_ChaChaPoly_BLAKE2s` | `0x00` | 96 + payload | 48 | supported, the default |
-| `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | supported on the end-to-end channel only (PQ-1); refused on the outer one |
+| `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | supported on both channels (end to end since PQ-1, outer since Phase 3) |
 
 Message 1 of the classical suite is `e` (32) + encrypted `s` (32 + 16) + the payload tag (16).
 In IKhfs, `e1` (the 1 184-byte ML-KEM-768 encapsulation key) follows `es`, so it is encrypted
@@ -182,8 +182,7 @@ Rules:
   the role is known only after message 1. A peer whose suite is accepted for the other role
   gets no message 2 and produces `handshake_suite_rejected` (WARN).
 - A suite that this build cannot run **on that channel** is a configuration error at startup,
-  on every side. In this release the outer channel runs only the classical suite: a hybrid
-  `--relay-suite`, relay pin or `relay.toml` entry stops the process.
+  on every side. Every suite of this release runs on both channels.
 
 #### 7.5.1 The hybrid suite on the end-to-end channel (PQ-1)
 
@@ -249,8 +248,8 @@ What IKhfs gives, and what it does not (AP-23):
   the responder, message 1 replayable (hence the confirmation, §7.3).
 - **Leaks lengths.** The suite is visible to anyone who sees the sizes of the `Data` frames
   (1 296 + payload vs 96 + payload).
-- **The relay channel stays classical.** The outer handshake, and with it the routing metadata
-  and the client's identity towards the relay, is X25519 only until a later phase.
+- **The relay channel** runs the hybrid suite only where it is pinned and accepted (§7.5.2);
+  otherwise the routing metadata and the client's identity towards the relay are X25519 only.
 - **HFS is not a final standard.** The pattern follows the Noise HFS extension (revision 1),
   not an RFC; the protocol name binds the exact construction, and a different construction
   would get a new suite id.
@@ -258,6 +257,42 @@ What IKhfs gives, and what it does not (AP-23):
 Memory: the agent's and the client's ML-KEM decapsulation key and seed are wiped when dropped;
 snow wipes its KEM output buffer. Not wiped in this release: snow's internal HKDF and DH
 temporaries, and the copies libcrux makes of its by-value arguments.
+
+#### 7.5.2 The hybrid suite on the outer channel (PQ-1, Phase 3)
+
+The same construction as §7.5.1 on the hops client ↔ relay and agent ↔ relay, with the prologue
+`TCN/2 outer` ‖ `0x01`. The prologue binds the channel: an outer hybrid message 1 is never valid
+end to end and the reverse, so a relay cannot replay a client's end-to-end message 1 to another
+relay as an outer one. The outer channel has no confirmation string: its key confirmation is
+the first authentic transport frame (`Register`, `Open` or `Ping`, §10.1), which a replayed
+message 1 can never produce. An end-to-end confirmation (`TCN/1 ready`, `TCN/2 ready`) never
+decodes as a frame.
+
+- **Relay (responder).** It accepts one set per role (`relay.toml`, OPERATIONS §4.1). It tries
+  the union of the two sets on message 1 (the role is known only from the key), then checks
+  the suite against the role's set: an agent whose suite is accepted only for clients, or the
+  reverse, gets no message 2, and the relay writes `handshake_suite_rejected` (WARN,
+  `confirmed = false`, rate-limited per identity, §10.1). An unknown key produces no per-suite
+  line. Message 1 is buffered up to the largest legitimate message 1 of the union (5 624 bytes
+  when the hybrid suite is accepted for either role); the first-frame cap of §10.1 applies only
+  after message 2 has been written.
+- **Initiators.** The agent pins one suite per relay (`--relay-suite`), the client one per
+  relay (`suite` in `[[relays]]`, `relay_suite` for the single-relay form). Neither ever
+  retries another suite. A client may still fail over to the next relay before `OpenAck`
+  (§13), with that relay's own pin; failover never lowers a pin.
+- **Audit.** Every summary interval the relay writes `outer_suites_confirmed` with the number
+  of key-confirmed handshakes per role and suite (`agents_classical`, `agents_hybrid`,
+  `clients_classical`, `clients_hybrid`, absent when zero), without identities: this is the
+  signal for the sunset of the classical suite (OPERATIONS §13), and replays never count. The
+  agent writes `relay_registered` with the pinned `suite` for every relay session.
+- **Cost.** About 1.2 KiB more in each direction per connection and the CPU of
+  docs/pq-snow.md §5, once per connection; the transport is unchanged. The relay does no KEM
+  work before the policy and suite decisions (encapsulation happens when message 2 is
+  written).
+- **Properties.** Those of §7.5.1 for the hop: hybrid forward secrecy of the routing metadata
+  and of the client's certificate in later transport frames against a recording adversary; no
+  post-quantum authentication and no post-quantum hiding of the static key or of the
+  certificate in message 1 (both are encrypted under `es`, X25519 only).
 
 ## 8. Lifecycle
 
@@ -337,7 +372,8 @@ accept ─(per-source token, pre-auth slot)─▶ unconfirmed ─first authentic
    checked first, so they do not spend the source's tokens.
 2. **Message 1** must be complete within `msg1_deadline` (≥ 5 s), however slowly it trickles
    in. Its length prefix is checked on sight: over the largest legitimate message 1 of the
-   accepted suites (4 424 bytes for the classical suite, §15.3), the connection is closed
+   accepted suites (4 424 bytes for the classical suite, 5 624 with the hybrid one, §15.3,
+   §7.5.2), the connection is closed
    before any byte of the message is buffered. Until key confirmation (step 4) the limit is the
    largest legitimate first transport message: 87 bytes, the tag and a `Register` or `Open` with
    a 63-byte name. A longer prefix is refused on sight and counted as `oversized`. After key
