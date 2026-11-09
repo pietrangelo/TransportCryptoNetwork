@@ -1,6 +1,7 @@
 # Post-quantum and resilience roadmap (pre-implementation plan)
 
-Status: **proposal, awaiting decisions**. No code changes yet.
+Status: phases 1–3 implemented (PQ-0, R-1, PQ-1 end to end and on the outer hops, R-2, R-3);
+phases 4–7 pending. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
 
 This plan merges two independent design analyses and the adversary review of both:
 

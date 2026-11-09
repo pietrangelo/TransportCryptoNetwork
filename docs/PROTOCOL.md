@@ -307,6 +307,14 @@ decodes as a frame.
    it, closes with `Close Unauthorized`. After that, `Data` frames carry the encrypted SSH bytes.
 4. A `Close` from one side is forwarded to the other. The loss of a connection closes all of its
    streams with `PeerGone`.
+5. **Drain** (a graceful stop, OPERATIONS §14). A draining relay closes its listening socket at
+   once (new connections are refused, so clients and agents move to another relay, §13) and
+   keeps routing the open streams, under the policy in force and its reloads (a revocation
+   still cuts a session). When the last stream ends, or at the drain deadline (60 s by
+   default), it sends `Close Drained` on both sides of every stream still open and closes
+   every connection. A draining agent answers every new `Open` with `Reject NodeOffline`, so
+   the relay and the client treat the node as offline on that path, keeps its open sessions
+   and drops its relay connections after the last one or at its deadline.
 
 A peer that violates a rule (frame order, role, credit, rate) loses the connection. The
 exception is frames **in flight** on a stream that is already closed (for example `Data` or
@@ -345,7 +353,22 @@ therefore bounded by `streams × MAX_WINDOW`.
 | `Ping` per connection | burst of 10, then 1 every 5 s |
 | relay: complete message 1 / message 2 sent / first authentic frame | 5 s / 10 s / 5 s after message 2 |
 | initiator handshake / idle / write | 10 s / 90 s / 30 s |
-| agent and client keepalive | 30 s |
+| relay idle per role: agents / clients (`relay.toml` `[liveness]`, 15–3600 s) | 90 s / 90 s |
+| agent and client keepalive (`Ping`) | 10 s |
+| agent: relay link dead after | 3 keepalive intervals with no inbound frame at all |
+| TCP on every socket: `TCP_USER_TIMEOUT` / keepalive idle, interval, probes | 20 s / 10 s, 5 s, 3 |
+| agent reconnect: first delay after a failure / cap / spread after a session that lived 10 s | full jitter over 1 s, doubling / 30 s / uniform over 10 s |
+| `agent_flapping`: registration takeovers of one node | 3 in 60 s, reported once per window |
+| drain deadline (`--drain-timeout`, 1–3600 s) | 60 s |
+
+Liveness (resilience R-2). The agent sends a `Ping` every keepalive interval and declares the
+relay link dead when **no frame at all** (not only no `Pong`) arrived for three intervals; it
+then reconnects. Any inbound frame counts, so a busy link never pings itself to death. The
+relay's idle timeout per role is the other side of the same check: it drops a silent agent and
+its registration, so a client gets `NodeOffline` at once instead of an `Open` that is never
+acknowledged. Its default stays at 90 s, three times the 30 s keepalive of agents before R-2,
+until the whole fleet is upgraded (OPERATIONS §4.1). `TCP_USER_TIMEOUT` makes the kernel give
+up on a peer that stops acknowledging within 20 s, whatever the application timers say.
 
 The relay's admission limits are set in `relay.toml` (OPERATIONS §4.1). Every value is checked
 at startup: none may be zero, none may be absurd, the message 1 deadline lies between 5 s
@@ -470,7 +493,12 @@ changes on the wire.
 
 - **Agent**: has a list of relays (at most 8, each with its own pinned key) and maintains a
   session to **each** of them, in parallel and with independent backoffs. An unreachable or
-  slow relay does not affect the sessions to the others.
+  slow relay does not affect the sessions to the others. The backoff is sans-IO
+  (`ReconnectPolicy`): after a failure the delay is uniform between 0 and an exponential bound
+  (1 s, doubling, at most 30 s, "full jitter"); after a session that lived at least 10 s (a
+  relay restart or drain) the first reconnect is uniform over the spread window
+  (`--reconnect-spread`, 10 s by default), so a fleet comes back over the window and not in
+  one wave.
 - **Client**: has an ordered list of relays (at most 8) and tries them in the given order. It
   moves on to the next one **only** for errors that occur before the `OpenAck` and that say
   nothing about the right of access:

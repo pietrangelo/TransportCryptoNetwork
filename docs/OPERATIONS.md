@@ -58,8 +58,17 @@ zt-agent run --relay relay.example.org:7443 --relay-key <relay public key> \
 ```
 
 The agent opens no ports: it connects outbound, reconnects on its own with exponential
-backoff (1 s → 60 s, with jitter) and forwards only to `127.0.0.1:22`
-(`--ssh-target` to change it).
+backoff (full jitter, from 1 s up to 30 s) and forwards only to `127.0.0.1:22`
+(`--ssh-target` to change it). After a session that lived (a relay restart or drain) the
+first reconnect is spread over `--reconnect-spread` seconds (10 by default; 0 with a single
+relay you want back at once), so the fleet does not come back in one wave. The agent pings
+every 10 s and reconnects when nothing at all arrived from the relay for 30 s (PROTOCOL §10).
+
+Both services have a `check` subcommand that takes the same options as `run`, loads and
+validates every file `run` would load, prints `configuration OK` and the SHA-256 of the trust
+and settings files, and listens on nothing. It exits 0, or 78 (`EX_CONFIG`) on a configuration
+error; `run` also exits 78 when its files are invalid, and the units do not restart on 78.
+`SIGTERM` drains the service (§14); `--drain-timeout` (default 60 s) bounds the drain.
 
 With multiple relays, `--relay` and `--relay-key` are repeated in the same order, or separated with
 commas (at most 8). The agent stays connected to all of them at the same time; `--max-streams`
@@ -123,7 +132,17 @@ msg1_deadline_secs = 5           # accept -> complete message 1 (at least 5)
 handshake_timeout_secs = 10      # accept -> message 2 sent (at most 300)
 first_frame_deadline_secs = 5    # message 2 -> first authentic frame
 summary_interval_secs = 10       # preauth_summary and per-identity line interval
+
+[liveness]
+agent_idle_secs = 90             # a silent agent connection is dropped after this (15..=3600)
+client_idle_secs = 90            # same for client connections
 ```
+
+`[liveness]` sets the relay's idle timeout per role (PROTOCOL §10). Agents of this release ping
+every 10 s and need at least 30 s; agents before R-2 ping every 30 s and need 90 s. Lower
+`agent_idle_secs` (for example to 35) only once every agent is upgraded: a stale registration
+then goes away in 35 s instead of 90 s, and clients get `NodeOffline` sooner after an agent's
+host dies.
 
 How to size it:
 
@@ -282,6 +301,14 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay; agent: the first two) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
 | `outer_suites_confirmed` | INFO | (relay) every summary interval, if any outer handshake confirmed its key: `agents_classical`, `agents_hybrid`, `clients_classical`, `clients_hybrid` (absent when zero). No identities; replays never count. The sunset signal of §13 |
 | `relay_registered` | INFO | (agent) registered with a relay: `node`, `relay` (address), `suite` (the pinned outer suite) |
+| `agent_flapping` | WARN | (relay) one node changed hands between agent connections 3 times within 60 s (two agents with the same key, or a reconnect loop): `node`, `peer`, `count`. Reported once per window; each registration still goes through |
+| `configuration_loaded` | INFO | (relay and agent) at startup: `generation` (1) and `files`, the `path=sha256:<hex>` of each trust and settings file. The reload events above carry the same `generation` (one more per successful reload) and `files` |
+| `relay_draining`, `relay_drained` | INFO | (relay) `SIGTERM` received: `timeout_secs`; drain over: `expired` (streams were still open at the deadline), `streams_closed` (closed with `Close Drained`) |
+| `agent_draining`, `agent_drained` | INFO | (agent) `SIGTERM` received: `node`, `sessions`, `timeout_secs`; drain over: `expired`, `sessions` still open |
+| `critical_task_failed` | ERROR | a background task the service relies on (reload, watchdog, key or CA watch) stopped: `task`, `how`. The service exits with 1 and systemd restarts it |
+| `watchdog_stalled` | ERROR | the hub (agent: the runtime) made no progress for a third of `WatchdogSec`: the watchdog is no longer kicked and systemd will restart the service if it does not resume |
+| `clock_jumped` | WARN | the wall clock stepped against the monotonic clock by 5 s or more: `delta_secs`, `direction`. Backward steps make expired certificates valid again until corrected (§10.7) |
+| `clock_unsynchronised` | ERROR | at startup the wall clock is before this build: `now`, `floor`. Certificate checks are unreliable until the clock is set |
 | `identity_events_suppressed` | WARN | (agent) once per 10 s interval, if events about more than 256 identities occurred: `count` of the events not logged per identity (the relay reports them as `suppressed_identities` in `preauth_summary`) |
 
 The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex),
@@ -460,6 +487,21 @@ what an agent accepts unless this line is added.
 The units are `Type=notify`: `systemctl start` returns when the service has loaded its key and
 trust files and is already handling `SIGHUP`, so a `systemctl reload` right afterwards is safe. The
 relay uses `Restart=always`, because an unexpected signal counts as a clean exit.
+
+The lifecycle directives of the units (resilience R-3):
+
+| Directive | Why |
+| :- | :- |
+| `After=time-sync.target` | certificates and revocations follow the wall clock (§10.7) |
+| `ExecReload=… check …` then `kill -HUP` | an invalid file fails `systemctl reload` visibly; the running service keeps its files either way |
+| `WatchdogSec=60s` | the relay's hub kicks the watchdog every 20 s, only while it processes events (its own 1 s tick counts); a stuck hub gets the relay restarted |
+| `TimeoutStopSec=90s` | room for the drain (§14, 60 s by default) before `SIGKILL` |
+| `RestartPreventExitStatus=78` | a configuration error is not restarted in a loop: fix it, then `systemctl restart` |
+| `StartLimitIntervalSec=0`, `RestartSteps=5`, `RestartMaxDelaySec=60s` | never give up restarting, but back off up to 60 s (systemd 254 and later; older versions ignore the last two) |
+| `LimitCORE=0` | no core dumps of a process holding keys; the binaries also set `PR_SET_DUMPABLE` 0 |
+
+`systemctl status` shows a `STATUS=` line: the relay's connections and streams every 10 s, or
+`draining`.
 
 ## 10. Client certificates and offline CA
 
@@ -821,3 +863,37 @@ Rollback is the reverse order: put the classical suite back into the relays' set
 rolling restart), remove the clients' and then the agents' hybrid pins (steps 4 and 3), and only
 then remove the hybrid suite from the relays (step 2). Removing it from a relay first cuts off
 every peer that pins it towards that relay.
+
+## 14. Restarts, drain and upgrades
+
+`systemctl stop` and `systemctl restart` send `SIGTERM`, which **drains** the service instead of
+cutting it (PROTOCOL §8):
+
+- **Relay**: the port closes at once, so new connections are refused and clients and agents go
+  to the other relays (§8). Open sessions continue, and the policy and its reloads still apply
+  to them, until the last one ends or `--drain-timeout` (60 s) passes; then the remaining ones
+  get `Close Drained` and the relay exits 0. `relay_draining` and `relay_drained` mark the two
+  ends.
+- **Agent**: new sessions get `Reject NodeOffline` on every relay (the node is offline during
+  its own drain; the client tries its next relay and then gives up), open ones continue up to
+  `--drain-timeout`, then the agent exits 0. `agent_draining` and `agent_drained` mark the two
+  ends.
+
+**Serial restarts.** Restart relays **one at a time** and wait for the restarted one to be back
+(`systemctl is-active`, and `agent_registered` lines from your agents) before the next: while one
+relay drains, the others carry the fleet. With Ansible, `serial: 1` on the relay play. Agents of
+different nodes can be restarted in parallel; two agents of the same node do not exist.
+
+**Over TCN itself.** Restarting an agent through an SSH session that goes through that same
+agent ends your own session at the end of the drain. Use `systemctl --no-block restart zt-agent`
+so the command returns before the drain starts, and reconnect afterwards; with Ansible, run the
+restart as an `async` task with `poll: 0`. The same applies to a relay restarted from a session
+that goes through it, if it is the only relay.
+
+**Drain length.** Keep `--drain-timeout` below `TimeoutStopSec` (90 s in the units) minus a few
+seconds. Long-lived sessions (an interactive shell, a long `scp`) are cut at the deadline with
+`Close Drained`; a shorter drain makes restarts faster, a longer one cuts fewer sessions.
+
+**Configuration errors.** A restart with an invalid file exits 78 and is not retried
+(`RestartPreventExitStatus=78`); run `zt-relay check` / `zt-agent check` with the unit's options
+before restarting, as `systemctl reload` already does.
