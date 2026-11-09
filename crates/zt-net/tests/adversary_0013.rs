@@ -198,7 +198,14 @@ async fn a_split_backlog_sheds_the_abusing_identity_and_the_audit_names_it() {
         abusers.push(ch);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the shed instead of sleeping a fixed time: a slow CI runner can need longer than
+    // a few hundred milliseconds to queue the abuser's backlog past the budget.
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while logs.events("queue_budget_exceeded").is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
 
     let shed = logs.events("queue_budget_exceeded");
     assert!(!shed.is_empty(), "nothing was shed: {}", logs.text());
