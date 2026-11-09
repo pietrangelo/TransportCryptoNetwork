@@ -21,6 +21,7 @@ pub mod kem;
 mod keyring;
 pub mod mldsa;
 pub mod noise;
+mod prefilter;
 mod resolver;
 
 pub use cert::{
@@ -30,6 +31,6 @@ pub use cert::{
     verify_certificate, verify_certificate_hybrid,
 };
 pub use error::CryptoError;
-pub use hybrid::{HybridPublicKey, PeerKey, hybrid_fingerprint_of};
+pub use hybrid::{HybridPin, HybridPublicKey, PeerKey, hybrid_fingerprint_of};
 pub use identity::{Identity, PublicKey, fingerprint_of_x25519};
 pub use keyring::Keyring;

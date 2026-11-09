@@ -15,12 +15,11 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use shake::{ExtendableOutput, Shake256, Update, XofReader};
-use zeroize::Zeroizing;
 use zt_domain::{Fingerprint, HybridFingerprint};
 
 use crate::error::CryptoError;
 use crate::identity::PublicKey;
-use crate::kem::{Kem, KemSeed, MlKem768, SEED_LEN};
+use crate::kem::{Kem, KemSeed, MlKem768};
 
 /// Domain separation of the static ML-KEM key derivation (D12).
 const KEM_SEED_DOMAIN: &[u8] = b"TCN ML-KEM-768 seed v1\0";
@@ -43,9 +42,12 @@ impl StaticKem {
         let mut xof = Shake256::default();
         xof.update(KEM_SEED_DOMAIN);
         xof.update(seed);
-        let mut dz = Zeroizing::new([0_u8; SEED_LEN]);
-        xof.finalize_xof().read(dz.as_mut());
-        let (dk, ek) = MlKem768::generate(&KemSeed::from_bytes(*dz));
+        // Written in place: no copy of `d ‖ z` is left on the stack (finding A12-8).
+        let Ok(seed) = KemSeed::filled_by(|bytes| {
+            xof.finalize_xof().read(bytes);
+            Ok::<(), core::convert::Infallible>(())
+        });
+        let (dk, ek) = MlKem768::generate(&seed);
         Self {
             dk,
             ek: Arc::from(ek),
@@ -149,6 +151,100 @@ impl fmt::Display for HybridPublicKey {
 impl fmt::Debug for HybridPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "HybridPublicKey({})", self.hybrid_fingerprint())
+    }
+}
+
+/// The compact v2 pin of a **responder** (finding A12-2 of review 0012): the Ed25519 key and
+/// the fingerprint v2, `tcn-pin-v2:<64 hex>:<64 hex>` (139 characters instead of 2 443). A
+/// responder never needs the initiator's encapsulation key from its configuration: message 1
+/// carries it, and the responder only compares its fingerprint v2 with the pin. An initiator
+/// needs the full [`HybridPublicKey`], so this form is refused there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HybridPin {
+    classical: PublicKey,
+    hybrid: HybridFingerprint,
+}
+
+impl HybridPin {
+    /// The prefix of the text form.
+    pub const PREFIX: &'static str = "tcn-pin-v2:";
+    /// The length of the text form: the prefix, 64 hex, `:`, 64 hex.
+    pub const TEXT_LEN: usize = Self::PREFIX.len() + 64 + 1 + 64;
+
+    /// The Ed25519 part: the v1 key of the same node.
+    #[must_use]
+    pub const fn classical(&self) -> &PublicKey {
+        &self.classical
+    }
+
+    /// The X25519-level fingerprint (v1): the unit of roles and revocation.
+    #[must_use]
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.classical.fingerprint()
+    }
+
+    /// The pinned fingerprint v2.
+    #[must_use]
+    pub const fn hybrid_fingerprint(&self) -> HybridFingerprint {
+        self.hybrid
+    }
+}
+
+impl From<&HybridPublicKey> for HybridPin {
+    fn from(key: &HybridPublicKey) -> Self {
+        Self {
+            classical: key.classical,
+            hybrid: key.hybrid_fingerprint(),
+        }
+    }
+}
+
+/// 64 lowercase hex characters, decoded.
+fn lower_hex32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    hex::decode_to_slice(text, &mut out).ok()?;
+    Some(out)
+}
+
+impl FromStr for HybridPin {
+    type Err = CryptoError;
+
+    /// Exactly `tcn-pin-v2:` + 64 lowercase hex (a canonical, non-weak Ed25519 key) + `:` + 64
+    /// lowercase hex (the fingerprint v2). No trimming.
+    fn from_str(text: &str) -> Result<Self, CryptoError> {
+        let rest = text
+            .strip_prefix(Self::PREFIX)
+            .ok_or(CryptoError::InvalidKey)?;
+        let (key, fingerprint) = rest.split_once(':').ok_or(CryptoError::InvalidKey)?;
+        let (Some(key), Some(fingerprint)) = (lower_hex32(key), lower_hex32(fingerprint)) else {
+            return Err(CryptoError::InvalidKey);
+        };
+        Ok(Self {
+            classical: PublicKey::from_canonical_bytes(&key)?,
+            hybrid: HybridFingerprint::from_bytes(fingerprint),
+        })
+    }
+}
+
+impl fmt::Display for HybridPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(Self::PREFIX)?;
+        f.write_str(&hex::encode(self.classical.to_bytes()))?;
+        f.write_str(":")?;
+        f.write_str(&hex::encode(self.hybrid.as_bytes()))
+    }
+}
+
+impl fmt::Debug for HybridPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HybridPin({})", self.hybrid)
     }
 }
 

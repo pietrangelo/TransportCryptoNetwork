@@ -72,6 +72,12 @@ pub enum DomainError {
         "a SHA256v2 fingerprint cannot be revoked: list the tcn-pub-v2 key or its SHA256 (v1) fingerprint"
     )]
     HybridFingerprintNotRevocable,
+    /// `require_hybrid_identity` (PQ-AUTH, finding A12-1) names a role that has an entry
+    /// without a v2 pin: that peer would be authenticated only classically.
+    #[error(
+        "peer {0} has no v2 identity (tcn-pub-v2 key or tcn-pin-v2 pin), but its role requires one"
+    )]
+    HybridIdentityRequired(crate::Fingerprint),
     /// The same key appears twice in the policy.
     #[error("peer {0} appears more than once in the access policy")]
     DuplicatePeer(crate::Fingerprint),

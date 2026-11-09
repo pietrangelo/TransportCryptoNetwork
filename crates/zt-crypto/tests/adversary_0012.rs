@@ -14,7 +14,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    clippy::print_stdout
 )]
 
 use std::sync::Arc;
@@ -375,8 +376,16 @@ fn the_union_of_suites_stays_within_the_unauthenticated_msg1_budget() {
             _ => unreachable!(),
         };
         // Best of three runs of each, interleaved: a shared machine is noisy.
-        let (mut base, mut union) = (f64::MAX, f64::MAX);
+        let (mut base, mut union, mut classical) = (f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..3 {
+            let start = Instant::now();
+            for _ in 0..ROUNDS {
+                let only = AcceptedSuites::only(CLASSIC);
+                assert!(
+                    noise::respond_suites(&ring, &garbage[..160], Channel::Outer, only).is_err()
+                );
+            }
+            classical = classical.min(start.elapsed().as_secs_f64());
             let start = Instant::now();
             for _ in 0..ROUNDS {
                 baseline_trial(&seeds, &garbage[..160]);
@@ -390,11 +399,13 @@ fn the_union_of_suites_stays_within_the_unauthenticated_msg1_budget() {
         }
         let per = |t: f64| t * 1e6 / f64::from(ROUNDS);
         println!(
-            "A12-6: {} key(s): classical baseline {:.0} us, all suites {:.0} us ({:.2}x)",
+            "A12-6: {} key(s): classical baseline {:.0} us, all suites {:.0} us ({:.2}x); \
+             classical only, this release: {:.0} us",
             seeds.len(),
             per(base),
             per(union),
-            union / base
+            union / base,
+            per(classical)
         );
         ratios.push(union / base);
     }

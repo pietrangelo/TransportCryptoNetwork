@@ -43,6 +43,7 @@ use crate::hybrid::{EK_LEN, PeerKey, hybrid_fingerprint_of};
 use crate::identity::{Identity, fingerprint_of_x25519};
 use crate::kem::{ENCAPSULATION_RANDOMNESS_LEN, Kem, MlKem768};
 use crate::keyring::Keyring;
+use crate::prefilter::{self, Symmetric};
 
 /// Maximum length of a Noise message.
 pub const MAX_MESSAGE_LEN: usize = 65_535;
@@ -282,9 +283,13 @@ fn initiate_hybrid(
     ))
 }
 
-/// Responder that tries every supported suite of `accepted`, each with the current key and
-/// then the previous one (PROTOCOL §7.5, §14). Nothing on the wire names the suite (AP-11):
-/// a suite whose message 1 cannot have this length is skipped without running Noise.
+/// Responder for the suites of `accepted`, with the current key or the previous one (PROTOCOL
+/// §7.5, §14). Nothing on the wire names the suite or the key (AP-11): the cheap test of
+/// [`select`] picks at most one suite and key, and only that one runs Noise in full.
+///
+/// The cost of an invalid message 1 (finding A12-6 of review 0012), per key: one X25519
+/// multiplication if a pre-PQ-AUTH suite fits its length, plus one static decapsulation and
+/// one multiplication if the hybrid IK suite does. Never a Noise state.
 ///
 /// # Errors
 /// [`CryptoError::Handshake`] if `msg1` is not valid for any accepted suite and key. The
@@ -295,20 +300,202 @@ pub fn respond_suites(
     channel: Channel,
     accepted: AcceptedSuites,
 ) -> Result<AuthorizationPending, CryptoError> {
-    // A failed attempt leaves no state: each try builds a new handshake. The timing reveals
-    // which suite and key worked; neither is a secret (the keys are public, and the suite is
-    // implied by the length).
-    for suite in accepted.iter().filter(|s| s.is_supported(channel)) {
-        if msg1.len() < suite.msg1_overhead() || msg1.len() > suite.max_msg1_len() {
-            continue;
+    // A failed attempt leaves no state. The timing reveals which suite and key passed the
+    // test; neither is a secret (the keys are public, and the suite is implied by the length).
+    let selected = select(keys, msg1, channel, accepted).ok_or(CryptoError::Handshake)?;
+    selected.respond(msg1, channel)
+}
+
+/// The suite and key a message 1 is for, by the test of [`prefilter`].
+struct Selected<'a> {
+    local: &'a Identity,
+    suite: HandshakeSuite,
+    /// `psk0` of the hybrid IK suite, already derived from the static decapsulation.
+    psk0: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl Selected<'_> {
+    /// The full Noise trial of the selected suite and key.
+    fn respond(self, msg1: &[u8], channel: Channel) -> Result<AuthorizationPending, CryptoError> {
+        ops::trial();
+        match self.psk0 {
+            Some(psk0) => respond_hybrid(self.local, msg1, channel, self.suite, &psk0),
+            None => respond_one(self.local, msg1, channel, self.suite),
         }
+    }
+}
+
+/// The length of the first field message 1 encrypts after `es`, tag included: `s` in IK,
+/// `e1` in `IKhfs` and in the hybrid IK suite. `None` for a suite this build does not know.
+const fn first_ciphertext_len(suite: HandshakeSuite) -> Option<usize> {
+    match suite {
+        HandshakeSuite::NoiseIk25519 => Some(DH_LEN + TAG_LEN),
+        HandshakeSuite::NoiseIkhfs25519MlKem768 | HandshakeSuite::NoiseIkHybrid25519MlKem768 => {
+            Some(EK_LEN + TAG_LEN)
+        }
+        _ => None,
+    }
+}
+
+/// The first ciphertext of a message that starts with `e`.
+fn first_ciphertext(message: &[u8], suite: HandshakeSuite) -> Option<&[u8]> {
+    message.get(DH_LEN..DH_LEN.checked_add(first_ciphertext_len(suite)?)?)
+}
+
+/// Length of an X25519 public key.
+const DH_LEN: usize = 32;
+
+/// Picks the suite of `candidates` and the key of `keys` that `msg1` is for, by the cheap test
+/// of [`prefilter`], in a fixed order: the suites without a static KEM first (one X25519
+/// multiplication per key serves all of them), then the hybrid IK suite (one decapsulation and
+/// one multiplication per key), each with the current key, then the previous one. The first
+/// that passes is the only one Noise runs on.
+fn select<'a>(
+    keys: &'a Keyring,
+    msg1: &[u8],
+    channel: Channel,
+    candidates: AcceptedSuites,
+) -> Option<Selected<'a>> {
+    if msg1.len() > MAX_MESSAGE_LEN {
+        return None;
+    }
+    let fits = |suite: &HandshakeSuite| {
+        suite.is_supported(channel)
+            && prologue(channel, *suite).is_some()
+            && (suite.msg1_overhead()..=suite.max_msg1_len()).contains(&msg1.len())
+    };
+    let classical: Vec<HandshakeSuite> = candidates
+        .iter()
+        .filter(|s| fits(s) && !s.requires_hybrid_identity())
+        .collect();
+    if let (false, Some(e)) = (classical.is_empty(), first_dh(msg1)) {
         for local in keys.identities() {
-            if let Ok(pending) = respond_one(local, msg1, channel, suite) {
-                return Ok(pending);
+            let shared = prefilter::dh(&local.x25519_secret(), &e);
+            for &suite in &classical {
+                if classical_test(local, msg1, channel, suite, &e, &shared) {
+                    return Some(Selected {
+                        local,
+                        suite,
+                        psk0: None,
+                    });
+                }
             }
         }
     }
-    Err(CryptoError::Handshake)
+    let hybrid = candidates
+        .iter()
+        .find(|s| fits(s) && s.requires_hybrid_identity())?;
+    keys.identities().find_map(|local| {
+        let psk0 = hybrid_test(local, msg1, channel, hybrid)?;
+        Some(Selected {
+            local,
+            suite: hybrid,
+            psk0: Some(psk0),
+        })
+    })
+}
+
+/// `e` at the start of a message.
+fn first_dh(message: &[u8]) -> Option<[u8; DH_LEN]> {
+    message.get(..DH_LEN)?.try_into().ok()
+}
+
+/// The test of a suite whose message 1 is `e, es, <first ciphertext>`, with `DH(s_r, e)`
+/// already computed.
+fn classical_test(
+    local: &Identity,
+    msg1: &[u8],
+    channel: Channel,
+    suite: HandshakeSuite,
+    e: &[u8; DH_LEN],
+    shared: &[u8; 32],
+) -> bool {
+    let (Some(prologue), Some(first)) = (prologue(channel, suite), first_ciphertext(msg1, suite))
+    else {
+        return false;
+    };
+    let mut state = Symmetric::new(suite.protocol_name(), prologue, local.x25519_public());
+    state.mix_hash(e);
+    state.mix_key(shared);
+    state.decrypts(first)
+}
+
+/// The test of the hybrid IK suite: `ct1`, then `psk0, e, es, e1`. Returns `psk0` if it
+/// passes, so that Noise does not decapsulate a second time.
+fn hybrid_test(
+    local: &Identity,
+    msg1: &[u8],
+    channel: Channel,
+    suite: HandshakeSuite,
+) -> Option<Zeroizing<[u8; 32]>> {
+    let (ct1, rest) = (msg1.get(..CT_LEN)?, msg1.get(CT_LEN..)?);
+    let e = first_dh(rest)?;
+    let first = first_ciphertext(rest, suite)?;
+    let own = local.static_kem();
+    ops::decaps();
+    let ss1 = MlKem768::decapsulate(&own.dk, ct1).ok()?;
+    let psk0 = kem_psk(PSK_INITIATOR, ct1, ss1.as_bytes());
+    let prologue = hybrid_prologue(channel, &own.ek, ct1).ok()?;
+    let mut state = Symmetric::new(suite.protocol_name(), &prologue, local.x25519_public());
+    state.mix_key_and_hash(psk0.as_ref());
+    state.mix_hash(&e);
+    state.mix_key(&e);
+    state.mix_key(prefilter::dh(&local.x25519_secret(), &e).as_ref());
+    state.decrypts(first).then_some(psk0)
+}
+
+/// Counted operations of the responder, for the unit tests of finding A12-6: X25519
+/// multiplications of the test, static decapsulations, full Noise trials.
+#[cfg(test)]
+pub(crate) mod ops {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub(crate) dh: usize,
+        pub(crate) decaps: usize,
+        pub(crate) trials: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+    }
+
+    fn bump(f: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|c| {
+            let mut counts = c.get();
+            f(&mut counts);
+            c.set(counts);
+        });
+    }
+
+    pub(crate) fn reset() {
+        COUNTS.with(|c| c.set(Counts::default()));
+    }
+
+    pub(crate) fn get() -> Counts {
+        COUNTS.with(Cell::get)
+    }
+
+    pub(crate) fn dh() {
+        bump(|c| c.dh = c.dh.saturating_add(1));
+    }
+
+    pub(crate) fn decaps() {
+        bump(|c| c.decaps = c.decaps.saturating_add(1));
+    }
+
+    pub(crate) fn trial() {
+        bump(|c| c.trials = c.trials.saturating_add(1));
+    }
+}
+
+/// Outside the unit tests nothing is counted.
+#[cfg(not(test))]
+pub(crate) mod ops {
+    pub(crate) const fn dh() {}
+    pub(crate) const fn decaps() {}
+    pub(crate) const fn trial() {}
 }
 
 /// What a responder learns from a message 1 (finding A9-3 of review 0009).
@@ -360,13 +547,18 @@ impl Identified {
     }
 }
 
-/// Like [`respond_suites`], then, only if no accepted suite fits, the other suites this build
-/// supports on `channel`: a known initiator whose suite is not accepted is then
-/// [`Responded::Unaccepted`], so that the caller can name it. Those attempts are read-only:
-/// no KEM operation and no message 2.
+/// Like [`respond_suites`], and the other suites this build supports on `channel` are tested
+/// too: a known initiator whose suite is not accepted is then [`Responded::Unaccepted`], so
+/// that the caller can name it. Those attempts never produce a message 2.
 ///
-/// The cost of an invalid message 1 is one trial per key for every suite this build supports
-/// on the channel whose length bounds fit, accepted or not.
+/// A suite that authenticates the static ML-KEM keys (the hybrid IK suite) is identified only
+/// if it is accepted: reading its message 1 needs a decapsulation with the responder's
+/// long-term key, which a responder that did not opt in never does (finding A12-4 of review
+/// 0012). Its initiator gets the generic failure.
+///
+/// The cost of an invalid message 1 is that of [`respond_suites`] for the accepted suites and
+/// the identified ones together: the pre-PQ-AUTH suites share one X25519 multiplication per
+/// key, so identifying them adds nothing.
 ///
 /// # Errors
 /// [`CryptoError::Handshake`] if `msg1` is valid for no supported suite and key.
@@ -376,14 +568,18 @@ pub fn respond_or_identify(
     channel: Channel,
     accepted: AcceptedSuites,
 ) -> Result<Responded, CryptoError> {
-    let err = match respond_suites(keys, msg1, channel, accepted) {
-        Ok(pending) => return Ok(Responded::Pending(Box::new(pending))),
-        Err(err) => err,
-    };
-    let Some(others) = AcceptedSuites::supported(channel).without(accepted) else {
-        return Err(err);
-    };
-    let pending = respond_suites(keys, msg1, channel, others)?;
+    let identified = AcceptedSuites::supported(channel)
+        .without(accepted)
+        .and_then(|others| {
+            AcceptedSuites::new(others.iter().filter(|s| !s.requires_hybrid_identity())).ok()
+        });
+    let candidates = identified.map_or(accepted, |others| accepted.union(others));
+    let selected = select(keys, msg1, channel, candidates).ok_or(CryptoError::Handshake)?;
+    let is_accepted = accepted.contains(selected.suite);
+    let pending = selected.respond(msg1, channel)?;
+    if is_accepted {
+        return Ok(Responded::Pending(Box::new(pending)));
+    }
     // The handshake state is dropped here: nothing can advance it any more.
     Ok(Responded::Unaccepted(Identified {
         peer: pending.peer,
@@ -416,7 +612,12 @@ fn respond_one(
         return Err(CryptoError::Handshake);
     }
     if suite.requires_hybrid_identity() {
-        return respond_hybrid(local, msg1, channel, suite);
+        let (Some(ct1), own) = (msg1.get(..CT_LEN), local.static_kem()) else {
+            return Err(CryptoError::Handshake);
+        };
+        let ss1 = MlKem768::decapsulate(&own.dk, ct1).map_err(|_| CryptoError::Handshake)?;
+        let psk0 = kem_psk(PSK_INITIATOR, ct1, ss1.as_bytes());
+        return respond_hybrid(local, msg1, channel, suite, &psk0);
     }
     let (builder, secret) = builder(local, channel, suite).map_err(|_| CryptoError::Handshake)?;
     let mut state = builder
@@ -445,26 +646,26 @@ fn respond_one(
     })
 }
 
-/// The responder of the hybrid IK suite: decapsulates `ct1` with the static key (the only
-/// KEM operation before the authorization decision), reads message 1, checks the initiator's
-/// encapsulation key (FIPS 203 §7.2) and binds it into the fingerprint v2.
+/// The responder of the hybrid IK suite, with `psk0` from the decapsulation of `ct1` with the
+/// static key (the only KEM operation before the authorization decision): reads message 1,
+/// checks the initiator's encapsulation key (FIPS 203 §7.2) and binds it into the fingerprint
+/// v2.
 fn respond_hybrid(
     local: &Identity,
     msg1: &[u8],
     channel: Channel,
     suite: HandshakeSuite,
+    psk0: &[u8; 32],
 ) -> Result<AuthorizationPending, CryptoError> {
     let (Some(ct1), Some(rest)) = (msg1.get(..CT_LEN), msg1.get(CT_LEN..)) else {
         return Err(CryptoError::Handshake);
     };
     let own = local.static_kem();
-    let ss1 = MlKem768::decapsulate(&own.dk, ct1).map_err(|_| CryptoError::Handshake)?;
-    let psk0 = kem_psk(PSK_INITIATOR, ct1, ss1.as_bytes());
     let prologue = hybrid_prologue(channel, &own.ek, ct1)?;
     let (builder, secret) =
         builder_with(local, channel, suite, &prologue).map_err(|_| CryptoError::Handshake)?;
     let mut state = builder
-        .psk(0, &psk0)
+        .psk(0, psk0)
         .and_then(|b| b.local_private_key(secret.as_ref()))
         .and_then(Builder::build_responder)
         .map_err(|_| CryptoError::Handshake)?;
@@ -758,7 +959,13 @@ fn remote_fingerprint(state: &HandshakeState) -> Result<Fingerprint, CryptoError
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     //! Counted operations of the responder (finding A12-6 of review 0012) and the KEM
     //! authentication of the initiator (A12-9). Unit tests: they need the crate's counters

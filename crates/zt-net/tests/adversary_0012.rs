@@ -12,6 +12,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::too_many_lines
 )]
@@ -68,14 +69,12 @@ fn write_trusted(path: &Path, text: &str) {
 /// How a client entry names its key.
 #[derive(Clone, Copy)]
 enum Form {
-    V1,
     FullV2,
     Pin,
 }
 
 fn key_text(id: &Identity, form: Form) -> String {
     match form {
-        Form::V1 => id.public_key().to_string(),
         Form::FullV2 => id.hybrid_public_key().to_string(),
         Form::Pin => id.hybrid_pin().to_string(),
     }
@@ -202,7 +201,7 @@ fn the_compact_pin_is_a_responder_side_form() {
             "relay = \"127.0.0.1:4433\"\nrelay_key = \"{relay_key}\"\nkey = \"client.key\"\n\n\
              [[nodes]]\nnode = \"web-01\"\npublic_key = \"{node_key}\"\nsuite = \"{HYBRID_NAME}\"\n"
         );
-        assert!(parse_client_settings("client.toml", &text).is_err());
+        assert!(parse_client_settings("client.toml", Path::new("/etc/tcn"), &text).is_err());
     }
     // In revoked.toml: the X25519-level fingerprint.
     let revoked = parse_revocations("revoked.toml", &format!("keys = [\"{pin}\"]\n")).unwrap();

@@ -13,20 +13,35 @@ use std::sync::Arc;
 use serde::Deserialize;
 use thiserror::Error;
 use zt_crypto::{
-    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, CryptoError, HybridPublicKey,
-    Identity, Keyring, PeerKey, PublicKey, decode_certificate_text, trusted_ca_key,
-    trusted_composite_ca_key,
+    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, CryptoError, HybridPin,
+    HybridPublicKey, Identity, Keyring, PeerKey, PublicKey, decode_certificate_text,
+    trusted_ca_key, trusted_composite_ca_key,
 };
 use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
 use zt_domain::trust::{CertTrust, Revocations, TrustedCaKey};
 use zt_domain::{
     AccessPolicy, AllowedNodes, AnyCertBody, AuthorizedClients, CertFormatError, CertSerial,
-    ClientGrant, DomainError, Fingerprint, FingerprintText, HybridFingerprint, NodeId,
-    decode_any_certificate,
+    ClientGrant, DomainError, Fingerprint, FingerprintText, HybridFingerprint, HybridRequirement,
+    NodeId, decode_any_certificate,
 };
 
-/// Maximum size of a configuration file.
+/// Maximum size of a key file (identity, CA key).
 const MAX_FILE_LEN: u64 = 1024 * 1024;
+
+/// Maximum number of peer entries (`[[agents]]` plus `[[clients]]`, or `[[nodes]]`) in one
+/// configuration file: a fleet of several thousand nodes and clients with room to spare
+/// (finding A12-2 of review 0012).
+pub const MAX_PEER_ENTRIES: usize = 32_768;
+
+/// The length of an entry the bound of [`MAX_TRUST_FILE_LEN`] is derived from: a compact v2
+/// entry (`tcn-pin-v2:`, 139 characters, with its name and `allow`) takes about 230 bytes.
+const COMPACT_ENTRY_LEN: usize = 256;
+
+/// Maximum size of a configuration file other than a key: the policy, `clients.toml`,
+/// `client.toml`, the denylist, `relay.toml` (finding A12-2). Derived from the entry bound:
+/// [`MAX_PEER_ENTRIES`] compact entries, 8 MiB. That is also about 3 300 entries with full
+/// `tcn-pub-v2:` keys (about 2 500 bytes each), which an initiator's `client.toml` needs.
+pub const MAX_TRUST_FILE_LEN: usize = MAX_PEER_ENTRIES * COMPACT_ENTRY_LEN;
 
 /// Maximum size of a certificate file: the largest certificate in hexadecimal fits comfortably
 /// in 16 KiB.
@@ -285,9 +300,10 @@ fn check_directory(_path: &Path, _uid: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Reads a trust file (see [`open_trusted`]).
+/// Reads a trust file (see [`open_trusted`]), at most [`MAX_TRUST_FILE_LEN`] bytes.
 fn read_limited(path: &Path) -> Result<String, ConfigError> {
-    read_file_limited(open_trusted(path, false)?, path)
+    let max = u64::try_from(MAX_TRUST_FILE_LEN).unwrap_or(u64::MAX);
+    read_file_bounded(open_trusted(path, false)?, path, max)
 }
 
 fn read_file_limited(file: std::fs::File, path: &Path) -> Result<String, ConfigError> {
@@ -343,15 +359,18 @@ pub fn load_keyring(current: &Path, previous: Option<&Path>) -> Result<Keyring, 
 }
 
 /// The public lines `keygen` prints (PROTOCOL §7.5.3, OPERATIONS §16): the v1 key and
-/// fingerprint, then the v2 key (`tcn-pub-v2:`) and fingerprint v2 derived from the same seed.
+/// fingerprint, then the v2 key (`tcn-pub-v2:`) and fingerprint v2 derived from the same seed,
+/// and the compact v2 pin (`tcn-pin-v2:`) for the responders' files (finding A12-2).
 #[must_use]
 pub fn public_identity_text(identity: &Identity) -> String {
     format!(
-        "public_key     = \"{}\"\nfingerprint    = {}\npublic_key_v2  = \"{}\"\nfingerprint_v2 = {}\n",
+        "public_key     = \"{}\"\nfingerprint    = {}\npublic_key_v2  = \"{}\"\nfingerprint_v2 = {}\n\
+         pin_v2         = \"{}\"\n",
         identity.public_key(),
         identity.fingerprint(),
         identity.hybrid_public_key(),
-        identity.hybrid_fingerprint()
+        identity.hybrid_fingerprint(),
+        identity.hybrid_pin()
     )
 }
 
@@ -459,6 +478,10 @@ struct RevocationsFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
+    /// The roles that must prove a pinned or certificate-bound hybrid identity (finding A12-1):
+    /// `"agents"`, `"clients"` (only `"clients"` in `clients.toml`).
+    #[serde(default)]
+    require_hybrid_identity: Vec<String>,
     #[serde(default)]
     agents: Vec<AgentEntry>,
     #[serde(default)]
@@ -560,6 +583,74 @@ impl Ctx<'_> {
             source,
         })
     }
+    /// A responder-side pin (relay policy, `clients.toml`): a v1 key, a v2 key, or the compact
+    /// v2 pin `tcn-pin-v2:` (finding A12-2). The X25519-level fingerprint, and the fingerprint
+    /// v2 to pin if the entry has one.
+    fn responder_key(
+        &self,
+        entry: &str,
+        text: &str,
+    ) -> Result<(Fingerprint, Option<HybridFingerprint>), ConfigError> {
+        if text.starts_with(HybridPin::PREFIX) {
+            let pin: HybridPin = text.parse().map_err(|source| ConfigError::Key {
+                path: self.0.into(),
+                entry: entry.into(),
+                source,
+            })?;
+            return Ok((pin.fingerprint(), Some(pin.hybrid_fingerprint())));
+        }
+        let key = self.key(entry, text)?;
+        Ok((
+            key.fingerprint(),
+            key.hybrid().map(HybridPublicKey::hybrid_fingerprint),
+        ))
+    }
+    /// At most [`MAX_PEER_ENTRIES`] entries (finding A12-2).
+    fn entries(&self, count: usize) -> Result<(), ConfigError> {
+        if count > MAX_PEER_ENTRIES {
+            return Err(ConfigError::Syntax {
+                path: self.0.into(),
+                message: format!("{count} entries, at most {MAX_PEER_ENTRIES}"),
+            });
+        }
+        Ok(())
+    }
+    /// `require_hybrid_identity`: an explicit set of roles, each named once (AP-7 style).
+    fn hybrid_requirement(
+        &self,
+        roles: &[String],
+        allowed: &[&str],
+    ) -> Result<HybridRequirement, ConfigError> {
+        let (mut agents, mut clients) = (false, false);
+        for role in roles {
+            let slot = match role.as_str() {
+                "agents" if allowed.contains(&"agents") => &mut agents,
+                "clients" if allowed.contains(&"clients") => &mut clients,
+                _ => {
+                    return Err(ConfigError::Syntax {
+                        path: self.0.into(),
+                        message: format!(
+                            "require_hybrid_identity: unknown role (expected {})",
+                            allowed.join(", ")
+                        ),
+                    });
+                }
+            };
+            if *slot {
+                return Err(ConfigError::Syntax {
+                    path: self.0.into(),
+                    message: "require_hybrid_identity: a role is listed twice".into(),
+                });
+            }
+            *slot = true;
+        }
+        Ok(HybridRequirement::new(agents, clients))
+    }
+    /// The entry name of the key a [`DomainError::HybridIdentityRequired`] names.
+    fn required(&self, name: Option<&NodeId>, source: DomainError) -> ConfigError {
+        let entry = name.map_or_else(|| "require_hybrid_identity".to_owned(), NodeId::to_string);
+        self.domain(&entry, source)
+    }
     /// A key that MUST be the canonical encoding of a valid, non-weak point: the CA and
     /// denylist keys (the byte-by-byte comparison in step 5 of PROTOCOL §15.4 assumes
     /// canonical pins).
@@ -617,21 +708,26 @@ impl Ctx<'_> {
 /// Parses the relay policy.
 ///
 /// ```toml
+/// require_hybrid_identity = ["agents", "clients"]   # optional (PQ-AUTH, finding A12-1)
+///
 /// [[agents]]
 /// node = "web-01"
 /// public_key = "<64 hex>"    # during rotation: public_keys = ["<new>", "<old>"]
 ///
 /// [[clients]]
 /// name = "ansible"
-/// public_key = "<64 hex>"
+/// public_key = "<64 hex>"    # or "tcn-pub-v2:<hex>", or "tcn-pin-v2:<hex>:<hex>"
 /// allow = ["web-01"]      # or ["*"] for every node
 /// ```
 ///
 /// # Errors
-/// Any invalid, duplicate or conflicting entry.
+/// Any invalid, duplicate or conflicting entry; more than [`MAX_PEER_ENTRIES`] entries; an
+/// entry of a role in `require_hybrid_identity` without a v2 key or pin.
 pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    ctx.entries(file.agents.len().saturating_add(file.clients.len()))?;
+    let required = ctx.hybrid_requirement(&file.require_hybrid_identity, &["agents", "clients"])?;
     let mut policy = AccessPolicy::new();
     for entry in &file.agents {
         let node = ctx.node(&entry.node, &entry.node)?;
@@ -643,27 +739,40 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
         };
         let keys = texts
             .into_iter()
-            .map(|t| ctx.key(&entry.node, t))
+            .map(|t| ctx.responder_key(&entry.node, t))
             .collect::<Result<Vec<_>, _>>()?;
-        let fingerprints: Vec<_> = keys.iter().map(PeerKey::fingerprint).collect();
+        let fingerprints: Vec<_> = keys.iter().map(|(fp, _)| *fp).collect();
         policy
             .add_agent_keys(node, &fingerprints)
             .map_err(|e| ctx.domain(&entry.node, e))?;
-        for key in &keys {
-            pin_hybrid(key, |fp, v2| policy.pin_hybrid(fp, v2))
-                .map_err(|e| ctx.domain(&entry.node, e))?;
+        for (fp, v2) in &keys {
+            if let Some(v2) = v2 {
+                policy
+                    .pin_hybrid(*fp, *v2)
+                    .map_err(|e| ctx.domain(&entry.node, e))?;
+            }
         }
     }
     for entry in &file.clients {
         let name = ctx.node(&entry.name, &entry.name)?;
-        let key = ctx.key(&entry.name, &entry.public_key)?;
+        let (fp, v2) = ctx.responder_key(&entry.name, &entry.public_key)?;
         let allowed = ctx.allowed(&entry.name, &entry.allow)?;
         policy
-            .add_client(key.fingerprint(), ClientGrant { name, allowed })
+            .add_client(fp, ClientGrant { name, allowed })
             .map_err(|e| ctx.domain(&entry.name, e))?;
-        pin_hybrid(&key, |fp, v2| policy.pin_hybrid(fp, v2))
-            .map_err(|e| ctx.domain(&entry.name, e))?;
+        if let Some(v2) = v2 {
+            policy
+                .pin_hybrid(fp, v2)
+                .map_err(|e| ctx.domain(&entry.name, e))?;
+        }
     }
+    // Once every entry is in: a v1 entry of a required role is refused here.
+    policy
+        .require_hybrid_identity(required)
+        .map_err(|e| match e {
+            DomainError::HybridIdentityRequired(fp) => ctx.required(policy.entry_name(&fp), e),
+            other => ctx.domain("require_hybrid_identity", other),
+        })?;
     // The CAs last: `set_cert_trust` rejects a CA key equal to that of a peer.
     let trust = parse_authorities(&ctx, &file.authorities)?;
     policy
@@ -709,20 +818,36 @@ pub fn parse_authorized_clients(
 ) -> Result<AuthorizedClients, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    ctx.entries(file.agents.len().saturating_add(file.clients.len()))?;
+    let required = ctx.hybrid_requirement(&file.require_hybrid_identity, &["clients"])?;
     let mut clients = AuthorizedClients::new();
+    let mut names: HashMap<Fingerprint, &str> = HashMap::new();
     for entry in &file.clients {
-        let key = ctx.key(&entry.name, &entry.public_key)?;
+        let (fp, v2) = ctx.responder_key(&entry.name, &entry.public_key)?;
         // A repeated key is not an error (it was a set before Phase 6), but its v2 identity
         // is pinned once: a v1 and a v2 entry of one key, or two v2 entries, are refused.
-        if !clients.contains_key(&key.fingerprint()) {
+        if !clients.contains_key(&fp) {
             clients
-                .add_client(key.fingerprint())
+                .add_client(fp)
                 .map_err(|e| ctx.domain(&entry.name, e))?;
-        } else if key.hybrid().is_some() || clients.hybrid_identity(&key.fingerprint()).is_some() {
-            return Err(ctx.domain(&entry.name, DomainError::DuplicatePeer(key.fingerprint())));
+            names.insert(fp, &entry.name);
+        } else if v2.is_some() || clients.hybrid_identity(&fp).is_some() {
+            return Err(ctx.domain(&entry.name, DomainError::DuplicatePeer(fp)));
         }
-        pin_hybrid(&key, |fp, v2| clients.pin_hybrid(fp, v2))
-            .map_err(|e| ctx.domain(&entry.name, e))?;
+        if let Some(v2) = v2 {
+            clients
+                .pin_hybrid(fp, v2)
+                .map_err(|e| ctx.domain(&entry.name, e))?;
+        }
+    }
+    if required.clients() {
+        clients.require_hybrid_identity().map_err(|e| {
+            let name = match &e {
+                DomainError::HybridIdentityRequired(fp) => names.get(fp).copied(),
+                _ => None,
+            };
+            ctx.domain(name.unwrap_or("require_hybrid_identity"), e)
+        })?;
     }
     let trust = parse_authorities(&ctx, &file.authorities)?;
     clients
@@ -753,25 +878,12 @@ pub fn parse_revocations(origin: &str, text: &str) -> Result<Revocations, Config
     Revocations::new(serials, keys).map_err(|e| ctx.domain("revocations", e))
 }
 
-/// Pins the v2 identity of `key` if it is a v2 key (PROTOCOL §7.5.3): the entry stays keyed
-/// by the X25519-level fingerprint (finding AP-6), and the pin forbids the classical
-/// handshakes to that key.
-fn pin_hybrid(
-    key: &PeerKey,
-    pin: impl FnOnce(Fingerprint, HybridFingerprint) -> Result<(), DomainError>,
-) -> Result<(), DomainError> {
-    match key.hybrid() {
-        Some(hybrid) => pin(hybrid.fingerprint(), hybrid.hybrid_fingerprint()),
-        None => Ok(()),
-    }
-}
-
 /// A `keys` entry of the denylist, reduced to the X25519-level fingerprint, the unit of
-/// revocation (PROTOCOL §15.8, finding AP-6): a v1 key (canonical), a v2 key or a `SHA256:`
-/// fingerprint. A `SHA256v2:` fingerprint would match nothing and is refused, unechoed.
+/// revocation (PROTOCOL §15.8, finding AP-6): a v1 key (canonical), a v2 key, a compact v2 pin
+/// or a `SHA256:` fingerprint. A `SHA256v2:` fingerprint would match nothing and is refused, unechoed.
 fn revoked_key(ctx: &Ctx<'_>, entry: &str, text: &str) -> Result<Fingerprint, ConfigError> {
-    if text.starts_with(HybridPublicKey::PREFIX) {
-        return ctx.key(entry, text).map(|k| k.fingerprint());
+    if text.starts_with(HybridPublicKey::PREFIX) || text.starts_with(HybridPin::PREFIX) {
+        return ctx.responder_key(entry, text).map(|(fp, _)| fp);
     }
     if text.starts_with(HybridFingerprint::PREFIX) {
         return Err(ctx.domain(entry, DomainError::HybridFingerprintNotRevocable));
@@ -943,6 +1055,7 @@ pub fn parse_known_nodes(
 ) -> Result<HashMap<NodeId, PeerKey>, ConfigError> {
     let ctx = Ctx(origin);
     let file: NodesFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    ctx.entries(file.nodes.len())?;
     let mut nodes = HashMap::new();
     for entry in &file.nodes {
         let node = ctx.node(&entry.node, &entry.node)?;
@@ -1257,6 +1370,7 @@ pub fn parse_client_settings(
 ) -> Result<ClientSettings, ConfigError> {
     let ctx = Ctx(origin);
     let file: ClientFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
+    ctx.entries(file.nodes.len())?;
     // `relay` + `relay_key` or `[[relays]]`, never both.
     let (addresses, key_texts): (Vec<String>, Vec<String>) =
         match (&file.relay, &file.relay_key, file.relays.as_slice()) {

@@ -36,6 +36,8 @@ pub struct Identity {
     key: SigningKey,
     /// The static ML-KEM-768 key pair derived from the seed (PQ-AUTH, D12).
     kem: StaticKem,
+    /// The X25519 public key, which the responder hashes into every message 1 it reads.
+    x25519: [u8; 32],
 }
 
 impl Identity {
@@ -60,9 +62,12 @@ impl Identity {
     }
 
     fn from_seed(seed: &[u8; 32]) -> Self {
+        let key = SigningKey::from_bytes(seed);
+        let x25519 = key.verifying_key().to_montgomery().to_bytes();
         Self {
-            key: SigningKey::from_bytes(seed),
+            key,
             kem: StaticKem::derive(seed),
+            x25519,
         }
     }
 
@@ -70,6 +75,13 @@ impl Identity {
     #[must_use]
     pub fn hybrid_public_key(&self) -> HybridPublicKey {
         HybridPublicKey::new(self.public_key(), std::sync::Arc::clone(&self.kem.ek))
+    }
+
+    /// The compact v2 pin of the identity, for responder-side configuration (`tcn-pin-v2:`,
+    /// finding A12-2).
+    #[must_use]
+    pub fn hybrid_pin(&self) -> crate::hybrid::HybridPin {
+        crate::hybrid::HybridPin::from(&self.hybrid_public_key())
     }
 
     /// The fingerprint v2 of the identity.
@@ -127,6 +139,11 @@ impl Identity {
     /// The corresponding X25519 secret, for Noise.
     pub(crate) fn x25519_secret(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.key.to_scalar_bytes())
+    }
+
+    /// The X25519 public key (the Montgomery form of the Ed25519 key).
+    pub(crate) const fn x25519_public(&self) -> &[u8; 32] {
+        &self.x25519
     }
 }
 

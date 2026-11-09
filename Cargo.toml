@@ -54,6 +54,11 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "jso
 # (libcrux), never from snow: no `pqclean` feature. snow is the vendored, patched copy below.
 snow          = { version = "0.10.0", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom", "hfs"] }
 ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+# Review 0012 (A12-6): the responder's pre-filter replays snow's first message-1 steps with
+# snow's own primitives: the same crates and versions as the vendored snow, already in the graph.
+blake2           = { version = "0.10.6", default-features = false }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+curve25519-dalek = { version = "4.1.3", default-features = false }
 sha2          = "0.11.1"
 hex           = "0.4.3"
 getrandom     = "0.4.3"

@@ -42,7 +42,9 @@ impl MlDsa65SigningKey {
     /// `ML-DSA.KeyGen_internal(ξ)` (FIPS 204 Algorithm 6).
     #[must_use]
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
-        let xi = Zeroizing::new(ml_dsa::B32::from(*seed));
+        // Copied into its final, wiped place: no temporary copy of the seed (finding A12-8).
+        let mut xi = Zeroizing::new(ml_dsa::B32::default());
+        xi.copy_from_slice(seed);
         Self(Box::new(SigningKey::<MlDsa65>::from_seed(&xi)))
     }
 

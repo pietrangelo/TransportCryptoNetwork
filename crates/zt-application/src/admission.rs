@@ -732,7 +732,9 @@ impl Admission {
 
 /// `true` if an `authentication_failed` for `peer` deserves its own audit line (finding AP-3):
 /// the configuration knows the key (whitelisted or revoked), or a pinned CA's signature binds
-/// it (a certificate rejected after its signature was verified). Anything else is a key that
+/// it (a certificate rejected after its signature was verified, or refused by
+/// `require_hybrid_identity` with `identity_downgrade`, which is decided only for a whitelisted
+/// key or a verified certificate: finding A12-1 of review 0012). Anything else is a key that
 /// anyone could have made up, and only counts in the summary.
 #[must_use]
 pub fn is_known_identity(
@@ -751,6 +753,7 @@ pub fn is_known_identity(
                 | CertRejection::UnknownAuthority
                 | CertRejection::BadSignature
         ),
+        AuthFailureReason::IdentityDowngrade => true,
         _ => false,
     }
 }

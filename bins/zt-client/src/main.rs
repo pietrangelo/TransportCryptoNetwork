@@ -132,6 +132,7 @@ fn certificate(flag: Option<&Path>) -> Result<(), String> {
     let body = &cert.body;
     let identity = config::load_identity(&settings.key).map_err(|e| e.to_string())?;
     reject_leaked_secret(cert_path, body, &identity)?;
+    check_hybrid_subject(cert_path, body, &identity)?;
     let mut out = String::new();
     let _ = writeln!(out, "file        = {}", cert_path.display());
     let _ = writeln!(out, "name        = {}", body.name());
@@ -208,6 +209,74 @@ fn check_validity(body: &AnyCertBody, now: UnixTime) -> Validity {
     }
 }
 
+/// A hybrid-bound certificate passes only a handshake that proves its fingerprint v2: the
+/// client's own (finding A12-7 of review 0012).
+fn check_hybrid_subject(
+    path: &Path,
+    body: &AnyCertBody,
+    identity: &Identity,
+) -> Result<(), String> {
+    match hybrid_subject(body) {
+        Some(bound) if *bound != identity.hybrid_fingerprint() => Err(format!(
+            "{}: the certificate is bound to the fingerprint v2 {bound}, not to this client's \
+             fingerprint v2 {}: it would be refused on every hop",
+            path.display(),
+            identity.hybrid_fingerprint()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The fingerprint v2 a hybrid-bound certificate (`subject_kind = 0x02`) is bound to.
+fn hybrid_subject(body: &AnyCertBody) -> Option<&zt_domain::HybridFingerprint> {
+    match body {
+        AnyCertBody::V1(_) => None,
+        AnyCertBody::V2(body) => body.subject().hybrid(),
+    }
+}
+
+/// A hybrid-bound certificate goes in message 1 of both hops, and passes only the hybrid IK
+/// suite (finding A12-7 of review 0012): a node pinned to another suite, or relays none of
+/// which is, refuse the client whatever happens, so that is an error before any connection;
+/// with some relays on another suite failover to them would be refused, so it is a warning
+/// that names them.
+fn check_hybrid_hops(config: &zt_net::client::ClientConfig, path: &Path) -> Result<(), String> {
+    let hybrid = |suite: HandshakeSuite| suite.requires_hybrid_identity();
+    if !hybrid(config.node_suite) {
+        return Err(format!(
+            "{}: the certificate is bound to a fingerprint v2 and passes only the hybrid IK \
+             suite, but node {} is pinned to {}: pin it to the hybrid IK suite with its \
+             tcn-pub-v2 key (OPERATIONS §16)",
+            path.display(),
+            config.node,
+            config.node_suite.protocol_name()
+        ));
+    }
+    let classical: Vec<&str> = config
+        .relays
+        .iter()
+        .filter(|r| !hybrid(r.suite))
+        .map(|r| r.address.as_str())
+        .collect();
+    if classical.len() == config.relays.len() {
+        return Err(format!(
+            "{}: the certificate is bound to a fingerprint v2 and passes only the hybrid IK \
+             suite, but no relay is pinned to it: pin the relays to the hybrid IK suite with \
+             their tcn-pub-v2 keys (OPERATIONS §16)",
+            path.display()
+        ));
+    }
+    if !classical.is_empty() {
+        warn(&format!(
+            "warning: {}: the certificate passes only the hybrid IK suite; a failover to the \
+             relay(s) {} pinned to another suite would be refused",
+            path.display(),
+            classical.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Loads the configured certificate and checks, before any connection, that it is for
 /// `identity` and has not expired. A certificate not yet valid or close to expiry only
 /// causes a warning on stderr (the relay and agent clocks decide).
@@ -236,6 +305,7 @@ fn load_own_certificate(
             identity.fingerprint()
         ));
     }
+    check_hybrid_subject(path, &cert.body, identity)?;
     let (nb, na) = (
         zt_net::utc_text(cert.body.not_before()),
         zt_net::utc_text(cert.body.not_after()),
@@ -353,6 +423,9 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
     let not_after = match settings.certificate.as_deref() {
         Some(path) => {
             let cert = load_own_certificate(path, &identity)?;
+            if hybrid_subject(&cert.body).is_some() {
+                check_hybrid_hops(&config, path)?;
+            }
             config.certificate = Some(cert.bytes);
             Some(cert.body.not_after())
         }

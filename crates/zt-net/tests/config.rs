@@ -130,7 +130,8 @@ fn secret_keys_require_private_permissions_and_are_never_overwritten() {
 
     let big = dir.join("big.toml");
     let mut f = std::fs::File::create(&big).unwrap();
-    f.write_all(&vec![b'#'; 2 * 1024 * 1024]).unwrap();
+    f.write_all(&vec![b'#'; zt_net::config::MAX_TRUST_FILE_LEN + 1])
+        .unwrap();
     assert!(matches!(
         zt_net::config::load_policy(&big),
         Err(ConfigError::TooLarge(_))

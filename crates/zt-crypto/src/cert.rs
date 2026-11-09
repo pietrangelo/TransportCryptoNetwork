@@ -278,6 +278,7 @@ fn verify_composite(
         .verifying_key()
         .verify_strict(message, &signature)
         .map_err(|_| CertRejection::BadSignature)?;
+    mldsa_calls::hit();
     if !mldsa::verify(
         composite.mldsa_key(),
         message,
@@ -287,6 +288,34 @@ fn verify_composite(
         return Err(CertRejection::BadSignature);
     }
     Ok(())
+}
+
+/// Calls of the ML-DSA verifier, counted for the unit test of the AP-5 order (finding A12-3
+/// of review 0012). Nothing is counted outside the unit tests.
+#[cfg(test)]
+mod mldsa_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn hit() {
+        CALLS.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    pub(super) fn reset() {
+        CALLS.with(|c| c.set(0));
+    }
+
+    pub(super) fn get() -> usize {
+        CALLS.with(Cell::get)
+    }
+}
+
+#[cfg(not(test))]
+mod mldsa_calls {
+    pub(super) const fn hit() {}
 }
 
 /// The signed message of a certificate v2: `CTX2 ‖ TBS` (both components sign it).

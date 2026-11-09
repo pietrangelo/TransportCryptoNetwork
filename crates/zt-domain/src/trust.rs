@@ -82,6 +82,17 @@ impl TrustedCaKey {
         }
     }
 
+    /// `true` if the two pins share a component key (AP-13, finding A12-5 of review 0012): the
+    /// Ed25519 key (by bytes or fingerprint, whatever the algorithm) or the ML-DSA-65 key of
+    /// two composites. A rotation that kept one half would not rotate it.
+    fn shares_a_component(&self, other: &Self) -> bool {
+        let mldsa = match (&self.composite, &other.composite) {
+            (Some(a), Some(b)) => a.mldsa_key == b.mldsa_key,
+            _ => false,
+        };
+        self.key == other.key || self.fingerprint == other.fingerprint || mldsa
+    }
+
     /// The certificate version this key signs: 1 or 2.
     #[must_use]
     pub const fn version(&self) -> u8 {
@@ -229,7 +240,7 @@ impl CertTrust {
         // v1 key it replaces, even in the same entry (finding AP-13).
         let distinct = match keys {
             [_] => true,
-            [a, b] => a.key != b.key && a.fingerprint != b.fingerprint,
+            [a, b] => !a.shares_a_component(b),
             _ => false,
         };
         if !distinct || keys.len() > MAX_AUTHORITY_KEYS {
@@ -253,7 +264,7 @@ impl CertTrust {
                 .authorities
                 .iter()
                 .flat_map(|a| a.keys.iter())
-                .any(|k| k.key == key.key || k.fingerprint == key.fingerprint);
+                .any(|k| k.shares_a_component(key));
             if taken {
                 return Err(DomainError::DuplicatePeer(key.fingerprint));
             }

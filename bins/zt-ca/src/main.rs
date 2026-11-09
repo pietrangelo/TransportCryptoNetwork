@@ -57,11 +57,17 @@ enum Command {
         /// Issuance log (TSV, append-only, 0600). Mandatory.
         #[arg(long)]
         log: PathBuf,
-        /// Public key of the client: 64 hex characters, or its `tcn-pub-v2:` key, which a v2
-        /// CA binds to the hybrid identity (the certificate then passes only the hybrid IK
-        /// suite, PROTOCOL §15.14).
+        /// Public key of the client: its `tcn-pub-v2:` key, which a v2 CA binds to the hybrid
+        /// identity (the certificate then passes only the hybrid IK suite, PROTOCOL §15.14),
+        /// or 64 hex characters (a v1 CA; a v2 CA only with `--classical-subject`).
         #[arg(long)]
         subject: String,
+        /// With a v2 CA and a 64-hex `--subject`: issue a classical-kind certificate, bound to
+        /// the X25519 key only. A CRQC that recovers that key can present it with its own
+        /// ML-KEM key, and a relay or agent with `require_hybrid_identity` refuses it
+        /// (finding A12-1 of review 0012).
+        #[arg(long)]
+        classical_subject: bool,
         /// Name of the client, for audit logs (`[a-z0-9-]`, 1..=63).
         #[arg(long)]
         name: String,
@@ -123,10 +129,12 @@ fn run(command: &Command) -> Result<(), String> {
             validity,
             not_before,
             out,
+            classical_subject,
         } => sign(&SignArgs {
             ca,
             log,
             subject,
+            classical_subject: *classical_subject,
             name,
             nodes,
             all_nodes: *all_nodes,
@@ -167,6 +175,7 @@ struct SignArgs<'a> {
     ca: &'a Path,
     log: &'a Path,
     subject: &'a str,
+    classical_subject: bool,
     name: &'a str,
     nodes: &'a [String],
     all_nodes: bool,
@@ -174,6 +183,11 @@ struct SignArgs<'a> {
     not_before: Option<u64>,
     out: &'a Path,
 }
+
+/// A v2 CA with a 64-hex subject and no `--classical-subject` (finding A12-1 of review 0012).
+const CLASSICAL_SUBJECT_NEEDED: &str = "--subject: a v2 CA binds the tcn-pub-v2 key of the \
+     client (zt-agent/zt-client pubkey); for a classical-kind certificate bound to the X25519 \
+     key only, which a CRQC could reuse, add --classical-subject";
 
 /// `--subject`: a v1 key, or a `tcn-pub-v2:` key and its fingerprint v2 (PROTOCOL §15.14).
 fn parse_subject(text: &str) -> Result<(PublicKey, Option<zt_domain::HybridFingerprint>), String> {
@@ -194,6 +208,14 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     // All argument checks before touching a file.
     let lifetime = parse_validity(args.validity)?;
     let (subject, subject_v2) = parse_subject(args.subject)?;
+    if args.classical_subject && subject_v2.is_some() {
+        return Err(
+            "--classical-subject: the subject is a tcn-pub-v2 key; give its 64-hex key for a \
+             classical-kind certificate, or drop the flag for a hybrid-bound one"
+                .into(),
+        );
+    }
+    let classical_choice = subject_v2.is_some() || args.classical_subject;
     let name =
         NodeId::try_from(args.name).map_err(|_| "--name: must be [a-z0-9-], 1..=63 characters")?;
     let scope = parse_scope(args.nodes, args.all_nodes)?;
@@ -239,6 +261,7 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
             let cert = sign_certificate(ca, &body).map_err(|e| format!("signing failed: {e}"))?;
             (cert, body.scope().clone(), "v1")
         }
+        AnyCaKey::V2(_) if !classical_choice => return Err(CLASSICAL_SUBJECT_NEEDED.into()),
         AnyCaKey::V2(ca) => {
             let public = ca.public_key();
             if subject.fingerprint() == public.fingerprint() {
@@ -289,15 +312,36 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     append_log(args.log, args.ca, line.as_bytes())?;
     write_public_new(args.out, text.as_bytes())?;
 
+    emit(&issued_text(
+        &serial.to_string(),
+        &subject_fp,
+        subject_v2.as_ref(),
+        not_before,
+        not_after,
+    ))
+}
+
+/// What `sign` prints: serial, subject (and `subject_v2`), the kind of subject, validity.
+fn issued_text(
+    serial: &str,
+    subject_fp: &zt_domain::Fingerprint,
+    subject_v2: Option<&zt_domain::HybridFingerprint>,
+    not_before: UnixTime,
+    not_after: UnixTime,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "serial      = {serial}");
     let _ = writeln!(out, "subject     = {subject_fp}");
     if let Some(hybrid) = subject_v2 {
         let _ = writeln!(out, "subject_v2  = {hybrid}");
     }
+    // The choice of `--classical-subject` is visible here and in the log (version and the
+    // `-` of the hybrid column).
+    let kind = subject_v2.map_or("classical", |_| "hybrid");
+    let _ = writeln!(out, "subject_kind = {kind}");
     let _ = writeln!(out, "not_before  = {}", zt_net::utc_text(not_before));
     let _ = writeln!(out, "not_after   = {}", zt_net::utc_text(not_after));
-    emit(&out)
+    out
 }
 
 /// The CA key given to `inspect --ca-key`: either version.

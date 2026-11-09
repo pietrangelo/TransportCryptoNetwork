@@ -43,7 +43,8 @@ pub use frame::{CloseReason, Credit, Frame, FrameKind, RejectReason};
 pub use ids::{NodeId, SessionId, StreamId};
 pub use payload::FramePayload;
 pub use policy::{
-    AccessPolicy, Admission, AllowedNodes, ClientCredential, ClientGrant, MAX_AGENT_KEYS, PeerRole,
+    AccessPolicy, Admission, AllowedNodes, ClientCredential, ClientGrant, HybridRequirement,
+    MAX_AGENT_KEYS, PeerRole,
 };
 pub use suite::{
     AcceptedSuites, HandshakeChannel, HandshakeSuite, InitiatorRole, SuiteError, SuitePolicy,
