@@ -28,13 +28,14 @@ fn client_toml(extra: &str) -> String {
     )
 }
 
-/// `connect_deadline_secs` in `client.toml`: 20 s by default, 1 to 300 s accepted.
+/// `connect_deadline_secs` in `client.toml`: 8 s by default (inside the 10 s `ConnectTimeout`
+/// that Ansible passes to `ssh`, finding A11-2), 1 to 300 s accepted.
 #[test]
 fn connect_deadline_is_read_from_client_toml() {
     let base = std::path::Path::new("/etc/tcn");
     let parse = |text: &str| zt_net::config::parse_client_settings("client.toml", base, text);
     let default = parse(&client_toml("")).unwrap();
-    assert_eq!(default.connect_deadline, Duration::from_secs(20));
+    assert_eq!(default.connect_deadline, Duration::from_secs(8));
     let set = parse(&client_toml("connect_deadline_secs = 7\n")).unwrap();
     assert_eq!(set.connect_deadline, Duration::from_secs(7));
     for bad in ["0", "301", "-1", "\"20\""] {

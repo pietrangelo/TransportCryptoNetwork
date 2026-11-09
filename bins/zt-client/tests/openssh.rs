@@ -428,3 +428,173 @@ async fn ssh_reports_the_failover_deadline() {
     );
     assert!(started.elapsed() < Duration::from_secs(6));
 }
+
+// ---------- Review 0011: failover under Ansible's ConnectTimeout (A11-2, A11-4) ----------
+
+/// A TCP proxy whose forwarding can be frozen (bytes are read and held): a half-open link.
+async fn freezable_proxy(
+    target: SocketAddr,
+    frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = l.accept().await {
+            let outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+            let (ri, wi) = inbound.into_split();
+            let (ro, wo) = outbound.into_split();
+            for (mut r, mut w, f) in [
+                (
+                    Box::new(ri) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(wo) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    frozen.clone(),
+                ),
+                (Box::new(ro), Box::new(wi), frozen.clone()),
+            ] {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    loop {
+                        let n = match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        while f.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+    addr
+}
+
+/// Finding A11-2: relay B, listed first, is alive and completes the outer handshake, but its
+/// link to the agent is half-open (G4; or B is overloaded or compromised and sits on `Open`).
+/// Relay A is healthy. `ssh` runs with `-o ConnectTimeout=<connect_timeout>`, which Ansible
+/// always passes (`[defaults] timeout`, 10 s by default) and which OpenSSH applies to the
+/// banner exchange through a `ProxyCommand`.
+async fn stalled_first_relay(connect_timeout: u32) -> (std::process::Output, Duration) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant};
+    let lab = Lab::start().await;
+    // Relay B: same policy as the lab's relay A, default (production) timeouts.
+    let relay_b_id = zt_crypto::Identity::generate().unwrap();
+    let mut policy = AccessPolicy::new();
+    policy
+        .add_agent(lab.fleet.agent_id.fingerprint(), common::node("web-01"))
+        .unwrap();
+    policy
+        .add_client(
+            lab.fleet.ansible.fingerprint(),
+            ClientGrant {
+                name: common::node("ansible"),
+                allowed: AllowedNodes::Only([common::node("web-01")].into_iter().collect()),
+            },
+        )
+        .unwrap();
+    let server = zt_net::relay::RelayServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        zt_crypto::Identity::from_secret_hex(&relay_b_id.to_secret_hex()).unwrap(),
+        policy,
+        zt_net::relay::RelayConfig::default(),
+    )
+    .await
+    .unwrap();
+    let relay_b = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+    // A second agent process for web-01 (same key), registered with B through the proxy.
+    let frozen = Arc::new(AtomicBool::new(false));
+    let via = freezable_proxy(relay_b, frozen.clone()).await;
+    let config = zt_net::agent::AgentConfig {
+        relays: vec![zt_net::RelayEndpoint {
+            address: via.to_string(),
+            public_key: relay_b_id.public_key(),
+            suite: zt_domain::HandshakeSuite::NoiseIk25519,
+        }],
+        node: common::node("web-01"),
+        ssh_target: "127.0.0.1:9".into(),
+        authorized_clients: zt_net::Revocable::fixed(
+            [lab.fleet.ansible.fingerprint()]
+                .into_iter()
+                .collect::<zt_domain::AuthorizedClients>(),
+        ),
+        timeouts: zt_net::Timeouts::default(),
+        max_streams: 16,
+        client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+        reconnect: zt_net::agent::ReconnectConfig::default(),
+    };
+    tokio::spawn(zt_net::agent::run(
+        Arc::new(zt_crypto::Keyring::single(
+            zt_crypto::Identity::from_secret_hex(&lab.fleet.agent_id.to_secret_hex()).unwrap(),
+        )),
+        config,
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The agent link of B is now half-open.
+    frozen.store(true, Ordering::SeqCst);
+    rewrite_relays(
+        &lab,
+        "",
+        &[
+            (relay_b.to_string(), relay_b_id.public_key()),
+            (lab.fleet.relay.to_string(), lab.fleet.relay_id.public_key()),
+        ],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab
+        .ssh()
+        .arg("-o")
+        .arg(format!("ConnectTimeout={connect_timeout}"))
+        .arg("echo tcn-failover"))
+    .await;
+    (out, started.elapsed())
+}
+
+/// Finding A11-2: under Ansible's default `ConnectTimeout = 10`, a first relay that stalls
+/// after its handshake no longer ends `ssh` before failover: the `OpenAck` wait (4 s with two
+/// relays) leaves the healthy relay enough time, banner exchange included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_fails_over_a_stalled_relay_within_ansibles_connect_timeout() {
+    let (out, at) = stalled_first_relay(10).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "tcn-failover\n");
+    assert!(
+        at >= Duration::from_secs(3) && at < Duration::from_secs(8),
+        "{at:?}"
+    );
+}
+
+/// Finding A11-4: with the default timeouts (no `connect_deadline_secs`), one silent relay
+/// ends at the 5 s handshake timeout; `ssh` exits 255 (what Ansible retries) with the reason
+/// from `zt-client` on stderr, inside Ansible's 10 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_reports_a_silent_relay_with_the_default_timeouts() {
+    let lab = Lab::start().await;
+    let silent = silent_relay().await;
+    rewrite_relays(
+        &lab,
+        "",
+        &[(
+            silent.to_string(),
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab.ssh().arg("-o").arg("ConnectTimeout=10").arg("true")).await;
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{stderr}");
+    assert!(
+        stderr.contains("zt-client: timed out: handshake"),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+}

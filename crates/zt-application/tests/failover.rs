@@ -2,8 +2,10 @@
 //! catalogue R4-F1..R4-F7; review 0007 AP-10 and D-4; backlog A5-4). Sans-IO: time enters as the
 //! time elapsed since the plan started, the jitter as a sample passed in.
 //!
-//! - an overall deadline (20 s) for establishment only;
-//! - per-step timeouts: connect 3 s, outer handshake 5 s, `OpenAck` 10 s;
+//! - an overall deadline (8 s) for establishment only, inside the 10 s `ConnectTimeout` that
+//!   Ansible passes to `ssh` (finding A11-2);
+//! - per-step timeouts: connect 3 s, outer handshake 5 s, `OpenAck` 4 s at most, shared out
+//!   over the relays left within the deadline and never under the stagger (finding A11-3);
 //! - a staggered hedge (2 s plus jitter) with at most two attempts in flight, **only while the
 //!   attempt in flight has not completed connect and outer handshake** (AP-10): a relay that
 //!   handshakes and then is slow to answer `Open` is overloaded, not dead;
@@ -63,10 +65,10 @@ fn ready(plan: &mut FailoverPlan, now: Duration, relay: usize) -> Vec<Action> {
 #[test]
 fn the_defaults_are_those_of_the_plan() {
     let c = FailoverConfig::default();
-    assert_eq!(c.deadline, secs(20));
+    assert_eq!(c.deadline, secs(8));
     assert_eq!(c.connect, secs(3));
     assert_eq!(c.handshake, secs(5));
-    assert_eq!(c.open, secs(10));
+    assert_eq!(c.open, secs(4));
     assert_eq!(c.stagger, secs(2));
     assert_eq!(MAX_IN_FLIGHT, 2);
     assert!(c.validate().is_ok());
@@ -162,22 +164,117 @@ fn a_slow_handshake_is_hedged() {
 }
 
 /// AP-10: once relay 1 has completed connect and outer handshake, a missing `OpenAck` is
-/// overload, not a dead relay: no hedge, the plan waits up to the open timeout (10 s) and only
-/// then moves on.
+/// overload, not a dead relay: no hedge, the plan waits up to the open timeout (here half of
+/// the 7.9 s left, for the two relays left) and only then moves on.
 #[test]
 fn a_slow_open_ack_is_never_hedged() {
     let mut p = plan(2);
     p.start();
     ready(&mut p, ms(100), 0);
     // The next wake is the open timeout, not a stagger.
-    assert_eq!(p.next_wake(), Some(ms(10_100)));
-    let actions = run_until(&mut p, ms(10_099));
+    assert_eq!(p.next_wake(), Some(ms(4_050)));
+    let actions = run_until(&mut p, ms(4_049));
     assert!(actions.is_empty(), "{actions:?}");
     assert_eq!(p.in_flight(), 1);
     assert_eq!(
-        p.tick(ms(10_100)),
+        p.tick(ms(4_050)),
         vec![Action::TimedOut(0, Step::Open), Action::Start(1)]
     );
+}
+
+/// Finding A11-3: relays that complete the outer handshake and then sit on `Open` share the
+/// deadline: each gets the time left divided by the relays left (itself included), so a
+/// healthy third relay is still reached, with as much time as the others.
+#[test]
+fn stalling_relays_share_the_deadline() {
+    let mut p = plan(3);
+    p.start();
+    ready(&mut p, Duration::ZERO, 0);
+    // 8 s for three relays.
+    let first = p.next_wake().unwrap();
+    assert!(first > ms(2_666) && first < ms(2_667), "{first:?}");
+    assert_eq!(
+        p.tick(first),
+        vec![Action::TimedOut(0, Step::Open), Action::Start(1)]
+    );
+    ready(&mut p, first, 1);
+    // The 5.33 s left for two relays.
+    let second = p.next_wake().unwrap();
+    assert!(second > ms(5_333) && second < ms(5_334), "{second:?}");
+    assert_eq!(
+        p.tick(second),
+        vec![Action::TimedOut(1, Step::Open), Action::Start(2)]
+    );
+    ready(&mut p, ms(5_400), 2);
+    assert_eq!(
+        p.handle(ms(5_500), Event::Acked(2)),
+        vec![Action::Proceed(2)]
+    );
+}
+
+/// Finding A11-3: the shared wait never drops under the stagger (2 s), so a long relay list
+/// does not turn a merely slow `OpenAck` into a failure; nor over the open timeout (4 s).
+#[test]
+fn the_shared_wait_is_bounded() {
+    let mut p = plan(8);
+    p.start();
+    ready(&mut p, Duration::ZERO, 0);
+    assert_eq!(p.next_wake(), Some(secs(2)));
+    let mut p = FailoverPlan::new(
+        FailoverConfig {
+            deadline: secs(60),
+            ..FailoverConfig::default()
+        },
+        2,
+        0,
+    );
+    p.start();
+    ready(&mut p, Duration::ZERO, 0);
+    assert_eq!(p.next_wake(), Some(secs(4)));
+}
+
+/// Finding A11-2: with two relays and the defaults, whatever way the first relay fails (black
+/// hole, accept and silence, handshake then no `OpenAck`, at any moment before the stagger),
+/// a healthy second relay (300 ms handshake, 100 ms `OpenAck`) gives `Proceed` within 6.5 s:
+/// inside the 10 s `ConnectTimeout` that Ansible passes to `ssh` by default, with room left for
+/// the end-to-end handshake and the SSH banner.
+#[test]
+fn one_failed_relay_fits_ansibles_connect_timeout() {
+    // When relay 1 completes its handshake (None: never) and whether it connects at all.
+    let mut cases: Vec<(Option<Duration>, bool)> = vec![(None, false), (None, true)];
+    for t in [10, 500, 1_000, 1_999] {
+        cases.push((Some(ms(t)), true));
+    }
+    for (handshake, connects) in cases {
+        for jitter in [0, 250, 500] {
+            let mut p = FailoverPlan::new(FailoverConfig::default(), 2, jitter);
+            let mut actions = p.start();
+            if connects {
+                actions.extend(p.handle(ms(5), Event::Connected(0)));
+            }
+            if let Some(t) = handshake {
+                actions.extend(p.handle(t, Event::OuterReady(0)));
+            }
+            let mut started = actions
+                .contains(&Action::Start(1))
+                .then_some(Duration::ZERO);
+            while started.is_none() {
+                let wake = p.next_wake().unwrap();
+                if p.tick(wake).contains(&Action::Start(1)) {
+                    started = Some(wake);
+                }
+            }
+            let at = started.unwrap();
+            ready(&mut p, at + ms(300), 1);
+            let done = at + ms(400);
+            assert!(
+                p.handle(done, Event::Acked(1))
+                    .contains(&Action::Proceed(1)),
+                "{handshake:?} {connects}"
+            );
+            assert!(done <= ms(6_500), "{handshake:?} {connects}: {done:?}");
+        }
+    }
 }
 
 /// Per-step timeouts: connect 3 s from the start, handshake 5 s from the connect.
@@ -243,10 +340,11 @@ fn no_replacement_hedge_against_a_slow_open_ack() {
     assert_eq!(p.tick(secs(2)), vec![Action::Start(1)]);
     ready(&mut p, ms(2_100), 1);
     assert_eq!(p.tick(secs(3)), vec![Action::TimedOut(0, Step::Connect)]);
-    let actions = run_until(&mut p, ms(12_099));
+    // Relay 2 waits (8 - 2.1) / 2 s: relay 3 is still to come.
+    let actions = run_until(&mut p, ms(5_049));
     assert!(actions.is_empty(), "{actions:?}");
     assert_eq!(
-        p.tick(ms(12_100)),
+        p.tick(ms(5_050)),
         vec![Action::TimedOut(1, Step::Open), Action::Start(2)]
     );
 }
@@ -257,15 +355,15 @@ fn the_deadline_gives_up() {
     let mut p = plan(2);
     p.start();
     ready(&mut p, ms(100), 0);
-    p.tick(ms(10_100));
-    ready(&mut p, ms(10_200), 1);
-    assert_eq!(p.next_wake(), Some(secs(20)));
+    p.tick(ms(4_050));
+    ready(&mut p, ms(4_150), 1);
+    assert_eq!(p.next_wake(), Some(secs(8)));
     assert_eq!(
-        p.tick(secs(20)),
+        p.tick(secs(8)),
         vec![Action::Cancel(1), Action::GiveUp(GiveUp::Deadline)]
     );
     assert!(p.is_finished());
-    assert!(p.handle(secs(21), Event::Acked(1)).is_empty());
+    assert!(p.handle(secs(9), Event::Acked(1)).is_empty());
 }
 
 /// A configured deadline shorter than the steps wins over them.

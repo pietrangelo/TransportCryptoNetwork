@@ -10,8 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zt_crypto::noise::Channel;
 use zt_crypto::{Identity, Keyring};
-use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant, HandshakeSuite, NodeId};
+use zt_domain::{
+    AccessPolicy, AllowedNodes, ClientGrant, Frame, HandshakeSuite, NodeId, RejectReason,
+};
 use zt_net::client::{self, ClientConfig};
 use zt_net::net::{Acceptor, Dialer};
 use zt_net::relay::{RelayConfig, RelayServer};
@@ -74,8 +77,83 @@ pub fn sim<'a>(seconds: u64, seed: u64) -> turmoil::Sim<'a> {
 pub enum RelayKind {
     /// The real relay with this policy.
     Real(Box<AccessPolicy>),
+    /// The real relay with this policy and configuration (admission limits, R-1).
+    Configured(Box<AccessPolicy>, Box<RelayConfig>),
     /// Accepts TCP and never answers: a relay whose handshake never completes.
     Silent,
+    /// A scripted relay that completes the outer handshake and records every frame it
+    /// receives (finding A11-5: what a hedge loser sends is observable).
+    Scripted(Script),
+}
+
+/// The behaviour of a [`RelayKind::Scripted`] relay.
+#[derive(Clone, Default)]
+pub struct Script {
+    /// Delay between message 1 and message 2 (a slow outer handshake).
+    pub msg2_delay: Duration,
+    /// The answer to `Open`, after `answer_delay`; `None`: no answer.
+    pub answer: Option<Answer>,
+    pub answer_delay: Duration,
+    /// Sent when the client closes the stream (a refusal that crosses the client's `Close`).
+    pub on_close: Option<RejectReason>,
+    /// Every frame received from clients, on every connection, in order.
+    pub log: Arc<Mutex<Vec<Frame>>>,
+}
+
+/// The answer of a scripted relay to `Open`.
+#[derive(Clone, Copy)]
+pub enum Answer {
+    Ack,
+    Reject(RejectReason),
+}
+
+impl Script {
+    pub fn frames(&self) -> Vec<Frame> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+/// One connection to a scripted relay: handshake, then record and answer.
+async fn scripted(tcp: turmoil::net::TcpStream, keys: Arc<Keyring>, script: Script) {
+    let timeouts = Timeouts::default();
+    let Ok(pending) = zt_net::channel::accept(tcp, &keys, Channel::Outer, &timeouts).await else {
+        return;
+    };
+    tokio::time::sleep(script.msg2_delay).await;
+    let Ok(mut ch) = pending.establish(&timeouts).await else {
+        return;
+    };
+    // The agent's own connection (it registers first) is not logged.
+    let mut agent = false;
+    while let Ok(Some(frame)) = ch.recv().await {
+        agent = agent || matches!(frame, Frame::Register { .. });
+        if !agent {
+            script.log.lock().unwrap().push(frame.clone());
+        }
+        match frame {
+            Frame::Open { stream, .. } => {
+                if let Some(answer) = script.answer {
+                    tokio::time::sleep(script.answer_delay).await;
+                    let reply = match answer {
+                        Answer::Ack => Frame::OpenAck { stream },
+                        Answer::Reject(reason) => Frame::Reject { stream, reason },
+                    };
+                    if ch.send(&reply, &timeouts).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Frame::Close { stream, .. } => {
+                if let Some(reason) = script.on_close {
+                    let _ = ch.send(&Frame::Reject { stream, reason }, &timeouts).await;
+                }
+            }
+            Frame::Ping { nonce } => {
+                let _ = ch.send(&Frame::Pong { nonce }, &timeouts).await;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The fleet: relay keys, agent, client identities, counters.
@@ -166,6 +244,21 @@ impl Fleet {
                         )
                         .unwrap();
                         server.run().await.unwrap();
+                    }
+                    RelayKind::Configured(policy, config) => {
+                        let keys = Identity::from_secret_hex(&secret).unwrap();
+                        let (policy, _updater) = Revocable::new(*policy);
+                        let server =
+                            RelayServer::with_acceptor(acceptor, keys, policy, *config).unwrap();
+                        server.run().await.unwrap();
+                    }
+                    RelayKind::Scripted(script) => {
+                        let keys =
+                            Arc::new(Keyring::single(Identity::from_secret_hex(&secret).unwrap()));
+                        loop {
+                            let (s, _) = acceptor.accept().await?;
+                            tokio::spawn(scripted(s, Arc::clone(&keys), script.clone()));
+                        }
                     }
                     RelayKind::Silent => {
                         let mut held = Vec::new();
@@ -271,6 +364,12 @@ pub enum Outcome {
 
 /// Connects with `config`, sends "ping" and waits for the echo; the session is then dropped.
 pub async fn echo(secret: &str, config: ClientConfig) -> Outcome {
+    echo_and_hold(secret, config, Duration::ZERO).await
+}
+
+/// Like [`echo`], keeping the session open for `hold` after the echo (as `ssh` does): the
+/// hedge losers are closed in the background of the session.
+pub async fn echo_and_hold(secret: &str, config: ClientConfig, hold: Duration) -> Outcome {
     let identity = Identity::from_secret_hex(secret).unwrap();
     let started = tokio::time::Instant::now();
     let (mut app, local) = tokio::io::duplex(1024);
@@ -284,6 +383,7 @@ pub async fn echo(secret: &str, config: ClientConfig) -> Outcome {
         read = app.read_exact(&mut buf) => {
             if read.is_ok() && &buf == b"ping" {
                 let at = started.elapsed();
+                tokio::time::sleep(hold).await;
                 task.abort();
                 return Outcome::Echoed(at);
             }

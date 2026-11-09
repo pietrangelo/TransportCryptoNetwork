@@ -246,6 +246,61 @@ async fn the_deadline_exits_with_tempfail_and_a_clear_message() {
     );
 }
 
+/// Runs `zt-client connect web-01` against `relay` with the default failover settings and
+/// returns its exit status, stderr and duration.
+async fn connect_to(relay: &str) -> (Option<i32>, String, Duration) {
+    let me = zt_crypto::Identity::generate().unwrap();
+    let dir = common::ClientDir::new(
+        &me,
+        relay,
+        &zt_crypto::Identity::generate().unwrap().public_key(),
+        &[(
+            "web-01",
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let started = std::time::Instant::now();
+    let child = dir.spawn("web-01");
+    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("zt-client did not give up")
+        .unwrap();
+    assert!(out.stdout.is_empty());
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        started.elapsed(),
+    )
+}
+
+/// Finding A11-4: every give-up that says nothing about the right of access is temporary,
+/// not only the deadline. A relay that refuses TCP (restart, crash) exits with 75 at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusing_relay_exits_with_tempfail() {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (code, stderr, at) = connect_to(&closed.to_string()).await;
+    assert_eq!(code, Some(75), "stderr: {stderr}");
+    assert!(stderr.contains("zt-client:"), "{stderr}");
+    assert!(at < Duration::from_secs(3), "{at:?}");
+}
+
+/// Finding A11-4 with the default timeouts: a relay that accepts TCP and stays silent ends at
+/// the 5 s handshake timeout, before the 8 s deadline, and that is temporary too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_relay_exits_with_tempfail_with_the_defaults() {
+    let silent = silent_relay().await;
+    let (code, stderr, at) = connect_to(&silent.to_string()).await;
+    assert_eq!(code, Some(75), "stderr: {stderr}");
+    assert!(stderr.contains("timed out: handshake"), "{stderr}");
+    assert!(
+        at >= Duration::from_secs(5) && at < Duration::from_secs(7),
+        "{at:?}"
+    );
+}
+
 // ---------- Phase 6, step 9: certificates (OPERATIONS §10.4, PROTOCOL §15.6) ----------
 
 /// Spec: `zt-client certificate` prints name, nodes, CA, serial and validity of the

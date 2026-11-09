@@ -2,8 +2,9 @@
 //! catalogue R4-F1..R4-F7; review 0007 AP-10 and D-4; backlog A5-4). Sans-IO: time enters as the
 //! time elapsed since the plan started, the jitter as a sample passed in.
 //!
-//! - an overall deadline (20 s) for establishment only;
-//! - per-step timeouts: connect 3 s, outer handshake 5 s, `OpenAck` 10 s;
+//! - an overall deadline (8 s) for establishment only;
+//! - per-step timeouts: connect 3 s, outer handshake 5 s, `OpenAck` 4 s at most (shared out
+//!   over the relays left, finding A11-3);
 //! - a staggered hedge (2 s plus jitter) with at most two attempts in flight, **only while the
 //!   attempt in flight has not completed connect and outer handshake** (AP-10): a relay that
 //!   handshakes and then is slow to answer `Open` is overloaded, not dead;
@@ -123,10 +124,10 @@ fn deadline_applies_to_establishment_only() {
     let mut p = plan(2);
     p.start();
     ready(&mut p, ms(100), 0);
-    p.tick(ms(10_100));
-    ready(&mut p, ms(10_200), 1);
+    p.tick(ms(4_050));
+    ready(&mut p, ms(4_150), 1);
     assert_eq!(
-        p.handle(ms(19_900), Event::Acked(1)),
+        p.handle(ms(7_900), Event::Acked(1)),
         vec![Action::Proceed(1)]
     );
     assert_eq!(p.next_wake(), None);
@@ -167,12 +168,15 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 proptest! {
-    /// R4-F7 and the invariants of §5.3 under arbitrary event sequences: at most two attempts
-    /// in flight, each relay started at most once (handshakes ≤ relays), at most one `Proceed`,
+    /// The invariants of §5.3 under arbitrary event sequences: at most two attempts in
+    /// flight, each relay started at most once (handshakes ≤ relays), at most one `Proceed`,
     /// nothing after `Proceed` or `GiveUp`, a hedge only while the attempt in flight is before
-    /// its outer handshake, and nothing past the deadline.
+    /// its outer handshake, and nothing past the deadline. This bounds the plan only; R4-F7
+    /// against the relays' real admission budget is
+    /// `zt-net/tests/failover_attacks.rs::hedge_losers_do_not_burn_the_controllers_admission_budget`
+    /// (finding A11-1).
     #[test]
-    fn hedging_stays_within_admission_budget(
+    fn hedging_stays_within_the_plans_bounds(
         relays in 1_usize..=8,
         sample in any::<u64>(),
         ops in proptest::collection::vec(op(), 0..60),
