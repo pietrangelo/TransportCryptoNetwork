@@ -339,7 +339,8 @@ prologue = "TCN/3 <channel>" ‖ 0x02 ‖ SHA-256(ek_r) ‖ ct1
 
 - `ct1` travels in clear in front of Noise message 1. The responder decapsulates it with its
   static key (with the current key, then the previous one, §14) before Noise runs: this is
-  its only KEM operation before the authorization decision. `psk0` keys every encrypted field
+  its only KEM operation before the authorization decision, and a responder that does not
+  accept the suite never does it (it cannot even name the initiator, review 0012 A12-4). `psk0` keys every encrypted field
   of message 1, so the initiator's static key, `ek_i` and certificate are hidden from a future
   quantum adversary, and only the holder of `dk_r` reads message 1.
 - `ek_i` is the first 1 184 bytes of the message 1 payload; the responder checks it (FIPS 203
@@ -366,6 +367,17 @@ v1 key is a configuration error (`client.toml`, `--relay-key`, OPERATIONS §15),
 handshake API refuses it (`HybridKeyRequired`). A v2 key may be pinned with any suite. The
 responder accepts the suite only if it is in the role's set (§7.5); there is no fallback.
 
+**Responder cost (review 0012, A12-6).** Nothing on the wire names the suite or the responder
+key, so a responder that accepts several suites first runs a cheap test per suite and key: the
+steps of Noise message 1 up to its first authenticated decryption (`s` in IK, `e1` in IKhfs and
+in the hybrid IK suite), with the same primitives. The classical and IKhfs suites carry `e` at
+offset 0 and share one X25519 multiplication per key; the hybrid IK suite costs one
+decapsulation and one multiplication per key, and is tested last and only when the length
+fits it. Noise runs in full on the first suite and key that pass, and only on that one: an
+invalid message 1 never builds a Noise state, and a message crafted to pass several tests still
+gets one trial. With the three suites accepted, an invalid message 1 costs about 1.3 times the
+classical responder of the release before PQ-AUTH with the same keys (docs/pq-snow.md §6).
+
 **Policy entries (AP-6).** A `tcn-pub-v2:` key in the relay policy or in `clients.toml` is
 keyed by its v1 fingerprint, like a v1 key, and also **pins the hybrid identity**: that peer is
 then admitted only by a hybrid IK handshake that proves exactly that fingerprint v2. A classical
@@ -377,6 +389,23 @@ works, and after key confirmation the relay and the agent write `classical_ident
 (WARN, `peer`, `peer_v2`): the configuration checked only its X25519 key.
 `session_established` and `e2e_session_started` carry `peer_v2` for a hybrid IK session.
 
+A responder never needs the initiator's `ek` from its configuration (message 1 carries it), so
+the relay policy and `clients.toml` also take the compact pin `tcn-pin-v2:<64 hex>:<64 hex>`:
+the Ed25519 key and the fingerprint v2, 139 characters instead of 2 443 (review 0012, A12-2).
+It pins exactly like the `tcn-pub-v2:` key it is printed from (`keygen`, `pubkey`). An
+initiator needs `ek_r`, so `client.toml` and `--relay-key` refuse the compact pin.
+
+**Requiring hybrid identities (review 0012, A12-1).** Pins are per entry, and a
+certificate-only client has no entry to pin. `require_hybrid_identity`, at the top of the
+relay policy (`["agents"]`, `["clients"]` or both) and of `clients.toml` (`["clients"]`), is an
+explicit set of roles, like the accepted suites (AP-7): for a role in it, a peer is admitted
+only through the hybrid IK suite with exactly the fingerprint v2 of its v2 pin or of its
+hybrid-bound certificate (`subject_kind = 0x02`). A classical or IKhfs handshake, a v1 or
+classical-kind certificate, or a hybrid IK handshake with another ML-KEM key, is refused before
+message 2 with `identity_downgrade`, never only warned about; an entry of that role without a
+v2 key or pin is a load error. The setting is reloaded with the file, and a reload that adds it
+closes the sessions that no longer satisfy it.
+
 **Certificates.** A certificate v2 with `subject_kind = 0x02` names the subject's fingerprint
 v2 (§15.14): it is accepted only from a hybrid IK handshake that proved it, and is
 `key_mismatch` over any other suite.
@@ -386,6 +415,10 @@ What it gives, and what it does not:
 - **Gives:** authentication of both parties against an adversary with a quantum computer
   *during* the handshake, as long as ML-KEM-768 holds (and, if it fails, X25519 as before); the
   confidentiality of IKhfs; post-quantum hiding of the initiator's identity and certificate.
+  The responder's guarantee holds **per peer**: for a peer pinned by its v2 key, or holding a
+  hybrid-bound certificate, and fleet-wide only for the roles in `require_hybrid_identity`. A
+  peer admitted through a v1 entry or a classical-kind certificate is authenticated by its
+  X25519 key only, which a quantum computer recovers from the public key.
 - **Does not hide** that a hybrid IK handshake took place (the sizes), nor which responder is
   reached (its address names it).
 - **Does not change IK's properties:** message 1 is replayable (hence key confirmation), and
@@ -393,7 +426,8 @@ What it gives, and what it does not:
 - **Revocation and roles stay classical-keyed**: revoking a key (v1 or v2 form) revokes every
   handshake of that X25519 key (§15.8).
 - The decapsulation with the static key is reachable before authentication by anyone who can
-  open a connection; it relies on libcrux's constant-time code (docs/pq-snow.md §5).
+  open a connection to a responder that accepts the suite; it relies on libcrux's constant-time
+  code (docs/pq-snow.md §5).
 
 ## 8. Lifecycle
 
@@ -880,8 +914,9 @@ which also fits a `Data` frame.
 
 With certificates v2 (§15.14) the payload bound is the longest certificate of any version,
 `MAX_ANY_CERT_LEN = 7 670`: message 1 is at most `96 + 7 670 = 7 766` bytes under the
-classical suite and `1 296 + 7 670 = 8 966` under the hybrid one, and both remain the relay's
-pre-authentication caps. A responder rejects a message 1 payload longer than
+classical suite, `1 296 + 7 670 = 8 966` under the HFS suite (IKhfs) and `3 568 + 7 670 =
+11 238` under the hybrid IK suite (§7.5.3); the relay's pre-authentication cap is the largest
+of these over the suites it accepts (§10.1). A responder rejects a message 1 payload longer than
 `MAX_ANY_CERT_LEN` without interpreting it.
 
 ### 15.4 Verification: order of checks

@@ -202,3 +202,39 @@ IK suite adds one encapsulation and one decapsulation per side and about 3.4 KB 
 the responder's unauthenticated cost grows by one decapsulation per key tried. The VM is noisy
 (the IKhfs p99 of this run is an outlier): the per-side p99 gate of pq.md §7 should be checked
 again on an idle machine before the suite becomes a default.
+
+**The union of suites (finding A12-6 of review 0012).** The rows above measure each suite
+alone. During the migration (OPERATIONS §16, Phases 3–5) a responder accepts all three suites,
+and nothing on the wire names the suite or the key, so the attacker picks a length that fits
+all of them. Before review 0012 the responder ran a full snow trial per suite and key whose
+length bounds fit: 3.4–3.5× the classical responder with one key, 6.7–8× with two keys in
+rotation, against the PQ-3 budget of 2.5×. The responder now runs a pre-filter first
+(`zt-crypto/src/prefilter.rs`): it replays snow's steps up to the first authenticated decryption
+of message 1 with snow's own primitives (one X25519 multiplication per key serves the
+classical and IKhfs suites, which both carry `e` at offset 0; the hybrid IK suite adds one
+decapsulation and one multiplication per key), and snow runs in full on the one suite and key
+that pass, the first in a fixed order. Measured with
+`cargo test --release -p zt-crypto --test adversary_0012 -- --ignored --nocapture` (an invalid
+4 000-byte message 1, best of three runs of 1 000; the baseline is the classical responder of
+the release before PQ-AUTH, one snow trial per key):
+
+| Keys | Baseline (pre-PQ-AUTH, classical) | All three suites | Ratio | Classical only, this release |
+| :-: | -: | -: | -: | -: |
+| 1 | 116–122 µs | 148–170 µs | 1.28–1.39× | 61 µs |
+| 2 (rotation) | 227–265 µs | 293–343 µs | 1.29–1.32× | 106 µs |
+
+The union is now within the budget against the same keyring; the rotation costs about 2.8× the
+single-key baseline (it was 6.7–8×). The classical responder alone got cheaper too, so against
+it the union is about 2.4–2.8×: Phase 6 of the runbook (drop the suites a role no longer uses)
+is recommended, not optional. The operation counts are a unit test in every build
+(`an_invalid_message_1_costs_a_bounded_number_of_operations`): per key, 2 multiplications and 1
+decapsulation for the union, 1 multiplication for the classical suite, no Noise state.
+
+**Residual: the PSK slots (finding A12-8).** `psk0` and `psk2` are copied into snow's
+`Builder` and `HandshakeState`, which do not wipe them on drop (patch 5 covers only the KEM
+output buffer). They are functions of `ss1` and `ss2` and of the handshake only, live for the
+duration of one handshake, and protect nothing once the transport keys are derived; the snow
+symmetric state (chaining key, handshake hash) has the same property and has never been wiped
+by snow. A sixth patch that adds `Drop` + `zeroize` to these fields is deferred to the next
+change of the vendored series, so that the series is reviewed once. TCN's own copies
+(`kem_psk`, the decapsulated secrets, the static key seed) are `Zeroizing`.

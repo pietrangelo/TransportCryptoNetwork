@@ -847,7 +847,12 @@ The secret file is `tcn-ca-secret-v2:<128 hex>` (both seeds), `0600`; back it up
 The public key is long (about 4 KB of text): copy it from the `zt-ca` output, never retype
 it. `zt-ca sign --ca <v2 key>` issues certificates v2 (`tcn-client-cert-v2:` files, about
 3.5–7.7 KB), with the same options as §10.3; every certificate is verified after signing with
-the fleet's own verifier before it is written. `zt-ca inspect --cert alice.cert` prints
+the fleet's own verifier before it is written. With a v2 CA, `--subject` is the client's
+`tcn-pub-v2:` key (`zt-client pubkey`, §15) and the certificate is **bound to its hybrid
+identity**; a 64-hex subject is refused unless `--classical-subject` is given, which issues a
+classical-kind certificate (bound to the X25519 key only, refused where
+`require_hybrid_identity` covers clients, §15). `sign` prints `subject_kind` and the log's
+hybrid column is `-` for such a certificate (review 0012, A12-1). `zt-ca inspect --cert alice.cert` prints
 `version = 2` and `ca_fp`; with `--ca-key <tcn-ca-pub-v2:…>` it also verifies both
 signatures.
 
@@ -883,9 +888,10 @@ built on the same Ed25519 key as the v1 one is a load error.
 still pinned. After step 5, pin the v1 key again next to the v2 one (step 3) and reload; v2
 certificates already issued stay valid.
 
-**Sizes and cost**: a message 1 with a v2 certificate is about 3.6–7.8 KB (8.9 KB at most
-under the hybrid suite), well within the relay's pre-authentication cap, which follows the
-largest certificate. Verifying a v2 certificate costs one Ed25519 and one ML-DSA-65
+**Sizes and cost**: a message 1 with a v2 certificate is about 3.6–7.8 KB under the classical
+suite, 8.9 KB at most under the HFS suite (IKhfs) and 11.2 KB at most under the hybrid IK suite
+(§15), within the relay's pre-authentication cap, which follows the largest certificate and the
+accepted suites. Verifying a v2 certificate costs one Ed25519 and one ML-DSA-65
 verification, only after the cheap checks (binding, pinned CA).
 
 ## 11. SSH key exchange: post-quantum today
@@ -1098,23 +1104,52 @@ public_key     = "<64 hex>"
 fingerprint    = SHA256:<64 hex>
 public_key_v2  = "tcn-pub-v2:<2 432 hex>"
 fingerprint_v2 = SHA256v2:<64 hex>
+pin_v2         = "tcn-pin-v2:<64 hex>:<64 hex>"
 ```
 
 For an existing key file, `zt-relay pubkey --key <file>` (and `zt-agent pubkey`, `zt-client
-pubkey`) prints the same four lines and leaves the file as it is: the v2 form is a function of
-the secret, so it is obtained where the key lives. Copy the v2 key from the output (about 2.4 KB
-of text), never retype it.
+pubkey`) prints the same five lines and leaves the file as it is: the v2 forms are a function
+of the secret, so they are obtained where the key lives. Copy them from the output (the v2 key
+is about 2.4 KB of text), never retype them. Scripts that parse this output: the `pin_v2` line
+is new in the release after review 0012, and the alignment of the `=` changed with PQ-AUTH
+(`public_key     =`, five spaces).
+
+`pin_v2` is the **compact responder pin** (review 0012, A12-2): the Ed25519 key and the
+fingerprint v2, 139 characters. A relay or an agent never needs a peer's ML-KEM key from its
+files (message 1 carries it), so the relay policy and `clients.toml` take the compact pin as
+well as the full key, with the same effect. An initiator needs the full key: `client.toml` and
+`--relay-key` refuse the pin. With full keys a policy entry is about 2.5 KB, with pins about
+230 bytes; trust files are capped at 8 MiB and 32 768 entries (about 3 300 entries with full
+keys, so use pins for large fleets).
 
 Where the v2 key goes:
 
 | File or option | v2 key accepted | Effect |
 | :- | :- | :- |
-| relay `policy.toml`, `[[agents]]` and `[[clients]]` `public_key(s)` | yes | the entry is keyed by the v1 fingerprint, as before, and **pins** the hybrid identity: only a hybrid IK handshake that proves it is admitted (`identity_downgrade` otherwise) |
-| agent `clients.toml` `[[clients]]` | yes | the same, on the end-to-end channel |
-| `revoked.toml` `keys` | yes (also v1 keys and `SHA256:` fingerprints) | revokes the X25519-level identity, for every suite; `SHA256v2:` is a load error |
-| `client.toml` `relay_key`, `[[relays]] public_key`, `[[nodes]] public_key` | yes | required for the hybrid IK `suite`; accepted with any suite |
-| `zt-agent --relay-key` | yes | the same, with `--relay-suite` |
-| `zt-ca sign --subject` | yes, with a v2 CA | a certificate v2 bound to the hybrid identity (`subject_v2`, log column 8); a v1 CA refuses it |
+| relay `policy.toml`, `[[agents]]` and `[[clients]]` `public_key(s)` | yes, or the `tcn-pin-v2:` pin | the entry is keyed by the v1 fingerprint, as before, and **pins** the hybrid identity: only a hybrid IK handshake that proves it is admitted (`identity_downgrade` otherwise) |
+| agent `clients.toml` `[[clients]]` | yes, or the pin | the same, on the end-to-end channel |
+| `revoked.toml` `keys` | yes, or the pin (also v1 keys and `SHA256:` fingerprints) | revokes the X25519-level identity, for every suite; `SHA256v2:` is a load error |
+| `client.toml` `relay_key`, `[[relays]] public_key`, `[[nodes]] public_key` | yes (never the pin) | required for the hybrid IK `suite`; accepted with any suite |
+| `zt-agent --relay-key` | yes (never the pin) | the same, with `--relay-suite` |
+| `zt-ca sign --subject` | yes, with a v2 CA (the default there) | a certificate v2 bound to the hybrid identity (`subject_v2`, log column 8); a v1 CA refuses it; a 64-hex subject with a v2 CA needs `--classical-subject` |
+
+**Requiring hybrid identities** (review 0012, A12-1). A pin protects one entry; a
+certificate-only client has no entry, and a v1 entry is still admitted with a stolen X25519
+key. The top-level setting
+
+```toml
+require_hybrid_identity = ["agents", "clients"]   # relay policy.toml
+require_hybrid_identity = ["clients"]             # agent clients.toml
+```
+
+closes that for whole roles: a peer of a listed role is admitted only over the hybrid IK suite,
+with exactly the fingerprint v2 of its v2 pin or of its hybrid-bound certificate. Anything
+else (a classical or IKhfs handshake, a v1 or classical-kind certificate, another ML-KEM key) is
+`authentication_failed reason = identity_downgrade`, logged per identity. A v1 entry of a listed
+role is a load error that names the entry, so `zt-relay check` and `zt-agent check` are the
+completion check of Phase 5 (§16). The list is explicit (no "all"), each role once; it is
+reloaded with the file, and a reload that adds it closes the sessions that no longer satisfy
+it.
 
 A v1 and a v2 entry of the same key in one file are the same identity: a duplicate, refused. An
 agent in rotation (§8) may list one v2 and one v1 key. Rules for the suite: a pin of
@@ -1125,10 +1160,15 @@ Audit: `session_established` and `e2e_session_started` carry `peer_v2` for a hyb
 `classical_identity_match` (WARN) names hybrid peers still matched by v1 entries; denylist and
 roles are reported by the v1 fingerprint, as before.
 
-Cost (docs/pq-snow.md §5): about 3.5 KB more in message 1 and 1.1 KB more in message 2 than the
-classical suite, and on each side one more encapsulation and one more decapsulation than IKhfs.
-The responder decapsulates `ct1` before Noise runs: an invalid message 1 of hybrid IK length
-costs one decapsulation per key (two during a rotation).
+Cost (docs/pq-snow.md §5, §6): about 3.5 KB more in message 1 and 1.1 KB more in message 2 than
+the classical suite, and on each side one more encapsulation and one more decapsulation than
+IKhfs. The responder decapsulates `ct1` before Noise runs, and only if it accepts the suite: an
+invalid message 1 of hybrid IK length costs one decapsulation and one X25519 multiplication per
+key (two keys during a rotation), plus one multiplication per key shared by the classical and
+IKhfs suites if they are accepted too. With all three suites accepted that is about 1.3 times
+the classical responder of the release before PQ-AUTH with the same keys, and about 2.4–2.8
+times the classical responder of this release: drop the suites a role no longer needs
+(Phase 6 of §16) once the counters allow it.
 
 ## 16. PQ-AUTH migration runbook
 
@@ -1146,9 +1186,13 @@ certificates, then drop the v1 key after `max_lifetime`. Watch `cert_version` in
 
 **Phase 2, collect the v2 identities.** Run `keygen` for new nodes, and for each existing node
 or client have its owner run `pubkey --key <its key file>` (§15). Keep them in your
-inventory next to the v1 keys; nothing is deployed yet. For certificate clients, re-issue the
-certificate with `--subject tcn-pub-v2:…` (a hybrid-bound certificate); it is accepted only over
-the hybrid IK suite, so distribute it to a client only together with its Phase 4 pin.
+inventory next to the v1 keys (and the `pin_v2` lines for the responders' files); nothing is
+deployed yet. For certificate clients, re-issue the certificate with `--subject tcn-pub-v2:…`
+(a hybrid-bound certificate); it is accepted only over the hybrid IK suite, so distribute it to
+a client only together with its Phase 4 pins. `zt-client` refuses, before any connection, a
+hybrid-bound certificate whose node pin is not on the hybrid IK suite (or whose relays none
+are), and warns about the relays that are not; it also refuses a certificate bound to another
+fingerprint v2 than its own key's.
 
 **Phase 3, responders accept the suite.**
 
@@ -1167,20 +1211,27 @@ the hybrid IK suite, so distribute it to a client only together with its Phase 4
 3. Watch `outer_suites_confirmed` and `e2e_session_started suite=…` for the remaining classical
    handshakes, and `classical_identity_match` for hybrid peers still matched by v1 entries.
 
-**Phase 5, pin the identities.** Replace v1 keys with `tcn-pub-v2:` keys in the relay policy and
-in `clients.toml`, per peer, **only after** that peer runs the hybrid IK suite on that hop
-(Phase 4): from then on that peer is refused over any other suite (`identity_downgrade`). Reload
-(no restart). `classical_identity_match` for that peer stops. The denylist needs no change: its
-entries keep matching every form.
+**Phase 5, pin the identities.** Replace v1 keys with `tcn-pin-v2:` pins (or `tcn-pub-v2:`
+keys) in the relay policy and in `clients.toml`, per peer, **only after** that peer runs the
+hybrid IK suite on that hop (Phase 4): from then on that peer is refused over any other suite
+(`identity_downgrade`). Reload (no restart). `classical_identity_match` for that peer stops. The
+denylist needs no change: its entries keep matching every form. Phase 5 ends with
+`require_hybrid_identity` (§15): add `["agents"]` once every agent is pinned, `["clients"]`
+once every client is pinned or holds a hybrid-bound certificate, in the relay policy, and
+`["clients"]` in each agent's `clients.toml`. `zt-relay check` / `zt-agent check` refuse the
+file while an entry of a listed role is still v1, and name it. Until this step the guarantee
+of PROTOCOL §7.5.3 holds per pinned peer only; with it, for the whole role.
 
-**Phase 6, sunset (optional).** When the counters show no classical or IKhfs handshake for a
+**Phase 6, sunset (recommended).** When the counters show no classical or IKhfs handshake for a
 role, remove those suites from that role's set on the relays and from `--accept-client-suites`,
-as §13 step 5.
+as §13 step 5. Besides closing the classical paths, it brings the cost of an invalid message 1
+back to that of one suite (§15).
 
 **Rollback**, in reverse order, each step a reload or a rolling restart:
 
 1. Phase 6: put the classical suite back in the sets first.
-2. Phase 5: replace `tcn-pub-v2:` entries with the v1 keys and reload; peers can then use any
+2. Phase 5: remove `require_hybrid_identity` first (a v1 entry is a load error while it lists
+   the role), then replace the v2 entries with the v1 keys and reload; peers can then use any
    accepted suite again. A peer revoked in between stays revoked (the denylist is v1-keyed).
 3. Phase 4: remove the clients' and then the agents' hybrid IK pins (and `require_outer_suite`).
    A hybrid-bound certificate stops working over the classical suite (`key_mismatch`): re-issue
@@ -1190,6 +1241,7 @@ as §13 step 5.
 5. Phase 1: as §10.8 rollback.
 
 Mixed states are safe but weaker: during Phase 4 a client may fail over to a relay pinned to an
-older suite (§13); `require_outer_suite` closes that window. During Phase 5 a v1-pinned peer
-with a stolen X25519 key is still admitted over a classical handshake; that is the reason to
-complete Phase 5.
+older suite (§13); `require_outer_suite` closes that window. During Phase 5 a v1-pinned peer,
+or a certificate-only client with a classical-kind certificate, with a stolen X25519 key is
+still admitted (over a classical handshake, or over the hybrid IK suite with the attacker's own
+ML-KEM key); that is the reason to complete Phase 5 with `require_hybrid_identity`.
