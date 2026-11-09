@@ -68,6 +68,9 @@ pub enum Input {
         /// The new policy.
         policy: Arc<AccessPolicy>,
     },
+    /// End of a drain (graceful stop, PROTOCOL §13): every stream still open is closed with
+    /// `Close Drained` on both sides, then every connection.
+    Shutdown,
 }
 
 /// Actions the network adapter must execute.
@@ -280,6 +283,12 @@ impl<S: SessionIds> RelayCore<S> {
         self.conns.len()
     }
 
+    /// Number of streams (sessions) open or opening: what a drain waits for.
+    #[must_use]
+    pub fn client_stream_count(&self) -> usize {
+        self.routes.len() / 2
+    }
+
     /// Processes an event and returns the actions to execute, in order.
     pub fn handle(&mut self, input: Input, now: Now) -> Vec<Output> {
         let mut out = Vec::new();
@@ -299,8 +308,51 @@ impl<S: SessionIds> RelayCore<S> {
             Input::Disconnected { conn } => self.teardown(conn, &mut out),
             Input::Tick => self.on_tick(now, &mut out),
             Input::PolicyUpdated { policy } => self.on_policy(policy, now.unix, &mut out),
+            Input::Shutdown => self.on_shutdown(&mut out),
         }
         out
+    }
+
+    /// Closes every stream with `Close Drained` and then every connection.
+    fn on_shutdown(&mut self, out: &mut Vec<Output>) {
+        let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
+        ids.sort_unstable();
+        for &conn in &ids {
+            let Some(Conn {
+                role: Role::Client { .. },
+                streams,
+                ..
+            }) = self.conns.get(&conn)
+            else {
+                continue;
+            };
+            let streams: Vec<StreamId> = streams.iter().copied().collect();
+            for stream in streams {
+                let Some(route) = self.remove_route(conn, stream) else {
+                    continue;
+                };
+                let (agent, agent_stream) = route.peer;
+                for (to, s) in [(conn, stream), (agent, agent_stream)] {
+                    out.push(Output::Send {
+                        conn: to,
+                        frame: Frame::Close {
+                            stream: s,
+                            reason: CloseReason::Drained,
+                        },
+                    });
+                }
+                out.push(Output::Audit(DomainEvent::ConnectionDrained {
+                    session: route.session,
+                    reason: CloseReason::Drained,
+                }));
+            }
+        }
+        for conn in ids {
+            out.push(Output::Close { conn });
+        }
+        self.conns.clear();
+        self.agents.clear();
+        self.routes.clear();
     }
 
     fn on_connected(

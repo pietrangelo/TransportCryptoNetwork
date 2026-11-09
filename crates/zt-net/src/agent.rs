@@ -5,12 +5,15 @@
 //! open SSH sessions to the nodes.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout};
 use zt_application::identity_lines::{IdentityEvent, IdentityLines};
+use zt_application::lifecycle::{DrainController, DrainStep};
 use zt_application::liveness::{Liveness, LivenessAction, LivenessConfig};
 pub use zt_application::reconnect::ReconnectConfig;
 use zt_application::reconnect::{ReconnectPolicy, SessionEnd};
@@ -67,6 +70,8 @@ struct Shared {
     sessions: Arc<Semaphore>,
     /// The per-identity audit lines of the current interval (finding A9-2).
     lines: Arc<Mutex<IdentityLines>>,
+    /// Set by the drain: new streams get `Reject NodeOffline`.
+    draining: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -153,6 +158,27 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
 
 /// Like [`run`], dialing relays and sshd through `dialer` (the network port, `crate::net`).
 pub async fn run_with<D: Dialer>(keys: Arc<Keyring>, config: AgentConfig, dialer: D) {
+    run_until(
+        keys,
+        config,
+        dialer,
+        std::future::pending(),
+        crate::lifecycle::DEFAULT_DRAIN_TIMEOUT,
+    )
+    .await;
+}
+
+/// Like [`run_with`], until `shutdown` resolves; then drains (OPERATIONS §14): new streams
+/// get `Reject NodeOffline` (the client tries another relay path or retries), the open
+/// sessions go on until the last one ends or `drain_timeout` passes, and then the relay
+/// connections are dropped.
+pub async fn run_until<D: Dialer>(
+    keys: Arc<Keyring>,
+    config: AgentConfig,
+    dialer: D,
+    shutdown: impl Future<Output = ()>,
+    drain_timeout: Duration,
+) {
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         tracing::error!(
             relays = config.relays.len(),
@@ -197,6 +223,7 @@ pub async fn run_with<D: Dialer>(keys: Arc<Keyring>, config: AgentConfig, dialer
     let shared = Shared {
         sessions: Arc::new(Semaphore::new(config.max_streams)),
         lines: Arc::new(Mutex::new(IdentityLines::default())),
+        draining: Arc::new(AtomicBool::new(false)),
     };
     let mut sessions = tokio::task::JoinSet::new();
     sessions.spawn(identity_summaries(
@@ -212,8 +239,44 @@ pub async fn run_with<D: Dialer>(keys: Arc<Keyring>, config: AgentConfig, dialer
             dialer.clone(),
         ));
     }
-    // The loops never terminate; if one panicked the others would keep going.
-    while sessions.join_next().await.is_some() {}
+    tokio::pin!(shutdown);
+    tokio::select! {
+        () = &mut shutdown => {}
+        // The loops never terminate; if one panicked the others would keep going.
+        () = async { while sessions.join_next().await.is_some() {} } => return,
+    }
+    shared.draining.store(true, Ordering::SeqCst);
+    crate::systemd::notify("STOPPING=1");
+    crate::systemd::status("draining");
+    let active = || {
+        config
+            .max_streams
+            .saturating_sub(shared.sessions.available_permits())
+    };
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "agent_draining",
+        node = %config.node,
+        sessions = active(),
+        timeout_secs = drain_timeout.as_secs(),
+        "agent draining: new sessions are rejected"
+    );
+    let drain = DrainController::new(Instant::now().into_std(), drain_timeout);
+    let expired = loop {
+        if let DrainStep::Finished { expired } = drain.step(Instant::now().into_std(), active()) {
+            break expired;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "agent_drained",
+        node = %config.node,
+        expired,
+        sessions = active(),
+        "agent drained"
+    );
+    sessions.abort_all();
 }
 
 fn liveness_config(t: &Timeouts) -> LivenessConfig {
@@ -389,6 +452,16 @@ fn on_relay_frame<D: Dialer>(
 ) -> Result<Option<Frame>, NetError> {
     match frame {
         Frame::Open { stream, target } => {
+            if shared.draining.load(Ordering::SeqCst) {
+                if stream.get() <= streams.last {
+                    return Err(NetError::Protocol("relay reused a stream id"));
+                }
+                streams.last = stream.get();
+                return Ok(Some(Frame::Reject {
+                    stream,
+                    reason: RejectReason::NodeOffline,
+                }));
+            }
             if target != config.node {
                 return Ok(Some(Frame::Reject {
                     stream,

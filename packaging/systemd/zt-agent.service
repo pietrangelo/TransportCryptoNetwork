@@ -12,8 +12,10 @@
 [Unit]
 Description=TCN agent (zt-agent)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
-After=network-online.target sshd.service
+After=network-online.target time-sync.target sshd.service
 Wants=network-online.target
+# Restarts are never given up on (the backoff below spaces them out).
+StartLimitIntervalSec=0
 
 [Service]
 # notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away).
@@ -24,9 +26,22 @@ Group=tcn
 EnvironmentFile=/etc/tcn/agent.env
 ExecStart=/usr/local/bin/zt-agent --log-format json run --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
 # Reloads the authorized clients and immediately closes the sessions of those removed.
+# `check` first: an invalid file fails `systemctl reload` visibly.
+ExecReload=/usr/local/bin/zt-agent --log-format json check --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
 ExecReload=/bin/kill -HUP $MAINPID
+# SIGTERM drains (OPERATIONS §14): new sessions get NodeOffline, open ones get up to
+# --drain-timeout (60 s by default). TimeoutStopSec leaves room for it.
+TimeoutStopSec=90s
+WatchdogSec=60s
+# A configuration error (exit 78) is not restarted: it needs an operator, not a loop.
 Restart=always
+RestartPreventExitStatus=78
 RestartSec=2s
+# Exponential restart backoff up to 60 s (systemd 254 and later; older versions ignore it).
+RestartSteps=5
+RestartMaxDelaySec=60s
+# No core dumps: the process holds secret keys (zt-agent also sets PR_SET_DUMPABLE 0).
+LimitCORE=0
 Environment=RUST_LOG=info
 
 # --- sandbox ---

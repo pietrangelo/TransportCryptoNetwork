@@ -6,7 +6,8 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::panic
+    clippy::panic,
+    clippy::too_many_lines
 )]
 
 use std::sync::Arc;

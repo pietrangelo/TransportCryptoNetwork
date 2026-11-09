@@ -38,6 +38,9 @@ pub enum NetError {
     /// The relay or the agent rejected the stream.
     #[error("stream rejected: {0:?}")]
     Rejected(RejectReason),
+    /// A task the service cannot run without stopped (for example the relay hub).
+    #[error("stopped: {0}")]
+    Stopped(&'static str),
     /// The stream was closed by the other side.
     #[error("stream closed: {0:?}")]
     StreamClosed(CloseReason),

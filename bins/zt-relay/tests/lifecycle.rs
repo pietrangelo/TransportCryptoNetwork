@@ -7,7 +7,9 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::arithmetic_side_effects,
+    clippy::assigning_clones
 )]
 
 use std::io::{BufRead, BufReader};
@@ -89,6 +91,8 @@ fn command(dir: &Dir, sub: &str) -> Command {
 struct Running {
     child: Child,
     lines: mpsc::Receiver<serde_json::Value>,
+    /// Lines read while waiting for another one.
+    seen: std::cell::RefCell<Vec<serde_json::Value>>,
     addr: String,
 }
 
@@ -123,6 +127,7 @@ impl Running {
         let mut r = Self {
             child,
             lines,
+            seen: std::cell::RefCell::default(),
             addr: String::new(),
         };
         let listening = r.wait_for(|v| v["fields"]["message"] == "relay listening");
@@ -136,6 +141,12 @@ impl Running {
     }
 
     fn wait_for(&self, pred: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        {
+            let mut seen = self.seen.borrow_mut();
+            if let Some(i) = seen.iter().position(&pred) {
+                return seen.remove(i);
+            }
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -146,6 +157,7 @@ impl Running {
             if pred(&v) {
                 return v;
             }
+            self.seen.borrow_mut().push(v);
         }
     }
 
@@ -224,7 +236,7 @@ fn sigterm_drains_and_exits_cleanly() {
 fn an_early_sigterm_is_clean() {
     let dir = setup("early");
     for delay in [0, 5, 20, 50] {
-        let mut child = command(&dir, "run")
+        let child = command(&dir, "run")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

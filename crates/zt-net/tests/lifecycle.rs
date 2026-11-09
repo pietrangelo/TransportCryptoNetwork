@@ -11,7 +11,6 @@
 
 mod common;
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,10 +33,8 @@ struct Drained {
     done: JoinHandle<Result<(), NetError>>,
 }
 
-fn signal(rx: oneshot::Receiver<()>) -> impl Future<Output = ()> + Send + 'static {
-    async move {
-        let _ = rx.await;
-    }
+async fn signal(rx: oneshot::Receiver<()>) {
+    let _ = rx.await;
 }
 
 /// A relay that drains for `drain` when told to.
@@ -176,7 +173,7 @@ async fn a_draining_relay_refuses_new_connections_and_keeps_sessions() {
     assert_eq!(log.events("relay_draining").len(), 1, "{}", log.text());
     let drained = log.events("relay_drained");
     assert_eq!(drained.len(), 1, "{}", log.text());
-    assert_eq!(field(&drained[0], "expired").as_deref(), Some("false"));
+    assert!(drained[0].contains("\"expired\":false"), "{}", drained[0]);
 }
 
 /// R3-C1: at the drain deadline the remaining streams are closed with `Close Drained` and the
@@ -219,12 +216,12 @@ async fn the_drain_deadline_closes_streams_with_drained() {
     assert!(
         audits
             .iter()
-            .any(|l| field(l, "reason").as_deref() == Some("drained")),
+            .any(|l| field(l, "reason").as_deref() == Some("Drained")),
         "{}",
         log.text()
     );
     let drained = log.events("relay_drained");
-    assert_eq!(field(&drained[0], "expired").as_deref(), Some("true"));
+    assert!(drained[0].contains("\"expired\":true"), "{}", drained[0]);
 }
 
 /// R3-C1 attack: a drain is not a window without revocation. A client removed from the policy

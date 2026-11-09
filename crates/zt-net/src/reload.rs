@@ -1,15 +1,22 @@
 //! Reloading of trust files on `SIGHUP`, without restart (hot revocation).
 
+use std::path::PathBuf;
+
 use crate::Updater;
 use crate::config::ConfigError;
+use crate::lifecycle::{Generation, digests};
 
-/// Names of the audit events of a reload.
-#[derive(Debug, Clone, Copy)]
+/// The audit events of a reload and what they identify.
+#[derive(Debug, Clone)]
 pub struct ReloadEvents {
     /// Successful reload, e.g. `policy_reloaded`.
     pub reloaded: &'static str,
     /// Failed reload: the previous value is kept. E.g. `policy_reload_failed`.
     pub failed: &'static str,
+    /// The service's configuration generation: a successful reload takes the next one.
+    pub generation: Generation,
+    /// The files reloaded: their SHA-256 goes in the success line (R3-C8).
+    pub files: Vec<PathBuf>,
 }
 
 /// The `SIGHUP`s received since it was created. It must be created **before** reading the
@@ -64,7 +71,15 @@ pub async fn on_sighup<T, F>(
         match load() {
             Ok(value) => {
                 updater.replace(value);
-                tracing::info!(target: "zt_audit", event_kind = events.reloaded, "configuration reloaded");
+                let files: Vec<&std::path::Path> =
+                    events.files.iter().map(PathBuf::as_path).collect();
+                tracing::info!(
+                    target: "zt_audit",
+                    event_kind = events.reloaded,
+                    generation = events.generation.next(),
+                    files = digests(&files),
+                    "configuration reloaded"
+                );
             }
             Err(err) => {
                 tracing::error!(

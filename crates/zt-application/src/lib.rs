@@ -16,6 +16,7 @@
 pub mod admission;
 pub mod flapping;
 pub mod identity_lines;
+pub mod lifecycle;
 pub mod liveness;
 pub mod ratelimit;
 pub mod reconnect;

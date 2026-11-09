@@ -6,13 +6,17 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use zt_crypto::Keyring;
 use zt_crypto::PublicKey;
 use zt_domain::{HandshakeChannel, NodeId};
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
+use zt_net::lifecycle::{self, Generation, Progress, Supervisor, Terminate};
 use zt_net::logging::{self, LogFormat};
+use zt_net::net::TcpDialer;
 use zt_net::reload::{self, Hangups, ReloadEvents};
 use zt_net::{Revocable, config, systemd};
 
@@ -35,6 +39,61 @@ enum Format {
     Json,
 }
 
+/// The files and settings of an agent, shared by `run` and `check`.
+#[derive(Debug, clap::Args)]
+struct AgentArgs {
+    /// Relay (`host:port`). Repeatable, or comma-separated: the agent stays connected to all
+    /// of them (at most 8).
+    #[arg(long, required = true, value_delimiter = ',')]
+    relay: Vec<String>,
+    /// Public key of each relay (64 hex characters), in the same order as `--relay`.
+    #[arg(long, required = true, value_delimiter = ',')]
+    relay_key: Vec<PublicKey>,
+    /// Handshake suite pinned for the relays (its exact Noise protocol name, PROTOCOL
+    /// §7.5): one for all of them, or one per `--relay` in the same order. Without it, the
+    /// classical suite; there is never a fallback to another suite. Pin the hybrid suite
+    /// only once the relay accepts it for agents (OPERATIONS §13).
+    #[arg(long, value_delimiter = ',')]
+    relay_suite: Vec<String>,
+    /// Handshake suites accepted from clients on the end-to-end channel (exact Noise
+    /// protocol names, comma-separated), for example
+    /// `Noise_IK_25519_ChaChaPoly_BLAKE2s,Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`.
+    /// Without it, the classical suite only (a default that never changes between
+    /// releases); new installations set both in `agent.env` (OPERATIONS §12).
+    #[arg(long, env = "TCN_ACCEPT_CLIENT_SUITES", value_delimiter = ',')]
+    accept_client_suites: Vec<String>,
+    /// Name of this node, as in the relay policy.
+    #[arg(long)]
+    node: String,
+    /// Secret key of the agent.
+    #[arg(long)]
+    key: PathBuf,
+    /// Previous secret key, during a rotation: the end-to-end channel still accepts it, so
+    /// clients can update gradually (PROTOCOL §14).
+    #[arg(long)]
+    previous_key: Option<PathBuf>,
+    /// Clients accepted end-to-end (TOML, `[[clients]]` sections). `SIGHUP` reloads it and
+    /// immediately closes the sessions of removed clients.
+    #[arg(long)]
+    authorized_clients: PathBuf,
+    /// Denylist of certificates and keys (`revoked.toml`, PROTOCOL §15.8). Mandatory if the
+    /// authorized clients pin a CA (`[[authorities]]`), even if empty. `SIGHUP` reloads it
+    /// together with the authorized clients.
+    #[arg(long)]
+    revocations: Option<PathBuf>,
+    /// Local SSH daemon.
+    #[arg(long, default_value = "127.0.0.1:22")]
+    ssh_target: String,
+    /// Spread window, in seconds, of the first reconnect to a relay after a session that
+    /// lived (a relay restart or drain): the fleet comes back over this window instead of
+    /// in one wave. 0 reconnects at once (a single relay); at most 3600.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=3600))]
+    reconnect_spread: u64,
+    /// Concurrent sessions (from 1 to 4096).
+    #[arg(long, default_value_t = 16, value_parser = parse_max_streams)]
+    max_streams: usize,
+}
+
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // value built once, at startup
 enum Command {
@@ -44,58 +103,22 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Starts the agent.
+    /// Starts the agent. `SIGTERM` drains it (OPERATIONS §14).
     Run {
-        /// Relay (`host:port`). Repeatable, or comma-separated: the agent stays connected to all
-        /// of them (at most 8).
-        #[arg(long, required = true, value_delimiter = ',')]
-        relay: Vec<String>,
-        /// Public key of each relay (64 hex characters), in the same order as `--relay`.
-        #[arg(long, required = true, value_delimiter = ',')]
-        relay_key: Vec<PublicKey>,
-        /// Handshake suite pinned for the relays (its exact Noise protocol name, PROTOCOL
-        /// §7.5): one for all of them, or one per `--relay` in the same order. Without it, the
-        /// classical suite; there is never a fallback to another suite. Pin the hybrid suite
-        /// only once the relay accepts it for agents (OPERATIONS §13).
-        #[arg(long, value_delimiter = ',')]
-        relay_suite: Vec<String>,
-        /// Handshake suites accepted from clients on the end-to-end channel (exact Noise
-        /// protocol names, comma-separated), for example
-        /// `Noise_IK_25519_ChaChaPoly_BLAKE2s,Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`.
-        /// Without it, the classical suite only (a default that never changes between
-        /// releases); new installations set both in `agent.env` (OPERATIONS §12).
-        #[arg(long, env = "TCN_ACCEPT_CLIENT_SUITES", value_delimiter = ',')]
-        accept_client_suites: Vec<String>,
-        /// Name of this node, as in the relay policy.
-        #[arg(long)]
-        node: String,
-        /// Secret key of the agent.
-        #[arg(long)]
-        key: PathBuf,
-        /// Previous secret key, during a rotation: the end-to-end channel still accepts it, so
-        /// clients can update gradually (PROTOCOL §14).
-        #[arg(long)]
-        previous_key: Option<PathBuf>,
-        /// Clients accepted end-to-end (TOML, `[[clients]]` sections). `SIGHUP` reloads it and
-        /// immediately closes the sessions of removed clients.
-        #[arg(long)]
-        authorized_clients: PathBuf,
-        /// Denylist of certificates and keys (`revoked.toml`, PROTOCOL §15.8). Mandatory if the
-        /// authorized clients pin a CA (`[[authorities]]`), even if empty. `SIGHUP` reloads it
-        /// together with the authorized clients.
-        #[arg(long)]
-        revocations: Option<PathBuf>,
-        /// Local SSH daemon.
-        #[arg(long, default_value = "127.0.0.1:22")]
-        ssh_target: String,
-        /// Spread window, in seconds, of the first reconnect to a relay after a session that
-        /// lived (a relay restart or drain): the fleet comes back over this window instead of
-        /// in one wave. 0 reconnects at once (a single relay); at most 3600.
-        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=3600))]
-        reconnect_spread: u64,
-        /// Concurrent sessions (from 1 to 4096).
-        #[arg(long, default_value_t = 16, value_parser = parse_max_streams)]
-        max_streams: usize,
+        #[command(flatten)]
+        args: AgentArgs,
+        /// On `SIGTERM`, how long the open sessions may go on (seconds, 1 to 3600); new ones
+        /// are rejected with `NodeOffline` meanwhile. Keep it below the unit's
+        /// `TimeoutStopSec`.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        drain_timeout: u64,
+    },
+    /// Validates every file and option `run` would use, with the same options, and prints the
+    /// SHA-256 of the trust files; exits 78 on a configuration error. `ExecReload` runs it
+    /// before `SIGHUP`.
+    Check {
+        #[command(flatten)]
+        args: AgentArgs,
     },
 }
 
@@ -117,13 +140,36 @@ fn main() -> ExitCode {
         Format::Json => LogFormat::Json,
     };
     logging::init(format, "info");
+    lifecycle::harden_process();
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
+        Err(Failure::Config(message)) => {
+            tracing::error!("{message}");
+            ExitCode::from(EX_CONFIG)
+        }
+        Err(Failure::Runtime(message)) => {
             tracing::error!("{message}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// How the process fails: a configuration error is `EX_CONFIG` (78), which the unit does not
+/// restart on (`RestartPreventExitStatus=78`); anything else is 1 and is restarted.
+enum Failure {
+    Config(String),
+    Runtime(String),
+}
+
+/// `EX_CONFIG` of `sysexits.h`.
+const EX_CONFIG: u8 = 78;
+
+fn config_error(e: impl std::fmt::Display) -> Failure {
+    Failure::Config(e.to_string())
+}
+
+fn runtime_error(e: impl std::fmt::Display) -> Failure {
+    Failure::Runtime(e.to_string())
 }
 
 /// `--relay-suite` (one for all relays, or one per `--relay`) and `--accept-client-suites`
@@ -161,102 +207,186 @@ fn pin_suites(
     .map_err(|e| e.to_string())
 }
 
-fn run(command: Command) -> Result<(), String> {
+fn run(command: Command) -> Result<(), Failure> {
     match command {
         Command::Keygen { out } => {
-            let identity = config::create_identity(&out).map_err(|e| e.to_string())?;
+            let identity = config::create_identity(&out).map_err(config_error)?;
             writeln!(
                 std::io::stdout(),
                 "public_key  = \"{}\"\nfingerprint = {}",
                 identity.public_key(),
                 identity.fingerprint()
             )
-            .map_err(|e| e.to_string())
+            .map_err(runtime_error)
+        }
+        Command::Check { args } => {
+            let prepared = prepare(args)?;
+            let mut out = std::io::stdout();
+            writeln!(out, "configuration OK").map_err(runtime_error)?;
+            for line in lifecycle::digests(&prepared.digested_paths()).split(", ") {
+                writeln!(out, "{line}").map_err(runtime_error)?;
+            }
+            Ok(())
         }
         Command::Run {
-            relay,
-            relay_key,
-            relay_suite,
-            accept_client_suites,
-            node,
-            key,
-            previous_key,
-            authorized_clients,
-            revocations,
-            ssh_target,
-            reconnect_spread,
-            max_streams,
-        } => {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            runtime.block_on(async move {
-                // Before reading the files: a SIGHUP during the read is not lost.
-                let hangups = Hangups::listen().map_err(|e| e.to_string())?;
-                let mut relays = config::relay_endpoints("--relay", &relay, &relay_key)
-                    .map_err(|e| e.to_string())?;
-                let client_suites = pin_suites(&mut relays, &relay_suite, &accept_client_suites)?;
-                let keys = Arc::new(
-                    config::load_keyring(&key, previous_key.as_deref())
-                        .map_err(|e| e.to_string())?,
-                );
-                // The agent key changes only with a restart (PROTOCOL §14).
-                tokio::spawn(zt_net::keys::watch(
-                    "agent",
-                    Revocable::fixed_shared(Arc::clone(&keys)),
-                    zt_net::keys::ROTATION_REMINDER,
-                ));
-                let path = authorized_clients;
-                // Authorized clients and denylist in a single step; a CA equal to the agent's key
-                // (current or previous) or to a `--relay-key` is rejected, at startup and on every
-                // reload (PROTOCOL §15.9, finding 0006-1): a compromised relay cannot sign
-                // certificates that the agent admits.
-                let mut forbidden = config::own_keys(&keys, "agent");
-                forbidden.extend(relays.iter().map(|r| config::ForbiddenKey {
-                    fingerprint: r.public_key.fingerprint(),
-                    role: "relay",
-                }));
-                let load = move || {
-                    let clients = config::load_authorized_clients(&path, revocations.as_deref())?;
-                    config::reject_infrastructure_keys_as_authority(
-                        &path.display().to_string(),
-                        clients.cert_trust(),
-                        &forbidden,
-                    )?;
-                    Ok(clients)
-                };
-                let authorized = load().map_err(|e: config::ConfigError| e.to_string())?;
-                let (authorized_clients, updater) = Revocable::new(authorized);
-                tokio::spawn(zt_net::keys::watch_authorities(
-                    "agent",
-                    authorized_clients.clone(),
-                    zt_net::keys::ROTATION_REMINDER,
-                ));
-                let node = NodeId::try_from(node.as_str()).map_err(|e| e.to_string())?;
-                let config = AgentConfig {
-                    relays,
-                    node,
-                    ssh_target,
-                    authorized_clients,
-                    timeouts: Timeouts::default(),
-                    max_streams,
-                    client_suites,
-                    identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
-                    reconnect: zt_net::agent::ReconnectConfig {
-                        spread: std::time::Duration::from_secs(reconnect_spread),
-                        ..zt_net::agent::ReconnectConfig::default()
-                    },
-                };
-                let events = ReloadEvents {
-                    reloaded: "authorized_clients_reloaded",
-                    failed: "authorized_clients_reload_failed",
-                };
-                tokio::spawn(reload::on_sighup(hangups, updater, events, load));
-                systemd::notify_ready();
-                agent::run(keys, config).await;
-                Ok(())
-            })
-        }
+            args,
+            drain_timeout,
+        } => serve(prepare(args)?, Duration::from_secs(drain_timeout)),
     }
+}
+
+/// Everything `run` needs, loaded and validated: what `check` checks.
+struct Prepared {
+    keys: Arc<Keyring>,
+    config: AgentConfig,
+    updater: zt_net::Updater<zt_domain::AuthorizedClients>,
+    load: Box<dyn Fn() -> Result<zt_domain::AuthorizedClients, config::ConfigError> + Send>,
+    digested: Vec<PathBuf>,
+}
+
+impl Prepared {
+    fn digested_paths(&self) -> Vec<&std::path::Path> {
+        self.digested.iter().map(PathBuf::as_path).collect()
+    }
+}
+
+fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
+    let AgentArgs {
+        relay,
+        relay_key,
+        relay_suite,
+        accept_client_suites,
+        node,
+        key,
+        previous_key,
+        authorized_clients,
+        revocations,
+        ssh_target,
+        reconnect_spread,
+        max_streams,
+    } = args;
+    let mut relays =
+        config::relay_endpoints("--relay", &relay, &relay_key).map_err(config_error)?;
+    let client_suites =
+        pin_suites(&mut relays, &relay_suite, &accept_client_suites).map_err(Failure::Config)?;
+    let keys = Arc::new(config::load_keyring(&key, previous_key.as_deref()).map_err(config_error)?);
+    let digested: Vec<PathBuf> = std::iter::once(authorized_clients.clone())
+        .chain(revocations.clone())
+        .collect();
+    let path = authorized_clients;
+    // Authorized clients and denylist in a single step; a CA equal to the agent's key
+    // (current or previous) or to a `--relay-key` is rejected, at startup and on every
+    // reload (PROTOCOL §15.9, finding 0006-1): a compromised relay cannot sign certificates
+    // that the agent admits.
+    let mut forbidden = config::own_keys(&keys, "agent");
+    forbidden.extend(relays.iter().map(|r| config::ForbiddenKey {
+        fingerprint: r.public_key.fingerprint(),
+        role: "relay",
+    }));
+    let load = move || {
+        let clients = config::load_authorized_clients(&path, revocations.as_deref())?;
+        config::reject_infrastructure_keys_as_authority(
+            &path.display().to_string(),
+            clients.cert_trust(),
+            &forbidden,
+        )?;
+        Ok(clients)
+    };
+    let authorized = load().map_err(config_error)?;
+    let (authorized_clients, updater) = Revocable::new(authorized);
+    let node = NodeId::try_from(node.as_str()).map_err(config_error)?;
+    let config = AgentConfig {
+        relays,
+        node,
+        ssh_target,
+        authorized_clients,
+        timeouts: Timeouts::default(),
+        max_streams,
+        client_suites,
+        identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+        reconnect: zt_net::agent::ReconnectConfig {
+            spread: Duration::from_secs(reconnect_spread),
+            ..zt_net::agent::ReconnectConfig::default()
+        },
+    };
+    Ok(Prepared {
+        keys,
+        config,
+        updater,
+        load: Box::new(load),
+        digested,
+    })
+}
+
+fn serve(prepared: Prepared, drain_timeout: Duration) -> Result<(), Failure> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(runtime_error)?;
+    runtime.block_on(async move {
+        let terminate = Terminate::listen().map_err(runtime_error)?;
+        let hangups = Hangups::listen().map_err(runtime_error)?;
+        let Prepared {
+            keys,
+            config,
+            updater,
+            load,
+            digested,
+        } = prepared;
+        // A SIGHUP between the first read (in `prepare`) and `Hangups::listen` would be lost:
+        // the files are read again now that it is collected.
+        updater.replace(load().map_err(config_error)?);
+        let generation = Generation::new();
+        lifecycle::configuration_loaded(
+            &generation,
+            &digested.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        );
+        let mut supervisor = Supervisor::new();
+        // The agent key changes only with a restart (PROTOCOL §14).
+        supervisor.spawn(
+            "agent_key_watch",
+            zt_net::keys::watch(
+                "agent",
+                Revocable::fixed_shared(Arc::clone(&keys)),
+                zt_net::keys::ROTATION_REMINDER,
+            ),
+        );
+        supervisor.spawn(
+            "authority_watch",
+            zt_net::keys::watch_authorities(
+                "agent",
+                config.authorized_clients.clone(),
+                zt_net::keys::ROTATION_REMINDER,
+            ),
+        );
+        let events = ReloadEvents {
+            reloaded: "authorized_clients_reloaded",
+            failed: "authorized_clients_reload_failed",
+            generation,
+            files: digested,
+        };
+        supervisor.spawn(
+            "authorized_clients_reload",
+            reload::on_sighup(hangups, updater, events, load),
+        );
+        // The agent has no central hub: its watchdog proves that the runtime still schedules
+        // tasks (a wedged runtime stops this heartbeat too).
+        let progress = Progress::new();
+        let beat = progress.clone();
+        supervisor.spawn("heartbeat", async move {
+            let mut every = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                every.tick().await;
+                beat.advance();
+            }
+        });
+        supervisor.spawn("watchdog", lifecycle::watchdog("agent", progress));
+        supervisor.spawn("clock_watch", lifecycle::watch_clock("agent"));
+        lifecycle::check_clock("agent");
+        systemd::notify_ready();
+        tokio::select! {
+            () = agent::run_until(keys, config, TcpDialer, terminate.wait(), drain_timeout) => Ok(()),
+            failure = supervisor.failed() => Err(Failure::Runtime(failure)),
+        }
+    })
 }

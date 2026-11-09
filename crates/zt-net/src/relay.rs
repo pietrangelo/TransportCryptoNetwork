@@ -32,8 +32,10 @@ use zt_domain::{
     HandshakeSuite, InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
 };
 
+use crate::lifecycle::Progress;
 use crate::net::Acceptor;
 use crate::{NetError, Timeouts, channel, lock};
+use zt_application::lifecycle::{DrainController, DrainStep};
 
 /// Relay configuration.
 #[derive(Debug, Clone)]
@@ -329,6 +331,7 @@ pub struct RelayServer<A = TcpListener> {
     keys: crate::Revocable<Keyring>,
     policy: crate::Revocable<AccessPolicy>,
     config: RelayConfig,
+    progress: Progress,
 }
 
 impl RelayServer<TcpListener> {
@@ -393,6 +396,7 @@ impl<A: Acceptor> RelayServer<A> {
             keys,
             policy,
             config,
+            progress: Progress::new(),
         })
     }
 
@@ -404,24 +408,56 @@ impl<A: Acceptor> RelayServer<A> {
         Ok(self.listener.local_addr()?)
     }
 
+    /// The hub's progress counter, for the systemd watchdog (AP-4): it moves with every event
+    /// the hub handles, its own one-second tick included.
+    #[must_use]
+    pub fn progress(&self) -> Progress {
+        self.progress.clone()
+    }
+
     /// Serves connections until the process exits.
     ///
     /// # Errors
-    /// Only fatal errors of the listening socket.
+    /// The hub stopped (see [`RelayServer::run_until`]).
     pub async fn run(self) -> Result<(), NetError> {
+        self.run_until(
+            std::future::pending(),
+            crate::lifecycle::DEFAULT_DRAIN_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Serves connections until `shutdown` resolves, then drains (PROTOCOL §13, OPERATIONS
+    /// §14): the listening socket is closed at once, open sessions go on (the policy and its
+    /// revocations still apply) until the last one ends or `drain_timeout` passes; then the
+    /// remaining streams get `Close Drained` and every connection is closed.
+    ///
+    /// # Errors
+    /// The hub stopped on its own (a panic): the relay can no longer route anything, so it
+    /// must not keep accepting connections.
+    pub async fn run_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()>,
+        drain_timeout: Duration,
+    ) -> Result<(), NetError> {
         let Self {
             mut listener,
             keys,
             policy,
             config,
+            progress,
         } = self;
         let (hub_tx, hub_rx) = mpsc::channel(4096);
+        let (drain_tx, drain_rx) = mpsc::channel(1);
         let core = RelayCore::new(
             policy.current(),
             config.limits.clone(),
             RandomIds { fallback: 0 },
         );
-        tokio::spawn(hub(core, hub_rx, policy.clone()));
+        let mut hub_task = tokio::spawn(hub(core, hub_rx, policy.clone(), progress, drain_rx));
+        // One clone per live connection task: the drain waits for them to flush.
+        let live = Arc::new(());
+        tokio::pin!(shutdown);
 
         audit_line!(
             false,
@@ -444,7 +480,15 @@ impl<A: Acceptor> RelayServer<A> {
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
         loop {
-            let (tcp, addr) = match listener.accept().await {
+            let accepted = tokio::select! {
+                () = &mut shutdown => break,
+                joined = &mut hub_task => {
+                    tracing::error!(?joined, "relay hub stopped");
+                    return Err(NetError::Stopped("relay hub"));
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let (tcp, addr) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
                     // E.g. EMFILE: back off instead of spinning.
@@ -479,11 +523,51 @@ impl<A: Acceptor> RelayServer<A> {
                 agent_idle: config.agent_idle.unwrap_or(config.timeouts.idle),
                 client_idle: config.client_idle.unwrap_or(config.timeouts.idle),
                 confirmed: Arc::clone(&confirmed),
+                _live: Arc::clone(&live),
                 capacity,
             };
             tokio::spawn(task.serve(tcp, addr, admitted));
         }
+        drain(listener, hub_task, &drain_tx, drain_timeout, &live).await
     }
+}
+
+/// The drain after `shutdown` (see [`RelayServer::run_until`]).
+async fn drain<A>(
+    listener: A,
+    hub_task: tokio::task::JoinHandle<DrainOutcome>,
+    drain_tx: &mpsc::Sender<Duration>,
+    drain_timeout: Duration,
+    live: &Arc<()>,
+) -> Result<(), NetError> {
+    // New connections are refused from now on (connection refused, not a timeout): clients
+    // and agents go to another relay at once.
+    drop(listener);
+    crate::systemd::notify("STOPPING=1");
+    crate::systemd::status("draining");
+    audit_line!(
+        false,
+        "relay_draining",
+        timeout_secs = drain_timeout.as_secs(),
+        "relay draining: no new connections"
+    );
+    if drain_tx.send(drain_timeout).await.is_err() {
+        return Err(NetError::Stopped("relay hub"));
+    }
+    let outcome = hub_task.await.map_err(|_| NetError::Stopped("relay hub"))?;
+    // The connection tasks flush what the hub queued (the `Close Drained` frames) and end.
+    let flushed = crate::deadline(Duration::from_secs(2));
+    while Arc::strong_count(live) > 1 && tokio::time::Instant::now() < flushed {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    audit_line!(
+        false,
+        "relay_drained",
+        expired = outcome.expired,
+        streams_closed = outcome.closed,
+        "relay drained"
+    );
+    Ok(())
 }
 
 struct Connection {
@@ -497,6 +581,8 @@ struct Connection {
     agent_idle: Duration,
     client_idle: Duration,
     confirmed: Arc<ConfirmedSuites>,
+    /// Counts the live connection tasks for the drain.
+    _live: Arc<()>,
     capacity: usize,
 }
 
@@ -991,21 +1077,55 @@ fn admit(
     Ok(certificate)
 }
 
+/// How a drain ended.
+#[derive(Debug, Clone, Copy, Default)]
+struct DrainOutcome {
+    /// Streams were still open at the deadline.
+    expired: bool,
+    /// The streams closed with `Close Drained`.
+    closed: usize,
+}
+
+/// Every how many ticks the hub writes its `STATUS=` line.
+const STATUS_TICKS: u64 = 10;
+
 async fn hub(
     mut core: RelayCore<RandomIds>,
     mut events: mpsc::Receiver<HubEvent>,
     mut policy: crate::Revocable<AccessPolicy>,
-) {
+    progress: Progress,
+    mut drain_rx: mpsc::Receiver<Duration>,
+) -> DrainOutcome {
     let mut peers: HashMap<ConnId, mpsc::Sender<Frame>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut drain: Option<DrainController> = None;
+    let mut ticks: u64 = 0;
     loop {
         let input = tokio::select! {
             // Policy first: a connection authenticated under the new policy must not reach the
-            // core before the policy itself.
+            // core before the policy itself. Then the tick, before the events: under a
+            // saturated event queue a `biased` select would never reach it, and deadlines,
+            // the drain and the watchdog's progress all depend on it (AP-4).
             biased;
             () = policy.changed() => Input::PolicyUpdated { policy: policy.current() },
+            _ = tick.tick() => {
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(STATUS_TICKS) {
+                    crate::systemd::status(&format!(
+                        "{}: {} connections, {} streams",
+                        if drain.is_some() { "draining" } else { "serving" },
+                        core.connection_count(),
+                        core.client_stream_count()
+                    ));
+                }
+                Input::Tick
+            }
+            Some(timeout) = drain_rx.recv(), if drain.is_none() => {
+                drain = Some(DrainController::new(mono_now(), timeout));
+                Input::Tick
+            }
             event = events.recv() => match event {
-                None => return,
+                None => return DrainOutcome::default(),
                 Some(HubEvent::Connected { conn, peer, certificate, tx }) => {
                     peers.insert(conn, tx);
                     Input::Connected { conn, peer, certificate }
@@ -1017,33 +1137,51 @@ async fn hub(
                     input
                 }
             },
-            _ = tick.tick() => Input::Tick,
         };
-        let mut pending = vec![input];
-        while let Some(input) = pending.pop() {
-            let now = Now {
-                instant: mono_now(),
-                unix: crate::unix_now(),
-            };
-            for output in core.handle(input, now) {
-                match output {
-                    Output::Send { conn, frame } => {
-                        let Some(tx) = peers.get(&conn) else { continue };
-                        if tx.try_send(frame).is_err() {
-                            // Queue full or connection already closed: detach it.
-                            tracing::warn!(conn = conn.0, "outbound queue overflow");
-                            peers.remove(&conn);
-                            pending.push(Input::Disconnected { conn });
-                        }
-                    }
-                    Output::Close { conn } => {
-                        // Dropping the sender closes the connection after the frames already
-                        // queued.
+        execute(&mut core, &mut peers, input, &progress);
+        if let Some(d) = &drain
+            && let DrainStep::Finished { expired } = d.step(mono_now(), core.client_stream_count())
+        {
+            let closed = core.client_stream_count();
+            execute(&mut core, &mut peers, Input::Shutdown, &progress);
+            // Dropping the senders closes every connection after its queued frames.
+            return DrainOutcome { expired, closed };
+        }
+    }
+}
+
+/// Hands `input` to the core and executes its outputs (and the disconnections they cause).
+fn execute(
+    core: &mut RelayCore<RandomIds>,
+    peers: &mut HashMap<ConnId, mpsc::Sender<Frame>>,
+    input: Input,
+    progress: &Progress,
+) {
+    let mut pending = vec![input];
+    while let Some(input) = pending.pop() {
+        let now = Now {
+            instant: mono_now(),
+            unix: crate::unix_now(),
+        };
+        for output in core.handle(input, now) {
+            match output {
+                Output::Send { conn, frame } => {
+                    let Some(tx) = peers.get(&conn) else { continue };
+                    if tx.try_send(frame).is_err() {
+                        // Queue full or connection already closed: detach it.
+                        tracing::warn!(conn = conn.0, "outbound queue overflow");
                         peers.remove(&conn);
+                        pending.push(Input::Disconnected { conn });
                     }
-                    Output::Audit(event) => audit(&event),
                 }
+                Output::Close { conn } => {
+                    // Dropping the sender closes the connection after the frames already
+                    // queued.
+                    peers.remove(&conn);
+                }
+                Output::Audit(event) => audit(&event),
             }
         }
     }
+    progress.advance();
 }
