@@ -313,6 +313,10 @@ fn ready_is_notified_only_once_sighup_is_handled() {
             status.is_none(),
             "round {round}: SIGHUP after READY killed the relay"
         );
+        // The reload's own `RELOADING=1` and `READY=1` (finding A10-1) belong to this round.
+        notify.set_nonblocking(true).unwrap();
+        while notify.recv(&mut buf).is_ok() {}
+        notify.set_nonblocking(false).unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

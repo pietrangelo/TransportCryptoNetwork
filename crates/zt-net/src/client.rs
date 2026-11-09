@@ -89,6 +89,19 @@ where
         .await
         {
             Ok(ch) => {
+                // During the rollout of OPERATIONS §13 pins are mixed: an attacker who
+                // resets the hybrid-pinned relays makes failover land on a classical one.
+                // Say so (finding A10-9); `require_outer_suite` rules it out.
+                if let Some(first) = config.relays.first()
+                    && first.suite != relay.suite
+                {
+                    tracing::warn!(
+                        relay = %relay.address,
+                        suite = relay.suite.protocol_name(),
+                        preferred_suite = first.suite.protocol_name(),
+                        "failover to a relay pinned to another outer suite"
+                    );
+                }
                 opened = Some(ch);
                 break;
             }

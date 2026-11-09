@@ -14,16 +14,39 @@ pub fn notify_ready() {
     notify("READY=1");
 }
 
+/// Whether a failed notification was already reported at warning level.
+static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Sends one notification (`STATUS=...`, `STOPPING=1`, `WATCHDOG=1`, ...) if the service runs
-/// under systemd with a notification socket; otherwise does nothing. Errors are logged at
+/// under systemd with a notification socket; otherwise does nothing. The socket is
+/// non-blocking (finding A10-3): a service manager that stops draining its queue costs a lost
+/// notification, never a blocked hub. The first error is logged as a warning, the next ones at
 /// debug level: the service keeps running without them.
 pub fn notify(message: &str) {
     let Some(socket) = std::env::var_os(NOTIFY_SOCKET).filter(|s| !s.is_empty()) else {
         return;
     };
     if let Err(err) = send(&socket, message.as_bytes()) {
-        tracing::warn!(error = %err, "cannot notify systemd");
+        if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(error = %err, "cannot notify systemd");
+        } else {
+            tracing::warn!(error = %err, "cannot notify systemd (further failures at debug level)");
+        }
     }
+}
+
+/// `CLOCK_MONOTONIC` in microseconds, for `MONOTONIC_USEC=` next to `RELOADING=1`.
+#[must_use]
+pub fn monotonic_usec() -> u64 {
+    #[cfg(unix)]
+    {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let secs = u64::try_from(now.tv_sec).unwrap_or(0);
+        let micros = u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000;
+        secs.saturating_mul(1_000_000).saturating_add(micros)
+    }
+    #[cfg(not(unix))]
+    0
 }
 
 /// A one-line status for `systemctl status` (`STATUS=`).
@@ -50,6 +73,7 @@ fn send(socket: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
     use std::os::unix::net::UnixDatagram;
     let raw = socket.as_bytes();
     let sock = UnixDatagram::unbound()?;
+    sock.set_nonblocking(true)?;
     match raw.split_first() {
         Some((b'/', _)) => sock.send_to(message, socket).map(drop),
         #[cfg(target_os = "linux")]

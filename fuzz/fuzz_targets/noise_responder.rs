@@ -14,8 +14,8 @@
 //! PQ-1 (PROTOCOL §7.5): with bit 3 of the mode the same runs with the hybrid suite
 //! `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` on the end-to-end channel, through the
 //! vendored snow's HFS paths (`e1` read, then `ekem1` written by `accept`). The responder
-//! accepts both suites, as an upgraded agent does; the reported suite is the one sent; the
-//! outer channel never accepts a hybrid msg1.
+//! accepts both suites, as an upgraded agent does; the reported suite is the one sent. (Before
+//! Phase 3 the outer channel never accepted a hybrid msg1; see the next paragraph.)
 //!
 //! PQ-1 on the outer channel (Phase 3): with bits 3 and 5 of the mode the hybrid suite runs on
 //! the outer channel, as a relay that accepts both suites; an outer hybrid msg1 is never valid

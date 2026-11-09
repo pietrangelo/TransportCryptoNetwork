@@ -396,7 +396,7 @@ fn the_agent_alone_detects_a_half_open_link() {
     sim.client("operator", async move {
         tokio::time::sleep(partition).await;
         turmoil::partition("agent", "relay");
-        tokio::time::sleep(repair - partition).await;
+        tokio::time::sleep(Duration::from_secs(37)).await;
         turmoil::repair("agent", "relay");
         tokio::time::sleep(Duration::from_secs(60)).await;
         Ok(())

@@ -10,11 +10,12 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use zt_crypto::Keyring;
 use zt_domain::AccessPolicy;
+use zt_net::config::{ConfigError, Digests};
 use zt_net::lifecycle::{self, Generation, Supervisor, Terminate};
 use zt_net::logging::{self, LogFormat};
 use zt_net::relay::{RelayConfig, RelayServer};
-use zt_net::reload::{self, Hangups, ReloadEvents};
-use zt_net::{Revocable, config, systemd};
+use zt_net::reload::{self, Hangups, Outcome, Publisher};
+use zt_net::{Revocable, Updater, config, systemd};
 
 /// TCN relay.
 #[derive(Debug, Parser)]
@@ -65,17 +66,6 @@ struct RelayArgs {
     config: Option<PathBuf>,
 }
 
-impl RelayArgs {
-    /// The trust and settings files, whose SHA-256 identifies the configuration in force (the
-    /// key files are identified by their public keys in `keys_in_use` instead).
-    fn digested(&self) -> Vec<&std::path::Path> {
-        std::iter::once(self.policy.as_path())
-            .chain(self.revocations.as_deref())
-            .chain(self.config.as_deref())
-            .collect()
-    }
-}
-
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Generates the relay key (new file, 0600 permissions) and prints the public key.
@@ -92,12 +82,32 @@ enum Command {
         /// they are closed with `Close Drained`. Keep it below the unit's `TimeoutStopSec`.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
         drain_timeout: u64,
+        /// Where the reload state for `reload` is published. Default: `$RUNTIME_DIRECTORY`
+        /// (systemd's `RuntimeDirectory=`); without either, `reload` cannot be used.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
     },
-    /// Validates every file `run` would load, with the same options, and prints their
-    /// SHA-256; exits 78 on a configuration error. `ExecReload` runs it before `SIGHUP`.
+    /// Validates every file `run` loads at startup, with the same options and the same code,
+    /// and prints their SHA-256; exits 78 on an invalid file, 1 on a missing or unreadable one.
+    /// A pre-flight before a restart; `systemctl reload` uses `reload`.
     Check {
         #[command(flatten)]
         args: RelayArgs,
+    },
+    /// Asks the running relay to reload (`SIGHUP`) and reports its outcome: exit 0 if the
+    /// relay applied the policy (warnings, e.g. a key file it could not reload, on stderr), 78
+    /// if it rejected it and kept the previous one, 1 if it did not answer. The relay validates
+    /// its own files with its own arguments, so this takes none (`ExecReload=`, finding A10-1).
+    Reload {
+        /// The relay's process id (`$MAINPID` in the unit).
+        #[arg(long)]
+        pid: u32,
+        /// The relay's runtime directory. Default: `$RUNTIME_DIRECTORY`.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
+        /// How long to wait for the outcome (seconds, 1 to 600).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
+        timeout: u64,
     },
 }
 
@@ -113,6 +123,17 @@ const EX_CONFIG: u8 = 78;
 
 fn config_error(e: impl std::fmt::Display) -> Failure {
     Failure::Config(e.to_string())
+}
+
+/// A file that could not be read (missing, unreadable: provisioning not finished, a late
+/// mount) is restarted with the unit's backoff; a file that was read and is invalid is
+/// `EX_CONFIG` (finding A10-8).
+fn load_error(e: &ConfigError) -> Failure {
+    if e.is_transient() {
+        Failure::Runtime(e.to_string())
+    } else {
+        Failure::Config(e.to_string())
+    }
 }
 
 fn runtime_error(e: impl std::fmt::Display) -> Failure {
@@ -140,35 +161,148 @@ fn main() -> ExitCode {
     }
 }
 
-/// The files needed to reload the relay keys.
-struct KeyFiles {
-    key: PathBuf,
-    previous_key: Option<PathBuf>,
-    policy: PathBuf,
-    revocations: Option<PathBuf>,
+/// Everything `run` loads at startup, validated: what `check` checks, by the same code.
+struct Startup {
+    settings: config::RelaySettings,
+    keys: Keyring,
+    policy: AccessPolicy,
+    digests: Digests,
 }
 
-/// Reloads the relay keys (`SIGHUP`, PROTOCOL §14) and rejects a key equal to a CA (§15.9,
-/// finding 0006-2). The same `SIGHUP` reloads policy and keys in two tasks, so the new key is
-/// compared both with the policy in force and with the one on disk: a key rotation and a new
-/// CA that are equal, in the same reload, do not get in together. The policy is compared only
-/// with the keys in force: a wrong key file does not block an urgent revocation.
-fn reload_keys(
-    files: &KeyFiles,
-    policy_in_force: &Revocable<AccessPolicy>,
-) -> Result<Keyring, config::ConfigError> {
-    let keys = config::load_keyring(&files.key, files.previous_key.as_deref())?;
-    let forbidden = config::own_keys(&keys, "relay");
-    let origin = files.policy.display().to_string();
+fn load_startup(args: &RelayArgs) -> Result<Startup, Failure> {
+    let mut digests = Digests::new();
+    let settings = match &args.config {
+        Some(path) => {
+            let (settings, d) =
+                config::load_relay_settings_digested(path).map_err(|e| load_error(&e))?;
+            digests.extend(d);
+            settings
+        }
+        None => config::RelaySettings::default(),
+    };
+    let keys = config::load_keyring(&args.key, args.previous_key.as_deref())
+        .map_err(|e| load_error(&e))?;
+    let (policy, d) = load_policy(&args.policy, args.revocations.as_deref(), &keys)
+        .map_err(|e| load_error(&e))?;
+    digests.extend(d);
+    Ok(Startup {
+        settings,
+        keys,
+        policy,
+        digests,
+    })
+}
+
+/// The policy and denylist, with a CA equal to a relay key (current or previous) rejected
+/// (PROTOCOL §15.9), and the digests of the bytes parsed.
+fn load_policy(
+    policy: &std::path::Path,
+    revocations: Option<&std::path::Path>,
+    keys: &Keyring,
+) -> Result<(AccessPolicy, Digests), ConfigError> {
+    let (loaded, digests) = config::load_relay_policy_digested(policy, revocations)?;
     config::reject_infrastructure_keys_as_authority(
-        &origin,
-        policy_in_force.current().cert_trust(),
-        &forbidden,
+        &policy.display().to_string(),
+        loaded.cert_trust(),
+        &config::own_keys(keys, "relay"),
     )?;
-    if let Ok(next) = config::load_relay_policy(&files.policy, files.revocations.as_deref()) {
-        config::reject_infrastructure_keys_as_authority(&origin, next.cert_trust(), &forbidden)?;
+    Ok((loaded, digests))
+}
+
+/// What a `SIGHUP` reloads, and how it applies it.
+struct Reloader {
+    key: PathBuf,
+    previous_key: Option<PathBuf>,
+    policy_path: PathBuf,
+    revocations: Option<PathBuf>,
+    keys: Revocable<Keyring>,
+    key_updater: Updater<Keyring>,
+    policy: Revocable<AccessPolicy>,
+    policy_updater: Updater<AccessPolicy>,
+}
+
+impl Reloader {
+    /// One `SIGHUP` (finding A10-2): the policy and denylist, checked against the keys in
+    /// force, and the keys, checked against the policy in force and the new one (a key and a
+    /// CA that are equal never get in together, finding 0006-2). The policy is the urgent part
+    /// (revocation): a key file that cannot be reloaded is a warning and does not block it.
+    /// `relay.toml` is read at startup only and is not part of a reload. One generation for
+    /// both, taken only if something was applied.
+    fn reload(&self, generation: &Generation) -> Outcome {
+        let policy = load_policy(
+            &self.policy_path,
+            self.revocations.as_deref(),
+            &self.keys.current(),
+        );
+        let keys = self.load_keys(policy.as_ref().ok().map(|(p, _)| p));
+        let generation = (policy.is_ok() || keys.is_ok()).then(|| generation.next());
+        let mut warnings = Vec::new();
+        match keys {
+            Ok(keys) => {
+                self.key_updater.replace(keys);
+                tracing::info!(
+                    target: "zt_audit",
+                    event_kind = "relay_keys_reloaded",
+                    generation,
+                    "relay keys reloaded"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "zt_audit",
+                    event_kind = "relay_keys_reload_failed",
+                    error = %err,
+                    "relay key reload failed: keeping the keys in force"
+                );
+                warnings.push(format!(
+                    "relay keys not reloaded, the keys in force remain: {err}"
+                ));
+            }
+        }
+        let result = match policy {
+            Ok((policy, digests)) => {
+                self.policy_updater.replace(policy);
+                tracing::info!(
+                    target: "zt_audit",
+                    event_kind = "policy_reloaded",
+                    generation,
+                    files = %digests,
+                    "configuration reloaded"
+                );
+                Ok((generation.unwrap_or_default(), digests.to_string()))
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "zt_audit",
+                    event_kind = "policy_reload_failed",
+                    error = %err,
+                    "reload failed: keeping the previous configuration"
+                );
+                Err(err.to_string())
+            }
+        };
+        Outcome { result, warnings }
     }
-    Ok(keys)
+
+    /// The keys on disk, with no CA of the policy in force or of `next` equal to one of them.
+    fn load_keys(&self, next: Option<&AccessPolicy>) -> Result<Keyring, ConfigError> {
+        let keys = config::load_keyring(&self.key, self.previous_key.as_deref())?;
+        let forbidden = config::own_keys(&keys, "relay");
+        let origin = self.policy_path.display().to_string();
+        config::reject_infrastructure_keys_as_authority(
+            &origin,
+            self.policy.current().cert_trust(),
+            &forbidden,
+        )?;
+        if let Some(next) = next {
+            config::reject_infrastructure_keys_as_authority(
+                &origin,
+                next.cert_trust(),
+                &forbidden,
+            )?;
+        }
+        Ok(keys)
+    }
 }
 
 fn run(command: Command) -> Result<(), Failure> {
@@ -187,56 +321,59 @@ fn run(command: Command) -> Result<(), Failure> {
         Command::Run {
             args,
             drain_timeout,
-        } => serve(args, Duration::from_secs(drain_timeout)),
+            runtime_dir,
+        } => serve(args, Duration::from_secs(drain_timeout), runtime_dir),
+        Command::Reload {
+            pid,
+            runtime_dir,
+            timeout,
+        } => request_reload(pid, runtime_dir, Duration::from_secs(timeout)),
     }
 }
 
-/// The policy and denylist, with a CA equal to a relay key (current or previous) rejected
-/// (PROTOCOL §15.9).
-fn load_policy(
-    policy: &std::path::Path,
-    revocations: Option<&std::path::Path>,
-    keys: &Keyring,
-) -> Result<AccessPolicy, config::ConfigError> {
-    let loaded = config::load_relay_policy(policy, revocations)?;
-    config::reject_infrastructure_keys_as_authority(
-        &policy.display().to_string(),
-        loaded.cert_trust(),
-        &config::own_keys(keys, "relay"),
-    )?;
-    Ok(loaded)
+/// `reload`: the outcome of the running relay's own reload.
+fn request_reload(pid: u32, runtime_dir: Option<PathBuf>, wait: Duration) -> Result<(), Failure> {
+    let dir = reload::runtime_dir(runtime_dir)
+        .ok_or_else(|| runtime_error(reload::RequestError::NoRuntimeDirectory))?;
+    let outcome = reload::request(pid, &dir, wait).map_err(runtime_error)?;
+    let mut err = std::io::stderr();
+    for warning in &outcome.warnings {
+        writeln!(err, "warning: {warning}").map_err(runtime_error)?;
+    }
+    match outcome.result {
+        Ok((generation, files)) => {
+            let mut out = std::io::stdout();
+            writeln!(out, "reload applied: generation {generation}").map_err(runtime_error)?;
+            for line in files.split(", ").filter(|l| !l.is_empty()) {
+                writeln!(out, "{line}").map_err(runtime_error)?;
+            }
+            Ok(())
+        }
+        Err(reason) => Err(Failure::Config(format!(
+            "reload rejected, the previous configuration remains in force: {reason}"
+        ))),
+    }
 }
 
-/// `check`: every file `run` loads, with the same checks, and nothing else.
+/// `check`: every file `run` loads at startup, through the same function.
 fn check(args: &RelayArgs) -> Result<(), Failure> {
-    if let Some(path) = &args.config {
-        config::load_relay_settings(path).map_err(config_error)?;
-    }
-    let keys =
-        config::load_keyring(&args.key, args.previous_key.as_deref()).map_err(config_error)?;
-    load_policy(&args.policy, args.revocations.as_deref(), &keys).map_err(config_error)?;
-    let digests = lifecycle::digests(&args.digested());
+    let startup = load_startup(args)?;
     let mut out = std::io::stdout();
     writeln!(out, "configuration OK").map_err(runtime_error)?;
-    for line in digests.split(", ") {
+    for line in startup.digests.to_string().split(", ") {
         writeln!(out, "{line}").map_err(runtime_error)?;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // the startup sequence, in the order it must happen
-fn serve(args: RelayArgs, drain_timeout: Duration) -> Result<(), Failure> {
-    let settings = match &args.config {
-        Some(path) => config::load_relay_settings(path).map_err(config_error)?,
-        None => config::RelaySettings::default(),
-    };
-    let relay_config = RelayConfig {
-        admission: settings.admission,
-        suites: settings.suites,
-        agent_idle: Some(settings.agent_idle),
-        client_idle: Some(settings.client_idle),
-        ..RelayConfig::default()
-    };
+fn serve(
+    args: RelayArgs,
+    drain_timeout: Duration,
+    runtime_dir: Option<PathBuf>,
+) -> Result<(), Failure> {
+    // A watchdog too short for the hub's tick would kill a healthy relay (finding A10-3).
+    lifecycle::check_watchdog().map_err(Failure::Config)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -246,58 +383,57 @@ fn serve(args: RelayArgs, drain_timeout: Duration) -> Result<(), Failure> {
         let terminate = Terminate::listen().map_err(runtime_error)?;
         // Before reading the files: a SIGHUP during the read is not lost.
         let hangups = Hangups::listen().map_err(runtime_error)?;
-        let key_hangups = Hangups::listen().map_err(runtime_error)?;
-        let digested: Vec<PathBuf> = args.digested().into_iter().map(PathBuf::from).collect();
-        let RelayArgs {
-            listen,
-            key,
-            previous_key,
+        let Startup {
+            settings,
+            keys,
             policy,
-            revocations,
-            ..
-        } = args;
-        let keys = config::load_keyring(&key, previous_key.as_deref()).map_err(config_error)?;
+            digests,
+        } = load_startup(&args)?;
+        let relay_config = RelayConfig {
+            admission: settings.admission,
+            suites: settings.suites,
+            agent_idle: Some(settings.agent_idle),
+            client_idle: Some(settings.client_idle),
+            ..RelayConfig::default()
+        };
+        let generation = Generation::new();
+        let first = lifecycle::configuration_loaded(&generation, &digests);
+        let publisher = Publisher::new(
+            reload::runtime_dir(runtime_dir),
+            Outcome::applied(first, digests.to_string()),
+        );
+        publisher.publish();
         // Relay key rotation without restart (PROTOCOL §14): the new keys apply to
         // subsequent handshakes; open connections remain.
         let (keys, key_updater) = Revocable::new(keys);
+        let (policy, policy_updater) = Revocable::new(policy);
         let mut supervisor = Supervisor::new();
         supervisor.spawn(
             "relay_key_watch",
             zt_net::keys::watch("relay", keys.clone(), zt_net::keys::ROTATION_REMINDER),
         );
-        let path = policy;
-        let (path_for_keys, revocations_for_keys) = (path.clone(), revocations.clone());
-        // Policy and denylist in a single step; a CA equal to the relay key (current or
-        // previous, the one in force at that moment) is rejected (PROTOCOL §15.9), at startup
-        // and on every reload.
-        let relay_keys = keys.clone();
-        let load = move || load_policy(&path, revocations.as_deref(), &relay_keys.current());
-        let policy = load().map_err(config_error)?;
-        let generation = Generation::new();
-        lifecycle::configuration_loaded(
-            &generation,
-            &digested.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
-        );
-        let (policy, updater) = Revocable::new(policy);
-        // The same check in the opposite direction (finding 0006-2), see `reload_keys`.
-        let key_events = ReloadEvents {
-            reloaded: "relay_keys_reloaded",
-            failed: "relay_keys_reload_failed",
-            generation: generation.clone(),
-            files: Vec::new(),
-        };
-        let files = KeyFiles {
+        let RelayArgs {
+            listen,
             key,
             previous_key,
-            policy: path_for_keys,
-            revocations: revocations_for_keys,
+            policy: policy_path,
+            revocations,
+            ..
+        } = args;
+        let reloader = Reloader {
+            key,
+            previous_key,
+            policy_path,
+            revocations,
+            keys: keys.clone(),
+            key_updater,
+            policy: policy.clone(),
+            policy_updater,
         };
-        let policy_in_force = policy.clone();
+        // Policy, denylist and keys on every SIGHUP, in one step with one outcome.
         supervisor.spawn(
-            "relay_key_reload",
-            reload::on_sighup(key_hangups, key_updater, key_events, move || {
-                reload_keys(&files, &policy_in_force)
-            }),
+            "reload",
+            reload::on_sighup(hangups, publisher, generation, move |g| reloader.reload(g)),
         );
         // Unfinished agent rotations (two keys for one node): reported at startup, on every
         // reload and every hour while they remain (finding 0005b-2).
@@ -305,13 +441,6 @@ fn serve(args: RelayArgs, drain_timeout: Duration) -> Result<(), Failure> {
             "agent_rotation_watch",
             zt_net::keys::watch_agent_rotations(policy.clone(), zt_net::keys::ROTATION_REMINDER),
         );
-        let events = ReloadEvents {
-            reloaded: "policy_reloaded",
-            failed: "policy_reload_failed",
-            generation,
-            files: digested,
-        };
-        supervisor.spawn("policy_reload", reload::on_sighup(hangups, updater, events, load));
         let authorities = policy.clone();
         let server = RelayServer::bind(listen, keys, policy, relay_config)
             .await

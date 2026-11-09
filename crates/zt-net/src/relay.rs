@@ -428,8 +428,9 @@ impl<A: Acceptor> RelayServer<A> {
     }
 
     /// Serves connections until `shutdown` resolves, then drains (PROTOCOL §13, OPERATIONS
-    /// §14): the listening socket is closed at once, open sessions go on (the policy and its
-    /// revocations still apply) until the last one ends or `drain_timeout` passes; then the
+    /// §14): the listening socket is closed at once, new streams on open connections are
+    /// rejected with `NodeOffline`, open sessions go on (the policy and its revocations still
+    /// apply) until the last one ends or `drain_timeout` passes; then the
     /// remaining streams get `Close Drained` and every connection is closed.
     ///
     /// # Errors
@@ -528,7 +529,10 @@ impl<A: Acceptor> RelayServer<A> {
             };
             tokio::spawn(task.serve(tcp, addr, admitted));
         }
-        drain(listener, hub_task, &drain_tx, drain_timeout, &live).await
+        let drained = drain(listener, hub_task, &drain_tx, drain_timeout, &live).await;
+        // The last interval's confirmed handshakes are not lost at shutdown (A10-10).
+        confirmed.flush();
+        drained
     }
 }
 
@@ -1072,7 +1076,11 @@ fn admit(
     };
     // Steps 5 and 7–11 and the precedence of the whitelist.
     policy
-        .admit(peer, certificate.as_ref(), crate::unix_now())
+        .admit(
+            peer,
+            certificate.as_ref(),
+            crate::lifecycle::certificate_now(),
+        )
         .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))?;
     Ok(certificate)
 }
@@ -1098,6 +1106,8 @@ async fn hub(
 ) -> DrainOutcome {
     let mut peers: HashMap<ConnId, mpsc::Sender<Frame>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // A late tick is not caught up in a burst (A10-10): one tick per second of progress.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut drain: Option<DrainController> = None;
     let mut ticks: u64 = 0;
     loop {
@@ -1122,7 +1132,8 @@ async fn hub(
             }
             Some(timeout) = drain_rx.recv(), if drain.is_none() => {
                 drain = Some(DrainController::new(mono_now(), timeout));
-                Input::Tick
+                // From now on new streams are rejected, also on open connections (A10-5).
+                Input::DrainStarted
             }
             event = events.recv() => match event {
                 None => return DrainOutcome::default(),
@@ -1161,7 +1172,7 @@ fn execute(
     while let Some(input) = pending.pop() {
         let now = Now {
             instant: mono_now(),
-            unix: crate::unix_now(),
+            unix: crate::lifecycle::certificate_now(),
         };
         for output in core.handle(input, now) {
             match output {

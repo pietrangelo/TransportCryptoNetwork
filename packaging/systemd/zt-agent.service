@@ -18,22 +18,31 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-# notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away).
+# notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away);
+# every SIGHUP is announced with RELOADING=1 and closed with READY=1.
 Type=notify
 NotifyAccess=main
 User=tcn
 Group=tcn
+# /run/zt-agent: where the running process publishes the outcome of each reload for
+# `zt-agent reload` ($RUNTIME_DIRECTORY).
+RuntimeDirectory=zt-agent
+RuntimeDirectoryMode=0700
 EnvironmentFile=/etc/tcn/agent.env
 ExecStart=/usr/local/bin/zt-agent --log-format json run --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
 # Reloads the authorized clients and immediately closes the sessions of those removed.
-# `check` first: an invalid file fails `systemctl reload` visibly.
-ExecReload=/usr/local/bin/zt-agent --log-format json check --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22
-ExecReload=/bin/kill -HUP $MAINPID
+# `reload` sends SIGHUP to the running agent and waits for its own verdict: the agent
+# validates its files with its own ExecStart= arguments (drop-ins included), so
+# `systemctl reload` fails exactly when the agent rejected them (OPERATIONS §4). It
+# takes no file arguments on purpose (review 0010, A10-1).
+ExecReload=/usr/local/bin/zt-agent --log-format json reload --pid $MAINPID
 # SIGTERM drains (OPERATIONS §14): new sessions get NodeOffline, open ones get up to
 # --drain-timeout (60 s by default). TimeoutStopSec leaves room for it.
 TimeoutStopSec=90s
 WatchdogSec=60s
-# A configuration error (exit 78) is not restarted: it needs an operator, not a loop.
+# A configuration error (exit 78: a file that was read and is invalid) is not restarted: it
+# needs an operator, not a loop. A missing or unreadable file (provisioning not finished, a
+# late mount) exits 1 and is retried with the backoff below.
 Restart=always
 RestartPreventExitStatus=78
 RestartSec=2s

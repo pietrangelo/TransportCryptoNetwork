@@ -562,7 +562,8 @@ fn startup_code(dir: &Dir, extra: &[&str]) -> Option<i32> {
 /// exit code.
 #[test]
 fn check_and_run_accept_the_same_files() {
-    let cases: [(&str, fn(&Dir) -> Vec<String>); 5] = [
+    type Prepare = fn(&Dir) -> Vec<String>;
+    let cases: [(&str, Prepare); 5] = [
         ("valid", |_| Vec::new()),
         ("bad-policy", |d| {
             write(&d.0, "policy.toml", "[[agents]]\nnode = 1\n");

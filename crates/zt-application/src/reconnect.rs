@@ -6,6 +6,10 @@
 //!   in a row. Drawing the whole delay at random spreads a fleet that failed together.
 //! - After a session that **lived** (the relay restarted or drained): `U(0, spread)`, and the
 //!   failure count starts again. Without it a whole fleet would come back in one wave.
+//! - From then on the spread window is also the floor of the failure ceiling,
+//!   `U(0, max(spread, min(cap, base·2ⁿ⁻¹)))` (finding A10-4): a relay that is still down when
+//!   the first retries arrive must not turn them into one-second retries that pile up just
+//!   after it returns. A fleet that boots (no lived session yet) keeps the base.
 
 use core::time::Duration;
 
@@ -73,6 +77,8 @@ pub enum SessionEnd {
 pub struct ReconnectPolicy {
     config: ReconnectConfig,
     failures: u32,
+    /// The floor of the failure ceiling: zero until a session lived, then the spread.
+    floor: Duration,
 }
 
 impl ReconnectPolicy {
@@ -82,6 +88,7 @@ impl ReconnectPolicy {
         Self {
             config,
             failures: 0,
+            floor: Duration::ZERO,
         }
     }
 
@@ -100,6 +107,7 @@ impl ReconnectPolicy {
         };
         if lived {
             self.failures = 0;
+            self.floor = self.config.spread;
             return uniform(self.config.spread, sample);
         }
         self.failures = self.failures.saturating_add(1);
@@ -109,7 +117,8 @@ impl ReconnectPolicy {
             .config
             .base
             .saturating_mul(1_u32 << doublings)
-            .min(self.config.cap);
+            .min(self.config.cap)
+            .max(self.floor);
         uniform(ceiling, sample)
     }
 }

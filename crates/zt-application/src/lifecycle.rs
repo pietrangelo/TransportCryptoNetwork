@@ -11,28 +11,56 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+/// What to do at one watchdog check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogAction {
+    /// Progress since the previous check (or the first check, a baseline): kick.
+    Kick,
+    /// No progress since the previous check: do not kick, nothing to report yet (or the stall
+    /// was already reported).
+    Hold,
+    /// The second check in a row without progress: do not kick, and report the stall (once
+    /// per stall).
+    Stalled,
+}
+
+/// The checks in a row without progress that make a stall (finding A10-3): one alone can be a
+/// check that came just before the hub's tick.
+pub const STALL_CHECKS: u32 = 2;
+
 /// Decides whether to kick the watchdog from a monotonically increasing progress counter.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressWatchdog {
     last: Option<u64>,
+    misses: u32,
 }
 
 impl ProgressWatchdog {
-    /// A watchdog that has seen no progress yet.
+    /// A watchdog that has seen nothing yet.
     #[must_use]
     pub const fn new() -> Self {
-        Self { last: None }
+        Self {
+            last: None,
+            misses: 0,
+        }
     }
 
-    /// `true` if the counter moved since the previous call (the first call kicks if the counter
-    /// is not zero).
-    pub fn should_kick(&mut self, counter: u64) -> bool {
-        let moved = match self.last {
-            None => counter > 0,
-            Some(prev) => counter != prev,
-        };
+    /// The action for the counter's current value. The first observation is a baseline and
+    /// kicks (the hub may not have ticked yet at startup, finding A10-3); afterwards, a counter
+    /// that moved kicks, and [`STALL_CHECKS`] checks in a row without a move are a stall.
+    pub fn observe(&mut self, counter: u64) -> WatchdogAction {
+        let moved = self.last.is_none_or(|prev| counter != prev);
         self.last = Some(counter);
-        moved
+        if moved {
+            self.misses = 0;
+            return WatchdogAction::Kick;
+        }
+        self.misses = self.misses.saturating_add(1);
+        if self.misses == STALL_CHECKS {
+            WatchdogAction::Stalled
+        } else {
+            WatchdogAction::Hold
+        }
     }
 }
 

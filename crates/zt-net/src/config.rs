@@ -137,6 +137,56 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// `true` for a file that is missing or cannot be read (not provisioned yet, a late mount,
+    /// a transient I/O error): a retry may succeed, unlike a file that was read and found
+    /// invalid (finding A10-8).
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Io { .. })
+    }
+}
+
+/// The SHA-256 of the bytes of each file a load parsed, in the order read: what identifies the
+/// configuration in force (R3-C8). Computed from the bytes parsed, never by reading the files
+/// again (finding A10-2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Digests(Vec<(String, [u8; 32])>);
+
+impl Digests {
+    /// No file yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn add(&mut self, path: &Path, text: &str) {
+        use sha2::Digest;
+        self.0.push((
+            path.display().to_string(),
+            sha2::Sha256::digest(text.as_bytes()).into(),
+        ));
+    }
+
+    /// Appends the digests of `other`.
+    pub fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+}
+
+impl std::fmt::Display for Digests {
+    /// `path=sha256:hex` per file, joined by `, `.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, (path, digest)) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{path}=sha256:{}", hex::encode(digest))?;
+        }
+        Ok(())
+    }
+}
+
 /// Opens a trust file or a secret key and checks, on the **already open** file (no window
 /// between check and read), what OpenSSH checks with `StrictModes` (finding 0003-1): regular
 /// file, owned by the current user or root, no write permission for group and others (for a
@@ -433,6 +483,10 @@ struct ClientFile {
     /// Form with several relays, in order of preference (PROTOCOL §13).
     #[serde(default)]
     relays: Vec<RelayEntry>,
+    /// The outer suite every relay must be pinned to, once the rollout of OPERATIONS §13 is
+    /// over: failover then never lands on a relay pinned to another suite (finding A10-9).
+    #[serde(default)]
+    require_outer_suite: Option<String>,
     key: String,
     /// Client certificate file (PROTOCOL §15), relative to this file.
     #[serde(default)]
@@ -796,16 +850,31 @@ pub fn load_relay_policy(
     policy: &Path,
     revocations: Option<&Path>,
 ) -> Result<AccessPolicy, ConfigError> {
+    load_relay_policy_digested(policy, revocations).map(|(policy, _)| policy)
+}
+
+/// Like [`load_relay_policy`], with the digests of the bytes parsed.
+///
+/// # Errors
+/// See [`load_relay_policy`].
+pub fn load_relay_policy_digested(
+    policy: &Path,
+    revocations: Option<&Path>,
+) -> Result<(AccessPolicy, Digests), ConfigError> {
     let origin = policy.display().to_string();
+    let mut digests = Digests::new();
     // Both files read and validated before building the result: no partial effect.
     let text = read_limited(policy)?;
-    let revoked = revocations.map(load_revocations).transpose()?;
+    digests.add(policy, &text);
+    let revoked = revocations
+        .map(|path| load_revocations(path, &mut digests))
+        .transpose()?;
     let mut parsed = parse_policy(&origin, &text)?;
     let trust = with_revocations(parsed.cert_trust(), revoked, &origin)?;
     parsed
         .set_cert_trust(trust)
         .map_err(|e| Ctx(&origin).domain("authorities", e))?;
-    Ok(parsed)
+    Ok((parsed, digests))
 }
 
 /// The keys of a keyring (current and previous) as keys forbidden to CAs, with the role to
@@ -855,8 +924,10 @@ pub fn reject_infrastructure_keys_as_authority(
 }
 
 /// Reads a denylist with the trust file rules.
-fn load_revocations(path: &Path) -> Result<Revocations, ConfigError> {
-    parse_revocations(&path.display().to_string(), &read_limited(path)?)
+fn load_revocations(path: &Path, digests: &mut Digests) -> Result<Revocations, ConfigError> {
+    let text = read_limited(path)?;
+    digests.add(path, &text);
+    parse_revocations(&path.display().to_string(), &text)
 }
 
 /// The CAs of `trust` with the denylist; a CA without a denylist cannot start (PROTOCOL §15.8).
@@ -883,15 +954,30 @@ pub fn load_authorized_clients(
     path: &Path,
     revocations: Option<&Path>,
 ) -> Result<AuthorizedClients, ConfigError> {
+    load_authorized_clients_digested(path, revocations).map(|(clients, _)| clients)
+}
+
+/// Like [`load_authorized_clients`], with the digests of the bytes parsed.
+///
+/// # Errors
+/// See [`load_authorized_clients`].
+pub fn load_authorized_clients_digested(
+    path: &Path,
+    revocations: Option<&Path>,
+) -> Result<(AuthorizedClients, Digests), ConfigError> {
     let origin = path.display().to_string();
+    let mut digests = Digests::new();
     let text = read_limited(path)?;
-    let revoked = revocations.map(load_revocations).transpose()?;
+    digests.add(path, &text);
+    let revoked = revocations
+        .map(|p| load_revocations(p, &mut digests))
+        .transpose()?;
     let mut clients = parse_authorized_clients(&origin, &text)?;
     let trust = with_revocations(clients.cert_trust(), revoked, &origin)?;
     clients
         .set_cert_trust(trust)
         .map_err(|e| Ctx(&origin).domain("authorities", e))?;
-    Ok(clients)
+    Ok((clients, digests))
 }
 
 /// Reads and parses the nodes known to a client.
@@ -1017,6 +1103,8 @@ fn valid_relay(text: &str) -> bool {
 /// # [[relays]]
 /// # address = "r1.example.org:7443"
 /// # public_key = "<64 hex>"
+/// # suite = "<Noise protocol name>"   (per relay; the classical suite without it)
+/// # require_outer_suite = "<Noise protocol name>"   (top level: every relay pinned to it)
 /// key = "client.key"
 ///
 /// [[nodes]]
@@ -1063,6 +1151,20 @@ pub fn parse_client_settings(
     for (relay, text) in relays.iter_mut().zip(suite_texts) {
         if let Some(text) = text {
             relay.suite = parse_suite(origin, text, zt_domain::HandshakeChannel::Outer)?;
+        }
+    }
+    if let Some(text) = &file.require_outer_suite {
+        let required = parse_suite(origin, text, zt_domain::HandshakeChannel::Outer)?;
+        if let Some(other) = relays.iter().find(|r| r.suite != required) {
+            return Err(ConfigError::Syntax {
+                path: origin.into(),
+                message: format!(
+                    "relay {} is pinned to {}, but require_outer_suite is {}",
+                    other.address,
+                    other.suite.protocol_name(),
+                    required.protocol_name()
+                ),
+            });
         }
     }
     if file.certificate.as_deref() == Some("") {
@@ -1135,8 +1237,10 @@ pub struct RelaySettings {
 /// R-2 (30 s), so that they survive a relay upgrade (catalogue R2-L3).
 pub const DEFAULT_RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// The shortest idle timeout `relay.toml` accepts: above the agent's dead-peer window of
-/// 3 × 10 s plus one keepalive of slack.
+/// The shortest idle timeout `relay.toml` accepts: one keepalive of a current agent or client
+/// (10 s, any authentic frame resets the timer) plus 5 s of slack. It is a floor, not a
+/// recommendation: OPERATIONS §4.1 recommends 30 s or more, so that a lost keepalive or two
+/// does not cost a live peer its connection (finding A10-10).
 const MIN_RELAY_IDLE_SECS: u64 = 15;
 /// The longest: one hour.
 const MAX_RELAY_IDLE_SECS: u64 = 3_600;
@@ -1315,7 +1419,21 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
 /// # Errors
 /// See [`parse_relay_settings`]; also a file writable by group or others.
 pub fn load_relay_settings(path: &Path) -> Result<RelaySettings, ConfigError> {
-    parse_relay_settings(&path.display().to_string(), &read_limited(path)?)
+    load_relay_settings_digested(path).map(|(settings, _)| settings)
+}
+
+/// Like [`load_relay_settings`], with the digest of the bytes parsed.
+///
+/// # Errors
+/// See [`load_relay_settings`].
+pub fn load_relay_settings_digested(path: &Path) -> Result<(RelaySettings, Digests), ConfigError> {
+    let text = read_limited(path)?;
+    let mut digests = Digests::new();
+    digests.add(path, &text);
+    Ok((
+        parse_relay_settings(&path.display().to_string(), &text)?,
+        digests,
+    ))
 }
 
 /// One handshake suite by its exact Noise protocol name (no case folding, trimming or

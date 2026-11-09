@@ -309,13 +309,19 @@ fuzz_target!(|data: &[u8]| {
                 // The system clock jumps (NTP, suspended VM) forward or backward; the monotonic
                 // one does not.
                 let Some(jump) = bytes.next() else { return };
-                let delta = u64::from(jump & 0x7f) * 3_600;
-                unix = if jump & 0x80 != 0 {
-                    unix.saturating_sub(delta)
+                // A zero jump starts the drain instead (finding A10-5): new streams are
+                // rejected from then on.
+                if jump == 0 {
+                    Input::DrainStarted
                 } else {
-                    unix.saturating_add(delta)
-                };
-                Input::Tick
+                    let delta = u64::from(jump & 0x7f) * 3_600;
+                    unix = if jump & 0x80 != 0 {
+                        unix.saturating_sub(delta)
+                    } else {
+                        unix.saturating_add(delta)
+                    };
+                    Input::Tick
+                }
             }
             _ => {
                 let Some(bits) = bytes.next() else { return };

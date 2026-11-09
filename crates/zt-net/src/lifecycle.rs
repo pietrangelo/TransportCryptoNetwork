@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use zt_application::lifecycle::{ClockJumpDetector, ProgressWatchdog};
+use zt_application::lifecycle::{ClockJumpDetector, ProgressWatchdog, WatchdogAction};
 
 use crate::systemd;
 
@@ -39,8 +39,10 @@ impl Progress {
     }
 }
 
-/// `SIGTERM` and `SIGINT`: the start of a graceful stop. Created as early as possible, before
-/// the files are read: from then on the signal no longer kills the process at once.
+/// `SIGTERM` and `SIGINT`: the start of a graceful stop. Created as early as possible, as the
+/// first thing inside the runtime: from then on the signal no longer kills the process at
+/// once. (The agent reads and validates its files before the runtime exists, so a `SIGTERM`
+/// during that read still has its default action; nothing is open yet to drain.)
 #[derive(Debug)]
 pub struct Terminate {
     #[cfg(unix)]
@@ -130,37 +132,76 @@ impl Supervisor {
     }
 }
 
+/// The shortest `WatchdogSec` accepted: three hub ticks. The hub and the agent's heartbeat move
+/// the progress counter once a second at idle, so a check more frequent than that misses
+/// progress and a healthy service gets killed (finding A10-3).
+pub const MIN_WATCHDOG: Duration = Duration::from_secs(3);
+
+/// How often the watchdog is checked for a `WatchdogSec` of `interval`: a third of it.
+///
+/// # Errors
+/// `interval` below [`MIN_WATCHDOG`], as a message for the operator.
+pub fn watchdog_period(interval: Duration) -> Result<Duration, String> {
+    if interval < MIN_WATCHDOG {
+        return Err(format!(
+            "WatchdogSec={} ms is below the minimum of {} s (three hub ticks)",
+            interval.as_millis(),
+            MIN_WATCHDOG.as_secs()
+        ));
+    }
+    Ok(interval.checked_div(3).unwrap_or(interval))
+}
+
+/// The watchdog systemd asked for, checked at startup: `Ok(None)` without one.
+///
+/// # Errors
+/// See [`watchdog_period`].
+pub fn check_watchdog() -> Result<Option<Duration>, String> {
+    systemd::watchdog_interval()
+        .map(watchdog_period)
+        .transpose()
+}
+
 /// Kicks the systemd watchdog (`WATCHDOG=1`) every third of `WatchdogSec`, but only while
 /// `progress` moves (AP-4): a hub that stopped processing anything gets the service restarted.
-/// Without a watchdog it waits forever, so it can be supervised like any critical task.
+/// The first check is a baseline and kicks; a stall is reported after two checks in a row
+/// without progress (finding A10-3). Without a watchdog it waits forever, so it can be
+/// supervised like any critical task. The binaries refuse a `WatchdogSec` below
+/// [`MIN_WATCHDOG`] at startup ([`check_watchdog`]); a library user gets a third of it anyway.
 pub async fn watchdog(role: &'static str, progress: Progress) {
     let Some(interval) = systemd::watchdog_interval() else {
         return std::future::pending().await;
     };
-    let period = interval
-        .checked_div(3)
-        .unwrap_or(interval)
-        .max(Duration::from_millis(100));
+    let period = watchdog_period(interval).unwrap_or_else(|_| {
+        interval
+            .checked_div(3)
+            .unwrap_or(interval)
+            .max(Duration::from_millis(100))
+    });
     let mut ticks = tokio::time::interval(period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut w = ProgressWatchdog::new();
     let mut stalled = false;
     loop {
         ticks.tick().await;
-        if w.should_kick(progress.get()) {
-            systemd::notify("WATCHDOG=1");
-            if stalled {
-                tracing::info!(role, "progress resumed: watchdog kicked again");
+        match w.observe(progress.get()) {
+            WatchdogAction::Kick => {
+                systemd::notify("WATCHDOG=1");
+                if stalled {
+                    tracing::info!(role, "progress resumed: watchdog kicked again");
+                }
+                stalled = false;
             }
-            stalled = false;
-        } else if !stalled {
-            stalled = true;
-            tracing::error!(
-                target: "zt_audit",
-                event_kind = "watchdog_stalled",
-                role,
-                "no progress since the last check: the watchdog is no longer kicked"
-            );
+            WatchdogAction::Hold => {}
+            WatchdogAction::Stalled => {
+                stalled = true;
+                tracing::error!(
+                    target: "zt_audit",
+                    event_kind = "watchdog_stalled",
+                    role,
+                    "no progress for two watchdog checks: the watchdog is no longer kicked"
+                );
+            }
         }
     }
 }
@@ -173,13 +214,16 @@ const CLOCK_CHECK: Duration = Duration::from_secs(10);
 
 /// Reports steps of the wall clock (`clock_jumped`, PROTOCOL §15.6): certificate validity
 /// and revocation timing follow the wall clock, and a backward step makes expired
-/// certificates valid again until the clock is corrected.
+/// certificates valid again until the clock is corrected. A VM suspend and resume looks like a
+/// forward step. Crossing the [`clock_floor`] either way is reported too: below it no
+/// certificate is accepted ([`certificate_time`]).
 pub async fn watch_clock(role: &'static str) {
     let mut c = ClockJumpDetector::new(
         CLOCK_JUMP_THRESHOLD,
         SystemTime::now(),
         std::time::Instant::now(),
     );
+    let mut below = before_floor(crate::unix_now());
     let mut ticks = tokio::time::interval(CLOCK_CHECK);
     ticks.tick().await;
     loop {
@@ -194,6 +238,19 @@ pub async fn watch_clock(role: &'static str) {
                 "the wall clock stepped"
             );
         }
+        let now = crate::unix_now();
+        match (below, before_floor(now)) {
+            (false, true) => unsynchronised(role, now),
+            (true, false) => tracing::warn!(
+                target: "zt_audit",
+                event_kind = "clock_synchronised",
+                role,
+                now = now.as_secs(),
+                "the wall clock is past this build again: certificates are checked again"
+            ),
+            _ => {}
+        }
+        below = before_floor(now);
     }
 }
 
@@ -206,20 +263,48 @@ pub fn clock_floor() -> u64 {
         .unwrap_or(1_767_225_600)
 }
 
+fn before_floor(now: zt_domain::UnixTime) -> bool {
+    now.as_secs() < clock_floor()
+}
+
+/// The time certificates are evaluated at (R3-C11, finding A10-7): the wall clock, or zero
+/// while it is before `floor`. A clock before the build cannot be trusted, and evaluating at
+/// zero makes every certificate not yet valid (fail closed, as a clock before 1970 already
+/// does): a certificate that expired before the build, and was left off the denylist because
+/// expiry was relied on, does not become valid again. Key-pinned peers do not depend on time.
+#[must_use]
+pub fn certificate_time(now: zt_domain::UnixTime, floor: u64) -> zt_domain::UnixTime {
+    if now.as_secs() < floor {
+        zt_domain::UnixTime::from_secs(0)
+    } else {
+        now
+    }
+}
+
+/// [`certificate_time`] for the wall clock and [`clock_floor`].
+#[must_use]
+pub fn certificate_now() -> zt_domain::UnixTime {
+    certificate_time(crate::unix_now(), clock_floor())
+}
+
+fn unsynchronised(role: &'static str, now: zt_domain::UnixTime) {
+    tracing::error!(
+        target: "zt_audit",
+        event_kind = "clock_unsynchronised",
+        role,
+        now = now.as_secs(),
+        floor = clock_floor(),
+        "the wall clock is before this build: certificates are refused until it is synchronised"
+    );
+}
+
 /// Logs `clock_unsynchronised` if the wall clock is before [`clock_floor`]. Not fatal: the
-/// service still starts, so a host with a broken RTC can be reached and fixed.
+/// service still starts, so a host with a broken RTC can be reached (with a pinned key) and
+/// fixed; certificates are refused meanwhile ([`certificate_time`]).
 pub fn check_clock(role: &'static str) {
-    let now = crate::unix_now().as_secs();
-    let floor = clock_floor();
-    if now < floor {
-        tracing::error!(
-            target: "zt_audit",
-            event_kind = "clock_unsynchronised",
-            role,
-            now,
-            floor,
-            "the wall clock is before this build: certificate checks are unreliable"
-        );
+    let now = crate::unix_now();
+    if before_floor(now) {
+        unsynchronised(role, now);
     }
 }
 
@@ -235,25 +320,8 @@ pub fn harden_process() {
     }
 }
 
-/// The SHA-256 of each file, as `path=sha256:hex` joined by `, `: what a log line or
-/// `check` prints to identify the configuration in force.
-#[must_use]
-pub fn digests(files: &[&std::path::Path]) -> String {
-    use sha2::Digest;
-    files
-        .iter()
-        .map(|path| {
-            let digest = std::fs::read(path).map_or_else(
-                |_| "unreadable".to_owned(),
-                |bytes| format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes))),
-            );
-            format!("{}={digest}", path.display())
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The configuration generation: 1 at startup, one more for every successful reload.
+/// The configuration generation: 1 at startup, one more for every reload that applied
+/// something (one per `SIGHUP` at most).
 #[derive(Debug, Clone, Default)]
 pub struct Generation(Arc<AtomicU64>);
 
@@ -271,13 +339,16 @@ impl Generation {
     }
 }
 
-/// Logs `configuration_loaded` with the next generation and the digests of `files`.
-pub fn configuration_loaded(generation: &Generation, files: &[&std::path::Path]) {
+/// Logs `configuration_loaded` with the next generation and the digests of the files parsed
+/// at startup.
+pub fn configuration_loaded(generation: &Generation, files: &crate::config::Digests) -> u64 {
+    let generation = generation.next();
     tracing::info!(
         target: "zt_audit",
         event_kind = "configuration_loaded",
-        generation = generation.next(),
-        files = digests(files),
+        generation,
+        files = %files,
         "configuration loaded"
     );
+    generation
 }

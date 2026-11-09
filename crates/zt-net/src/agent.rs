@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,6 +72,25 @@ struct Shared {
     lines: Arc<Mutex<IdentityLines>>,
     /// Set by the drain: new streams get `Reject NodeOffline`.
     draining: Arc<AtomicBool>,
+    /// Streams acknowledged to the relay and not yet holding a session permit (in mid
+    /// handshake): the drain counts them too (finding A10-5).
+    handshaking: Arc<AtomicUsize>,
+}
+
+/// One stream in mid-handshake, counted in [`Shared::handshaking`] until it is dropped.
+struct Handshaking(Arc<AtomicUsize>);
+
+impl Handshaking {
+    fn start(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for Handshaking {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Shared {
@@ -224,6 +243,7 @@ pub async fn run_until<D: Dialer>(
         sessions: Arc::new(Semaphore::new(config.max_streams)),
         lines: Arc::new(Mutex::new(IdentityLines::default())),
         draining: Arc::new(AtomicBool::new(false)),
+        handshaking: Arc::new(AtomicUsize::new(0)),
     };
     let mut sessions = tokio::task::JoinSet::new();
     sessions.spawn(identity_summaries(
@@ -248,10 +268,13 @@ pub async fn run_until<D: Dialer>(
     shared.draining.store(true, Ordering::SeqCst);
     crate::systemd::notify("STOPPING=1");
     crate::systemd::status("draining");
+    // Open sessions, and streams the relay was told `OpenAck` for that are still in their
+    // end-to-end handshake: those end at the permit with `Drained` (finding A10-5).
     let active = || {
         config
             .max_streams
             .saturating_sub(shared.sessions.available_permits())
+            .saturating_add(shared.handshaking.load(Ordering::SeqCst))
     };
     tracing::info!(
         target: "zt_audit",
@@ -315,7 +338,9 @@ async fn run_one<D: Dialer>(
         let end = registered.map_or(SessionEnd::Failed, |at: Instant| SessionEnd::Ended {
             lived: at.elapsed(),
         });
-        let delay = policy.next(end, getrandom::u64().unwrap_or(0));
+        // Without randomness, the longest delay rather than none: a failing RNG must not turn
+        // the backoff into a hot loop (finding A10-4).
+        let delay = policy.next(end, getrandom::u64().unwrap_or(u64::MAX));
         tokio::time::sleep(delay).await;
     }
 }
@@ -354,6 +379,9 @@ async fn run_session<D: Dialer>(
         t,
     )
     .await?;
+    // Logged once `Register` is sent (finding A10-10): message 2 already proved that the relay
+    // accepts this suite for agents (OPERATIONS §13 step 3), but the relay may still refuse
+    // the registration itself (admission, a node not in its policy) and close.
     tracing::info!(
         target: "zt_audit",
         event_kind = "relay_registered",
@@ -497,6 +525,8 @@ fn on_relay_frame<D: Dialer>(
                 timeouts: config.timeouts.clone(),
                 client_suites: config.client_suites,
                 dialer: dialer.clone(),
+                // Counted before the `OpenAck` leaves: the drain cannot miss it.
+                handshaking: Handshaking::start(&shared.handshaking),
             };
             let done = done_tx.clone();
             tokio::spawn(async move {
@@ -571,6 +601,8 @@ struct StreamTask<D> {
     client_suites: AcceptedSuites,
     /// How sshd is reached.
     dialer: D,
+    /// Counts this stream for the drain until it holds a session permit.
+    handshaking: Handshaking,
 }
 
 /// Steps 1–10 and 12 of PROTOCOL §15.4 on the end-to-end channel, with this agent's CAs,
@@ -596,7 +628,12 @@ fn admit_client(
     };
     // After the signature, the rejection carries the certificate (finding 0006-3).
     clients
-        .admit(client, certificate.as_ref(), node, crate::unix_now())
+        .admit(
+            client,
+            certificate.as_ref(),
+            node,
+            crate::lifecycle::certificate_now(),
+        )
         .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))
 }
 
@@ -654,6 +691,7 @@ async fn read_msg1(
 }
 
 impl<D: Dialer> StreamTask<D> {
+    #[allow(clippy::too_many_lines)] // the end-to-end handshake, step by step
     async fn serve(self) {
         let Self {
             mut io,
@@ -665,6 +703,7 @@ impl<D: Dialer> StreamTask<D> {
             timeouts,
             client_suites,
             dialer,
+            handshaking,
         } = self;
         let Some(responded) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
             return;
@@ -742,6 +781,11 @@ impl<D: Dialer> StreamTask<D> {
                 return;
             }
         }
+        // A drain that started during the handshake: no new session (finding A10-5).
+        if shared.draining.load(Ordering::SeqCst) {
+            io.close(CloseReason::Drained).await;
+            return;
+        }
         // Only now, with a real client, is one of the `max_streams` global slots taken; it
         // stays taken until the end of this function.
         let Ok(_session) = Arc::clone(&shared.sessions).try_acquire_owned() else {
@@ -749,6 +793,8 @@ impl<D: Dialer> StreamTask<D> {
             io.close(CloseReason::Drained).await;
             return;
         };
+        // From here the permit counts the session for the drain.
+        drop(handshaking);
         let Ok(Ok(ssh)) = timeout(timeouts.ssh_connect, dialer.connect(&ssh_target)).await else {
             tracing::warn!(target = %ssh_target, "cannot reach local ssh daemon");
             io.close(CloseReason::PeerGone).await;
@@ -787,7 +833,7 @@ enum Cut {
 /// clients and, for a certificate, at `min(not_after, now + 60 s)`.
 async fn until_cut(session: &Session, authorized: &mut crate::Revocable<AuthorizedClients>) -> Cut {
     loop {
-        let now = crate::unix_now();
+        let now = crate::lifecycle::certificate_now();
         let clients = authorized.current();
         if !clients.still_admits(&session.client, &session.credential, &session.node, now) {
             return match &session.credential {

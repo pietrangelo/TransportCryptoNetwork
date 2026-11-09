@@ -144,8 +144,8 @@ fn the_spread_is_uniform_over_the_window() {
 }
 
 proptest! {
-    /// R2-L4: after any history and for any sample, the delay never exceeds the cap (nor the
-    /// spread after a lived session) and nothing overflows.
+    /// R2-L4: after any history and for any sample, the delay never exceeds the larger of the
+    /// cap and the spread, and nothing overflows.
     #[test]
     fn backoff_is_bounded_for_any_sample(
         history in proptest::collection::vec((any::<bool>(), any::<u64>(), 0_u64..100_000), 0..300),
@@ -166,6 +166,7 @@ proptest! {
             let d = p.next(end, s);
             prop_assert!(d <= config.cap.max(config.spread));
         }
-        prop_assert!(p.next(SessionEnd::Failed, sample) <= config.cap);
+        // After a lived session the spread is the floor of the ceiling (finding A10-4).
+        prop_assert!(p.next(SessionEnd::Failed, sample) <= config.cap.max(config.spread));
     }
 }

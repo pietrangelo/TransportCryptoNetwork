@@ -15,7 +15,9 @@
     clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::missing_panics_doc,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::unchecked_time_subtraction,
+    clippy::format_push_string
 )]
 
 mod common;
@@ -211,7 +213,8 @@ async fn a_draining_relay_rejects_new_streams_on_existing_connections() {
 /// A10-5: an agent that starts draining while a stream is acknowledged but not yet authorized
 /// end to end waits for it, and the client that then completes the handshake gets `Drained`
 /// instead of a new session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// One thread: the captured log is the thread's default subscriber.
+#[tokio::test]
 async fn a_draining_agent_counts_and_refuses_streams_in_mid_handshake() {
     let log = common::Captured::default();
     let _guard = log.install();

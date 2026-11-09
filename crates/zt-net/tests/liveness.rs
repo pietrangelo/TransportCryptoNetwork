@@ -153,10 +153,15 @@ async fn dialed_sockets_have_user_timeout_and_keepalive() {
     );
     assert!(rustix::net::sockopt::socket_keepalive(&stream).unwrap());
     assert!(stream.nodelay().unwrap());
-    // The relay applies the same to accepted sockets.
-    let (accepted, _) = listener.accept().await.unwrap();
-    zt_net::net::configure(&accepted);
+    // The relay applies the same to accepted sockets, through its `Acceptor` (finding A10-6:
+    // not by calling `configure` by hand).
+    let mut listener = listener;
+    let (accepted, _) = zt_net::net::Acceptor::accept(&mut listener).await.unwrap();
     assert!(rustix::net::sockopt::socket_keepalive(&accepted).unwrap());
+    assert_eq!(
+        rustix::net::sockopt::tcp_user_timeout(&accepted).unwrap(),
+        u32::try_from(zt_net::net::TCP_USER_TIMEOUT.as_millis()).unwrap()
+    );
 }
 
 /// R2-L6 on the wire: two agents with the same key take the node from each other; the relay

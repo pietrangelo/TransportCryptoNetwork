@@ -14,10 +14,11 @@ use zt_crypto::PublicKey;
 use zt_domain::{HandshakeChannel, NodeId};
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
+use zt_net::config::{ConfigError, Digests};
 use zt_net::lifecycle::{self, Generation, Progress, Supervisor, Terminate};
 use zt_net::logging::{self, LogFormat};
 use zt_net::net::TcpDialer;
-use zt_net::reload::{self, Hangups, ReloadEvents};
+use zt_net::reload::{self, Hangups, Outcome, Publisher};
 use zt_net::{Revocable, config, systemd};
 
 /// TCN agent.
@@ -112,13 +113,33 @@ enum Command {
         /// `TimeoutStopSec`.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
         drain_timeout: u64,
+        /// Where the reload state for `reload` is published. Default: `$RUNTIME_DIRECTORY`
+        /// (systemd's `RuntimeDirectory=`); without either, `reload` cannot be used.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
     },
-    /// Validates every file and option `run` would use, with the same options, and prints the
-    /// SHA-256 of the trust files; exits 78 on a configuration error. `ExecReload` runs it
-    /// before `SIGHUP`.
+    /// Validates every file and option `run` uses at startup, with the same options and the
+    /// same code, and prints the SHA-256 of the trust files; exits 78 on an invalid file or
+    /// option, 1 on a missing or unreadable file. A pre-flight before a restart;
+    /// `systemctl reload` uses `reload`.
     Check {
         #[command(flatten)]
         args: AgentArgs,
+    },
+    /// Asks the running agent to reload its authorized clients (`SIGHUP`) and reports its
+    /// outcome: exit 0 if applied, 78 if rejected (the previous clients remain), 1 if the agent
+    /// did not answer. The agent validates its own files with its own arguments, so this takes
+    /// none (`ExecReload=`, finding A10-1).
+    Reload {
+        /// The agent's process id (`$MAINPID` in the unit).
+        #[arg(long)]
+        pid: u32,
+        /// The agent's runtime directory. Default: `$RUNTIME_DIRECTORY`.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
+        /// How long to wait for the outcome (seconds, 1 to 600).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
+        timeout: u64,
     },
 }
 
@@ -166,6 +187,17 @@ const EX_CONFIG: u8 = 78;
 
 fn config_error(e: impl std::fmt::Display) -> Failure {
     Failure::Config(e.to_string())
+}
+
+/// A file that could not be read (missing, unreadable: provisioning not finished, a late
+/// mount) is restarted with the unit's backoff; a file that was read and is invalid is
+/// `EX_CONFIG` (finding A10-8).
+fn load_error(e: &ConfigError) -> Failure {
+    if e.is_transient() {
+        Failure::Runtime(e.to_string())
+    } else {
+        Failure::Config(e.to_string())
+    }
 }
 
 fn runtime_error(e: impl std::fmt::Display) -> Failure {
@@ -223,7 +255,7 @@ fn run(command: Command) -> Result<(), Failure> {
             let prepared = prepare(args)?;
             let mut out = std::io::stdout();
             writeln!(out, "configuration OK").map_err(runtime_error)?;
-            for line in lifecycle::digests(&prepared.digested_paths()).split(", ") {
+            for line in prepared.digests.to_string().split(", ") {
                 writeln!(out, "{line}").map_err(runtime_error)?;
             }
             Ok(())
@@ -231,23 +263,55 @@ fn run(command: Command) -> Result<(), Failure> {
         Command::Run {
             args,
             drain_timeout,
-        } => serve(prepare(args)?, Duration::from_secs(drain_timeout)),
+            runtime_dir,
+        } => serve(
+            prepare(args)?,
+            Duration::from_secs(drain_timeout),
+            runtime_dir,
+        ),
+        Command::Reload {
+            pid,
+            runtime_dir,
+            timeout,
+        } => request_reload(pid, runtime_dir, Duration::from_secs(timeout)),
     }
 }
+
+/// `reload`: the outcome of the running agent's own reload.
+fn request_reload(pid: u32, runtime_dir: Option<PathBuf>, wait: Duration) -> Result<(), Failure> {
+    let dir = reload::runtime_dir(runtime_dir)
+        .ok_or_else(|| runtime_error(reload::RequestError::NoRuntimeDirectory))?;
+    let outcome = reload::request(pid, &dir, wait).map_err(runtime_error)?;
+    let mut err = std::io::stderr();
+    for warning in &outcome.warnings {
+        writeln!(err, "warning: {warning}").map_err(runtime_error)?;
+    }
+    match outcome.result {
+        Ok((generation, files)) => {
+            let mut out = std::io::stdout();
+            writeln!(out, "reload applied: generation {generation}").map_err(runtime_error)?;
+            for line in files.split(", ").filter(|l| !l.is_empty()) {
+                writeln!(out, "{line}").map_err(runtime_error)?;
+            }
+            Ok(())
+        }
+        Err(reason) => Err(Failure::Config(format!(
+            "reload rejected, the previous authorized clients remain in force: {reason}"
+        ))),
+    }
+}
+
+/// Loads the authorized clients and denylist, with the digests of the bytes parsed.
+type ClientsLoader =
+    Box<dyn Fn() -> Result<(zt_domain::AuthorizedClients, Digests), ConfigError> + Send>;
 
 /// Everything `run` needs, loaded and validated: what `check` checks.
 struct Prepared {
     keys: Arc<Keyring>,
     config: AgentConfig,
     updater: zt_net::Updater<zt_domain::AuthorizedClients>,
-    load: Box<dyn Fn() -> Result<zt_domain::AuthorizedClients, config::ConfigError> + Send>,
-    digested: Vec<PathBuf>,
-}
-
-impl Prepared {
-    fn digested_paths(&self) -> Vec<&std::path::Path> {
-        self.digested.iter().map(PathBuf::as_path).collect()
-    }
+    load: ClientsLoader,
+    digests: Digests,
 }
 
 fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
@@ -269,10 +333,8 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         config::relay_endpoints("--relay", &relay, &relay_key).map_err(config_error)?;
     let client_suites =
         pin_suites(&mut relays, &relay_suite, &accept_client_suites).map_err(Failure::Config)?;
-    let keys = Arc::new(config::load_keyring(&key, previous_key.as_deref()).map_err(config_error)?);
-    let digested: Vec<PathBuf> = std::iter::once(authorized_clients.clone())
-        .chain(revocations.clone())
-        .collect();
+    let keys =
+        Arc::new(config::load_keyring(&key, previous_key.as_deref()).map_err(|e| load_error(&e))?);
     let path = authorized_clients;
     // Authorized clients and denylist in a single step; a CA equal to the agent's key
     // (current or previous) or to a `--relay-key` is rejected, at startup and on every
@@ -284,15 +346,16 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         role: "relay",
     }));
     let load = move || {
-        let clients = config::load_authorized_clients(&path, revocations.as_deref())?;
+        let (clients, digests) =
+            config::load_authorized_clients_digested(&path, revocations.as_deref())?;
         config::reject_infrastructure_keys_as_authority(
             &path.display().to_string(),
             clients.cert_trust(),
             &forbidden,
         )?;
-        Ok(clients)
+        Ok((clients, digests))
     };
-    let authorized = load().map_err(config_error)?;
+    let (authorized, digests) = load().map_err(|e| load_error(&e))?;
     let (authorized_clients, updater) = Revocable::new(authorized);
     let node = NodeId::try_from(node.as_str()).map_err(config_error)?;
     let config = AgentConfig {
@@ -314,11 +377,17 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         config,
         updater,
         load: Box::new(load),
-        digested,
+        digests,
     })
 }
 
-fn serve(prepared: Prepared, drain_timeout: Duration) -> Result<(), Failure> {
+fn serve(
+    prepared: Prepared,
+    drain_timeout: Duration,
+    runtime_dir: Option<PathBuf>,
+) -> Result<(), Failure> {
+    // A watchdog too short for the heartbeat would kill a healthy agent (finding A10-3).
+    lifecycle::check_watchdog().map_err(Failure::Config)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -331,16 +400,19 @@ fn serve(prepared: Prepared, drain_timeout: Duration) -> Result<(), Failure> {
             config,
             updater,
             load,
-            digested,
+            ..
         } = prepared;
         // A SIGHUP between the first read (in `prepare`) and `Hangups::listen` would be lost:
         // the files are read again now that it is collected.
-        updater.replace(load().map_err(config_error)?);
+        let (authorized, digests) = load().map_err(|e| load_error(&e))?;
+        updater.replace(authorized);
         let generation = Generation::new();
-        lifecycle::configuration_loaded(
-            &generation,
-            &digested.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        let first = lifecycle::configuration_loaded(&generation, &digests);
+        let publisher = Publisher::new(
+            reload::runtime_dir(runtime_dir),
+            Outcome::applied(first, digests.to_string()),
         );
+        publisher.publish();
         let mut supervisor = Supervisor::new();
         // The agent key changes only with a restart (PROTOCOL §14).
         supervisor.spawn(
@@ -359,15 +431,35 @@ fn serve(prepared: Prepared, drain_timeout: Duration) -> Result<(), Failure> {
                 zt_net::keys::ROTATION_REMINDER,
             ),
         );
-        let events = ReloadEvents {
-            reloaded: "authorized_clients_reloaded",
-            failed: "authorized_clients_reload_failed",
-            generation,
-            files: digested,
-        };
+        // The authorized clients and denylist on every SIGHUP, validated by this process with
+        // its own arguments; `reload` reports the outcome (finding A10-1).
         supervisor.spawn(
             "authorized_clients_reload",
-            reload::on_sighup(hangups, updater, events, load),
+            reload::on_sighup(hangups, publisher, generation, move |generation| {
+                match load() {
+                    Ok((clients, digests)) => {
+                        let generation = generation.next();
+                        updater.replace(clients);
+                        tracing::info!(
+                            target: "zt_audit",
+                            event_kind = "authorized_clients_reloaded",
+                            generation,
+                            files = %digests,
+                            "configuration reloaded"
+                        );
+                        Outcome::applied(generation, digests.to_string())
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            target: "zt_audit",
+                            event_kind = "authorized_clients_reload_failed",
+                            error = %err,
+                            "reload failed: keeping the previous configuration"
+                        );
+                        Outcome::rejected(err.to_string())
+                    }
+                }
+            }),
         );
         // The agent has no central hub: its watchdog proves that the runtime still schedules
         // tasks (a wedged runtime stops this heartbeat too).

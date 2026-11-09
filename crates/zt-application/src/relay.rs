@@ -68,6 +68,10 @@ pub enum Input {
         /// The new policy.
         policy: Arc<AccessPolicy>,
     },
+    /// Start of a drain (graceful stop, PROTOCOL §13): from now on a new `Open`, also on a
+    /// connection established before, is rejected with `NodeOffline` (the client tries another
+    /// relay); the open streams go on (finding A10-5).
+    DrainStarted,
     /// End of a drain (graceful stop, PROTOCOL §13): every stream still open is closed with
     /// `Close Drained` on both sides, then every connection.
     Shutdown,
@@ -254,6 +258,8 @@ pub struct RelayCore<S> {
     agents: HashMap<NodeId, ConnId>,
     routes: HashMap<(ConnId, StreamId), Route>,
     flapping: FlapDetector,
+    /// A drain started: new streams are rejected.
+    draining: bool,
 }
 
 impl<S: SessionIds> RelayCore<S> {
@@ -268,6 +274,7 @@ impl<S: SessionIds> RelayCore<S> {
             agents: HashMap::new(),
             routes: HashMap::new(),
             flapping: FlapDetector::new(limits_flapping),
+            draining: false,
         }
     }
 
@@ -308,6 +315,7 @@ impl<S: SessionIds> RelayCore<S> {
             Input::Disconnected { conn } => self.teardown(conn, &mut out),
             Input::Tick => self.on_tick(now, &mut out),
             Input::PolicyUpdated { policy } => self.on_policy(policy, now.unix, &mut out),
+            Input::DrainStarted => self.draining = true,
             Input::Shutdown => self.on_shutdown(&mut out),
         }
         out
@@ -692,9 +700,13 @@ impl<S: SessionIds> RelayCore<S> {
             out.push(reject(RejectReason::ResourceExhausted));
             return Ok(());
         }
-        let Some(&agent) = self.agents.get(&target) else {
-            out.push(reject(RejectReason::NodeOffline));
-            return Ok(());
+        // A draining relay looks like one without the node: the client moves on.
+        let agent = match self.agents.get(&target) {
+            Some(&agent) if !self.draining => agent,
+            _ => {
+                out.push(reject(RejectReason::NodeOffline));
+                return Ok(());
+            }
         };
         let max_agent = self.limits.max_streams_per_agent;
         let Some(agent_stream) = self
