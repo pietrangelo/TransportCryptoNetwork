@@ -236,9 +236,10 @@ async fn the_preauth_cap_admits_the_largest_hybrid_message_1_and_nothing_more() 
     let log = Captured::default();
     let _guard = log.install();
     let alice = Identity::generate().unwrap();
+    // A key the relay does not know: its failures are only counted (PROTOCOL §10.1).
     let policy = relay_policy(
         &Identity::generate().unwrap().fingerprint(),
-        &[alice.fingerprint()],
+        &[],
         zt_domain::trust::CertTrust::new(),
     );
     let relay = start_relay_with(

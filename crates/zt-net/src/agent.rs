@@ -253,7 +253,14 @@ async fn run_session(
         t,
     )
     .await?;
-    tracing::info!(node = %config.node, relay = %relay.address, "registered with relay");
+    tracing::info!(
+        target: "zt_audit",
+        event_kind = "relay_registered",
+        node = %config.node,
+        relay = %relay.address,
+        suite = relay.suite.protocol_name(),
+        "registered with relay"
+    );
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(1024);
     let (done_tx, mut done_rx) = mpsc::channel::<StreamId>(config.max_streams.saturating_add(1));

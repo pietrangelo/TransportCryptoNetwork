@@ -84,7 +84,7 @@ async fn hybrid_agent_and_client_reach_each_other_through_a_hybrid_relay() {
     let (mut app, _task) = lab
         .session_with(&alice, lab.config_outer(None, HFS, HFS))
         .await
-        .unwrap();
+        .unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
     assert_alive(&mut app).await;
     // The agent names the suite it registered with (audit, not only a debug line).
     let registered = log.events("relay_registered");

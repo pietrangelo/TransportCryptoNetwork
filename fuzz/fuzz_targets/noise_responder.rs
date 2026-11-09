@@ -17,6 +17,10 @@
 //! accepts both suites, as an upgraded agent does; the reported suite is the one sent; the
 //! outer channel never accepts a hybrid msg1.
 //!
+//! PQ-1 on the outer channel (Phase 3): with bits 3 and 5 of the mode the hybrid suite runs on
+//! the outer channel, as a relay that accepts both suites; an outer hybrid msg1 is never valid
+//! end to end, and an end-to-end one never on the outer channel.
+//!
 //! Review 0009 (A9-7): with bits 3 and 4 of the mode the responder accepts only the classical
 //! suite, as a default agent does, and runs `respond_or_identify`: a hybrid msg1 is never
 //! pending, only identified (with the true initiator), and the genuine one is identified.
@@ -45,6 +49,8 @@ struct Fixture {
     with_payload: [Vec<u8>; 2],
     /// Genuine hybrid msg1s (end to end): without and with [`PAYLOAD`].
     hybrid: [Vec<u8>; 2],
+    /// Genuine hybrid msg1s on the outer channel: without and with [`PAYLOAD`].
+    outer_hybrid: [Vec<u8>; 2],
 }
 
 fn both() -> AcceptedSuites {
@@ -91,6 +97,10 @@ fn hybrid(f: &Fixture, mode: u8, rest: &[u8]) {
         }
         return;
     }
+    if mode & 32 != 0 {
+        outer_hybrid(f, mode, rest);
+        return;
+    }
     let (genuine, sent): (&[u8], &[u8]) = if mode & 2 == 0 {
         (&f.hybrid[0], &[])
     } else {
@@ -124,6 +134,39 @@ fn hybrid(f: &Fixture, mode: u8, rest: &[u8]) {
         let _ = pending.accept();
     } else {
         assert!(msg != genuine, "the genuine hybrid msg1 was rejected");
+    }
+}
+
+/// The hybrid suite on the outer channel, as a relay accepting both suites (Phase 3).
+fn outer_hybrid(f: &Fixture, mode: u8, rest: &[u8]) {
+    let (genuine, sent): (&[u8], &[u8]) = if mode & 2 == 0 {
+        (&f.outer_hybrid[0], &[])
+    } else {
+        (&f.outer_hybrid[1], &PAYLOAD)
+    };
+    let msg = if mode & 1 == 0 {
+        rest.to_vec()
+    } else {
+        mutate(genuine, rest)
+    };
+    assert!(
+        noise::respond_suites(&f.keys, &msg, Channel::EndToEnd, both()).is_err(),
+        "the end-to-end channel accepted an outer hybrid msg1"
+    );
+    if let Ok(pending) = noise::respond_suites(&f.keys, &msg, Channel::Outer, both()) {
+        assert_eq!(
+            pending.peer(),
+            f.initiator.fingerprint(),
+            "a modified msg1 was accepted with another identity"
+        );
+        assert!(pending.payload().len() <= MAX_HANDSHAKE_PAYLOAD_LEN);
+        if msg == genuine {
+            assert_eq!(pending.suite(), HFS);
+            assert_eq!(pending.payload(), sent, "the genuine payload changed");
+        }
+        let _ = pending.accept();
+    } else {
+        assert!(msg != genuine, "the genuine outer hybrid msg1 was rejected");
     }
 }
 
@@ -176,6 +219,17 @@ fn fixture() -> &'static Fixture {
             .expect("initiate hybrid")
             .0
         });
+        let outer_hybrid = [&[][..], &PAYLOAD[..]].map(|payload| {
+            noise::initiate_suite(
+                &initiator,
+                &responder.public_key(),
+                Channel::Outer,
+                HFS,
+                payload,
+            )
+            .expect("initiate outer hybrid")
+            .0
+        });
         Fixture {
             responder,
             keys,
@@ -183,6 +237,7 @@ fn fixture() -> &'static Fixture {
             msg1,
             with_payload,
             hybrid,
+            outer_hybrid,
         }
     })
 }

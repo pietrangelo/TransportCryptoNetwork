@@ -6,9 +6,9 @@
 //! the suite travels in the clear (finding AP-11): a responder finds the suite by trying the
 //! ones it accepts, as it already tries its current and previous key.
 //!
-//! A suite is supported per [`HandshakeChannel`]: PQ-1 runs the hybrid suite on the
-//! end-to-end channel only, which needs no relay upgrade; the outer channel follows in a later
-//! release by flipping [`HandshakeSuite::is_supported`] for it.
+//! A suite is supported per [`HandshakeChannel`]. PQ-1 ran the hybrid suite on the end-to-end
+//! channel first (it needs no relay upgrade); since Phase 3 it runs on the outer channel too,
+//! with its own prologue (PROTOCOL §7.5.2).
 
 use std::fmt;
 use std::str::FromStr;
@@ -39,7 +39,7 @@ pub enum HandshakeSuite {
     /// byte for byte the handshake of every release so far.
     NoiseIk25519,
     /// `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` with the `TCN/2` prologues: hybrid
-    /// forward secrecy (X25519 and ML-KEM-768). PQ-1: end-to-end channel only.
+    /// forward secrecy (X25519 and ML-KEM-768), on both channels.
     NoiseIkhfs25519MlKem768,
 }
 
@@ -87,11 +87,10 @@ impl HandshakeSuite {
     /// `true` if this build can run the suite on `channel`. Configuration refuses the others.
     #[must_use]
     pub const fn is_supported(self, channel: HandshakeChannel) -> bool {
+        // Every suite runs on both channels since PQ-1 on the outer channel (Phase 3). The
+        // match stays, so that a future suite has to decide per channel.
         match (self, channel) {
-            (Self::NoiseIk25519, _)
-            | (Self::NoiseIkhfs25519MlKem768, HandshakeChannel::EndToEnd) => true,
-            // The relays are upgraded in a later release (docs/pq-resilience-plan.md §4).
-            (Self::NoiseIkhfs25519MlKem768, HandshakeChannel::Outer) => false,
+            (Self::NoiseIk25519 | Self::NoiseIkhfs25519MlKem768, _) => true,
         }
     }
 

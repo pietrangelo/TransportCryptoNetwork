@@ -50,7 +50,7 @@ fn each_suite_has_its_own_confirmation() {
 fn the_suites_a_channel_supports_form_a_set() {
     assert_eq!(
         AcceptedSuites::supported(HandshakeChannel::Outer),
-        AcceptedSuites::only(CLASSIC)
+        AcceptedSuites::new([CLASSIC, HFS]).unwrap()
     );
     assert_eq!(
         AcceptedSuites::supported(HandshakeChannel::EndToEnd),
@@ -134,12 +134,12 @@ fn an_accepted_set_is_explicit_and_non_empty() {
 }
 
 #[test]
-fn a_set_with_the_hybrid_suite_is_supported_end_to_end_only() {
-    // The relay's configuration refuses it on the outer channel in this build.
+fn a_set_with_the_hybrid_suite_is_supported_on_both_channels() {
+    // PQ-1 on the outer channel (Phase 3): the relay's configuration accepts it too.
     let set = AcceptedSuites::new([CLASSIC, HFS]).unwrap();
     assert!(set.contains(HFS));
     assert!(set.all_supported(HandshakeChannel::EndToEnd));
-    assert!(!set.all_supported(HandshakeChannel::Outer));
+    assert!(set.all_supported(HandshakeChannel::Outer));
 }
 
 #[test]

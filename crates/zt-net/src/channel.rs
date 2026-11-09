@@ -213,11 +213,8 @@ where
         Ok(Some(Ok(msg1))) => msg1,
     };
     let pending = noise::respond_suites(local, &msg1, channel, accepted)?;
-    // Until the key is confirmed, at most the largest legitimate first frame (finding A8-4);
-    // `Established::confirmed` lifts the cap to the Noise maximum.
-    framed
-        .codec_mut()
-        .set_max_frame_length(MAX_FIRST_MESSAGE_LEN);
+    // Nothing is read until message 2 is sent: `Pending::establish` sets the first-frame cap
+    // then (the codec applies its maximum to writes too, and a hybrid message 2 is longer).
     Ok(Pending {
         framed,
         handshake: pending,
@@ -277,6 +274,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
         timeout(timeouts.write, framed.send(Bytes::from(msg2)))
             .await
             .map_err(|_| NetError::Timeout("handshake write"))??;
+        // Until the key is confirmed, at most the largest legitimate first frame (finding
+        // A8-4); `Established::confirmed` lifts the cap to the Noise maximum. Set only after
+        // message 2: the codec checks its maximum on writes as well, and a hybrid message 2
+        // (1 152 bytes) is longer than the first-frame cap.
+        framed
+            .codec_mut()
+            .set_max_frame_length(MAX_FIRST_MESSAGE_LEN);
         let mut established = Established {
             framed,
             transport,

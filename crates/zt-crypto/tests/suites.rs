@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use zt_crypto::noise::{self, Channel};
-use zt_crypto::{CryptoError, Identity, Keyring};
+use zt_crypto::{Identity, Keyring};
 use zt_domain::{AcceptedSuites, HandshakeSuite};
 
 const CLASSIC: HandshakeSuite = HandshakeSuite::NoiseIk25519;
@@ -103,10 +103,14 @@ fn the_previous_key_is_still_tried_for_every_accepted_suite() {
 }
 
 #[test]
-fn an_initiator_cannot_pin_a_suite_this_build_does_not_support() {
+fn an_initiator_pins_the_hybrid_suite_on_either_channel() {
+    // Every suite of this build runs on both channels since PQ-1 on the outer channel;
+    // `UnsupportedSuite` stays for a future suite that does not.
     let (client, relay) = ids();
-    assert_eq!(
-        noise::initiate_suite(&client, &relay.public_key(), Channel::Outer, HFS, &[]).err(),
-        Some(CryptoError::UnsupportedSuite)
-    );
+    for channel in [Channel::Outer, Channel::EndToEnd] {
+        let (msg1, waiting) =
+            noise::initiate_suite(&client, &relay.public_key(), channel, HFS, &[]).unwrap();
+        assert_eq!(msg1.len(), HFS.msg1_overhead());
+        assert_eq!(waiting.suite(), HFS);
+    }
 }

@@ -55,8 +55,8 @@ enum Command {
         relay_key: Vec<PublicKey>,
         /// Handshake suite pinned for the relays (its exact Noise protocol name, PROTOCOL
         /// §7.5): one for all of them, or one per `--relay` in the same order. Without it, the
-        /// classical suite; there is never a fallback to another suite. Only the classical
-        /// suite runs on the relay channel in this release.
+        /// classical suite; there is never a fallback to another suite. Pin the hybrid suite
+        /// only once the relay accepts it for agents (OPERATIONS §13).
         #[arg(long, value_delimiter = ',')]
         relay_suite: Vec<String>,
         /// Handshake suites accepted from clients on the end-to-end channel (exact Noise

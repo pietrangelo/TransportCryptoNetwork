@@ -29,7 +29,7 @@ use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
     AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
-    InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
+    HandshakeSuite, InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
 };
 
 use crate::{NetError, Timeouts, channel, lock};
@@ -381,7 +381,12 @@ impl RelayServer {
             config.admission.clone(),
             std::time::Instant::now(),
         )));
-        tokio::spawn(summaries(Arc::downgrade(&admission)));
+        let confirmed = Arc::new(ConfirmedSuites::default());
+        tokio::spawn(summaries(
+            Arc::downgrade(&admission),
+            Arc::clone(&confirmed),
+            config.admission.summary_interval,
+        ));
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;
         loop {
@@ -418,6 +423,7 @@ impl RelayServer {
                 timeouts: config.timeouts.clone(),
                 admission: config.admission.clone(),
                 suites: config.suites,
+                confirmed: Arc::clone(&confirmed),
                 capacity,
             };
             tokio::spawn(task.serve(tcp, addr, admitted));
@@ -433,7 +439,47 @@ struct Connection {
     timeouts: Timeouts,
     admission: AdmissionConfig,
     suites: SuitePolicy,
+    confirmed: Arc<ConfirmedSuites>,
     capacity: usize,
+}
+
+/// Confirmed outer handshakes per role and suite in the current summary interval: the
+/// sunset signal of OPERATIONS §13, without identities. Only key confirmation counts, so a
+/// replayed message 1 cannot inflate it.
+#[derive(Default)]
+struct ConfirmedSuites {
+    counts: Mutex<HashMap<(InitiatorRole, HandshakeSuite), u64>>,
+}
+
+impl ConfirmedSuites {
+    fn note(&self, role: InitiatorRole, suite: HandshakeSuite) {
+        let mut counts = lock(&self.counts);
+        let n = counts.entry((role, suite)).or_insert(0);
+        *n = n.saturating_add(1);
+    }
+
+    /// `outer_suites_confirmed` for the interval that ended, if anything was confirmed.
+    fn flush(&self) {
+        let counts = std::mem::take(&mut *lock(&self.counts));
+        if counts.is_empty() {
+            return;
+        }
+        let n = |role, suite| counts.get(&(role, suite)).copied();
+        let (agent, client) = (InitiatorRole::Agent, InitiatorRole::Client);
+        let (classical, hybrid) = (
+            HandshakeSuite::NoiseIk25519,
+            HandshakeSuite::NoiseIkhfs25519MlKem768,
+        );
+        tracing::info!(
+            target: "zt_audit",
+            event_kind = "outer_suites_confirmed",
+            agents_classical = n(agent, classical),
+            agents_hybrid = n(agent, hybrid),
+            clients_classical = n(client, classical),
+            clients_hybrid = n(client, hybrid),
+            "confirmed outer handshakes per role and suite"
+        );
+    }
 }
 
 /// One admitted connection: its admission ticket is released when the connection ends, on
@@ -487,10 +533,19 @@ fn initiator_role(policy: &AccessPolicy, peer: &Fingerprint) -> InitiatorRole {
 }
 
 /// Emits the aggregated `preauth_summary` (finding AP-3) until the relay goes away.
-async fn summaries(admission: std::sync::Weak<Mutex<Admission>>) {
+async fn summaries(
+    admission: std::sync::Weak<Mutex<Admission>>,
+    confirmed: Arc<ConfirmedSuites>,
+    interval: Duration,
+) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut next_flush = crate::deadline(interval);
     loop {
         tick.tick().await;
+        if tokio::time::Instant::now() >= next_flush {
+            confirmed.flush();
+            next_flush = crate::deadline(interval);
+        }
         let Some(admission) = admission.upgrade() else {
             return;
         };
@@ -728,7 +783,8 @@ impl Connection {
             return None;
         }
         ch.confirmed();
-        tracing::debug!(%addr, %peer, conn = self.conn.0, "peer connected");
+        self.confirmed.note(role, suite);
+        tracing::debug!(%addr, %peer, conn = self.conn.0, ?suite, "peer connected");
         Some((ch, peer, certificate, first))
     }
 

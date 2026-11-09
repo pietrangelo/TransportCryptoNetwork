@@ -276,19 +276,6 @@ fn the_client_refuses_a_suite_it_cannot_run() {
             "{relay_suite} / {node_suite}"
         );
     }
-    let text = format!(
-        r#"
-        key = "client.key"
-        [[relays]]
-        address = "r1.example.org:7443"
-        public_key = "{r1}"
-        suite = "{HFS}"
-        [[nodes]]
-        node = "web-01"
-        public_key = "{n1}"
-        "#
-    );
-    assert!(parse_client_settings("client.toml", Path::new("/etc/tcn"), &text).is_err());
 }
 
 /// PQ-1: a client pins the hybrid suite per node. Nodes without `suite` stay classical (the
