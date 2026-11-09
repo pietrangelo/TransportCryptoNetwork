@@ -26,6 +26,7 @@ mod ids;
 pub mod limits;
 mod payload;
 mod policy;
+pub mod suite;
 pub mod trust;
 
 pub use cert::{
@@ -42,4 +43,5 @@ pub use payload::FramePayload;
 pub use policy::{
     AccessPolicy, Admission, AllowedNodes, ClientCredential, ClientGrant, MAX_AGENT_KEYS, PeerRole,
 };
+pub use suite::{AcceptedSuites, HandshakeSuite, InitiatorRole, SuiteError, SuitePolicy};
 pub use trust::{Authority, CertTrust, Revocations, TrustedCaKey};

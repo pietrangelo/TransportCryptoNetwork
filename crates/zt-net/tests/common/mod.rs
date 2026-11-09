@@ -248,8 +248,11 @@ pub fn agent_clients(whitelist: &[Fingerprint], trust: CertTrust) -> AuthorizedC
 pub fn relay_config() -> RelayConfig {
     RelayConfig {
         timeouts: timeouts(),
-        handshake_burst: 1_000,
-        wide_handshake_burst: 1_000,
+        admission: zt_application::admission::AdmissionConfig {
+            source_burst: 1_000,
+            wide_burst: 1_000,
+            ..zt_application::admission::AdmissionConfig::default()
+        },
         ..RelayConfig::default()
     }
 }
@@ -262,10 +265,15 @@ pub struct Relay {
 }
 
 pub async fn start_relay(policy: AccessPolicy) -> Relay {
+    start_relay_with(policy, relay_config()).await
+}
+
+/// Like [`start_relay`], with explicit limits.
+pub async fn start_relay_with(policy: AccessPolicy, config: RelayConfig) -> Relay {
     let id = Identity::generate().unwrap();
     let key = id.public_key();
     let (rx, updater) = Revocable::new(policy);
-    let server = RelayServer::bind("127.0.0.1:0".parse().unwrap(), id, rx, relay_config())
+    let server = RelayServer::bind("127.0.0.1:0".parse().unwrap(), id, rx, config)
         .await
         .unwrap();
     let addr = server.local_addr().unwrap();
@@ -302,9 +310,19 @@ impl Lab {
         policies: Vec<AccessPolicy>,
         clients: AuthorizedClients,
     ) -> Self {
+        let configs = policies.into_iter().map(|p| (p, relay_config())).collect();
+        Self::start_configured(agent, configs, clients).await
+    }
+
+    /// Like [`Lab::start_with`], with explicit relay limits.
+    pub async fn start_configured(
+        agent: Arc<Identity>,
+        relays_config: Vec<(AccessPolicy, RelayConfig)>,
+        clients: AuthorizedClients,
+    ) -> Self {
         let mut relays = Vec::new();
-        for p in policies {
-            relays.push(start_relay(p).await);
+        for (p, c) in relays_config {
+            relays.push(start_relay_with(p, c).await);
         }
         let (ssh, sshd) = counting_echo().await;
         let (clients_rx, clients) = Revocable::new(clients);
@@ -316,6 +334,7 @@ impl Lab {
                     .map(|r| zt_net::RelayEndpoint {
                         address: r.addr.to_string(),
                         public_key: r.key,
+                        suite: zt_domain::HandshakeSuite::NoiseIk25519,
                     })
                     .collect(),
                 node: node("web-01"),
@@ -323,6 +342,9 @@ impl Lab {
                 authorized_clients: clients_rx,
                 timeouts: timeouts(),
                 max_streams: 16,
+                client_suites: zt_domain::AcceptedSuites::only(
+                    zt_domain::HandshakeSuite::NoiseIk25519,
+                ),
             },
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -342,10 +364,12 @@ impl Lab {
                 .map(|r| zt_net::RelayEndpoint {
                     address: r.addr.to_string(),
                     public_key: r.key,
+                    suite: zt_domain::HandshakeSuite::NoiseIk25519,
                 })
                 .collect(),
             node: node("web-01"),
             node_key: self.agent.public_key(),
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: certificate.cloned(),
             timeouts: timeouts(),
         }
@@ -439,12 +463,16 @@ impl FakeRelay {
                 relays: vec![zt_net::RelayEndpoint {
                     address: addr.to_string(),
                     public_key: relay_id.public_key(),
+                    suite: zt_domain::HandshakeSuite::NoiseIk25519,
                 }],
                 node: node("web-01"),
                 ssh_target: ssh.to_string(),
                 authorized_clients: Revocable::fixed(clients),
                 timeouts: timeouts(),
                 max_streams: 16,
+                client_suites: zt_domain::AcceptedSuites::only(
+                    zt_domain::HandshakeSuite::NoiseIk25519,
+                ),
             },
         ));
         let (tcp, _) = listener.accept().await.unwrap();

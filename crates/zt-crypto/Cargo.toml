@@ -16,12 +16,17 @@ sha2.workspace = true
 zeroize.workspace = true
 hex.workspace = true
 getrandom.workspace = true
+libcrux-ml-kem.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
 # Phase 6: attack tests (signatures with -s, hand-written msg2 payloads). Crate already in graph.
 ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
-snow.workspace = true
+# PQ-0 spike (docs/pq-snow.md): the HFS code path of stock snow, for tests only. Features of
+# dev-dependencies do not reach the release binaries.
+snow = { workspace = true, features = ["hfs"] }
+ml-kem.workspace = true
 
 [lints]
 workspace = true

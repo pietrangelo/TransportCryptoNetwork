@@ -2,6 +2,7 @@ use crate::cert::{CertClaims, CertRef, CertRejection};
 use crate::crypto::Fingerprint;
 use crate::frame::CloseReason;
 use crate::ids::{NodeId, SessionId};
+use crate::suite::HandshakeSuite;
 
 /// Why an authentication attempt failed.
 ///
@@ -118,6 +119,14 @@ pub enum DomainEvent {
         /// The expired certificate.
         certificate: CertRef,
     },
+    /// A known peer completed message 1 with a suite that is not in the accepted set of its
+    /// role (PROTOCOL §7.5): it gets no message 2.
+    HandshakeSuiteRejected {
+        /// The identity of the peer.
+        peer: Fingerprint,
+        /// The suite it used.
+        suite: HandshakeSuite,
+    },
 }
 
 impl DomainEvent {
@@ -134,6 +143,8 @@ impl DomainEvent {
             Self::ConnectionDrained { .. } => "connection_drained",
             Self::AccessRevoked { .. } => "access_revoked",
             Self::CertificateExpired { .. } => "certificate_expired",
+            // RED stub (PQ-0).
+            Self::HandshakeSuiteRejected { .. } => "audit_event",
         }
     }
 

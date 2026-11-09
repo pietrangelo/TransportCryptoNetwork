@@ -52,6 +52,12 @@ ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
 sha2          = "0.11.1"
 hex           = "0.4.3"
 getrandom     = "0.4.3"
+# PQ-0: ML-KEM-768 (FIPS 203). Exact pin: the formally verified code is a specific release.
+# Portable + AVX2 only: the NEON (simd128) backend is disabled through `.cargo/config.toml`
+# until it is verified (docs/analysis/pq.md §5, GHSA-2cgv-28vr-rv6j).
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+# Test-only differential oracle for ML-KEM (an independent implementation).
+ml-kem = { version = "=0.3.4", default-features = false }
 
 # --- configuration ---
 serde = { version = "1.0.229", features = ["derive"] }

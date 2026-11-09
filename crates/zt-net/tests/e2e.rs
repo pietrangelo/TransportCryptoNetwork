@@ -128,6 +128,7 @@ impl Fleet {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
                 public_key: self.relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -138,6 +139,7 @@ impl Fleet {
             ),
             timeouts: fast_timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(
@@ -164,9 +166,11 @@ impl Fleet {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
                 public_key: self.relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node(target),
             node_key: self.agent_id.public_key(),
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: fast_timeouts(),
         }
@@ -380,8 +384,8 @@ async fn silent_connections_are_dropped_after_the_handshake_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handshake_floods_from_one_address_are_rate_limited() {
     let mut config = test_relay_config();
-    config.handshake_burst = 3;
-    config.handshake_refill = Duration::from_secs(3600);
+    config.admission.source_burst = 3;
+    config.admission.source_refill = Duration::from_secs(3600);
     let fleet = Fleet::start(config).await;
     // The first 3 connections pass the limiter (and then fail the handshake by timeout or
     // close); the fourth is closed immediately.

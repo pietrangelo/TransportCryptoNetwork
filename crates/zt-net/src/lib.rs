@@ -42,6 +42,8 @@ pub struct RelayEndpoint {
     pub address: String,
     /// Public key of the relay, pinned.
     pub public_key: PublicKey,
+    /// Handshake suite pinned for this relay (PROTOCOL §7.5): no fallback to another one.
+    pub suite: zt_domain::HandshakeSuite,
 }
 
 /// Timeouts of all network operations.

@@ -154,6 +154,7 @@ fn endpoint(addr: SocketAddr, key: &PublicKey) -> RelayEndpoint {
     RelayEndpoint {
         address: addr.to_string(),
         public_key: *key,
+        suite: zt_domain::HandshakeSuite::NoiseIk25519,
     }
 }
 
@@ -180,6 +181,7 @@ async fn start_agent_with(
         ),
         timeouts: timeouts(),
         max_streams,
+        client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
     };
     tokio::spawn(agent::run(Arc::new(keys), config));
 }
@@ -189,6 +191,7 @@ fn client_config(relays: Vec<RelayEndpoint>, node_key: &PublicKey) -> ClientConf
         relays,
         node: node("web-01"),
         node_key: *node_key,
+        node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),
     }
@@ -870,6 +873,7 @@ async fn an_out_of_range_max_streams_is_refused_without_panic() {
             authorized_clients: Revocable::fixed(zt_domain::AuthorizedClients::new()),
             timeouts: timeouts(),
             max_streams: max,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         };
         let keys: Keyring = Identity::generate().unwrap().into();
         tokio::time::timeout(Duration::from_secs(2), agent::run(Arc::new(keys), config))

@@ -23,6 +23,8 @@ pub struct ClientConfig {
     pub node: NodeId,
     /// Public key of the node's agent, pinned for the end-to-end channel.
     pub node_key: PublicKey,
+    /// Handshake suite pinned for the end-to-end channel with the node (PROTOCOL §7.5).
+    pub node_suite: zt_domain::HandshakeSuite,
     /// Client certificate (PROTOCOL §15), sent in message 1 of both channels.
     pub certificate: Option<std::sync::Arc<[u8]>>,
     /// Network timeouts.

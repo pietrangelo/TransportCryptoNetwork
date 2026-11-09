@@ -1,0 +1,8 @@
+# Build settings shared by every build of the workspace.
+
+[env]
+# libcrux-ml-kem enables its NEON backend on every aarch64 build. That backend is not covered by
+# the formal verification and had a wrong-result advisory (GHSA-2cgv-28vr-rv6j), so TCN builds
+# the portable backend on aarch64 until NEON is verified (docs/analysis/pq.md §5). The AVX2
+# backend on x86_64 is verified and selected at run time only if the CPU supports it.
+LIBCRUX_DISABLE_SIMD128 = "1"

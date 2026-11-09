@@ -184,6 +184,9 @@ fn run(command: Command) -> Result<(), String> {
                     authorized_clients,
                     timeouts: Timeouts::default(),
                     max_streams,
+                    client_suites: zt_domain::AcceptedSuites::only(
+                        zt_domain::HandshakeSuite::NoiseIk25519,
+                    ),
                 };
                 let events = ReloadEvents {
                     reloaded: "authorized_clients_reloaded",

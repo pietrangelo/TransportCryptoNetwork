@@ -117,12 +117,14 @@ impl Lab {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay.to_string(),
                 public_key: relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: echo().await.to_string(),
             authorized_clients: clients_rx,
             timeouts: fast(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(
@@ -147,9 +149,11 @@ impl Lab {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
                 public_key: self.relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             node_key: self.agent_id.public_key(),
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: fast(),
         }

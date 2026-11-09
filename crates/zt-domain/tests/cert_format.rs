@@ -23,7 +23,7 @@ use zt_domain::limits::{
     CERT_CLOCK_SKEW_SECS, DEFAULT_AUTHORITY_LIFETIME_SECS, MAX_AUTHORITIES, MAX_AUTHORITY_KEYS,
     MAX_CERT_LEN, MAX_CERT_LIFETIME_SECS, MAX_CERT_NODES, MAX_PAYLOAD_LEN, MAX_REVOKED_KEYS,
     MAX_REVOKED_SERIALS, MIN_AUTHORITY_LIFETIME_SECS, MIN_CERT_LEN, NOISE_MAX_MESSAGE_LEN,
-    NOISE_MSG1_OVERHEAD, NOISE_TAG_LEN,
+    NOISE_MSG1_OVERHEAD,
 };
 use zt_domain::{
     CertBody, CertFormatError, CertKey, CertScope, CertSerial, NodeId, UnixTime, decode_certificate,
@@ -148,8 +148,10 @@ fn limits_are_consistent() {
         fixed + 1 + 63 + 1 + 1 + MAX_CERT_NODES * (1 + 63) + CERT_SIGNATURE_LEN
     );
     // Message 1 carrying the largest certificate fits in a `Data` frame and in a Noise message.
-    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= MAX_PAYLOAD_LEN);
-    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN + NOISE_TAG_LEN <= NOISE_MAX_MESSAGE_LEN);
+    // `NOISE_MSG1_OVERHEAD` already contains the payload tag: it is not added twice.
+    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN <= MAX_PAYLOAD_LEN);
+    assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN <= NOISE_MAX_MESSAGE_LEN);
+    assert_eq!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN, 4_424);
     assert!(DEFAULT_AUTHORITY_LIFETIME_SECS <= MAX_CERT_LIFETIME_SECS);
     assert!(MIN_AUTHORITY_LIFETIME_SECS <= DEFAULT_AUTHORITY_LIFETIME_SECS);
     // Format constants.

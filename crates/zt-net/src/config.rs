@@ -117,6 +117,24 @@ pub enum ConfigError {
         /// The format error.
         source: CertFormatError,
     },
+    /// Invalid handshake suite or accepted set (PROTOCOL §7.5).
+    #[error("{path}: {entry}: {source}")]
+    Suite {
+        /// The file (or the option).
+        path: String,
+        /// The entry.
+        entry: String,
+        /// The error.
+        source: zt_domain::SuiteError,
+    },
+    /// Invalid admission limits (PROTOCOL §10.1).
+    #[error("{path}: [admission]: {source}")]
+    Admission {
+        /// The file.
+        path: String,
+        /// The error.
+        source: zt_application::admission::AdmissionConfigError,
+    },
 }
 
 /// Opens a trust file or a secret key and checks, on the **already open** file (no window
@@ -884,6 +902,8 @@ pub struct ClientSettings {
     pub nodes: HashMap<NodeId, PublicKey>,
     /// The client certificate file, if configured (PROTOCOL §15).
     pub certificate: Option<std::path::PathBuf>,
+    /// The end-to-end handshake suite pinned per node (PROTOCOL §7.5).
+    pub node_suites: HashMap<NodeId, zt_domain::HandshakeSuite>,
 }
 
 impl ClientSettings {
@@ -904,6 +924,7 @@ impl ClientSettings {
             relays: self.relays.clone(),
             node: node.clone(),
             node_key: *node_key,
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts,
         })
@@ -945,6 +966,7 @@ pub fn relay_endpoints(
         out.push(crate::RelayEndpoint {
             address: address.clone(),
             public_key: *key,
+            suite: zt_domain::HandshakeSuite::NoiseIk25519,
         });
     }
     Ok(out)
@@ -1043,6 +1065,8 @@ pub fn parse_client_settings(
         key: base.join(&file.key),
         nodes,
         certificate: file.certificate.as_ref().map(|c| base.join(c)),
+        // RED stub (PQ-0): no per-node suite yet.
+        node_suites: HashMap::new(),
     })
 }
 
@@ -1056,4 +1080,57 @@ pub fn load_client_settings(path: &Path) -> Result<ClientSettings, ConfigError> 
         _ => Path::new("."),
     };
     parse_client_settings(&path.display().to_string(), base, &read_limited(path)?)
+}
+
+/// Handshake suites and admission limits of the relay (`relay.toml`, OPERATIONS §4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySettings {
+    /// Admission limits.
+    pub admission: zt_application::admission::AdmissionConfig,
+    /// Suites accepted per role.
+    pub suites: zt_domain::SuitePolicy,
+}
+
+/// Parses `relay.toml` (RED stub).
+///
+/// # Errors
+/// Always (stub).
+pub fn parse_relay_settings(origin: &str, _text: &str) -> Result<RelaySettings, ConfigError> {
+    Err(ConfigError::Syntax {
+        path: origin.into(),
+        message: "not implemented".into(),
+    })
+}
+
+/// Reads and parses `relay.toml` (RED stub).
+///
+/// # Errors
+/// Always (stub).
+pub fn load_relay_settings(path: &Path) -> Result<RelaySettings, ConfigError> {
+    parse_relay_settings(&path.display().to_string(), "")
+}
+
+/// One handshake suite by its Noise protocol name (RED stub).
+///
+/// # Errors
+/// Always (stub).
+pub fn parse_suite(origin: &str, _name: &str) -> Result<zt_domain::HandshakeSuite, ConfigError> {
+    Err(ConfigError::Syntax {
+        path: origin.into(),
+        message: "not implemented".into(),
+    })
+}
+
+/// An accepted set of suites by their Noise protocol names (RED stub).
+///
+/// # Errors
+/// Always (stub).
+pub fn parse_suites(
+    origin: &str,
+    _names: &[String],
+) -> Result<zt_domain::AcceptedSuites, ConfigError> {
+    Err(ConfigError::Syntax {
+        path: origin.into(),
+        message: "not implemented".into(),
+    })
 }

@@ -162,6 +162,7 @@ impl Fleet {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
                 public_key: self.relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -172,6 +173,7 @@ impl Fleet {
             ),
             timeouts: fast_timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(

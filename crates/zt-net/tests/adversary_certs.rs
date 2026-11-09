@@ -24,7 +24,7 @@ use common::{
 };
 use zt_crypto::Identity;
 use zt_crypto::noise::Channel;
-use zt_domain::limits::{MAX_CERT_LEN, MAX_PAYLOAD_LEN, NOISE_MSG1_OVERHEAD, NOISE_TAG_LEN};
+use zt_domain::limits::{MAX_CERT_LEN, MAX_PAYLOAD_LEN, NOISE_MSG1_OVERHEAD};
 use zt_domain::{AllowedNodes, CloseReason, Fingerprint};
 use zt_net::NetError;
 use zt_net::config::{ConfigError, load_authorized_clients, load_relay_policy};
@@ -112,7 +112,9 @@ async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
 
 /// The malformed payloads used against both the relay and the agent.
 fn bad_payloads(cert: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
-    let max_in_data = MAX_PAYLOAD_LEN - NOISE_MSG1_OVERHEAD - NOISE_TAG_LEN;
+    // The tag is already part of NOISE_MSG1_OVERHEAD: this is the largest payload whose msg1
+    // still fits a `Data` frame.
+    let max_in_data = MAX_PAYLOAD_LEN - NOISE_MSG1_OVERHEAD;
     let mut bad_sig = cert.to_vec();
     *bad_sig.last_mut().unwrap() ^= 0x01;
     let mut trailing = cert.to_vec();

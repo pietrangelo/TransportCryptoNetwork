@@ -150,9 +150,11 @@ impl Relay {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.addr.clone(),
                 public_key: self.key.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: NodeId::try_from("web-01").unwrap(),
             node_key: Identity::generate().unwrap().public_key(),
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: Timeouts {
                 handshake: Duration::from_secs(2),

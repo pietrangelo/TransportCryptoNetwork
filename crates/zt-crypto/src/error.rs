@@ -25,4 +25,7 @@ pub enum CryptoError {
     /// The system random number generator is not available.
     #[error("system random generator unavailable")]
     Random,
+    /// The handshake suite is not supported by this build (PROTOCOL §7.5).
+    #[error("handshake suite not supported")]
+    UnsupportedSuite,
 }

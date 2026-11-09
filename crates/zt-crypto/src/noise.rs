@@ -13,7 +13,7 @@
 //! simply does not reply: the initiator learns nothing, not even whether its key exists.
 
 use snow::{Builder, HandshakeState, TransportState};
-use zt_domain::Fingerprint;
+use zt_domain::{AcceptedSuites, Fingerprint, HandshakeSuite};
 
 use crate::error::CryptoError;
 use crate::identity::{Identity, PublicKey, fingerprint_of_x25519};
@@ -108,6 +108,34 @@ pub fn initiate_with_payload(
     ))
 }
 
+/// Initiator with an explicit, pinned `suite` (PROTOCOL §7.5): there is no fallback to another
+/// suite (RED stub).
+///
+/// # Errors
+/// Always (stub).
+pub fn initiate_suite(
+    _local: &Identity,
+    _remote: &PublicKey,
+    _channel: Channel,
+    _suite: HandshakeSuite,
+    _payload: &[u8],
+) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    Err(CryptoError::UnsupportedSuite)
+}
+
+/// Responder that tries the suites of `accepted` (RED stub).
+///
+/// # Errors
+/// Always (stub).
+pub fn respond_suites(
+    _keys: &Keyring,
+    _msg1: &[u8],
+    _channel: Channel,
+    _accepted: AcceptedSuites,
+) -> Result<AuthorizationPending, CryptoError> {
+    Err(CryptoError::Handshake)
+}
+
 /// Responder: reads the first message and finds out who the initiator is.
 ///
 /// # Errors
@@ -173,6 +201,12 @@ pub struct AwaitingResponse {
 }
 
 impl AwaitingResponse {
+    /// The suite of this handshake (RED stub).
+    #[must_use]
+    pub fn suite(&self) -> HandshakeSuite {
+        HandshakeSuite::NoiseIkhfs25519MlKem768
+    }
+
     /// Completes the handshake with the second message.
     ///
     /// # Errors
@@ -206,6 +240,12 @@ pub struct AuthorizationPending {
 }
 
 impl AuthorizationPending {
+    /// The suite the initiator used (RED stub).
+    #[must_use]
+    pub fn suite(&self) -> HandshakeSuite {
+        HandshakeSuite::NoiseIkhfs25519MlKem768
+    }
+
     /// The authenticated identity of the initiator.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {

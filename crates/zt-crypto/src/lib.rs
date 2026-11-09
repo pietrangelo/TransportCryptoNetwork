@@ -13,6 +13,7 @@
 pub mod cert;
 mod error;
 mod identity;
+pub mod kem;
 mod keyring;
 pub mod noise;
 

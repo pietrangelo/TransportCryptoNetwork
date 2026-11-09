@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout_at;
+use zt_application::admission::AdmissionConfig;
 use zt_application::ratelimit::HandshakeGate;
 use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
@@ -25,7 +26,7 @@ use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
     AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
-    SessionId,
+    SessionId, SuitePolicy,
 };
 
 use crate::{NetError, Timeouts, channel};
@@ -35,22 +36,12 @@ use crate::{NetError, Timeouts, channel};
 pub struct RelayConfig {
     /// Relay core limits.
     pub limits: RelayLimits,
-    /// Network timeouts.
+    /// Network timeouts (write and idle; the handshake deadlines are in `admission`).
     pub timeouts: Timeouts,
-    /// Concurrent connections (including those in the handshake).
-    pub max_connections: usize,
-    /// Handshakes allowed in a burst per IP address.
-    pub handshake_burst: u32,
-    /// One more handshake per IP every `handshake_refill`.
-    pub handshake_refill: Duration,
-    /// IP addresses tracked by the rate limiter.
-    pub max_tracked_ips: usize,
-    /// Handshakes allowed in a burst per IPv6 /48 prefix.
-    pub wide_handshake_burst: u32,
-    /// One more handshake per /48 every `wide_handshake_refill`.
-    pub wide_handshake_refill: Duration,
-    /// Tracked /48 prefixes.
-    pub max_tracked_wide: usize,
+    /// Admission limits (PROTOCOL §10.1).
+    pub admission: AdmissionConfig,
+    /// Handshake suites accepted per role (PROTOCOL §7.5).
+    pub suites: SuitePolicy,
 }
 
 impl Default for RelayConfig {
@@ -58,13 +49,8 @@ impl Default for RelayConfig {
         Self {
             limits: RelayLimits::default(),
             timeouts: Timeouts::default(),
-            max_connections: 4096,
-            handshake_burst: 20,
-            handshake_refill: Duration::from_secs(3),
-            max_tracked_ips: 65_536,
-            wide_handshake_burst: 64,
-            wide_handshake_refill: Duration::from_secs(1),
-            max_tracked_wide: 16_384,
+            admission: AdmissionConfig::default(),
+            suites: SuitePolicy::classical(),
         }
     }
 }
@@ -364,14 +350,16 @@ impl RelayServer {
         );
         tokio::spawn(hub(core, hub_rx, policy.clone()));
 
-        let slots = Arc::new(Semaphore::new(config.max_connections));
+        // RED stub (R-1): the old single pool and gate, fed from the admission limits.
+        let a = &config.admission;
+        let slots = Arc::new(Semaphore::new(a.max_established));
         let mut gate = HandshakeGate::new(
-            config.max_tracked_ips,
-            config.handshake_burst,
-            config.handshake_refill,
-            config.wide_handshake_burst,
-            config.wide_handshake_refill,
-            config.max_tracked_wide,
+            a.max_tracked_sources,
+            a.source_burst,
+            a.source_refill,
+            a.wide_burst,
+            a.wide_refill,
+            a.max_tracked_wide,
         );
         let capacity = outbound_capacity(&config.limits);
         let mut next_conn: u64 = 0;

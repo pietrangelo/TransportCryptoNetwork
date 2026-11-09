@@ -111,6 +111,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay.to_string(),
                 public_key: relay_key,
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -121,15 +122,18 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
             ),
             timeouts: timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         },
     ));
     let config = ClientConfig {
         relays: vec![zt_net::RelayEndpoint {
             address: relay.to_string(),
             public_key: relay_key,
+            suite: zt_domain::HandshakeSuite::NoiseIk25519,
         }],
         node: node("web-01"),
         node_key: agent_id.public_key(),
+        node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),
     };
@@ -217,6 +221,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay_addr.to_string(),
                 public_key: relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -227,6 +232,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
             ),
             timeouts: timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         },
     ));
 
@@ -309,6 +315,7 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay_addr.to_string(),
                 public_key: relay_id.public_key(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -319,6 +326,7 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
             ),
             timeouts: slow,
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
         },
     ));
     let (tcp, _) = listener.accept().await.unwrap();

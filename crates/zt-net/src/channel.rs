@@ -110,6 +110,34 @@ where
     Ok(Pending { framed, pending })
 }
 
+/// Deadlines of a responder handshake (PROTOCOL §10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptDeadlines {
+    /// From the call to a complete message 1.
+    pub msg1: std::time::Duration,
+}
+
+/// Responder-side handshake that accepts the suites of `accepted` and buffers at most the
+/// longest legitimate message 1 of those suites (RED stub: like [`accept`]).
+///
+/// # Errors
+/// Like [`accept`].
+pub async fn accept_suites<IO>(
+    io: IO,
+    local: &Keyring,
+    channel: Channel,
+    _accepted: zt_domain::AcceptedSuites,
+    deadlines: AcceptDeadlines,
+    timeouts: &Timeouts,
+) -> Result<Pending<IO>, NetError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut t = timeouts.clone();
+    t.handshake = deadlines.msg1;
+    accept(io, local, channel, &t).await
+}
+
 /// Half-completed handshake: the responder knows the peer and must decide.
 ///
 /// Dropping this value closes the connection without replying: the peer learns nothing.
@@ -124,6 +152,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.pending.peer()
+    }
+
+    /// The suite the peer used (PROTOCOL §7.5).
+    #[must_use]
+    pub fn suite(&self) -> zt_domain::HandshakeSuite {
+        self.pending.suite()
     }
 
     /// The payload of message 1 (empty without a certificate).

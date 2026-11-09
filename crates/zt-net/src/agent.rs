@@ -39,6 +39,8 @@ pub struct AgentConfig {
     pub timeouts: Timeouts,
     /// Concurrent streams, from 1 to [`MAX_STREAMS`].
     pub max_streams: usize,
+    /// Handshake suites accepted from clients on the end-to-end channel (PROTOCOL §7.5).
+    pub client_suites: zt_domain::AcceptedSuites,
 }
 
 /// Maximum of `max_streams`: well below the limit of the tokio semaphore, which panics beyond
