@@ -5,7 +5,7 @@
 //! open SSH sessions to the nodes.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -76,12 +76,7 @@ impl Shared {
             }
             _ => None,
         };
-        let full = key.is_none_or(|(peer, ev)| {
-            self.lines
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .note(peer, ev)
-        });
+        let full = key.is_none_or(|(peer, ev)| crate::lock(&self.lines).note(peer, ev));
         if full {
             audit(event);
         }
@@ -95,7 +90,7 @@ async fn identity_summaries(lines: Arc<Mutex<IdentityLines>>, interval: Duration
     tick.tick().await;
     loop {
         tick.tick().await;
-        let ended = lines.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let ended = crate::lock(&lines).take();
         for repeated in &ended.repeated {
             repeated_line(repeated);
         }

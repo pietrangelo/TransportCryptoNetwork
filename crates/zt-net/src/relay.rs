@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -32,7 +32,7 @@ use zt_domain::{
     InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
 };
 
-use crate::{NetError, Timeouts, channel};
+use crate::{NetError, Timeouts, channel, lock};
 
 /// Relay configuration.
 #[derive(Debug, Clone)]
@@ -434,12 +434,6 @@ struct Connection {
     admission: AdmissionConfig,
     suites: SuitePolicy,
     capacity: usize,
-}
-
-/// `lock` that survives a poisoned mutex: the admission state stays consistent across a panic
-/// (each operation is a few map updates), and refusing every connection would be worse.
-fn lock(admission: &Mutex<Admission>) -> MutexGuard<'_, Admission> {
-    admission.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One admitted connection: its admission ticket is released when the connection ends, on

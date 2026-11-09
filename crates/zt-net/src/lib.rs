@@ -134,6 +134,15 @@ fn civil(secs: u64) -> Option<String> {
     ))
 }
 
+/// Locks `mutex`, also when it is poisoned: the guarded tables (admission, per-identity
+/// lines) stay consistent across a panic (each operation is a few map updates), and refusing
+/// every connection would be worse.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Deadline `after` from now. An absurd duration that would overflow the clock expires
 /// immediately (fail closed) instead of never expiring.
 pub(crate) fn deadline(after: Duration) -> tokio::time::Instant {
