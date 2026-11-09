@@ -58,16 +58,20 @@ async fn a_hybrid_pin_towards_a_classical_agent_fails_closed() {
     assert_eq!(ssh.count(), 0);
 }
 
-/// The relay pin is the outer channel: the hybrid suite is refused there in this release,
-/// before any connection.
+/// The relay pin is the outer channel (PQ-1, Phase 3): the hybrid suite is a valid pin, and at
+/// a relay that accepts only the classical suite it fails closed, without falling back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hybrid_relay_pin_is_a_configuration_error() {
+async fn a_hybrid_relay_pin_at_a_classical_relay_fails_closed() {
     let fleet = Fleet::start().await;
     let dir = fleet.client_dir(&fleet.ansible);
     let path = dir.config();
     let toml = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, format!("relay_suite = \"{HFS}\"\n{toml}")).unwrap();
-    let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(20)).await;
     assert!(!out.success);
-    assert!(out.stderr.contains("suite"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("not supported or not accepted"),
+        "a configuration error: {}",
+        out.stderr
+    );
 }

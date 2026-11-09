@@ -350,6 +350,25 @@ impl Lab {
         clients: AuthorizedClients,
         client_suites: zt_domain::AcceptedSuites,
     ) -> Self {
+        Self::start_outer(
+            agent,
+            relays_config,
+            clients,
+            client_suites,
+            zt_domain::HandshakeSuite::NoiseIk25519,
+        )
+        .await
+    }
+
+    /// Like [`Lab::start_suites`], with the suite the agent pins towards every relay (PQ-1
+    /// on the outer channel).
+    pub async fn start_outer(
+        agent: Arc<Identity>,
+        relays_config: Vec<(AccessPolicy, RelayConfig)>,
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+        relay_suite: zt_domain::HandshakeSuite,
+    ) -> Self {
         let mut relays = Vec::new();
         for (p, c) in relays_config {
             relays.push(start_relay_with(p, c).await);
@@ -364,7 +383,7 @@ impl Lab {
                     .map(|r| zt_net::RelayEndpoint {
                         address: r.addr.to_string(),
                         public_key: r.key,
-                        suite: zt_domain::HandshakeSuite::NoiseIk25519,
+                        suite: relay_suite,
                     })
                     .collect(),
                 node: node("web-01"),
@@ -395,6 +414,20 @@ impl Lab {
         certificate: Option<&Arc<[u8]>>,
         node_suite: zt_domain::HandshakeSuite,
     ) -> ClientConfig {
+        self.config_outer(
+            certificate,
+            zt_domain::HandshakeSuite::NoiseIk25519,
+            node_suite,
+        )
+    }
+
+    /// Like [`Lab::config_suite`], with the outer suite the client pins for every relay.
+    pub fn config_outer(
+        &self,
+        certificate: Option<&Arc<[u8]>>,
+        relay_suite: zt_domain::HandshakeSuite,
+        node_suite: zt_domain::HandshakeSuite,
+    ) -> ClientConfig {
         ClientConfig {
             relays: self
                 .relays
@@ -402,7 +435,7 @@ impl Lab {
                 .map(|r| zt_net::RelayEndpoint {
                     address: r.addr.to_string(),
                     public_key: r.key,
-                    suite: zt_domain::HandshakeSuite::NoiseIk25519,
+                    suite: relay_suite,
                 })
                 .collect(),
             node: node("web-01"),

@@ -93,12 +93,25 @@ fn relay_toml_refuses_what_it_does_not_know() {
 }
 
 #[test]
-fn a_suite_this_build_cannot_run_is_a_configuration_error() {
-    let text = format!("[handshake]\nclient_suites = [\"{CLASSIC}\", \"{HFS}\"]");
-    match parse_relay_settings("relay.toml", &text) {
-        Err(ConfigError::Suite { source, .. }) => assert_eq!(source, SuiteError::Unsupported),
-        other => panic!("{other:?}"),
-    }
+fn the_relay_accepts_the_hybrid_suite_per_role() {
+    // PQ-1 on the outer channel: rollout step 3 (OPERATIONS §13) accepts both suites for both
+    // roles; the sets stay independent.
+    let text = format!(
+        "[handshake]\nagent_suites = [\"{HFS}\"]\nclient_suites = [\"{CLASSIC}\", \"{HFS}\"]"
+    );
+    let s = parse_relay_settings("relay.toml", &text).unwrap();
+    assert_eq!(
+        s.suites.agents,
+        AcceptedSuites::only(HandshakeSuite::NoiseIkhfs25519MlKem768)
+    );
+    assert_eq!(
+        s.suites.clients,
+        AcceptedSuites::new([
+            HandshakeSuite::NoiseIk25519,
+            HandshakeSuite::NoiseIkhfs25519MlKem768
+        ])
+        .unwrap()
+    );
 }
 
 #[test]
@@ -172,7 +185,7 @@ fn suites_are_named_by_their_exact_noise_protocol_name() {
 
 /// PQ-1: the hybrid suite runs end to end, not on the outer channel (yet).
 #[test]
-fn the_hybrid_suite_is_accepted_end_to_end_and_refused_on_the_outer_channel() {
+fn the_hybrid_suite_is_accepted_on_both_channels() {
     assert_eq!(
         parse_suite("--x", HFS, HandshakeChannel::EndToEnd).unwrap(),
         HandshakeSuite::NoiseIkhfs25519MlKem768
@@ -190,18 +203,19 @@ fn the_hybrid_suite_is_accepted_end_to_end_and_refused_on_the_outer_channel() {
         ])
         .unwrap()
     );
-    match parse_suite("--x", HFS, HandshakeChannel::Outer) {
-        Err(ConfigError::Suite { source, .. }) => assert_eq!(source, SuiteError::Unsupported),
-        other => panic!("{other:?}"),
-    }
-    match parse_suites(
-        "--x",
-        &[CLASSIC.to_owned(), HFS.to_owned()],
-        HandshakeChannel::Outer,
-    ) {
-        Err(ConfigError::Suite { source, .. }) => assert_eq!(source, SuiteError::Unsupported),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(
+        parse_suite("--x", HFS, HandshakeChannel::Outer).unwrap(),
+        HandshakeSuite::NoiseIkhfs25519MlKem768
+    );
+    assert_eq!(
+        parse_suites(
+            "--x",
+            &[CLASSIC.to_owned(), HFS.to_owned()],
+            HandshakeChannel::Outer,
+        )
+        .unwrap(),
+        AcceptedSuites::supported(HandshakeChannel::Outer)
+    );
 }
 
 #[test]
@@ -239,8 +253,12 @@ fn the_client_pins_a_suite_per_relay_and_per_node() {
 #[test]
 fn the_client_refuses_a_suite_it_cannot_run() {
     let (r1, n1) = (key(), key());
-    // The hybrid suite towards a relay is the outer channel: not in this release.
-    for (relay_suite, node_suite) in [(HFS, CLASSIC), ("bogus", CLASSIC), (CLASSIC, "bogus")] {
+    // Unknown names, on either pin (the hybrid suite runs on both channels since PQ-1).
+    for (relay_suite, node_suite) in [
+        ("Noise_IKhfs_25519+Kyber1024_ChaChaPoly_BLAKE2s", CLASSIC),
+        ("bogus", CLASSIC),
+        (CLASSIC, "bogus"),
+    ] {
         let text = format!(
             r#"
             relay = "r1.example.org:7443"
@@ -305,4 +323,46 @@ fn the_client_pins_the_hybrid_suite_per_node() {
     );
     let c = s.client_config(&db, zt_net::Timeouts::default()).unwrap();
     assert_eq!(c.node_suite, HandshakeSuite::NoiseIk25519);
+}
+
+/// The single-relay form pins the hybrid suite with `relay_suite`, the list form per relay.
+#[test]
+fn the_client_pins_the_hybrid_suite_towards_relays() {
+    let (r1, r2, n1) = (key(), key(), key());
+    let single = format!(
+        r#"
+        relay = "r1.example.org:7443"
+        relay_key = "{r1}"
+        relay_suite = "{HFS}"
+        key = "client.key"
+        [[nodes]]
+        node = "web-01"
+        public_key = "{n1}"
+        "#
+    );
+    let s = parse_client_settings("client.toml", Path::new("/etc/tcn"), &single).unwrap();
+    assert_eq!(s.relays[0].suite, HandshakeSuite::NoiseIkhfs25519MlKem768);
+    let list = format!(
+        r#"
+        key = "client.key"
+        [[relays]]
+        address = "r1.example.org:7443"
+        public_key = "{r1}"
+        suite = "{HFS}"
+        [[relays]]
+        address = "r2.example.org:7443"
+        public_key = "{r2}"
+        [[nodes]]
+        node = "web-01"
+        public_key = "{n1}"
+        "#
+    );
+    let s = parse_client_settings("client.toml", Path::new("/etc/tcn"), &list).unwrap();
+    assert_eq!(
+        s.relays.iter().map(|r| r.suite).collect::<Vec<_>>(),
+        vec![
+            HandshakeSuite::NoiseIkhfs25519MlKem768,
+            HandshakeSuite::NoiseIk25519
+        ]
+    );
 }

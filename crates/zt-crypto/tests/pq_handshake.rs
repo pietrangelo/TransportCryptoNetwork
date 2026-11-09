@@ -105,18 +105,24 @@ fn the_previous_key_is_tried_for_the_hybrid_suite() {
     waiting.complete(&msg2).unwrap();
 }
 
-/// PQ-1 covers the end-to-end channel only: the outer channel refuses the hybrid suite on
-/// both sides until the release that upgrades relays.
+/// PQ-1 on the outer channel: the hybrid suite completes there too, with the outer prologue
+/// (`TCN/2 outer` ‖ `0x01`), and an end-to-end hybrid message 1 is not valid on it.
 #[test]
-fn the_hybrid_suite_is_refused_on_the_outer_channel() {
+fn the_hybrid_suite_runs_on_the_outer_channel_with_its_own_prologue() {
     let (client, keys, pk) = setup();
+    let (msg1, waiting) = noise::initiate_suite(&client, &pk, Channel::Outer, HFS, &[]).unwrap();
+    assert_eq!(msg1.len(), HFS.msg1_overhead());
+    let pending =
+        noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(HFS)).unwrap();
+    assert_eq!(pending.suite(), HFS);
+    let (msg2, mut responder) = pending.accept().unwrap();
+    assert_eq!(msg2.len(), HFS.msg2_len());
+    let mut initiator = waiting.complete(&msg2).unwrap();
+    let sealed = initiator.encrypt(b"first frame").unwrap();
+    assert_eq!(responder.decrypt(&sealed).unwrap(), b"first frame");
+    let (e2e, _) = noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, &[]).unwrap();
     assert_eq!(
-        noise::initiate_suite(&client, &pk, Channel::Outer, HFS, &[]).err(),
-        Some(CryptoError::UnsupportedSuite)
-    );
-    let (msg1, _) = noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, &[]).unwrap();
-    assert_eq!(
-        noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(HFS)).err(),
+        noise::respond_suites(&keys, &e2e, Channel::Outer, AcceptedSuites::only(HFS)).err(),
         Some(CryptoError::Handshake)
     );
 }

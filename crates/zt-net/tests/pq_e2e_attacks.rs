@@ -22,7 +22,7 @@ use common::{
 use zt_crypto::Identity;
 use zt_crypto::noise::{self, Channel};
 use zt_domain::trust::CertTrust;
-use zt_domain::{AcceptedSuites, CloseReason, HandshakeSuite, SuiteError, SuitePolicy};
+use zt_domain::{AcceptedSuites, CloseReason, HandshakeSuite, SuitePolicy};
 use zt_net::NetError;
 use zt_net::relay::{RelayConfig, RelayServer};
 
@@ -278,10 +278,10 @@ async fn a_truncated_hybrid_message_1_is_an_invalid_handshake() {
     assert_eq!(relay.sshd_connections(), 0);
 }
 
-/// A8-11 stays dead code on the relay in this release: the outer channel refuses the hybrid
-/// suite for either role, so the relay cannot be configured into the per-role branch.
+/// Every per-role set of both suites binds on the outer channel since PQ-1 (Phase 3); A8-11's
+/// network tests are in `pq_outer_attacks.rs`.
 #[tokio::test]
-async fn the_relay_refuses_the_hybrid_suite_on_the_outer_channel() {
+async fn the_relay_binds_with_hybrid_sets_for_either_role() {
     for suites in [
         SuitePolicy {
             agents: both(),
@@ -303,9 +303,6 @@ async fn the_relay_refuses_the_hybrid_suite_on_the_outer_channel() {
             config,
         )
         .await;
-        assert!(
-            matches!(bound, Err(NetError::Suite(SuiteError::Unsupported))),
-            "{suites:?}"
-        );
+        assert!(bound.is_ok(), "{suites:?}");
     }
 }

@@ -439,11 +439,33 @@ fn the_accepted_suites_can_come_from_the_environment() {
     );
 }
 
-/// The relay pin is the outer channel, which stays classical in this release.
+/// The relay pin is the outer channel: since PQ-1 (Phase 3) the hybrid suite is a valid pin,
+/// for all relays or per relay; an unknown name still stops the agent.
 #[test]
-fn the_hybrid_suite_towards_the_relays_is_refused() {
+fn the_hybrid_suite_towards_the_relays_is_accepted() {
     let dir = setup("pq-relay");
-    let relay = key();
+    let (a, b) = (key(), key());
+    for suites in [
+        HFS.to_owned(),
+        format!("{HFS},Noise_IK_25519_ChaChaPoly_BLAKE2s"),
+    ] {
+        let out = run(
+            &dir,
+            &[
+                "--relay",
+                "127.0.0.1:9,127.0.0.1:10",
+                "--relay-key",
+                &format!("{a},{b}"),
+                "--relay-suite",
+                &suites,
+            ],
+        );
+        assert!(
+            out.status.code().is_none() || out.status.success(),
+            "valid relay suites refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     fails_with(
         &run(
             &dir,
@@ -451,9 +473,9 @@ fn the_hybrid_suite_towards_the_relays_is_refused() {
                 "--relay",
                 "127.0.0.1:9",
                 "--relay-key",
-                &relay,
+                &a,
                 "--relay-suite",
-                HFS,
+                "Noise_IKhfs_25519+Kyber1024_ChaChaPoly_BLAKE2s",
             ],
         ),
         "suite",

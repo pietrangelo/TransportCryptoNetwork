@@ -27,14 +27,15 @@ fn the_classical_suite_is_todays_noise_ik() {
 /// PQ-1: the hybrid suite runs on the end-to-end channel (client ↔ agent), which needs no
 /// relay upgrade. The outer channel keeps refusing it until the release that upgrades relays.
 #[test]
-fn the_hybrid_suite_is_supported_end_to_end_only() {
+fn the_hybrid_suite_is_supported_on_both_channels() {
     assert_eq!(
         HFS.protocol_name(),
         "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"
     );
     assert_eq!(HFS.id(), 0x01);
     assert!(HFS.is_supported(HandshakeChannel::EndToEnd));
-    assert!(!HFS.is_supported(HandshakeChannel::Outer));
+    // PQ-1, outer channel (Phase 3): both channels.
+    assert!(HFS.is_supported(HandshakeChannel::Outer));
 }
 
 /// The client's first end-to-end transport message names the suite generation (PROTOCOL
