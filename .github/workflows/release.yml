@@ -1,7 +1,11 @@
 name: release
 
 # A vN.N.N tag produces static binaries (musl) for x86_64 and aarch64, signed with an SLSA
-# provenance attestation (verifiable with `gh attestation verify`), and a draft release.
+# provenance attestation (verifiable with `gh attestation verify`), and a draft release with
+# SHA256SUMS. The draft stays a draft until the maintainer signs SHA256SUMS offline with the
+# release keys (SLH-DSA-SHA2-128s and Ed25519, packaging/release/tcn-release.sh), uploads the
+# two signatures and runs release-publish.yml, which verifies both and publishes (PQ-REL,
+# OPERATIONS §9).
 on:
   push:
     tags: ["v*"]

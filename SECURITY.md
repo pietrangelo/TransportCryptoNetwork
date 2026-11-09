@@ -55,10 +55,27 @@ The threat model and the defences are described in `docs/PROTOCOL.md` and in the
 
 ## Verifying a released binary
 
-Every release archive has an SLSA provenance attestation signed by GitHub Actions:
+Every release archive has an SLSA provenance attestation signed by GitHub Actions, and
+`SHA256SUMS` carries two detached signatures by the offline release keys (PQ-REL):
+`SHA256SUMS.slhdsa.sig` (SLH-DSA-SHA2-128s, post-quantum, hash-based) and
+`SHA256SUMS.ed25519.sig` (Ed25519). **Both are required**: checking only one of them strips
+the post-quantum (or the classical) half. Verify them with OpenSSL 3.5 or later, never with a
+`zt-*` binary you just downloaded (a binary that verifies itself proves nothing). The public
+keys are in `packaging/release/keys/` at the release tag; check their fingerprints against the
+ones published below before trusting them.
 
 ```bash
-sha256sum -c SHA256SUMS
+ctx="TCN release SHA256SUMS v1"
+openssl pkeyutl -verify -rawin -pubin -inkey release-slhdsa.pub.pem \
+  -in SHA256SUMS -sigfile SHA256SUMS.slhdsa.sig -pkeyopt "context-string:$ctx"
+openssl pkeyutl -verify -rawin -pubin -inkey release-ed25519.pub.pem \
+  -in SHA256SUMS -sigfile SHA256SUMS.ed25519.sig \
+  -pkeyopt instance:Ed25519ctx -pkeyopt "context-string:$ctx"
+sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify tcn-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz \
   --repo pietrangelo/TransportCryptoNetwork
 ```
+
+`packaging/release/tcn-release.sh verify packaging/release/keys SHA256SUMS` does the same and
+also refuses a malformed `SHA256SUMS`. Fingerprints of the release keys (SHA-256 of the DER
+public key, `tcn-release.sh fingerprint`): published here with the first signed release.

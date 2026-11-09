@@ -554,8 +554,17 @@ aarch64 with a provenance attestation: verify them before installing.
 
 ```bash
 gh attestation verify tcn-v0.1.0-x86_64-unknown-linux-musl.tar.gz -R pietrangelo/TransportCryptoNetwork
+# Both offline release signatures over SHA256SUMS, with OpenSSL >= 3.5 (SECURITY.md):
+OPENSSL=openssl packaging/release/tcn-release.sh verify packaging/release/keys SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 ```
+
+`SHA256SUMS` is signed twice, by an offline **SLH-DSA-SHA2-128s** key and an offline
+**Ed25519** key (PQ-REL), with standard detached signatures that OpenSSL 3.5 or later verifies
+on its own: the commands are in `SECURITY.md`. Never verify a release with the `zt-*` binary it
+contains. The public keys are committed in `packaging/release/keys/`; compare their
+fingerprints with those in `SECURITY.md`. Upgrading an installed fleet: verify the new release
+on a machine you trust, with OpenSSL, before copying the binaries out.
 
 ```bash
 install -m 0755 zt-relay zt-agent zt-client /usr/local/bin/

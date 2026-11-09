@@ -28,7 +28,10 @@ in the GitHub settings (only the owner can do that).
   timeout on every job, `concurrency`, matrix inputs passed via `env`.
 - `ci.yml` → `zizmor` job: static analysis of the workflows, fails on any finding.
 - `release.yml`: `verify-tag` (tag on `main`, semver name), `attest` and `release`
-  in the `release` environment.
+  in the `release` environment; the release stays a draft.
+- `release-publish.yml` (by hand, `release` environment): publishes a draft only once
+  `SHA256SUMS` carries both offline release signatures, verified with a pinned OpenSSL 3.5.
+- `soak.yml`: nightly 30-minute soak with the leak gate (R-6), read-only.
 - `.github/dependabot.yml`: Cargo (`/` and `/fuzz`) and GitHub Actions, weekly, 7-day cooldown.
 - `.github/CODEOWNERS`, `SECURITY.md`.
 - `.github/rulesets/*.json`: the branch and tag rules, ready to import.
@@ -108,6 +111,43 @@ CI. When a second maintainer joins, set `required_approving_review_count` to 1 a
 - **Dependency graph**, **Dependabot alerts**, **Dependabot security updates**: Enable.
 - **Secret Protection** / **Secret scanning** and **Push protection**: Enable.
 - **Code scanning → CodeQL analysis → Set up → Default**: Rust and GitHub Actions languages.
+
+## Release signing keys (PQ-REL, maintainer)
+
+`SHA256SUMS` of every release is signed offline by two keys, SLH-DSA-SHA2-128s and Ed25519,
+with `packaging/release/tcn-release.sh` and OpenSSL 3.5 or later. The private keys never
+reach GitHub, CI or any networked machine; CI only verifies (`release-publish.yml`).
+
+Once, on an offline machine with OpenSSL >= 3.5:
+
+```bash
+packaging/release/tcn-release.sh keygen /media/offline/tcn-release   # private keys 0600
+packaging/release/tcn-release.sh fingerprint /media/offline/tcn-release
+```
+
+Commit only `release-slhdsa.pub.pem` and `release-ed25519.pub.pem` to
+`packaging/release/keys/` (reviewed PR to `main`), and publish the two fingerprints in
+`SECURITY.md` and out of band (for example a signed announcement). Back up the private keys
+offline, in two places. Until the public keys are committed, `release-publish.yml` refuses
+every release (fail closed).
+
+For each release, after `release.yml` made the draft:
+
+1. Download `SHA256SUMS` from the draft (`gh release download vX.Y.Z --pattern SHA256SUMS`),
+   check it lists exactly the expected archives and that their attestations verify.
+2. Carry it to the offline machine and sign:
+   `packaging/release/tcn-release.sh sign /media/offline/tcn-release SHA256SUMS`. The tool
+   refuses a private key readable by others and verifies what it signed.
+3. Bring back `SHA256SUMS.slhdsa.sig` and `SHA256SUMS.ed25519.sig` and upload them to the
+   draft: `gh release upload vX.Y.Z SHA256SUMS.slhdsa.sig SHA256SUMS.ed25519.sig`.
+4. Run **release-publish** (Actions → release-publish → `vX.Y.Z`). In the `release`
+   environment, after approval, it builds a pinned OpenSSL 3.5, verifies both signatures
+   against the keys committed at the tag, checks every archive against `SHA256SUMS`, and only
+   then publishes the draft.
+
+A lost or compromised release key: commit the new public key (reviewed), publish the new
+fingerprint with the reason, and sign every later release with the new pair. Releases signed by
+the old key stay verifiable against the key at their own tag.
 
 ## Verification
 

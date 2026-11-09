@@ -41,7 +41,13 @@ expect_ok() {
 expect_fail() {
   local name=$1
   shift
-  if "$@" >"$work/out" 2>&1; then fail "$name (succeeded)"; else pass "$name"; fi
+  if "$@" >"$work/out" 2>&1; then
+    fail "$name (succeeded)"
+  else
+    pass "$name"
+    # VERBOSE=1 shows why: a refusal for the wrong reason proves nothing.
+    if [ -n "${VERBOSE:-}" ]; then head -n1 "$work/out" | sed 's/^/     > /'; fi
+  fi
 }
 
 # A SHA256SUMS like the release workflow's: two archives.
