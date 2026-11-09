@@ -209,16 +209,31 @@ corruption, with the same error and no oracle on which field was wrong.
 
 The agent (responder) handles message 1 as follows:
 
-1. A length outside the accepted set's bounds is refused before Noise runs.
+1. A length above the largest message 1 of any suite this build runs end to end (5 624
+   bytes) is refused before Noise runs, as a malformed certificate. The bound does not depend
+   on the accepted set, so that a known client with a large certificate is still named in
+   step 3 (review 0009, A9-5).
 2. It tries the accepted suites whose message 1 can have that length.
 3. Only if none succeeds, it tries the other suites it supports on this channel, to recognise
-   a known client whose suite it does not accept. That client gets no message 2: the agent
-   records `handshake_suite_rejected` (WARN, with `peer` and `suite`) and closes the stream
-   with `Unauthorized`. An unknown key produces no per-suite line, whatever its suite.
+   a known client whose suite it does not accept. The result of this step is a value without
+   `accept` (`noise::Responded::Unaccepted`, A9-3): that client gets no message 2. The agent
+   records `handshake_suite_rejected` (WARN, with `peer`, `suite` and `confirmed = false`)
+   and closes the stream with `Unauthorized`. An unknown key produces no per-suite line,
+   whatever its suite. A message 1 valid for no suite is `handshake_failed`, or a malformed
+   certificate if it is longer than any accepted message 1.
 4. The confirmation of the suite (`TCN/2 ready`) must arrive before sshd is contacted.
 
-An agent that accepts both suites spends at most one extra hybrid trial on an invalid
-message 1 of a length both suites can have (the `both suites` row of docs/pq-snow.md §5).
+`handshake_suite_rejected` is written before any proof that the client is live: message 1 can
+be replayed (§7.3), and there is no message 2 to confirm. A compromised relay that recorded a
+client's message 1 can produce it at will, so the agent rate-limits it per identity, like the
+relay (§10.1), together with every `authentication_failed` line that names a peer.
+
+Cost: steps 2 and 3 run on every agent whose accepted set is not every supported suite (the
+default, classical-only agent included). An invalid message 1 costs one trial per key for
+each suite whose length bounds fit, accepted or not: with both suites and two keys (during a
+rotation), up to four trials, on any agent (the `both suites` row of docs/pq-snow.md §5 is the
+two-trial case). The trials of step 3 are read-only: no KEM operation happens before
+`accept`.
 
 What IKhfs gives, and what it does not (AP-23):
 
@@ -367,7 +382,8 @@ Consequences:
 - A recorded message 1 of a known identity can be replayed at will, for example one of a key
   revoked since or one whose certificate has expired since. So the line about a known identity
   (`authentication_failed`, `handshake_suite_rejected`, `admission_refused`) is written in full
-  once per identity and `summary_interval`. The repeats are counted in one
+  once per identity and `summary_interval` (on the agent, `authentication_failed` with a peer
+  and `handshake_suite_rejected`, once per identity and 10 s, review 0009 A9-2). The repeats are counted in one
   `<event>_repeated{peer, …, count}` line per identity and interval. At most 256 identities are
   logged per interval; beyond them the events are only counted (`suppressed_identities` in
   `preauth_summary`).

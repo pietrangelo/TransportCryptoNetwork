@@ -98,6 +98,9 @@ impl snow::types::Kem for SnowMlKem768 {
         shared_secret_out: &mut [u8],
         ciphertext_out: &mut [u8],
     ) -> Result<(usize, usize), snow::Error> {
+        // `m` comes from the operating system, not from snow's `rng` (snow's `encapsulate`
+        // does not receive one): a resolver with a deterministic test RNG still encapsulates
+        // with fresh randomness (review 0009, A9-8).
         let mut m = Zeroizing::new([0_u8; ENCAPSULATION_RANDOMNESS_LEN]);
         getrandom::fill(m.as_mut_slice()).map_err(|_| snow::Error::Rng)?;
         // The FIPS 203 §7.2 check of the peer's key happens here, after the authorization

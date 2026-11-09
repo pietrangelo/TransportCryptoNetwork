@@ -274,11 +274,12 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `revocations_in_use` | INFO | (relay and agent) at startup and on every reload: how many `serials` and `keys` entries the denylist has |
 | `handshake_suites_in_use` | INFO | (relay) at startup: `agent_suites`, `client_suites`, the accepted suites as comma-separated protocol names (§4.1) |
 | `handshake_suites_in_use` | INFO | (agent) at startup: `role=agent`, `client_suites` (accepted end to end) and `relay_suites` (pinned towards the relays) |
-| `handshake_suite_rejected` | WARN | (relay) a known peer completed message 1 with a suite not accepted for its role; (agent) a known client sent an end-to-end message 1 with a suite the agent does not accept: `peer`, `suite`. It got no message 2 |
+| `handshake_suite_rejected` | WARN | (relay) a known peer completed message 1 with a suite not accepted for its role; (agent) a known client sent an end-to-end message 1 with a suite the agent does not accept: `peer`, `suite`, `confirmed = false`. It got no message 2. **Unconfirmed**: a replayed message 1 produces it too (see below) |
 | `preauth_summary` | INFO | (relay) every 10 s, if anything failed before key confirmation: one count per reason, `distinct_sources`, `distinct_keys`, `saturated`, `suppressed_identities` (see below) |
 | `admission_limits_in_use` | INFO | (relay) at startup: every admission limit in force (§4.1) |
 | `admission_refused` | WARN | (relay) a peer that confirmed its key was refused by `max_per_identity` (`reason = identity_limit`) or a full established pool (`established_pool_full`): `peer`. Its `Open` got `Reject RateLimited` |
-| `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
+| `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay; agent: the first two) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
+| `identity_events_suppressed` | WARN | (agent) once per 10 s interval, if events about more than 256 identities occurred: `count` of the events not logged per identity (the relay reports them as `suppressed_identities` in `preauth_summary`) |
 
 The event data are separate fields: `peer` (fingerprint), `node`, `session` (hex),
 `stream`, `reason`, `rule`, depending on the event. Never payloads or secrets.
@@ -320,6 +321,10 @@ verified. A recorded message 1 can be replayed at will, though, so these lines (
 event of a `peer` in each 10 s interval is logged in full, the others are counted in one
 `<event>_repeated` line with `peer`, the reason fields and `count`. At most 256 identities are
 logged per interval; the events of further identities only add to `suppressed_identities`.
+
+The agent applies the same rule (review 0009, A9-2) to its `authentication_failed` lines that
+name a peer and to `handshake_suite_rejected`, with a 10 s interval, across all its relays: a
+compromised relay can replay a recorded end-to-end message 1 as often as it likes.
 
 How to read them:
 
@@ -741,17 +746,33 @@ Rollout, in this order:
    one. A client pinned to the hybrid suite towards an agent that does not accept it **fails
    closed** (no session, no fallback); the agent logs `handshake_suite_rejected` if it is
    already an upgraded agent, and an older agent ignores it as an invalid handshake
-   (`handshake_failed`).
+   (`handshake_failed`). `zt-client` then says that the agent may not accept the pinned
+   suite. Distribute configurations with a hybrid pin only to upgraded clients: a `zt-client`
+   older than PQ-1 refuses the whole configuration (unknown suite), so **every** node becomes
+   unreachable for it, not only the pinned one.
 3. **Later (PQ-SUNSET), optional.** Once every client of an agent pins the hybrid suite (no
    `e2e_session_started` with the classical suite for a period you choose), accept only the
    hybrid one on that agent. Classical clients then fail with `handshake_suite_rejected`.
+
+**Which signal to act on.** Base the sunset and rollback decisions on `e2e_session_started`
+(written after the client's confirmation, so it proves a live client and names its suite)
+and on your client inventory, **never on `handshake_suite_rejected` alone**. That line is
+written before any proof of liveness (`confirmed = false`): a compromised relay that recorded
+a classical message 1 before the sunset can replay it to produce "client X is still classical"
+on any agent, for any client it ever recorded, to push you into re-accepting the classical
+suite. A rejection that repeats identically, especially as `handshake_suite_rejected_repeated`
+with a large `count`, from a client that otherwise shows `e2e_session_started` with the hybrid
+suite, is a replay signal. Confirm with the client's owner before rolling back.
 
 Rollback is the reverse order:
 
 1. Accept both suites again on the agents that accept only the hybrid one (step 3).
 2. Remove `suite` from the clients' `[[nodes]]` entries (back to the classical suite).
 3. Only then, if needed, remove the hybrid suite from the agents or downgrade them. Doing this
-   before step 2 cuts off the clients that still pin the hybrid suite.
+   before step 2 cuts off the clients that still pin the hybrid suite. An agent older than
+   PQ-1 ignores `TCN_ACCEPT_CLIENT_SUITES` and silently runs classical-only.
+4. Downgrade `zt-client` only after its configuration has no `suite` pin left (see step 2 of
+   the rollout).
 
 Cost: the hybrid handshake adds about 1.2 KiB to each end-to-end message and roughly 0.1–0.2 ms
 of CPU per side (docs/pq-snow.md §5). The relay sees larger `Data` frames during the handshake

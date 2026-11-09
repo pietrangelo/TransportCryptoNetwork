@@ -53,7 +53,11 @@ state machine changes, and that state machine is the code the spike exercised.
     least-exercised code in the TCB, under `panic = "abort"`);
   - no KEM inside snow: the resolver hands it `zt_crypto::kem::MlKem768`, so snow never sees
     a KEM implementation other than the one the test vectors cover;
-  - `cargo deny` keeps checking the vendored crate (its license and sources do not change).
+  - `cargo deny` keeps checking the vendored crate's licence and sources, but **not** its
+    advisories: a path crate is outside RustSec matching (review 0009, A9-1). The `vendor` CI
+    workflow closes the gap: it checks the upstream release (`vendor/upstream-advisories`) on
+    every pull request and daily, verifies that `vendor/snow` is that release plus the patch
+    series in `vendor/patches/snow`, and runs upstream's tests on it (`vendor/snow/PATCHES.md`).
 - **Upstream PR**, opportunistic: if a release with ML-KEM-768 appears, the vendored copy goes.
 - **Until PQ-1**, no hybrid handshake ships: the `hfs` feature is enabled only in zt-crypto's
   dev-dependencies (the spike), and `HandshakeSuite::NoiseIkhfs25519MlKem768.is_supported()` is
@@ -122,3 +126,26 @@ Reading it:
   the relay is not involved at all in this release (the hybrid suite runs end to end only).
 - aarch64 figures (NEON backend disabled, see `.cargo/config.toml`) are still to be recorded on
   real hardware before the gate is evaluated there.
+- From review 0009 (A9-3) the fallback of PROTOCOL §7.5.1 step 3 runs on **every** upgraded
+  agent whose set is not both suites, including the classical-only default: the "both suites"
+  row is then also the cost of an invalid hybrid-length message 1 at such an agent, per key
+  (up to four trials during a key rotation).
+
+Release binary growth (perf gate of pq.md §7 PQ-1: at most 400 KB per binary), measured by
+review 0009 (`cargo build --release --locked -p zt-agent -p zt-client`,
+`x86_64-unknown-linux-gnu`, fat LTO, stripped), `dc979e5` (before PQ-1) vs `d2db0c2`:
+
+| Binary | before | PQ-1 | Growth |
+| :- | -: | -: | -: |
+| `zt-agent` | 2 362 104 B | 2 695 552 B | +333 448 B (326 KiB) |
+| `zt-client` | 1 957 616 B | 2 285 984 B | +328 368 B (321 KiB) |
+
+**Passed** on this target. The musl and aarch64 release targets are not measured yet.
+
+Side channels of decapsulation (pq.md §7 PQ-1 asks for "libcrux claim plus a dudect-style smoke
+test"): **decided not to add the dudect test** (review 0009, A9-7). The initiator's
+decapsulation key is ephemeral and used exactly once, and the ciphertext is decapsulated only
+after its AEAD tag verifies, so an attacker gets at most one timing sample per key, with no
+repeated-query oracle to amplify a leak; the constant-time claim rests on libcrux's verified
+portable and AVX2 code. The decision is revisited if the KEM is ever used with a static key
+(for example a post-quantum authenticated suite).
