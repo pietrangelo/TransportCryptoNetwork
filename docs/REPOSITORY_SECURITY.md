@@ -125,11 +125,20 @@ packaging/release/tcn-release.sh keygen /media/offline/tcn-release   # private k
 packaging/release/tcn-release.sh fingerprint /media/offline/tcn-release
 ```
 
-Commit only `release-slhdsa.pub.pem` and `release-ed25519.pub.pem` to
-`packaging/release/keys/` (reviewed PR to `main`), and publish the two fingerprints in
-`SECURITY.md` and out of band (for example a signed announcement). Back up the private keys
-offline, in two places. Until the public keys are committed, `release-publish.yml` refuses
-every release (fail closed).
+Commit `release-slhdsa.pub.pem` and `release-ed25519.pub.pem` to `packaging/release/keys/`
+and **pin** the two fingerprint lines in the same reviewed PR to `main` (review 0013, A13-4),
+in three places that the release tests check against each other:
+
+- `PINNED_FINGERPRINTS` in `packaging/release/tcn-release.sh` (what `verify` trusts);
+- `packaging/release/release-keys.fingerprints`;
+- the "Pinned release keys" block of `SECURITY.md`.
+
+Publish them out of band too (for example a signed announcement). Back up the private keys
+offline, in two places, encrypted:
+`openssl pkey -in release-ed25519.key.pem -aes-256-cbc -out release-ed25519.key.enc.pem`
+(the same for the SLH-DSA key); `keygen` writes them unencrypted because they live on an
+offline machine. Until the keys are pinned, `verify` and `release-publish.yml` refuse every
+release (fail closed).
 
 For each release, after `release.yml` made the draft:
 
@@ -137,17 +146,29 @@ For each release, after `release.yml` made the draft:
    check it lists exactly the expected archives and that their attestations verify.
 2. Carry it to the offline machine and sign:
    `packaging/release/tcn-release.sh sign /media/offline/tcn-release SHA256SUMS`. The tool
-   refuses a private key readable by others and verifies what it signed.
+   refuses a malformed `SHA256SUMS` (A13-5) and a private key readable by others, and verifies
+   what it signed.
 3. Bring back `SHA256SUMS.slhdsa.sig` and `SHA256SUMS.ed25519.sig` and upload them to the
    draft: `gh release upload vX.Y.Z SHA256SUMS.slhdsa.sig SHA256SUMS.ed25519.sig`.
-4. Run **release-publish** (Actions → release-publish → `vX.Y.Z`). In the `release`
-   environment, after approval, it builds a pinned OpenSSL 3.5, verifies both signatures
-   against the keys committed at the tag, checks every archive against `SHA256SUMS`, and only
-   then publishes the draft.
+4. Run **release-publish** from the tag: Actions → release-publish → *Run workflow* → *Use
+   workflow from* → *Tags* → `vX.Y.Z` (A13-6: the tag is the ref of the run, there is no
+   input, and the `release` environment admits only `v*` tags, so a run from `main` is
+   refused). A job with a read-only token builds a pinned OpenSSL 3.5 with the script of the
+   default branch. Then, in the `release` environment, after approval, the publishing job checks
+   that the tag's commit is on `main`, verifies both signatures with `tcn-release.sh` **and its
+   pins from the default branch** against the keys committed at the tag (`--tag vX.Y.Z`),
+   checks every archive against `SHA256SUMS`, checks that the draft holds exactly those files,
+   downloads them again and compares them byte for byte, and only then publishes the draft.
+   The write token is set only on the steps that call `gh`.
 
-A lost or compromised release key: commit the new public key (reviewed), publish the new
-fingerprint with the reason, and sign every later release with the new pair. Releases signed by
-the old key stay verifiable against the key at their own tag.
+A lost or compromised release key: commit the new public key and pin its fingerprint in the
+three places (reviewed PR to `main`), publish the new fingerprint with the reason, and sign
+every later release with the new pair. For a planned rotation, keep the old pin next to the new
+one until the last release signed by the old pair is out of support, and sign the announcement
+of the new fingerprints with the old pair (`openssl pkeyutl -sign` with each old key over the
+announcement), so that users who pinned the old keys can follow. A compromised key's pin is
+removed at once. Releases signed by an old key stay verifiable with `verify --pins` and the old
+lines.
 
 ## Verification
 

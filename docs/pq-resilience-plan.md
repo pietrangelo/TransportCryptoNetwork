@@ -3,8 +3,9 @@
 Status: phases 1–6 implemented (PQ-0, R-1, PQ-1 end to end and on the outer hops, R-2, R-3,
 R-4 failover deadline and limited hedge, which closes backlog A5-4; PQ-AUTH; R-5 metrics
 textfile and `status`, R-6 byte budgets, window tuning, fewer copies and the nightly soak,
-which closes backlog 0001-10, and PQ-REL offline SLH-DSA + Ed25519 release signatures); phase 7
-pending. The adversary review of phase 6 is still to be written. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
+which closes backlog 0001-10, and PQ-REL offline SLH-DSA + Ed25519 release signatures, with
+the findings of review 0013 fixed: per-identity shedding, pinned release keys); phase 7
+pending. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
 
 This plan merges two independent design analyses and the adversary review of both:
 
@@ -74,7 +75,9 @@ fuzzing are the controls TCN owns.
 offline. Verification uses an independently installed tool, not the downloaded binary (AP-19).
 As implemented: two standard detached signatures (SLH-DSA-SHA2-128s and Ed25519ctx, context
 `TCN release SHA256SUMS v1`), both required, by `packaging/release/tcn-release.sh`; CI only
-verifies them (`release-publish.yml`, pinned OpenSSL 3.5.9) before publishing a draft.
+verifies them (`release-publish.yml`, pinned OpenSSL 3.5.9) before publishing a draft. The keys
+are trusted only through fingerprints pinned in the script, in
+`packaging/release/release-keys.fingerprints` and in SECURITY.md (review 0013, A13-4).
 
 ## 3. Resilience, corrected
 

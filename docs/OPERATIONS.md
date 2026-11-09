@@ -553,18 +553,26 @@ The releases (`.github/workflows/release.yml`) contain static binaries (musl) fo
 aarch64 with a provenance attestation: verify them before installing.
 
 ```bash
+set -e
 gh attestation verify tcn-v0.1.0-x86_64-unknown-linux-musl.tar.gz -R pietrangelo/TransportCryptoNetwork
-# Both offline release signatures over SHA256SUMS, with OpenSSL >= 3.5 (SECURITY.md):
-OPENSSL=openssl packaging/release/tcn-release.sh verify packaging/release/keys SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
+# Both offline release signatures over SHA256SUMS, by the pinned keys, with OpenSSL >= 3.5
+# (SECURITY.md). Use the tcn-release.sh you already trust (from the release you run, or from
+# main): it refuses keys that are not pinned in it.
+OPENSSL=openssl packaging/release/tcn-release.sh verify --tag v0.1.0 keys/ SHA256SUMS
+grep ' tcn-v0.1.0-x86_64-unknown-linux-musl.tar.gz$' SHA256SUMS | sha256sum -c -
 ```
 
 `SHA256SUMS` is signed twice, by an offline **SLH-DSA-SHA2-128s** key and an offline
 **Ed25519** key (PQ-REL), with standard detached signatures that OpenSSL 3.5 or later verifies
 on its own: the commands are in `SECURITY.md`. Never verify a release with the `zt-*` binary it
-contains. The public keys are committed in `packaging/release/keys/`; compare their
-fingerprints with those in `SECURITY.md`. Upgrading an installed fleet: verify the new release
-on a machine you trust, with OpenSSL, before copying the binaries out.
+contains. The public keys are committed in `packaging/release/keys/`, but they are trusted only
+through their **pinned fingerprints** (review 0013, A13-4): the same lines are built into
+`tcn-release.sh`, in `packaging/release/release-keys.fingerprints` and in `SECURITY.md`, and
+`verify` refuses any key that is not pinned. Take the fingerprints out of band **once** (from
+`SECURITY.md` on `main`, or the release announcement), keep them, and verify later releases
+against them (`verify --pins FILE`); keys and fingerprints that come from the same download
+prove nothing. Upgrading an installed fleet: verify the new release on a machine you trust, with
+OpenSSL, before copying the binaries out.
 
 ```bash
 install -m 0755 zt-relay zt-agent zt-client /usr/local/bin/
@@ -1287,14 +1295,23 @@ ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 \
 ReadWritePaths=/var/lib/node_exporter/textfile
 ```
 
-The directory must be writable by `tcn` (for example `root:tcn 0775`) because of the rename;
-node_exporter reads only `*.prom` files, and the temporary name never ends in `.prom`. Use a
-different file name for each service on the host (`zt-relay.prom`, `zt-agent.prom`).
+The directory must be writable by `tcn` because of the rename. Make it **sticky**
+(`root:tcn 1775`), or give TCN a directory of its own and point node_exporter's
+`--collector.textfile.directory` at both: in a shared directory without the sticky bit, `tcn`
+could rename over or delete the other collectors' files, so a compromised relay could forge or
+hide host metrics (review 0013, A13-8). node_exporter reads only `*.prom` files, and the
+temporary name never ends in `.prom`. Use a different file name for each service on the host
+(`zt-relay.prom`, `zt-agent.prom`). Every process series carries a `role` label, so the files
+of a relay, an agent and a client on one host never export the same series (A13-3).
 
 **`status`.** `zt-relay status` and `zt-agent status` print the file's age and every value
 (`--metrics-file`, default the runtime directory): exit 0 if fresh, 1 if missing or invalid,
 2 if stale (older than three intervals: the process stopped writing, or is wedged). Run it as
-root or as `tcn`. Control characters in the file are never printed.
+root or as `tcn`. It does not trust the file (A13-8): anything but a regular file (a FIFO, a
+device) is invalid and never blocks it; a write time more than 60 seconds in the future is
+invalid (a forged file, or a dead process after a backward clock step); the interval the file
+claims is capped at 3600 seconds; only printable ASCII is printed (control characters and
+format characters such as bidi overrides become `?`).
 
 **What is in it.** Only roles, suites, reasons and relay indices are labels; there is never a
 fingerprint, a client or node name, a certificate field or an address, so the file reveals no
@@ -1304,11 +1321,12 @@ inventory and its size is fixed (about 150 lines). Per-identity detail stays in 
 | Metric | Type | Meaning |
 | :- | :- | :- |
 | `tcn_build_info{role,version}` | gauge | always 1 |
-| `tcn_config_generation` | gauge | generation in force (`configuration_loaded`, reloads) |
-| `tcn_reloads_total{result}` | counter | `applied`, `rejected` |
-| `tcn_watchdog_progress_total` | counter | the hub's (relay) or the heartbeat's (agent) progress; flat = wedged |
-| `tcn_draining` | gauge | 1 during a drain |
-| `tcn_metrics_last_write_timestamp_seconds`, `tcn_metrics_interval_seconds` | gauge | freshness |
+| `tcn_config_generation{role}` | gauge | generation in force (`configuration_loaded`, reloads) |
+| `tcn_reloads_total{role,result}` | counter | `applied`, `rejected` |
+| `tcn_watchdog_progress_total{role}` | counter | the hub's (relay) or the heartbeat's (agent) progress; flat = wedged |
+| `tcn_draining{role}` | gauge | 1 during a drain |
+| `tcn_process_start_time_seconds{role}` | gauge | start time |
+| `tcn_metrics_last_write_timestamp_seconds{role}`, `tcn_metrics_interval_seconds{role}` | gauge | freshness (the client file has the first one, `role="client"`) |
 | `tcn_relay_preauth_failures_total{reason}` | counter | the `preauth_summary` reasons (§6), before key confirmation |
 | `tcn_relay_admission_refusals_total{reason}` | counter | confirmed identities refused (`established_pool_full`, `identity_limit`) |
 | `tcn_relay_handshakes_total{role,suite}` | counter | confirmed outer handshakes: the sunset signal of §13 |
@@ -1318,7 +1336,7 @@ inventory and its size is fixed (about 150 lines). Per-identity detail stays in 
 | `tcn_relay_open_rejects_total{reason}`, `tcn_relay_stream_closes_total{reason}` | counter | `Reject` and `Close` reasons |
 | `tcn_relay_forwarded_bytes_total` | counter | `Data` bytes forwarded |
 | `tcn_relay_queue_bytes`, `tcn_relay_queue_budget_bytes` | gauge | outbound queue and its budget (§18) |
-| `tcn_relay_queue_shed_total`, `tcn_relay_queue_overflow_total` | counter | slow readers shed by the budget; peers breaking the credit |
+| `tcn_relay_queue_shed_total`, `tcn_relay_queue_overflow_total` | counter | connections shed by the budget (the identity holding the most, §18); peers breaking the credit |
 | `tcn_agent_relay_up{relay}` | gauge | 1 while registered with relay *n* (`--relay` order, 0-based) |
 | `tcn_agent_relay_registrations_total{relay}`, `tcn_agent_relay_session_failures_total{relay}` | counter | registrations; sessions ended by an error (reconnects) |
 | `tcn_agent_relay_consecutive_failures{relay}` | gauge | failures since the last registration |
@@ -1327,14 +1345,18 @@ inventory and its size is fixed (about 150 lines). Per-identity detail stays in 
 | `tcn_agent_auth_failures_total{reason}` | counter | end-to-end refusals (`unconfirmed`: a replayed message 1) |
 | `tcn_agent_ssh_connect_failures_total` | counter | sshd unreachable |
 | `tcn_agent_session_bytes_total{direction}` | counter | `to_ssh`, `from_ssh` |
-| `tcn_agent_buffer_bytes`, `tcn_agent_buffer_budget_bytes`, `tcn_agent_buffer_refusals_total` | gauge/counter | receive windows and their budget (§18) |
+| `tcn_agent_buffer_bytes`, `tcn_agent_buffer_budget_bytes` | gauge | receive windows and their budget (§18) |
+| `tcn_agent_buffer_refusals_total` | counter | authenticated sessions refused because no initial window was left (§18) |
+| `tcn_agent_window_grows_total`, `tcn_agent_window_growth_refusals_total` | counter | windows grown; growths refused at the budget's last quarter (benign) |
 
 **Client.** `metrics_file = "zt-client.prom"` in `client.toml` (relative to it) makes
 `zt-client connect` write the outcome of its session when it ends:
 `tcn_client_last_session_outcome{outcome}`, `_relay_index` (-1: none), `_attempts`,
 `_failover` (1 if not the first relay), `_bytes{direction}`. Concurrent clients overwrite one
 another: the file describes the last session, which is enough for a cron-driven health probe
-(`ssh -o BatchMode=yes node true`), not for fleet statistics.
+(`ssh -o BatchMode=yes node true`), not for fleet statistics. Like the services' files it is
+mode 0644 whatever the umask, so other local users can read the last session's timing and byte
+counts: put it in a directory only its owner can enter if that matters.
 
 **Dashboards.** One row per relay: `rate(tcn_relay_handshakes_total[5m])` by role and suite
 (stacked; the classical share is the §13 sunset signal), `tcn_relay_connections`,
@@ -1351,7 +1373,7 @@ groups:
   - name: tcn
     rules:
       - alert: TcnMetricsStale            # the process stopped writing: dead or wedged
-        expr: time() - tcn_metrics_last_write_timestamp_seconds > 3 * tcn_metrics_interval_seconds
+        expr: time() - tcn_metrics_last_write_timestamp_seconds{role!="client"} > on (instance, role) 3 * tcn_metrics_interval_seconds
         for: 2m
       - alert: TcnWatchdogStalled         # progress flat while the file is still written
         expr: rate(tcn_watchdog_progress_total[5m]) == 0
@@ -1372,8 +1394,8 @@ groups:
         for: 10m
       - alert: TcnQueueBudgetShedding     # slow readers disconnected by the byte budget (§18)
         expr: increase(tcn_relay_queue_shed_total[15m]) > 0
-      - alert: TcnAgentBufferExhausted    # streams rejected: the agent's byte budget is full (§18)
-        expr: increase(tcn_agent_buffer_refusals_total[15m]) > 0 and tcn_agent_buffer_bytes > 0.9 * tcn_agent_buffer_budget_bytes
+      - alert: TcnAgentBufferExhausted    # sessions refused: the agent's byte budget is full (§18)
+        expr: increase(tcn_agent_buffer_refusals_total[15m]) > 0
       - alert: TcnKnownIdentityRefused    # revoked keys or certificates still trying
         expr: increase(tcn_relay_auth_failures_total{reason=~"key_revoked|certificate|identity_downgrade"}[15m]) > 0
       - alert: TcnDraining                # a drain that lasts more than the drain timeout
@@ -1389,26 +1411,46 @@ it there is backpressure or a disconnection, never an out-of-memory (resilience 
 
 | Process | Option | Default | Past the budget |
 | :- | :- | :- | :- |
-| relay | `run --queue-budget-mib N` (16–65536) | a quarter of the memory (the cgroup limit included), from 64 MiB to 1 GiB | the connection with the **largest backlog** (the slowest reader) is disconnected at once, even in the middle of a write; ties go to the newest connection |
-| agent | `run --buffer-budget-mib N` (16–65536) | the same rule | a new stream whose initial window (256 KiB) does not fit is rejected with `Reject ResourceExhausted`; a window does not grow |
+| relay | `run --queue-budget-mib N` (16–65536) | a quarter of the memory (the cgroup limit included), from 128 MiB to 1 GiB | the **identity** (peer fingerprint) holding the most of the budget loses its largest connection at once, even in the middle of a write; ties go to the newest connection. An identity over its share (a quarter of the budget, never less than one connection's full credit) is shed even within the budget |
+| agent | `run --buffer-budget-mib N` (16–65536) | the same rule | an authenticated session whose initial window (256 KiB) does not fit is closed (`Close Drained`); a window does not grow |
 
-**Relay.** Every frame queued towards a peer is counted until it is written. A shed connection
-is audited (`queue_budget_exceeded`, WARN, with the connection id, its backlog and the budget)
-and counted in `tcn_relay_queue_shed_total`. Its streams end as when the peer disconnects: the
-other side sees `Close PeerGone`, not `Drained` (resilience.md §5.6 said `Drained`; `PeerGone`
-is what the relay core already sends for a lost connection, and it is the truth). A healthy
-reader holds at most one window (1 MiB at most) per stream in the queue: keep the budget well
-above `streams per connection × 1 MiB`, which the default does on any real host. Reads and
-writes of a connection stay in one task, so a client that stops reading cannot make the relay
-queue more than its credit either (a regression test guards it).
+**Relay.** Every frame queued towards a peer is counted until it is written, per connection and
+per authenticated identity. Shedding is **fair per identity** (review 0013, A13-1): one client
+key that spreads its backlog over many connections (up to `max_per_identity`) is shed as one
+identity, so it can no longer get an honest slow-link download shed in its place. The rules:
 
-**Agent.** Each stream reserves its receive window from the budget when it opens and gives it
-back when it ends. A window **grows** (doubling, up to the protocol's `MAX_WINDOW`, 1 MiB) when
+1. no identity may hold more than its share: a quarter of the budget, never less than one
+   connection's full credit (its streams × 1 MiB); past it, that identity loses its largest
+   connection, even while the budget as a whole has room;
+2. past the budget, the identity with the largest excess loses its largest connection. An
+   agent's **normal credit** (`max_streams_per_agent × 1 MiB`, 64 MiB by default) is not
+   counted as excess: an agent within its credit is shed only when agents alone hold more than
+   the budget (the last resort, so the budget still holds).
+
+A shed connection is audited (`queue_budget_exceeded`, WARN) with `conn`, `peer` (the
+fingerprint), `role` (`agent` or `client`), `cause` (`identity_cap` or `budget`), `backlog`,
+`identity_backlog`, `budget` and `identity_cap`, and counted in `tcn_relay_queue_shed_total`.
+Its streams end as when the peer disconnects: the other side sees `Close PeerGone`, not
+`Drained` (resilience.md §5.6 said `Drained`; `PeerGone` is what the relay core already sends for
+a lost connection, and it is the truth). A healthy reader holds at most one window (1 MiB at
+most) per stream in the queue. The default minimum (128 MiB) is two agents' full credit; a
+smaller `--queue-budget-mib`, below `2 × max_streams_per_agent × 1 MiB`, is reported at startup
+(`queue_budget_below_agent_credit`, WARN). Reads and writes of a connection stay in one task, so
+a client that stops reading cannot make the relay queue more than its credit either (a
+regression test guards it).
+
+**Agent.** Each session reserves its receive window from the budget once its client is
+authenticated (key confirmation) and gives it back when it ends. Before that, a stream is
+bounded only by the per-relay quota (`--max-streams`, its initial window each), as before R-6:
+a compromised relay that opens streams and never sends message 1 cannot exhaust the budget that
+the other relays' streams share (review 0013, A13-2). A window **grows** (doubling, up to the protocol's `MAX_WINDOW`, 1 MiB) when
 the agent delivered a whole window to sshd while waiting for data, that is when the window and
 not sshd limits a transfer over a long or fat path; `tcn_agent_window_grows_total` counts it.
 Growth stops at three quarters of the budget: the last quarter is kept for the initial windows
 of new streams, so one bulk transfer cannot lock other clients out. A refused growth is counted
-in `tcn_agent_buffer_refusals_total` and the transfer simply goes on with its current window.
+in `tcn_agent_window_growth_refusals_total` (benign) and the transfer simply goes on with its
+current window; `tcn_agent_buffer_refusals_total` counts only sessions refused for want of an
+initial window (A13-11).
 The client tunes its own window the same way, within a budget of its own. No wire change: old
 peers keep working, and the relay and every peer still refuse a window beyond 1 MiB.
 
@@ -1426,7 +1468,13 @@ an agent and an echo server on localhost for 30 minutes: clients open sessions i
 relay is restarted every minute and its policy reloaded every 10 seconds. File descriptors,
 resident memory and live tasks are sampled every 5 seconds; the run fails if any of them grows
 under load (least-squares trend after a warm-up quarter: more than 8 descriptors, 16 tasks or
-24 MiB) or has not come back after the load stops. The samples are kept as the `soak-samples`
+24 MiB) or has not come back after the load stops. One more client loop moves 4 MiB per
+session, so receive windows grow inside the budgets; once the load stops, the budgets and the
+gauges must be back to zero (`tcn_agent_buffer_bytes`, `tcn_agent_sessions`,
+`tcn_relay_queue_bytes`, `tcn_relay_streams`, client connections): a leaked reservation costs no
+memory, only the counters show it (review 0013, A13-7). Shedding is not exercised by the soak
+(localhost TCP buffers absorb a slow reader's backlog); `budget_attacks.rs` and
+`adversary_0013.rs` cover it. The samples are kept as the `soak-samples`
 artifact (CSV). A 15-second version runs in every CI build, and a test injects a leak to prove
 the gate fails. To run it by hand:
 

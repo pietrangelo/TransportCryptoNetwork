@@ -368,6 +368,23 @@ A11-3). PROTOCOL §13 and OPERATIONS §5 have the operator view.
   relay would expose its node inventory); only roles, reasons and relay indices. Node names
   could be added later as an opt-in for the relay.
 
+**As implemented (R-5).** The design above was superseded by review 0007 AP-21 and decision
+R1 of the roadmap; this is what shipped (OPERATIONS §17):
+
+- No listening socket anywhere: no `--metrics-listen`, no `/healthz` or `/readyz`. The relay
+  and the agent both write a node_exporter textfile (`--metrics-file`, default `metrics.prom`
+  in the runtime directory, not `/run/tcn/agent.prom`), atomically, every
+  `--metrics-interval` seconds (15 by default); the client can write the outcome of its last
+  session (`metrics_file`).
+- `zt-relay status` and `zt-agent status` read that file (fresh, stale, invalid); `STATUS=`
+  is sent to systemd.
+- Not implemented: the handshake latency histogram, hub loop lag, the Ping round trip, the
+  current backoff, `clock_jump`, certificate expiries. The watchdog's progress counter
+  (`tcn_watchdog_progress_total`) stands in for the hub's liveness.
+- Every process series carries a `role` label, so the files of several services on one host
+  never collide (review 0013, A13-3).
+- Catalogue rows R5-O1, O4 and O6 below name HTTP tests: they are void (there is no HTTP).
+
 ### 5.6 Efficiency (G11, G13)
 
 - **Fewer copies:**
@@ -411,6 +428,12 @@ A11-3). PROTOCOL §13 and OPERATIONS §5 have the operator view.
 - Byte budgets: as above for the relay, plus a budget of receive windows on the agent (AP-22)
   with growth limited to three quarters of it. A shed connection's streams get `Close
   PeerGone` from the core, not `Drained`.
+- Since review 0013 (A13-1), the relay sheds per authenticated **identity**, not per
+  connection: the identity holding the most of the budget loses its largest connection, no
+  identity may hold more than a quarter of the budget (never less than one connection's
+  credit), and an agent's normal credit is shed only as a last resort. The minimum default
+  budget is 128 MiB, two agents' full credit. The agent reserves a session's window only after
+  end-to-end authentication (A13-2).
 - The agent's runtime has two workers.
 
 ### 5.7 Testing: chaos, simulation, soak (G14)
@@ -545,22 +568,22 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 
 | ID | Category | Hypothesis | Expected | Test |
 | :- | :- | :- | :- | :- |
-| R5-O1 | Parsing | malformed/huge HTTP request to the metrics port | bounded read (1 KiB), timeout, close; fuzzed | fuzz target `metrics_request` |
+| R5-O1 | Parsing | malformed/huge HTTP request to the metrics port | void: no metrics port (AP-21) | — |
 | R5-O2 | Side channels | labels expose fingerprints, node names, client names | none by default | `metrics_have_no_identities` |
 | R5-O3 | Resources | label cardinality grows with peers | fixed label sets only | `metric_cardinality_is_bounded` |
-| R5-O4 | Operator | metrics bound to 0.0.0.0 by mistake | warning at startup; documented | `public_metrics_bind_is_warned` |
+| R5-O4 | Operator | metrics bound to 0.0.0.0 by mistake | void: nothing listens (AP-21) | — |
 | R5-O5 | Resources | textfile write fails (disk full, read-only) | logged once, agent keeps serving | `textfile_failure_is_not_fatal` |
-| R5-O6 | State | `/readyz` during drain | not ready; `/healthz` still ok | `readiness_follows_drain` |
+| R5-O6 | State | `/readyz` during drain | void: no endpoint; `tcn_draining{role}` is 1 during a drain | `process_metrics_follow_reloads_drain_and_progress` |
 
 ### R-6 Efficiency
 
 | ID | Category | Hypothesis | Expected | Test |
 | :- | :- | :- | :- | :- |
-| R6-E1 | Resources | authenticated slow reader across many connections | global byte budget enforced; largest backlog shed; others unaffected | `queue_budget_sheds_the_slowest_reader` |
+| R6-E1 | Resources | authenticated slow reader across many connections | global byte budget enforced; the identity holding the most shed (review 0013, A13-1); others unaffected | `queue_budget_sheds_the_slowest_reader`, `a_split_backlog_sheds_the_abusing_identity_and_the_audit_names_it` |
 | R6-E2 | Resources | refactor splits read/write into separate tasks | bound test fails (guards the invariant) | `relay_queue_never_exceeds_credit_while_writes_block` |
 | R6-E3 | Malleability/Parsing | zero-copy decode path differs from current decoder | identical results on fuzz corpus | differential proptest |
 | R6-E4 | Resources | receiver auto-tunes window beyond `MAX_WINDOW` | refused by sender and relay (existing rules) | existing `tiny_or_overflowing_window_updates_are_violations` + new grow test |
-| R6-E5 | Resources | 1 h soak | RSS/fd/task slope ≈ 0; no audit loss | nightly `soak` job |
+| R6-E5 | Resources | 30 min soak (the nightly workflow; it was 1 h here) | RSS/fd/task slope ≈ 0; budgets and gauges back to zero after the load (A13-7); audit loss is not checked | nightly `soak` job, `soak_short` in every build |
 
 ---
 
@@ -577,7 +600,7 @@ plus failure-mode categories: **Partition**, **Crash/restart**, **Overload**, **
 | D-7 | Watchdog scope | (a) **internal liveness only (hub tick, critical tasks, runtime)**; (b) also external connectivity | **(a)**: restarts don't fix network problems and amplify herds |
 | D-8 | Faster Ansible bursts (connection reuse) | (a) **ControlPersist guidance only now**; (b) local `zt-client` multiplexer daemon (Unix socket, `SO_PEERCRED`, one outer connection, ≤ 32 streams); (c) Noise resumption tickets (`IKpsk2`, per-relay ticket keys) | **(a)** now; re-evaluate **(b)** with PQ measurements (it amortises PQ outer handshakes without new crypto); (c) not recommended (new key-management surface, no shared state between relays) |
 | D-9 | Network simulation | (a) **`turmoil` as dev-dependency behind a narrow `Dialer`/`Acceptor` port**; (b) hand-rolled in-memory duplex simulator; (c) only sans-IO unit tests | **(a)** (needs `cargo deny` approval of a dev-only crate); (c) is necessary but not sufficient |
-| D-10 | Metrics exposure | (a) **relay: localhost HTTP, off by default; agent: textfile + `STATUS=`**; (b) Unix-socket endpoint for both; (c) logs only | **(a)**: agent keeps zero inbound ports; minimal hand-written HTTP, fuzzed |
+| D-10 | Metrics exposure | (a) relay: localhost HTTP, off by default; agent: textfile + `STATUS=`; (b) Unix-socket endpoint for both; (c) logs only; (d) **textfile for both** | **(d)**, as decided by AP-21 and roadmap R1 (this row recommended (a) before them) |
 | D-11 | Reload feedback | (a) `check` subcommand in `ExecReload` (portable), plus `Type=notify-reload` where systemd ≥ 253; (b) notify-reload only; (c) keep `kill -HUP`; (d) **`reload --pid $MAINPID`: the running process validates and publishes its verdict** | (a), replaced by **(d)** after review 0010 (A10-1) |
 | D-12 | Pre-auth logging | (a) **aggregate refusals (10 s summaries + counters); per-event audit only after Noise identity**; (b) keep per-connection lines | **(a)**: avoids journald dropping real audit events |
 | D-13 | Global memory protection | (a) **byte budget shedding the largest backlog + `MemoryHigh`/`MemoryMax`**; (b) unit limits only | **(a)** |
