@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    Ca, Captured, Lab, agent_clients, field, now_secs, raw_msg1, relay_config, relay_policy, scope,
-    seeded, timeouts, trust,
+    Ca, Captured, Lab, agent_clients, field, now_secs, number, raw_msg1, relay_config,
+    relay_policy, scope, seeded, summed, timeouts, trust,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -42,13 +42,6 @@ async fn replay_from(relay: SocketAddr, host: u8, msg1: &[u8]) -> bool {
         tokio::time::timeout(Duration::from_secs(4), tcp.read_exact(&mut head)).await,
         Ok(Ok(_))
     )
-}
-
-/// The numeric field `key` of a JSON log line.
-fn number(line: &str, key: &str) -> Option<u64> {
-    let (_, rest) = line.split_once(&format!("\"{key}\":"))?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
 }
 
 /// Full lines and repeated counts naming `peer` for the event `kind`.
@@ -205,11 +198,7 @@ async fn an_unconfirmed_connection_cannot_announce_a_large_first_frame() {
         started.elapsed()
     );
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let oversized: u64 = logs
-        .events("preauth_summary")
-        .iter()
-        .filter_map(|l| number(l, "oversized"))
-        .sum();
+    let oversized = summed(&logs.events("preauth_summary"), "oversized");
     assert_eq!(oversized, 1, "{}", logs.text());
 }
 

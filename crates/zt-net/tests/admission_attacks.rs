@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use common::{
     Captured, Lab, agent_clients, field, probe_relay, raw_msg1, relay_config, relay_policy, seeded,
+    summed,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -45,20 +46,6 @@ async fn lab(config: RelayConfig, clients: &[&Identity]) -> Lab {
         agent_clients(&whitelist, CertTrust::new()),
     )
     .await
-}
-
-/// The sum of the numeric field `key` over the `preauth_summary` lines: a burst of failures
-/// may straddle two intervals.
-fn summed(lines: &[String], key: &str) -> u64 {
-    let needle = format!("\"{key}\":");
-    lines
-        .iter()
-        .filter_map(|line| {
-            let (_, rest) = line.split_once(&needle)?;
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse::<u64>().ok()
-        })
-        .sum()
 }
 
 /// `true` if the relay closes `tcp` within `within` without sending anything.

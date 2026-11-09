@@ -601,3 +601,16 @@ pub fn field(line: &str, key: &str) -> Option<String> {
     let (value, _) = rest.split_once('"')?;
     Some(value.to_owned())
 }
+
+/// `"key":<number>` in a JSON line.
+pub fn number(line: &str, key: &str) -> Option<u64> {
+    let (_, rest) = line.split_once(&format!("\"{key}\":"))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The sum of the numeric field `key` over `lines` (for example the `preauth_summary` lines:
+/// a burst of failures may straddle two intervals).
+pub fn summed(lines: &[String], key: &str) -> u64 {
+    lines.iter().filter_map(|line| number(line, key)).sum()
+}
