@@ -47,6 +47,13 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Prints the public keys of an existing key file (v1 and `tcn-pub-v2:`, OPERATIONS §15),
+    /// without changing it.
+    Pubkey {
+        /// The secret key file.
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Connects stdin/stdout to the node's SSH daemon (usage: `ProxyCommand zt-client connect %n`).
     Connect {
         /// Suffix to strip from the host name before looking it up among the nodes (e.g. `.tcn` for
@@ -76,6 +83,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Keygen { out } => keygen(&out).map_err(Failure::from),
+        Command::Pubkey { key } => pubkey(&key).map_err(Failure::from),
         Command::Connect { strip_suffix, node } => match node.as_slice() {
             [name] => connect(cli.config, strip_suffix.as_deref(), name),
             _ => Err(Failure::from(
@@ -277,6 +285,16 @@ fn reject_leaked_secret(
 
 fn warn(message: &str) {
     let _ = writeln!(std::io::stderr(), "zt-client: {message}");
+}
+
+fn pubkey(key: &Path) -> Result<(), String> {
+    let identity = config::load_identity(key).map_err(|e| e.to_string())?;
+    write!(
+        std::io::stdout(),
+        "{}",
+        config::public_identity_text(&identity)
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn keygen(out: &Path) -> Result<(), String> {

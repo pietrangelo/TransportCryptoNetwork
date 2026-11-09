@@ -102,7 +102,10 @@ fn the_denylist_takes_keys_and_v1_fingerprints_only() {
     let v2 = a.hybrid_fingerprint().to_string();
     let err = parse_revocations("revoked.toml", &format!("keys = [\"{v2}\"]\n")).unwrap_err();
     let shown = err.to_string();
-    assert!(!shown.contains(&v2[9..40]), "{shown}");
+    assert!(
+        !shown.contains(&v2[9..40]),
+        "the error message echoes the fingerprint"
+    );
     assert!(
         shown.contains("v2") || shown.contains("SHA256v2"),
         "{shown}"

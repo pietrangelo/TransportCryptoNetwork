@@ -74,6 +74,13 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Prints the public keys of an existing key file (v1 and `tcn-pub-v2:`, OPERATIONS §15),
+    /// without changing it.
+    Pubkey {
+        /// The secret key file.
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Starts the relay. `SIGTERM` drains it (OPERATIONS §14).
     Run {
         #[command(flatten)]
@@ -307,6 +314,15 @@ impl Reloader {
 
 fn run(command: Command) -> Result<(), Failure> {
     match command {
+        Command::Pubkey { key } => {
+            let identity = config::load_identity(&key).map_err(|e| load_error(&e))?;
+            write!(
+                std::io::stdout(),
+                "{}",
+                config::public_identity_text(&identity)
+            )
+            .map_err(runtime_error)
+        }
         Command::Keygen { out } => {
             let identity = config::create_identity(&out).map_err(config_error)?;
             write!(

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use zt_crypto::kem::{Kem, KemSeed, MlKem768, SEED_LEN};
 use zt_crypto::noise::{self, Channel};
-use zt_crypto::{Identity, Keyring};
+use zt_crypto::{Identity, Keyring, PeerKey};
 use zt_domain::{AcceptedSuites, HandshakeSuite};
 
 const ROUNDS: usize = 2_000;
@@ -59,7 +59,12 @@ fn time(mut op: impl FnMut()) -> Vec<Duration> {
 fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
     let client = Identity::generate().unwrap();
     let responder = Identity::generate().unwrap();
-    let responder_pk = responder.public_key();
+    // The hybrid IK suite pins the responder's v2 key (PROTOCOL §7.5.3).
+    let responder_pk: PeerKey = if suite.requires_hybrid_identity() {
+        responder.hybrid_public_key().into()
+    } else {
+        responder.public_key().into()
+    };
     let keys = Keyring::single(responder);
     let accepted = AcceptedSuites::only(suite);
     let cert = vec![0x5a; 400];
@@ -68,10 +73,10 @@ fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
     report(
         "initiator: write msg1",
         time(|| {
-            let _ = noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
+            let _ = noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
         }),
     );
-    let (msg1, _) = noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
+    let (msg1, _) = noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
     report(
         "responder: read msg1 (unauthenticated cost)",
         time(|| {
@@ -98,7 +103,7 @@ fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
         time_with(
             || {
                 let (msg1, waiting) =
-                    noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
+                    noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
                 let pending = noise::respond_suites(&keys, &msg1, channel, accepted).unwrap();
                 let (msg2, _) = pending.accept().unwrap();
                 (waiting, msg2)
@@ -112,7 +117,7 @@ fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
         "full handshake, both sides",
         time(|| {
             let (msg1, waiting) =
-                noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
+                noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
             let pending = noise::respond_suites(&keys, &msg1, channel, accepted).unwrap();
             let (msg2, _) = pending.accept().unwrap();
             let _ = waiting.complete(&msg2).unwrap();
@@ -170,6 +175,24 @@ fn hybrid_handshake_cpu_baseline() {
         "both suites: reject an invalid msg1",
         time(|| {
             assert!(noise::respond_suites(&keys, &msg1, Channel::EndToEnd, both).is_err());
+        }),
+    );
+}
+
+/// PQ-AUTH: the hybrid IK suite on both channels. Its responder decapsulates `ct1` with its
+/// static key before Noise runs: that is the new unauthenticated cost of an invalid message 1.
+#[test]
+#[ignore = "timing baseline: run explicitly in release mode"]
+fn hybrid_ik_handshake_cpu_baseline() {
+    handshake_baseline(HandshakeSuite::NoiseIkHybrid25519MlKem768, Channel::Outer);
+    handshake_baseline(
+        HandshakeSuite::NoiseIkHybrid25519MlKem768,
+        Channel::EndToEnd,
+    );
+    report(
+        "identity: derive the static ML-KEM key",
+        time(|| {
+            let _ = Identity::from_secret_hex(&"11".repeat(32)).unwrap();
         }),
     );
 }

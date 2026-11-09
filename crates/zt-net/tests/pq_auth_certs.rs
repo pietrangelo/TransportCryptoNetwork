@@ -77,7 +77,10 @@ fn bad_composite_pins_are_refused_without_echo() {
     ] {
         let err = parse_policy("p", &policy_with(std::slice::from_ref(&bad))).unwrap_err();
         let shown = err.to_string();
-        assert!(!shown.contains(&text[20..80]), "{shown}");
+        assert!(
+            !shown.contains(&text[20..80]),
+            "the error message echoes the key"
+        );
     }
 }
 

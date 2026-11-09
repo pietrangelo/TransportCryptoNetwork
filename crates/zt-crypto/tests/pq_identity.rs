@@ -164,5 +164,9 @@ fn identity_debug_shows_no_kem_secret() {
     let (seed, id) = seeded(0x36);
     let debug = format!("{id:?}");
     assert!(!debug.contains(&hex::encode(seed)));
-    assert!(debug.len() < 200, "{debug}");
+    assert!(
+        debug.len() < 200,
+        "Debug of an identity is {} bytes long",
+        debug.len()
+    );
 }

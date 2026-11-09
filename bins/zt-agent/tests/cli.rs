@@ -539,3 +539,29 @@ fn keygen_prints_both_public_keys() {
         Some(id.hybrid_fingerprint().to_string())
     );
 }
+
+/// Spec (OPERATIONS §15): `pubkey` prints the same lines for an existing key, and leaves the
+/// file as it was.
+#[test]
+fn pubkey_prints_the_keys_of_an_existing_file() {
+    let dir = setup("pubkey-v2");
+    let path = dir.0.join("node.key");
+    let made = Command::new(BIN)
+        .args(["keygen", "--out", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    let before = std::fs::read(&path).unwrap();
+    let shown = Command::new(BIN)
+        .args(["pubkey", "--key", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    assert_eq!(shown.stdout, made.stdout);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let missing = Command::new(BIN)
+        .args(["pubkey", "--key", dir.0.join("none.key").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+}
