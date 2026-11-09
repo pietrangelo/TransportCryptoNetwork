@@ -85,8 +85,8 @@ fn builder(
     Ok((builder, secret))
 }
 
-/// Maximum payload of message 1: a client certificate (PROTOCOL §15.3).
-pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = zt_domain::limits::MAX_CERT_LEN;
+/// Maximum payload of message 1: a client certificate of any version (PROTOCOL §15.3, §15.14).
+pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = zt_domain::limits::MAX_ANY_CERT_LEN;
 
 /// Initiator: produces the first message toward a responder whose key it knows.
 ///

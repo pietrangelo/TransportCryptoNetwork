@@ -16,14 +16,17 @@ use std::process::ExitCode;
 
 use clap::{ArgGroup, Parser, Subcommand};
 use zt_crypto::{
-    CaSigningKey, PublicKey, cert_key, encode_certificate_text, sign_certificate, trusted_ca_key,
-    verify_certificate,
+    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, PublicKey, cert_key,
+    encode_certificate_text, sign_certificate, sign_certificate_v2, trusted_ca_key,
+    trusted_composite_ca_key,
 };
 use zt_domain::limits::{MAX_CERT_LIFETIME_SECS, MAX_CERT_NODES};
+use zt_domain::trust::TrustedCaKey;
 use zt_domain::{
-    AllowedNodes, CertBody, CertScope, CertSerial, CertTrust, NodeId, Revocations, UnixTime,
+    AllowedNodes, AnyCertBody, CertBody, CertBodyV2, CertScope, CertSerial, CertSubject, CertTrust,
+    NodeId, Revocations, UnixTime,
 };
-use zt_net::config;
+use zt_net::config::{self, AnyCaKey};
 
 /// TCN offline CA.
 #[derive(Debug, Parser)]
@@ -40,11 +43,15 @@ enum Command {
         /// File to create.
         #[arg(long)]
         out: PathBuf,
+        /// A composite ML-DSA-65 + Ed25519 key (`tcn-ca-secret-v2:`), which signs
+        /// certificates v2 (PROTOCOL §15.14). Both components are fresh.
+        #[arg(long)]
+        v2: bool,
     },
     /// Signs a certificate for a client's public key.
     #[command(group(ArgGroup::new("scope").required(true).multiple(false).args(["nodes", "all_nodes"])))]
     Sign {
-        /// Secret key of the CA (`tcn-ca-secret-v1:`).
+        /// Secret key of the CA (`tcn-ca-secret-v1:` signs v1, `tcn-ca-secret-v2:` signs v2).
         #[arg(long)]
         ca: PathBuf,
         /// Issuance log (TSV, append-only, 0600). Mandatory.
@@ -77,7 +84,8 @@ enum Command {
         /// Certificate file.
         #[arg(long)]
         cert: PathBuf,
-        /// Public key of the CA to verify the signature with (64 hex characters).
+        /// Public key of the CA to verify the signature with (64 hex characters, or
+        /// `tcn-ca-pub-v2:` for a certificate v2).
         #[arg(long)]
         ca_key: Option<String>,
     },
@@ -96,7 +104,13 @@ fn main() -> ExitCode {
 
 fn run(command: &Command) -> Result<(), String> {
     match command {
-        Command::Keygen { out } => keygen(out),
+        Command::Keygen { out, v2 } => {
+            if *v2 {
+                keygen_v2(out)
+            } else {
+                keygen(out)
+            }
+        }
         Command::Sign {
             ca,
             log,
@@ -137,6 +151,16 @@ fn keygen(out: &Path) -> Result<(), String> {
     emit(&out)
 }
 
+fn keygen_v2(out: &Path) -> Result<(), String> {
+    let ca = config::create_ca_key_v2(out).map_err(|e| config_error(&e))?;
+    let public = ca.public_key();
+    let mut out = String::new();
+    let _ = writeln!(out, "public_key  = \"{public}\"");
+    let _ = writeln!(out, "fingerprint = {}", public.fingerprint());
+    let _ = writeln!(out, "ca_fp       = {}", public.ca_fp());
+    emit(&out)
+}
+
 struct SignArgs<'a> {
     ca: &'a Path,
     log: &'a Path,
@@ -165,29 +189,55 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
         .checked_add(lifetime)
         .ok_or("--not-before: the validity ends after the end of time")?;
 
-    let ca = config::load_ca_key(args.ca).map_err(|e| config_error(&e))?;
+    let ca = config::load_any_ca_key(args.ca).map_err(|e| config_error(&e))?;
     // The CA secret pasted in place of the client key: rejected, because the certificate
     // and the log would make it public.
     if is_ca_secret(&ca, args.subject) {
         return Err("--subject: this is a secret key, not a public key".into());
     }
-    let subject_key = cert_key(&subject);
-    let ca_key = cert_key(&ca.public_key());
-    if subject_key == ca_key {
-        return Err("--subject: the CA cannot certify its own key".into());
-    }
     let serial = random_serial()?;
-    let body = CertBody::new(
-        ca_key,
-        subject_key,
-        serial,
-        not_before,
-        not_after,
-        name.clone(),
-        scope,
-    )
-    .map_err(|e| format!("certificate not valid: {e}"))?;
-    let cert = sign_certificate(&ca, &body).map_err(|e| format!("signing failed: {e}"))?;
+    let (cert, scope, version) = match &ca {
+        AnyCaKey::V1(ca) => {
+            let subject_key = cert_key(&subject);
+            let ca_key = cert_key(&ca.public_key());
+            if subject_key == ca_key {
+                return Err("--subject: the CA cannot certify its own key".into());
+            }
+            let body = CertBody::new(
+                ca_key,
+                subject_key,
+                serial,
+                not_before,
+                not_after,
+                name.clone(),
+                scope,
+            )
+            .map_err(|e| format!("certificate not valid: {e}"))?;
+            let cert = sign_certificate(ca, &body).map_err(|e| format!("signing failed: {e}"))?;
+            (cert, body.scope().clone(), "v1")
+        }
+        AnyCaKey::V2(ca) => {
+            let public = ca.public_key();
+            if subject.fingerprint() == public.fingerprint() {
+                return Err("--subject: the CA cannot certify its own key".into());
+            }
+            let body = CertBodyV2::new(
+                public.ca_fp(),
+                CertSubject::Classical(subject.fingerprint()),
+                serial,
+                not_before,
+                not_after,
+                name.clone(),
+                scope,
+            )
+            .map_err(|e| format!("certificate not valid: {e}"))?;
+            // `sign_certificate_v2` verifies the certificate with the fleet's verifier before
+            // returning it (finding AP-5).
+            let cert =
+                sign_certificate_v2(ca, &body).map_err(|e| format!("signing failed: {e}"))?;
+            (cert, body.scope().clone(), "v2")
+        }
+    };
     let text = encode_certificate_text(&cert);
 
     // `--out` is never overwritten (`create_new` guarantees it anyway): checking it first
@@ -196,11 +246,13 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
         return Err(format!("{}: already exists", args.out.display()));
     }
     let subject_fp = subject.fingerprint();
+    // Columns: serial, subject (X25519-level fingerprint, the revocation unit, AP-6), name,
+    // validity, scope, certificate version, hybrid fingerprint of the subject (`-` if none).
     let line = format!(
-        "{serial}\t{subject_fp}\t{name}\t{}\t{}\t{}\n",
+        "{serial}\t{subject_fp}\t{name}\t{}\t{}\t{}\t{version}\t-\n",
         not_before.as_secs(),
         not_after.as_secs(),
-        scope_column(body.scope()),
+        scope_column(&scope),
     );
     // The log first, synced; then the certificate. A certificate without a line in the
     // log must not exist (OPERATIONS §10.3).
@@ -215,19 +267,44 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     emit(&out)
 }
 
+/// The CA key given to `inspect --ca-key`: either version.
+enum InspectKey {
+    V1(PublicKey),
+    V2(CompositeCaPublicKey),
+}
+
+impl InspectKey {
+    fn trusted(&self) -> Result<TrustedCaKey, String> {
+        match self {
+            Self::V1(key) => Ok(trusted_ca_key(key)),
+            Self::V2(key) => {
+                trusted_composite_ca_key(key).map_err(|_| "--ca-key: not usable".to_owned())
+            }
+        }
+    }
+    fn fingerprint(&self) -> zt_domain::Fingerprint {
+        match self {
+            Self::V1(key) => key.fingerprint(),
+            Self::V2(key) => key.fingerprint(),
+        }
+    }
+}
+
 fn inspect(cert: &Path, ca_key: Option<&str>) -> Result<(), String> {
+    const BAD_KEY: &str = "--ca-key: not a valid CA public key (64 lowercase hexadecimal \
+                           characters, or tcn-ca-pub-v2:<hex>)";
     let expected_ca = match ca_key {
-        Some(text) => Some(parse_public_key(text).ok_or(
-            "--ca-key: not a valid Ed25519 public key (64 lowercase hexadecimal characters)",
-        )?),
+        Some(text) if text.starts_with(CompositeCaPublicKey::PREFIX) => Some(InspectKey::V2(
+            text.parse::<CompositeCaPublicKey>().map_err(|_| BAD_KEY)?,
+        )),
+        Some(text) => Some(InspectKey::V1(parse_public_key(text).ok_or(BAD_KEY)?)),
         None => None,
     };
     let file = config::load_certificate(cert).map_err(|e| config_error(&e))?;
     let body = &file.body;
-    let ca = PublicKey::from_canonical_bytes(body.ca_key().as_bytes()).ok();
-    let subject = PublicKey::from_canonical_bytes(body.subject_key().as_bytes()).ok();
 
     let mut out = String::new();
+    let _ = writeln!(out, "version     = {}", body.version());
     let _ = writeln!(out, "name        = \"{}\"", body.name());
     match body.scope() {
         CertScope::All => {
@@ -238,27 +315,43 @@ fn inspect(cert: &Path, ca_key: Option<&str>) -> Result<(), String> {
             let _ = writeln!(out, "nodes       = [{}]", list.join(", "));
         }
     }
-    let _ = writeln!(
-        out,
-        "ca_key      = \"{}\"",
-        hex_of(body.ca_key().as_bytes())
-    );
-    match ca {
-        Some(key) => {
-            let _ = writeln!(out, "ca          = {}", key.fingerprint());
+    let subject = match body {
+        AnyCertBody::V1(body) => {
+            let ca = PublicKey::from_canonical_bytes(body.ca_key().as_bytes()).ok();
+            let subject = PublicKey::from_canonical_bytes(body.subject_key().as_bytes()).ok();
+            let _ = writeln!(
+                out,
+                "ca_key      = \"{}\"",
+                hex_of(body.ca_key().as_bytes())
+            );
+            match ca {
+                Some(key) => {
+                    let _ = writeln!(out, "ca          = {}", key.fingerprint());
+                }
+                None => {
+                    let _ = writeln!(out, "ca          = invalid key");
+                }
+            }
+            match subject {
+                Some(key) => {
+                    let _ = writeln!(out, "subject     = {}", key.fingerprint());
+                }
+                None => {
+                    let _ = writeln!(out, "subject     = invalid key");
+                }
+            }
+            subject.map(|k| k.fingerprint())
         }
-        None => {
-            let _ = writeln!(out, "ca          = invalid key");
+        AnyCertBody::V2(body) => {
+            let _ = writeln!(out, "ca_fp       = {}", body.ca_fp());
+            // The X25519-level fingerprint is the revocation unit (finding AP-6).
+            let _ = writeln!(out, "subject     = {}", body.subject().classical());
+            if let Some(hybrid) = body.subject().hybrid() {
+                let _ = writeln!(out, "subject_v2  = {hybrid}");
+            }
+            Some(*body.subject().classical())
         }
-    }
-    match subject {
-        Some(key) => {
-            let _ = writeln!(out, "subject     = {}", key.fingerprint());
-        }
-        None => {
-            let _ = writeln!(out, "subject     = invalid key");
-        }
-    }
+    };
     let _ = writeln!(out, "serial      = {}", body.serial());
     let _ = writeln!(
         out,
@@ -289,7 +382,7 @@ fn inspect(cert: &Path, ca_key: Option<&str>) -> Result<(), String> {
     let Some(expected_ca) = expected_ca else {
         return emit(&out);
     };
-    let verdict = verify_signature(&file.bytes, subject, &expected_ca);
+    let verdict = verify_signature(&file.bytes, body, subject, &expected_ca);
     if verdict.is_ok() {
         let _ = writeln!(
             out,
@@ -301,26 +394,33 @@ fn inspect(cert: &Path, ca_key: Option<&str>) -> Result<(), String> {
     verdict
 }
 
-/// Verifies the signature with `ca` as the only pinned CA (steps 3–6 of PROTOCOL §15.4).
+/// Verifies the signature with `ca` as the only pinned CA (steps 3–6 of PROTOCOL §15.4). A
+/// hybrid-bound v2 certificate is checked against its own hybrid fingerprint: `inspect` has
+/// no handshake, it checks the signatures.
 fn verify_signature(
     bytes: &[u8],
-    subject: Option<PublicKey>,
-    ca: &PublicKey,
+    body: &AnyCertBody,
+    subject: Option<zt_domain::Fingerprint>,
+    ca: &InspectKey,
 ) -> Result<(), String> {
     let subject = subject.ok_or("signature: the certificate's subject key is not valid")?;
+    let hybrid = match body {
+        AnyCertBody::V2(body) => body.subject().hybrid().copied(),
+        AnyCertBody::V1(_) => None,
+    };
     let name = NodeId::try_from("inspect").map_err(|_| "internal error")?;
     let mut trust = CertTrust::new();
     trust
         .add_authority(
             name,
-            &[trusted_ca_key(ca)],
+            &[ca.trusted()?],
             AllowedNodes::All,
             MAX_CERT_LIFETIME_SECS,
         )
         .map_err(|_| "--ca-key: not usable as a CA key")?;
     let empty = Revocations::new([], []).map_err(|_| "internal error")?;
     trust.set_revocations(empty);
-    verify_certificate(bytes, &subject.fingerprint(), &trust)
+    zt_crypto::verify_certificate_hybrid(bytes, &subject, hybrid.as_ref(), &trust)
         .map(|_| ())
         .map_err(|rejection| {
             format!(
@@ -400,20 +500,27 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
-/// `true` if `text` is the CA secret (with or without prefix).
-fn is_ca_secret(ca: &CaSigningKey, text: &str) -> bool {
-    let secret = ca.to_secret_text();
-    let Some(hex) = secret
-        .trim_end_matches('\n')
-        .strip_prefix(CaSigningKey::FILE_PREFIX)
-    else {
+/// `true` if `text` is the CA secret (with or without prefix) or, for a composite key, either
+/// of its two 32-byte seeds: each half alone is 64 hex characters, the shape of a public key.
+fn is_ca_secret(ca: &AnyCaKey, text: &str) -> bool {
+    let (secret, prefix) = match ca {
+        AnyCaKey::V1(ca) => (ca.to_secret_text(), CaSigningKey::FILE_PREFIX),
+        AnyCaKey::V2(ca) => (ca.to_secret_text(), CompositeCaSigningKey::FILE_PREFIX),
+    };
+    let Some(hex) = secret.trim_end_matches('\n').strip_prefix(prefix) else {
         return true;
     };
     let candidate = text.trim();
-    let candidate = candidate
-        .strip_prefix(CaSigningKey::FILE_PREFIX)
-        .unwrap_or(candidate);
-    candidate.eq_ignore_ascii_case(hex)
+    let candidate = candidate.strip_prefix(prefix).unwrap_or(candidate);
+    if candidate.eq_ignore_ascii_case(hex) {
+        return true;
+    }
+    match (hex.get(..64), hex.get(64..)) {
+        (Some(ed), Some(ml)) if !ml.is_empty() => {
+            candidate.eq_ignore_ascii_case(ed) || candidate.eq_ignore_ascii_case(ml)
+        }
+        _ => false,
+    }
 }
 
 fn parse_scope(nodes: &[String], all_nodes: bool) -> Result<CertScope, String> {
@@ -512,14 +619,15 @@ fn append_log(path: &Path, ca: &Path, line: &[u8]) -> Result<(), String> {
             ));
         }
     }
-    // The file is open for reading from the start: the first bytes tell whether it is a CA key.
+    // The file is open for reading from the start: the first bytes tell whether it is a CA key
+    // of either version (both prefixes have the same length).
     let prefix = CaSigningKey::FILE_PREFIX.as_bytes();
     let mut head = Vec::with_capacity(prefix.len());
     (&mut file)
         .take(u64::try_from(prefix.len()).unwrap_or(u64::MAX))
         .read_to_end(&mut head)
         .map_err(io)?;
-    if head == prefix {
+    if head == prefix || head == CompositeCaSigningKey::FILE_PREFIX.as_bytes() {
         return Err(format!(
             "{}: the issuance log looks like a CA key file: use a separate file",
             path.display()

@@ -106,6 +106,7 @@ fn authentication_failed(
         ca = c.ca.as_deref(),
         serial = c.serial.as_deref(),
         cert_name = c.cert_name.as_deref(),
+        cert_version = c.cert_version,
         not_after = c.not_after,
         "authentication failed"
     );
@@ -135,16 +136,17 @@ pub(crate) fn audit(event: &DomainEvent) {
         } => {
             let c = CertFields::of(certificate.as_ref());
             emit!(
-                session = %session_hex(session),
-                peer = %client,
-                node = %target,
-                credential = c.credential,
-                ca = c.ca.as_deref(),
-                serial = c.serial.as_deref(),
-                cert_name = c.cert_name.as_deref(),
-                not_after = c.not_after,
-                "session established"
-            );
+                    session = %session_hex(session),
+                    peer = %client,
+                    node = %target,
+                    credential = c.credential,
+                    ca = c.ca.as_deref(),
+                    serial = c.serial.as_deref(),
+                    cert_name = c.cert_name.as_deref(),
+            cert_version = c.cert_version,
+                    not_after = c.not_after,
+                    "session established"
+                );
         }
         DomainEvent::AuthenticationFailed {
             peer,
@@ -158,15 +160,16 @@ pub(crate) fn audit(event: &DomainEvent) {
         } => {
             let c = CertFields::of(certificate.as_ref());
             emit!(
-                peer = %client,
-                node = %target,
-                credential = c.credential,
-                ca = c.ca.as_deref(),
-                serial = c.serial.as_deref(),
-                cert_name = c.cert_name.as_deref(),
-                not_after = c.not_after,
-                "access denied"
-            );
+                    peer = %client,
+                    node = %target,
+                    credential = c.credential,
+                    ca = c.ca.as_deref(),
+                    serial = c.serial.as_deref(),
+                    cert_name = c.cert_name.as_deref(),
+            cert_version = c.cert_version,
+                    not_after = c.not_after,
+                    "access denied"
+                );
         }
         DomainEvent::ProtocolViolation { peer, rule } => {
             emit!(%peer, rule = *rule, "protocol violation");
@@ -182,26 +185,28 @@ pub(crate) fn audit(event: &DomainEvent) {
             let c = CertFields::of(certificate.as_ref());
             let node = target.as_ref().map(ToString::to_string);
             emit!(
-                %peer,
-                node = node.as_deref(),
-                credential = c.credential,
-                ca = c.ca.as_deref(),
-                serial = c.serial.as_deref(),
-                cert_name = c.cert_name.as_deref(),
-                not_after = c.not_after,
-                "access revoked"
-            );
+                    %peer,
+                    node = node.as_deref(),
+                    credential = c.credential,
+                    ca = c.ca.as_deref(),
+                    serial = c.serial.as_deref(),
+                    cert_name = c.cert_name.as_deref(),
+            cert_version = c.cert_version,
+                    not_after = c.not_after,
+                    "access revoked"
+                );
         }
         DomainEvent::CertificateExpired { peer, certificate } => {
             let c = CertFields::of(Some(certificate));
             emit!(
-                %peer,
-                ca = c.ca.as_deref(),
-                serial = c.serial.as_deref(),
-                cert_name = c.cert_name.as_deref(),
-                not_after = c.not_after,
-                "certificate expired"
-            );
+                    %peer,
+                    ca = c.ca.as_deref(),
+                    serial = c.serial.as_deref(),
+                    cert_name = c.cert_name.as_deref(),
+            cert_version = c.cert_version,
+                    not_after = c.not_after,
+                    "certificate expired"
+                );
         }
         // `DomainEvent` is `non_exhaustive`: a new event at least stays readable.
         // Written before any proof that the peer is live (there is no message 2, so no
@@ -234,6 +239,8 @@ pub(crate) struct CertFields {
     pub(crate) serial: Option<String>,
     pub(crate) cert_name: Option<String>,
     pub(crate) not_after: Option<u64>,
+    /// 1 or 2 (PQ-AUTH): which certificate format admitted the peer.
+    pub(crate) cert_version: Option<u8>,
 }
 
 impl CertFields {
@@ -245,6 +252,7 @@ impl CertFields {
                 serial: None,
                 cert_name: None,
                 not_after: None,
+                cert_version: None,
             },
             Some(c) => Self {
                 credential: "certificate",
@@ -252,6 +260,7 @@ impl CertFields {
                 serial: Some(c.serial.to_string()),
                 cert_name: Some(c.name.to_string()),
                 not_after: Some(c.not_after.as_secs()),
+                cert_version: Some(c.version),
             },
         }
     }

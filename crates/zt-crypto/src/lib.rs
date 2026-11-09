@@ -18,12 +18,15 @@ mod error;
 mod identity;
 pub mod kem;
 mod keyring;
+pub mod mldsa;
 pub mod noise;
 mod resolver;
 
 pub use cert::{
-    CERT_FILE_PREFIX, CaSigningKey, cert_key, decode_certificate_text, encode_certificate_text,
-    sign_certificate, trusted_ca_key, verify_certificate,
+    CERT_FILE_PREFIX, CERT_FILE_PREFIX_V2, CaSigningKey, CompositeCaPublicKey,
+    CompositeCaSigningKey, cert_key, decode_certificate_text, encode_certificate_text,
+    sign_certificate, sign_certificate_v2, trusted_ca_key, trusted_composite_ca_key,
+    verify_certificate, verify_certificate_hybrid,
 };
 pub use error::CryptoError;
 pub use identity::{Identity, PublicKey, fingerprint_of_x25519};

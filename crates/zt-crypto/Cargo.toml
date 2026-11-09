@@ -17,6 +17,7 @@ zeroize.workspace = true
 hex.workspace = true
 getrandom.workspace = true
 libcrux-ml-kem.workspace = true
+ml-dsa.workspace = true
 subtle.workspace = true
 
 [dev-dependencies]
@@ -27,6 +28,8 @@ ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
 snow.workspace = true
 # `zeroize`: the oracle satisfies the `ZeroizeOnDrop` bound of `Kem::DecapsulationKey`.
 ml-kem = { workspace = true, features = ["zeroize"] }
+# The ML-DSA differential oracle (decision D11): test-only.
+libcrux-ml-dsa.workspace = true
 
 [lints]
 workspace = true

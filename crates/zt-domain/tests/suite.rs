@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects, missing_docs)]
 
 use zt_domain::limits::{
-    MAX_CERT_LEN, MAX_PAYLOAD_LEN, NOISE_MAX_MESSAGE_LEN, NOISE_MSG1_OVERHEAD,
+    MAX_ANY_CERT_LEN, MAX_PAYLOAD_LEN, NOISE_MAX_MESSAGE_LEN, NOISE_MSG1_OVERHEAD,
 };
 use zt_domain::{
     AcceptedSuites, DomainEvent, Fingerprint, HandshakeChannel, HandshakeSuite, InitiatorRole,
@@ -86,13 +86,14 @@ fn suite_names_and_ids_round_trip() {
 }
 
 /// Side finding of the plan: `NOISE_MSG1_OVERHEAD` already contains the payload tag, so the
-/// longest message 1 is `96 + 4 328`, the value the agent enforces, not `96 + 4 328 + 16`.
+/// longest message 1 is `96 + 7 670` (the largest certificate of any version, v2 since
+/// PQ-AUTH), the value the agent enforces, not `96 + 7 670 + 16`.
 #[test]
 fn classical_message_sizes_are_exact() {
     assert_eq!(NOISE_MSG1_OVERHEAD, 32 + (32 + 16) + 16);
     assert_eq!(CLASSIC.msg1_overhead(), NOISE_MSG1_OVERHEAD);
-    assert_eq!(CLASSIC.max_msg1_len(), 96 + MAX_CERT_LEN);
-    assert_eq!(CLASSIC.max_msg1_len(), 4_424);
+    assert_eq!(CLASSIC.max_msg1_len(), 96 + MAX_ANY_CERT_LEN);
+    assert_eq!(CLASSIC.max_msg1_len(), 7_766);
     // msg2: e (32) + empty payload tag (16).
     assert_eq!(CLASSIC.msg2_len(), 48);
 }
@@ -103,7 +104,7 @@ fn classical_message_sizes_are_exact() {
 fn hybrid_message_sizes_are_those_of_the_plan() {
     assert_eq!(HFS.msg1_overhead(), 32 + (1_184 + 16) + (32 + 16) + 16);
     assert_eq!(HFS.msg1_overhead(), 1_296);
-    assert_eq!(HFS.max_msg1_len(), 1_296 + MAX_CERT_LEN);
+    assert_eq!(HFS.max_msg1_len(), 1_296 + MAX_ANY_CERT_LEN);
     assert_eq!(HFS.msg2_len(), 32 + (1_088 + 16) + 16);
     assert_eq!(HFS.msg2_len(), 1_152);
 }
@@ -144,11 +145,11 @@ fn a_set_with_the_hybrid_suite_is_supported_on_both_channels() {
 
 #[test]
 fn the_message_1_cap_is_the_largest_legitimate_message_of_the_set() {
-    assert_eq!(AcceptedSuites::only(CLASSIC).max_msg1_len(), 4_424);
-    assert_eq!(AcceptedSuites::only(HFS).max_msg1_len(), 5_624);
+    assert_eq!(AcceptedSuites::only(CLASSIC).max_msg1_len(), 7_766);
+    assert_eq!(AcceptedSuites::only(HFS).max_msg1_len(), 8_966);
     assert_eq!(
         AcceptedSuites::new([CLASSIC, HFS]).unwrap().max_msg1_len(),
-        5_624
+        8_966
     );
 }
 

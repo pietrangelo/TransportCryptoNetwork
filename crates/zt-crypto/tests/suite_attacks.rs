@@ -79,7 +79,7 @@ fn message_1_lengths_outside_the_suite_bounds_are_refused() {
 #[test]
 fn a_message_1_at_the_largest_legitimate_size_is_accepted() {
     let (client, keys, pk) = setup();
-    let payload = vec![0x5a; zt_domain::limits::MAX_CERT_LEN];
+    let payload = vec![0x5a; zt_domain::limits::MAX_ANY_CERT_LEN];
     let (msg1, _) = noise::initiate_suite(&client, &pk, Channel::Outer, CLASSIC, &payload).unwrap();
     assert_eq!(msg1.len(), CLASSIC.max_msg1_len());
     let pending =

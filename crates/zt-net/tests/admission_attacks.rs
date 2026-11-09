@@ -91,7 +91,7 @@ async fn the_largest_legitimate_msg1_fits_the_preauth_cap() {
         seed,
         &relay.key,
         Channel::Outer,
-        &vec![0x54; zt_domain::limits::MAX_CERT_LEN],
+        &vec![0x54; zt_domain::limits::MAX_ANY_CERT_LEN],
     );
     assert_eq!(
         msg1.len(),

@@ -94,6 +94,7 @@ fn trust(bits: u8) -> CertTrust {
             &[TrustedCaKey {
                 key: CertKey::from_bytes([CA; 32]),
                 fingerprint: fp(CA),
+                composite: None,
             }],
             allowed,
             lifetime,
@@ -180,7 +181,7 @@ fn may_stay(
         Some(_) => return !trust.is_key_revoked(peer),
         None => {}
     }
-    let Some(authority) = trust.authority_for_key(cert.ca_key()) else {
+    let Some(authority) = trust.authority_for(cert.authority_key()) else {
         return false;
     };
     let nb = cert.not_before().as_secs();

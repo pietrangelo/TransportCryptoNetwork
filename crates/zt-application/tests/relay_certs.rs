@@ -108,6 +108,7 @@ fn policy(ca: &Ca) -> Arc<AccessPolicy> {
             &[TrustedCaKey {
                 key: CertKey::from_bytes([CA; 32]),
                 fingerprint: fp(CA),
+                composite: None,
             }],
             ca.allow.clone(),
             ca.max_lifetime,

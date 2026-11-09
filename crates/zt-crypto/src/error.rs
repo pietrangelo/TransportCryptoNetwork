@@ -28,4 +28,8 @@ pub enum CryptoError {
     /// The handshake suite is not supported by this build (PROTOCOL §7.5).
     #[error("handshake suite not supported")]
     UnsupportedSuite,
+    /// A certificate just signed does not verify with the fleet's verifier (finding AP-5):
+    /// it is not issued.
+    #[error("the new certificate failed verification after signing")]
+    VerifyAfterSign,
 }

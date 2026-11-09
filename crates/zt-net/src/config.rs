@@ -13,14 +13,14 @@ use std::sync::Arc;
 use serde::Deserialize;
 use thiserror::Error;
 use zt_crypto::{
-    CaSigningKey, CryptoError, Identity, Keyring, PublicKey, decode_certificate_text,
-    trusted_ca_key,
+    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, CryptoError, Identity, Keyring,
+    PublicKey, decode_certificate_text, trusted_ca_key, trusted_composite_ca_key,
 };
 use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
-use zt_domain::trust::{CertTrust, Revocations};
+use zt_domain::trust::{CertTrust, Revocations, TrustedCaKey};
 use zt_domain::{
-    AccessPolicy, AllowedNodes, AuthorizedClients, CertBody, CertFormatError, CertSerial,
-    ClientGrant, DomainError, NodeId, decode_certificate,
+    AccessPolicy, AllowedNodes, AnyCertBody, AuthorizedClients, CertFormatError, CertSerial,
+    ClientGrant, DomainError, NodeId, decode_any_certificate,
 };
 
 /// Maximum size of a configuration file.
@@ -561,6 +561,21 @@ impl Ctx<'_> {
         // `to_bytes` returns the 32 bytes as written, not the re-encoding of the point.
         PublicKey::from_canonical_bytes(&parsed.to_bytes()).map_err(fail)
     }
+    /// A CA key of `[[authorities]]`: a v1 Ed25519 key (64 hex characters, canonical) or a
+    /// composite v2 key (`tcn-ca-pub-v2:`, PROTOCOL §15.14). The text decides the algorithm,
+    /// and the pin carries it: certificates are then verified with the pin's algorithm only.
+    fn ca_key(&self, entry: &str, text: &str) -> Result<TrustedCaKey, ConfigError> {
+        let fail = |source| ConfigError::Key {
+            path: self.0.into(),
+            entry: entry.into(),
+            source,
+        };
+        if text.starts_with(CompositeCaPublicKey::PREFIX) {
+            let key: CompositeCaPublicKey = text.parse().map_err(fail)?;
+            return trusted_composite_ca_key(&key).map_err(fail);
+        }
+        self.canonical_key(entry, text).map(|k| trusted_ca_key(&k))
+    }
     fn allowed(&self, entry: &str, allow: &[String]) -> Result<AllowedNodes, ConfigError> {
         if allow.iter().any(|a| a == "*") {
             return Ok(AllowedNodes::All);
@@ -647,10 +662,7 @@ fn parse_authorities(ctx: &Ctx<'_>, entries: &[AuthorityEntry]) -> Result<CertTr
         };
         let keys = texts
             .into_iter()
-            .map(|t| {
-                ctx.canonical_key(&entry.name, t)
-                    .map(|k| trusted_ca_key(&k))
-            })
+            .map(|t| ctx.ca_key(&entry.name, t))
             .collect::<Result<Vec<_>, _>>()?;
         let allowed = ctx.allowed(&entry.name, &entry.allow)?;
         let max_lifetime = entry
@@ -755,11 +767,12 @@ fn parse_serial(ctx: &Ctx<'_>, index: usize, text: &str) -> Result<CertSerial, C
 pub struct CertificateFile {
     /// The certificate bytes, to be sent in message 1.
     pub bytes: Arc<[u8]>,
-    /// The decoded body.
-    pub body: CertBody,
+    /// The decoded body, of either version.
+    pub body: AnyCertBody,
 }
 
-/// Parses a certificate file (`tcn-client-cert-v1:<hex>`, PROTOCOL §15.1).
+/// Parses a certificate file (`tcn-client-cert-v1:<hex>` or `tcn-client-cert-v2:<hex>`,
+/// PROTOCOL §15.1, §15.14).
 ///
 /// # Errors
 /// [`ConfigError::Certificate`] for an invalid text or certificate.
@@ -769,7 +782,7 @@ pub fn parse_certificate_file(origin: &str, text: &str) -> Result<CertificateFil
         source,
     };
     let bytes = decode_certificate_text(text).map_err(fail)?;
-    let body = decode_certificate(&bytes).map_err(fail)?.body;
+    let body = decode_any_certificate(&bytes).map_err(fail)?.into_body();
     Ok(CertificateFile {
         bytes: bytes.into(),
         body,
@@ -798,6 +811,52 @@ pub fn create_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
     })?;
     write_private_new(path, ca.to_secret_text().as_bytes())?;
     Ok(ca)
+}
+
+/// A CA secret key of either version (`zt-ca`).
+#[derive(Debug)]
+pub enum AnyCaKey {
+    /// `tcn-ca-secret-v1:`: signs certificates v1 (Ed25519).
+    V1(CaSigningKey),
+    /// `tcn-ca-secret-v2:`: signs certificates v2 (ML-DSA-65 + Ed25519).
+    V2(CompositeCaSigningKey),
+}
+
+/// Generates a composite (v2) CA key and writes it to a new file with `0600` permissions.
+/// Never overwrites an existing file.
+///
+/// # Errors
+/// File already exists, I/O error, RNG unavailable.
+pub fn create_ca_key_v2(path: &Path) -> Result<CompositeCaSigningKey, ConfigError> {
+    let ca = CompositeCaSigningKey::generate().map_err(|source| ConfigError::Key {
+        path: path.display().to_string(),
+        entry: "ca secret key".into(),
+        source,
+    })?;
+    write_private_new(path, ca.to_secret_text().as_bytes())?;
+    Ok(ca)
+}
+
+/// Loads a CA key of either version, with the secret key rules: the file prefix decides.
+///
+/// # Errors
+/// Like [`load_identity`]; a node key file is rejected.
+pub fn load_any_ca_key(path: &Path) -> Result<AnyCaKey, ConfigError> {
+    let file = open_trusted(path, true)?;
+    let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
+    let fail = |source| ConfigError::Key {
+        path: path.display().to_string(),
+        entry: "ca secret key".into(),
+        source,
+    };
+    if text.starts_with(CompositeCaSigningKey::FILE_PREFIX) {
+        return CompositeCaSigningKey::from_secret_text(&text)
+            .map(AnyCaKey::V2)
+            .map_err(fail);
+    }
+    CaSigningKey::from_secret_text(&text)
+        .map(AnyCaKey::V1)
+        .map_err(fail)
 }
 
 /// Loads a CA key, with the secret key rules.

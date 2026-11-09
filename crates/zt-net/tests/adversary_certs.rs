@@ -1,5 +1,5 @@
 //! Phase 6, step 7: attacks on client certificates over real TCP (PROTOCOL §15.3, §15.4,
-//! §15.5, §15.6, §15.8, §15.14). Every rejection has a positive check in the same test, so an
+//! §15.5, §15.6, §15.8, §15.15). Every rejection has a positive check in the same test, so an
 //! implementation that rejects everything does not pass.
 #![allow(
     clippy::unwrap_used,

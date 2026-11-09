@@ -272,7 +272,8 @@ fn an_oversized_msg1_payload_is_refused_on_both_sides() {
     let (seed, client) = seeded(0x21);
     let max = vec![0x42; MAX_HANDSHAKE_PAYLOAD_LEN];
     let over = vec![0x42; MAX_HANDSHAKE_PAYLOAD_LEN + 1];
-    assert_eq!(MAX_HANDSHAKE_PAYLOAD_LEN, 4_328);
+    // The largest certificate of any version (v2, PROTOCOL §15.14).
+    assert_eq!(MAX_HANDSHAKE_PAYLOAD_LEN, 7_670);
     for ch in [Channel::Outer, Channel::EndToEnd] {
         // Initiator: the maximum passes, one more does not.
         assert!(noise::initiate_with_payload(&client, &relay.public_key(), ch, &max).is_ok());

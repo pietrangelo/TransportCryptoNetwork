@@ -32,6 +32,21 @@ pub const MAX_CERT_LEN: usize = 4_328;
 /// Minimum length of a client certificate: `scope = 0x01` and a 1-byte name.
 pub const MIN_CERT_LEN: usize = 170;
 
+/// Maximum length of a certificate v2 (PQ-AUTH, PROTOCOL §15.14): a hybrid subject
+/// (`subject_kind = 0x02`), 64 nodes of 63 bytes, a name of 63 bytes and the composite
+/// ML-DSA-65 + Ed25519 signature (3 373 bytes).
+pub const MAX_CERT_V2_LEN: usize = 7_670;
+
+/// Minimum length of a certificate v2: a classical subject, `scope = 0x01`, a 1-byte name.
+pub const MIN_CERT_V2_LEN: usize = 3_480;
+
+/// The longest certificate of any version: the payload bound of a handshake message 1.
+pub const MAX_ANY_CERT_LEN: usize = if MAX_CERT_V2_LEN > MAX_CERT_LEN {
+    MAX_CERT_V2_LEN
+} else {
+    MAX_CERT_LEN
+};
+
 /// Maximum number of nodes in a certificate with `scope = 0x00`.
 pub const MAX_CERT_NODES: usize = 64;
 
@@ -78,4 +93,6 @@ const _: () = {
     assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN <= MAX_PAYLOAD_LEN);
     assert!(NOISE_MSG1_OVERHEAD + MAX_CERT_LEN <= NOISE_MAX_MESSAGE_LEN);
     assert!(MIN_CERT_LEN <= MAX_CERT_LEN);
+    assert!(MIN_CERT_V2_LEN <= MAX_CERT_V2_LEN);
+    assert!(NOISE_MSG1_OVERHEAD + MAX_ANY_CERT_LEN <= MAX_PAYLOAD_LEN);
 };

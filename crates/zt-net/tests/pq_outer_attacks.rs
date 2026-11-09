@@ -253,7 +253,7 @@ async fn the_preauth_cap_admits_the_largest_hybrid_message_1_and_nothing_more() 
         }),
     )
     .await;
-    let payload = vec![0x5a; zt_domain::limits::MAX_CERT_LEN];
+    let payload = vec![0x5a; zt_domain::limits::MAX_ANY_CERT_LEN];
     let (largest, _) =
         noise::initiate_suite(&alice, &relay.key, Channel::Outer, HFS, &payload).unwrap();
     assert_eq!(largest.len(), HFS.max_msg1_len());

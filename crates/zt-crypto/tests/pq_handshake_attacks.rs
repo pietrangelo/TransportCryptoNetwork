@@ -27,7 +27,7 @@ use snow::types::{Cipher, Dh, Hash, Random};
 use zt_crypto::kem::{Kem, KemSeed, MlKem768, SEED_LEN};
 use zt_crypto::noise::{self, AwaitingResponse, Channel};
 use zt_crypto::{CryptoError, Identity, Keyring, PublicKey};
-use zt_domain::limits::MAX_CERT_LEN;
+use zt_domain::limits::MAX_ANY_CERT_LEN;
 use zt_domain::{AcceptedSuites, HandshakeSuite};
 
 const CLASSIC: HandshakeSuite = HandshakeSuite::NoiseIk25519;
@@ -439,7 +439,7 @@ fn a_message_2_with_a_payload_is_refused() {
 #[test]
 fn an_oversized_message_1_is_refused() {
     let p = pair();
-    let payload = vec![0x5a; MAX_CERT_LEN + 1];
+    let payload = vec![0x5a; MAX_ANY_CERT_LEN + 1];
     assert_eq!(
         noise::initiate_suite(&p.client, &p.agent_pk, Channel::EndToEnd, HFS, &payload).err(),
         Some(CryptoError::MessageTooLarge)

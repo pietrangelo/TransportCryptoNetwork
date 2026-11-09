@@ -13,7 +13,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::limits::{MAX_CERT_LEN, NOISE_MSG1_OVERHEAD, NOISE_TAG_LEN};
+use crate::limits::{MAX_ANY_CERT_LEN, NOISE_MSG1_OVERHEAD, NOISE_TAG_LEN};
 
 /// Length of an X25519 public key (Noise `e`, `s`).
 const DH_LEN: usize = 32;
@@ -122,7 +122,7 @@ impl HandshakeSuite {
     /// (PROTOCOL §15.3).
     #[must_use]
     pub const fn max_msg1_len(self) -> usize {
-        self.msg1_overhead().saturating_add(MAX_CERT_LEN)
+        self.msg1_overhead().saturating_add(MAX_ANY_CERT_LEN)
     }
 
     /// The length of message 2, whose payload is always empty.

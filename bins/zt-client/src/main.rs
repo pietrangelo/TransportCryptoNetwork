@@ -17,7 +17,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use zt_crypto::{Identity, PublicKey, cert_key};
-use zt_domain::{CertBody, CertScope, CloseReason, HandshakeSuite, NodeId, RejectReason, UnixTime};
+use zt_domain::{
+    AnyCertBody, CertScope, CloseReason, HandshakeSuite, NodeId, RejectReason, UnixTime,
+};
 use zt_net::config::{self, ClientSettings};
 use zt_net::{NetError, Timeouts, client};
 
@@ -134,20 +136,32 @@ fn certificate(flag: Option<&Path>) -> Result<(), String> {
             .join(", "),
     };
     let _ = writeln!(out, "nodes       = {nodes}");
-    match PublicKey::from_canonical_bytes(body.ca_key().as_bytes()) {
-        Ok(ca) => {
-            let _ = writeln!(out, "ca          = {}", ca.fingerprint());
+    let _ = writeln!(out, "version     = {}", body.version());
+    match body {
+        AnyCertBody::V1(body) => {
+            match PublicKey::from_canonical_bytes(body.ca_key().as_bytes()) {
+                Ok(ca) => {
+                    let _ = writeln!(out, "ca          = {}", ca.fingerprint());
+                }
+                Err(_) => {
+                    let _ = writeln!(out, "ca          = invalid key");
+                }
+            }
+            match PublicKey::from_canonical_bytes(body.subject_key().as_bytes()) {
+                Ok(subject) => {
+                    let _ = writeln!(out, "subject     = {}", subject.fingerprint());
+                }
+                Err(_) => {
+                    let _ = writeln!(out, "subject     = invalid key");
+                }
+            }
         }
-        Err(_) => {
-            let _ = writeln!(out, "ca          = invalid key");
-        }
-    }
-    match PublicKey::from_canonical_bytes(body.subject_key().as_bytes()) {
-        Ok(subject) => {
-            let _ = writeln!(out, "subject     = {}", subject.fingerprint());
-        }
-        Err(_) => {
-            let _ = writeln!(out, "subject     = invalid key");
+        AnyCertBody::V2(body) => {
+            let _ = writeln!(out, "ca_fp       = {}", body.ca_fp());
+            let _ = writeln!(out, "subject     = {}", body.subject().classical());
+            if let Some(hybrid) = body.subject().hybrid() {
+                let _ = writeln!(out, "subject_v2  = {hybrid}");
+            }
         }
     }
     let _ = writeln!(out, "serial      = {}", body.serial());
@@ -174,7 +188,7 @@ enum Validity {
     Expired,
 }
 
-fn check_validity(body: &CertBody, now: UnixTime) -> Validity {
+fn check_validity(body: &AnyCertBody, now: UnixTime) -> Validity {
     if now >= body.not_after() {
         Validity::Expired
     } else if now < body.not_before() {
@@ -195,12 +209,22 @@ fn load_own_certificate(
 ) -> Result<config::CertificateFile, String> {
     let cert = config::load_certificate(path).map_err(|e| e.to_string())?;
     reject_leaked_secret(path, &cert.body, identity)?;
-    if *cert.body.subject_key() != cert_key(&identity.public_key()) {
+    let subject = match &cert.body {
+        AnyCertBody::V1(body) => (*body.subject_key() == cert_key(&identity.public_key()))
+            .then_some(())
+            .ok_or_else(|| {
+                PublicKey::from_canonical_bytes(body.subject_key().as_bytes())
+                    .map_or_else(|_| "invalid".to_owned(), |k| k.fingerprint().to_string())
+            }),
+        AnyCertBody::V2(body) => (*body.subject().classical() == identity.fingerprint())
+            .then_some(())
+            .ok_or_else(|| body.subject().classical().to_string()),
+    };
+    if let Err(subject) = subject {
         return Err(format!(
-            "{}: the certificate is for another key (subject {}), not for this client's key {}",
+            "{}: the certificate is for another key (subject {subject}), not for this client's \
+             key {}",
             path.display(),
-            PublicKey::from_canonical_bytes(cert.body.subject_key().as_bytes())
-                .map_or_else(|_| "invalid".to_owned(), |k| k.fingerprint().to_string()),
             identity.fingerprint()
         ));
     }
@@ -232,7 +256,15 @@ fn load_own_certificate(
 /// the content of the key file, 64 hex characters like a public key): the secret is now in a
 /// public file and in the CA log, so the key must be regenerated (finding 0006-6). The
 /// message never reports the secret.
-fn reject_leaked_secret(path: &Path, body: &CertBody, identity: &Identity) -> Result<(), String> {
+fn reject_leaked_secret(
+    path: &Path,
+    body: &AnyCertBody,
+    identity: &Identity,
+) -> Result<(), String> {
+    // A v2 certificate carries fingerprints, not keys: a secret cannot leak into it.
+    let AnyCertBody::V1(body) = body else {
+        return Ok(());
+    };
     if identity.is_own_secret(body.subject_key().as_bytes()) {
         return Err(format!(
             "{}: secret key leaked into a certificate: regenerate the client key \

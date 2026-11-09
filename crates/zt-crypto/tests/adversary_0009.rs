@@ -13,7 +13,7 @@
 
 use zt_crypto::noise::{self, Channel, Responded};
 use zt_crypto::{Identity, Keyring};
-use zt_domain::limits::MAX_CERT_LEN;
+use zt_domain::limits::MAX_ANY_CERT_LEN;
 use zt_domain::{AcceptedSuites, HandshakeSuite};
 
 const CLASSIC: HandshakeSuite = HandshakeSuite::NoiseIk25519;
@@ -107,7 +107,7 @@ fn an_invalid_message_1_is_an_error_for_every_set() {
 fn a_hybrid_message_1_with_the_largest_certificate_is_identified_by_a_classical_responder() {
     let (agent, keys) = agent();
     let alice = Identity::generate().unwrap();
-    let payload = vec![0x54; MAX_CERT_LEN];
+    let payload = vec![0x54; MAX_ANY_CERT_LEN];
     let (msg1, _) = noise::initiate_suite(
         &alice,
         &agent.public_key(),

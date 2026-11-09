@@ -883,6 +883,7 @@ async fn bridge<S>(
         ca = c.ca.as_deref(),
         serial = c.serial.as_deref(),
         cert_name = c.cert_name.as_deref(),
+        cert_version = c.cert_version,
         not_after = c.not_after,
         "end-to-end session started"
     );

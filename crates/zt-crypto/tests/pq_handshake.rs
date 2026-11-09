@@ -18,7 +18,7 @@
 
 use zt_crypto::noise::{self, Channel};
 use zt_crypto::{CryptoError, Identity, Keyring};
-use zt_domain::limits::MAX_CERT_LEN;
+use zt_domain::limits::MAX_ANY_CERT_LEN;
 use zt_domain::{AcceptedSuites, HandshakeSuite};
 
 const CLASSIC: HandshakeSuite = HandshakeSuite::NoiseIk25519;
@@ -61,7 +61,7 @@ fn a_pinned_hybrid_handshake_completes_end_to_end() {
 #[test]
 fn the_hybrid_suite_has_the_sizes_its_constants_say() {
     let (client, keys, pk) = setup();
-    for payload in [Vec::new(), vec![0x42; 300], vec![0x5a; MAX_CERT_LEN]] {
+    for payload in [Vec::new(), vec![0x42; 300], vec![0x5a; MAX_ANY_CERT_LEN]] {
         let (msg1, waiting) =
             noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, &payload).unwrap();
         assert_eq!(msg1.len(), 1_296 + payload.len());

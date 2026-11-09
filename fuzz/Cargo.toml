@@ -90,3 +90,17 @@ path = "fuzz_targets/kem_inputs.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cert_v2_decoder"
+path = "fuzz_targets/cert_v2_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_v2_verify"
+path = "fuzz_targets/cert_v2_verify.rs"
+test = false
+doc = false
+bench = false

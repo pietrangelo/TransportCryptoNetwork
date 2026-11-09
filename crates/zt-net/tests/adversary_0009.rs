@@ -274,8 +274,9 @@ async fn an_invalid_e1_from_a_known_client_is_audited() {
     assert_eq!(relay.sshd_connections(), 0);
 }
 
-/// A certificate for `subject` with 64 node names of 55 bytes (one of them `web-01`): over
-/// 3 128 bytes, so that its hybrid message 1 is longer than any classical one.
+/// A v2 certificate for `subject` with 64 node names of 55 bytes (one of them `web-01`): over
+/// 6 470 bytes, so that its hybrid message 1 is longer than any classical one (the classical
+/// bound counts the largest certificate of any version, PROTOCOL §15.14).
 fn large_certificate(ca: &Ca, subject: &zt_crypto::PublicKey) -> Arc<[u8]> {
     let mut nodes: Vec<NodeId> = vec![node("web-01")];
     for i in 1..64 {
@@ -293,7 +294,7 @@ fn large_certificate(ca: &Ca, subject: &zt_crypto::PublicKey) -> Arc<[u8]> {
 async fn a_large_certificate_hybrid_msg1_to_a_classical_agent_is_a_suite_rejection() {
     let log = Captured::default();
     let _guard = log.install();
-    let ca = Ca::new();
+    let ca = Ca::new_v2();
     let alice = Arc::new(Identity::generate().unwrap());
     let cert = large_certificate(&ca, &alice.public_key());
     let mut relay = FakeRelay::start_logging(

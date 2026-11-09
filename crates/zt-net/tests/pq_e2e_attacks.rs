@@ -232,7 +232,7 @@ async fn an_oversized_message_1_is_refused_before_parsing() {
             &relay.agent.public_key(),
             Channel::EndToEnd,
             HFS,
-            &vec![0x5a; zt_domain::limits::MAX_CERT_LEN],
+            &vec![0x5a; zt_domain::limits::MAX_ANY_CERT_LEN],
         )
         .unwrap();
         msg1.resize(len, 0);

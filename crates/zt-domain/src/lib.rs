@@ -30,11 +30,13 @@ pub mod suite;
 pub mod trust;
 
 pub use cert::{
-    CertBody, CertClaims, CertFormatError, CertKey, CertRef, CertRejection, CertScope, CertSerial,
-    ParsedCert, UnixTime, decode_certificate,
+    AnyCertBody, AnyParsedCert, CaFingerprint, CaKeyRef, CertBody, CertBodyV2, CertClaims,
+    CertFormatError, CertKey, CertRef, CertRejection, CertScope, CertSerial, CertSubject,
+    ParsedCert, ParsedCertV2, UnixTime, decode_any_certificate, decode_certificate,
+    decode_certificate_v2,
 };
 pub use clients::AuthorizedClients;
-pub use crypto::{AuthToken, Fingerprint};
+pub use crypto::{AuthToken, Fingerprint, FingerprintText, HybridFingerprint};
 pub use error::DomainError;
 pub use events::{AuthFailureReason, DomainEvent};
 pub use frame::{CloseReason, Credit, Frame, FrameKind, RejectReason};
@@ -46,4 +48,4 @@ pub use policy::{
 pub use suite::{
     AcceptedSuites, HandshakeChannel, HandshakeSuite, InitiatorRole, SuiteError, SuitePolicy,
 };
-pub use trust::{Authority, CertTrust, Revocations, TrustedCaKey};
+pub use trust::{Authority, CertTrust, CompositeCaPin, Revocations, TrustedCaKey};
