@@ -104,3 +104,10 @@ path = "fuzz_targets/cert_v2_verify.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hybrid_ik"
+path = "fuzz_targets/hybrid_ik.rs"
+test = false
+doc = false
+bench = false

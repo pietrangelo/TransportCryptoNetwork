@@ -374,6 +374,276 @@ fn the_hybrid_suite_needs_a_v2_pin() {
     }
 }
 
+// --- attacks ------------------------------------------------------------------------------
+
+/// Attack (KEM tampering): any change to `ct1` (first, middle, last byte) breaks `psk0` and
+/// the prologue: the responder does not answer.
+#[test]
+fn a_tampered_ct1_is_refused() {
+    let (client, agent) = (node(0x17), node(0x29));
+    let (msg1, _) = noise::initiate_suite(
+        &client.id,
+        &agent.id.hybrid_public_key(),
+        Channel::Outer,
+        HYBRID,
+        &[],
+    )
+    .unwrap();
+    for pos in [0, 1, CT / 2, CT - 1] {
+        let mut bad = msg1.clone();
+        bad[pos] ^= 0x01;
+        assert_eq!(
+            noise::respond_suites(&keys(&agent), &bad, Channel::Outer, only(HYBRID)).err(),
+            Some(CryptoError::Handshake),
+            "{pos}"
+        );
+    }
+}
+
+/// Attack (KEM tampering): any change to `ct2` breaks `psk2`: the initiator rejects message 2.
+#[test]
+fn a_tampered_ct2_is_refused() {
+    let (client, agent) = (node(0x18), node(0x2a));
+    for pos in [0, CT / 2, CT - 1, CT, HYBRID.msg2_len() - 1] {
+        let (msg1, waiting) = noise::initiate_suite(
+            &client.id,
+            &agent.id.hybrid_public_key(),
+            Channel::Outer,
+            HYBRID,
+            &[],
+        )
+        .unwrap();
+        let (mut msg2, _) = noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID))
+            .unwrap()
+            .accept()
+            .unwrap();
+        msg2[pos] ^= 0x80;
+        assert_eq!(waiting.complete(&msg2).err(), Some(CryptoError::Handshake), "{pos}");
+    }
+}
+
+/// Attack (Identity): an initiator that pinned another ML-KEM key for the responder (or an
+/// impostor responder that lacks the pinned key's `dk`) never gets a handshake.
+#[test]
+fn a_message_1_for_another_responder_kem_key_is_refused() {
+    let (client, agent) = (node(0x19), node(0x2b));
+    let (msg1, _) = hand_msg1(
+        &client.x25519,
+        &client.ek,
+        &agent,
+        Channel::Outer,
+        &[],
+        Twist {
+            wrong_responder_ek: true,
+            ..Twist::default()
+        },
+    );
+    assert!(noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).is_err());
+    // Another responder does not decrypt a message 1 pinned to the genuine v2 key.
+    let other = Keyring::single(Identity::generate().unwrap());
+    let (msg1, _) = noise::initiate_suite(
+        &client.id,
+        &agent.id.hybrid_public_key(),
+        Channel::Outer,
+        HYBRID,
+        &[],
+    )
+    .unwrap();
+    assert!(noise::respond_suites(&other, &msg1, Channel::Outer, only(HYBRID)).is_err());
+}
+
+/// Attack (AP-12, CRQC impostor): the victim's X25519 secret with the attacker's ML-KEM key
+/// gives another fingerprint v2; with the victim's own (public) ML-KEM key the impostor
+/// passes the pre-message-2 check, gets a message 2, and fails at key confirmation: it cannot
+/// decapsulate `ct2`, so it shares no key with the responder.
+#[test]
+fn a_crqc_impostor_fails_at_key_confirmation() {
+    let (victim, attacker, agent) = (node(0x1a), node(0x1b), node(0x2c));
+    // Victim's X25519, attacker's ek: the fingerprint v2 is not the victim's.
+    let (msg1, _) = hand_msg1(
+        &victim.x25519,
+        &attacker.ek,
+        &agent,
+        Channel::Outer,
+        &[],
+        Twist::default(),
+    );
+    let pending =
+        noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).unwrap();
+    assert_eq!(pending.peer(), victim.id.fingerprint());
+    assert_ne!(pending.hybrid_peer(), Some(victim.id.hybrid_fingerprint()));
+    assert_eq!(pending.hybrid_peer(), Some(zt_crypto::hybrid_fingerprint_of(
+        &victim.id.public_key().x25519(),
+        &attacker.ek
+    )));
+    // Victim's X25519 and the victim's ek: message 2, then nothing.
+    let (msg1, state) = hand_msg1(
+        &victim.x25519,
+        &victim.ek,
+        &agent,
+        Channel::Outer,
+        &[],
+        Twist::default(),
+    );
+    let pending =
+        noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).unwrap();
+    assert_eq!(pending.hybrid_peer(), Some(victim.id.hybrid_fingerprint()));
+    let (msg2, mut responder) = pending.accept().unwrap();
+    assert!(hand_complete(state, None, &msg2).is_err());
+    // Whatever the impostor sends as confirmation does not decrypt.
+    let mut fake = vec![0_u8; 11 + 16];
+    getrandom::fill(&mut fake).unwrap();
+    assert!(responder.decrypt(&fake).is_err());
+}
+
+/// Attack (Parsing): an initiator ML-KEM key that fails the FIPS 203 modulus check is refused
+/// before any message 2 (and before the caller sees an identity).
+#[test]
+fn an_invalid_initiator_kem_key_is_refused() {
+    let (client, agent) = (node(0x1c), node(0x2d));
+    let (msg1, _) = hand_msg1(
+        &client.x25519,
+        &client.ek,
+        &agent,
+        Channel::Outer,
+        &[],
+        Twist {
+            payload_ek_all_ff: true,
+            ..Twist::default()
+        },
+    );
+    assert!(noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).is_err());
+    // A payload shorter than an encapsulation key is refused too.
+    let (msg1, _) = hand_msg1(&client.x25519, &client.ek[..100], &agent, Channel::Outer, &[], Twist::default());
+    assert!(noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).is_err());
+}
+
+/// Attack (Replay, State): a replayed message 1 gets a fresh message 2, whose keys are not
+/// those of the genuine session: the genuine confirmation does not decrypt there.
+#[test]
+fn a_replayed_message_1_shares_no_key() {
+    let (client, agent) = (node(0x1d), node(0x2e));
+    let (msg1, waiting) = noise::initiate_suite(
+        &client.id,
+        &agent.id.hybrid_public_key(),
+        Channel::EndToEnd,
+        HYBRID,
+        &[],
+    )
+    .unwrap();
+    let ring = keys(&agent);
+    let (msg2, _) = noise::respond_suites(&ring, &msg1, Channel::EndToEnd, only(HYBRID))
+        .unwrap()
+        .accept()
+        .unwrap();
+    let mut initiator = waiting.complete(&msg2).unwrap();
+    let confirmation = initiator.encrypt(HYBRID.confirmation()).unwrap();
+    let (msg2b, mut replayed) = noise::respond_suites(&ring, &msg1, Channel::EndToEnd, only(HYBRID))
+        .unwrap()
+        .accept()
+        .unwrap();
+    assert_ne!(msg2, msg2b);
+    assert!(replayed.decrypt(&confirmation).is_err());
+}
+
+/// Attack (Downgrade, AP-11): a message of one suite is never read as another, in every
+/// direction, and the responder of a set without the hybrid suite only identifies it.
+#[test]
+fn no_suite_is_read_as_another() {
+    let (client, agent) = (node(0x1e), node(0x2f));
+    let v2 = agent.id.hybrid_public_key();
+    let ring = keys(&agent);
+    let (hybrid, _) = noise::initiate_suite(&client.id, &v2, Channel::Outer, HYBRID, &[]).unwrap();
+    let classic_and_hfs = AcceptedSuites::new([CLASSIC, HFS]).unwrap();
+    assert!(noise::respond_suites(&ring, &hybrid, Channel::Outer, classic_and_hfs).is_err());
+    for suite in [CLASSIC, HFS] {
+        let (other, _) = noise::initiate_suite(&client.id, &v2, Channel::Outer, suite, &[]).unwrap();
+        assert!(noise::respond_suites(&ring, &other, Channel::Outer, only(HYBRID)).is_err());
+    }
+    match noise::respond_or_identify(&ring, &hybrid, Channel::Outer, classic_and_hfs).unwrap() {
+        Responded::Unaccepted(found) => {
+            assert_eq!(found.suite(), HYBRID);
+            assert_eq!(found.peer(), client.id.fingerprint());
+            assert_eq!(found.hybrid_peer(), Some(client.id.hybrid_fingerprint()));
+        }
+        Responded::Pending(_) => panic!("accepted outside the set"),
+    }
+}
+
+/// Attack (cross-channel prologue confusion): a message 1 of one channel is refused on the
+/// other, and so is one written with the IKhfs prologue or without `SHA-256(ek_r)`.
+#[test]
+fn the_prologue_binds_channel_suite_and_responder_kem_key() {
+    let (client, agent) = (node(0x21), node(0x30));
+    let ring = keys(&agent);
+    let (outer, _) = noise::initiate_suite(
+        &client.id,
+        &agent.id.hybrid_public_key(),
+        Channel::Outer,
+        HYBRID,
+        &[],
+    )
+    .unwrap();
+    assert!(noise::respond_suites(&ring, &outer, Channel::EndToEnd, only(HYBRID)).is_err());
+    assert!(noise::respond_suites(&ring, &outer, Channel::Outer, only(HYBRID)).is_ok());
+    // Hand-built with altered prologues.
+    let variants: [fn(&[u8], &[u8]) -> Vec<u8>; 3] = [
+        |ct1, _ek| [b"TCN/2 outer\x01".as_slice(), ct1].concat(),
+        |ct1, _ek| [b"TCN/3 outer\x02".as_slice(), ct1].concat(),
+        |ct1, ek| [b"TCN/3 outer\x01".as_slice(), &Sha256::digest(ek), ct1].concat(),
+    ];
+    for prologue_of in variants {
+        let (ct1, ss1) = MlKem768::encapsulate(&agent.ek, &rnd()).unwrap();
+        let mut state = Builder::with_resolver(NAME.parse().unwrap(), Box::new(TestResolver))
+            .prologue(&prologue_of(&ct1, &agent.ek))
+            .unwrap()
+            .psk(0, &psk(b"TCN/3 skem-i\0", &ct1, ss1.as_bytes()))
+            .unwrap()
+            .local_private_key(&client.x25519)
+            .unwrap()
+            .remote_public_key(&agent.id.public_key().x25519())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut out = vec![0_u8; 65_535];
+        let n = state.write_message(&client.ek, &mut out).unwrap();
+        let msg1 = [ct1.as_slice(), &out[..n]].concat();
+        assert!(noise::respond_suites(&ring, &msg1, Channel::Outer, only(HYBRID)).is_err());
+    }
+}
+
+/// Attack (Parsing, Resources): truncated or extended messages, and a message 1 over the
+/// largest legitimate one, are refused.
+#[test]
+fn truncated_and_oversized_messages_are_refused() {
+    let (client, agent) = (node(0x23), node(0x31));
+    let ring = keys(&agent);
+    let v2 = agent.id.hybrid_public_key();
+    let (msg1, waiting) = noise::initiate_suite(&client.id, &v2, Channel::Outer, HYBRID, &[]).unwrap();
+    for len in [0, 1, CT - 1, CT, CT + 32, msg1.len() - 1] {
+        assert!(noise::respond_suites(&ring, &msg1[..len], Channel::Outer, only(HYBRID)).is_err(), "{len}");
+    }
+    let mut longer = msg1.clone();
+    longer.push(0);
+    assert!(noise::respond_suites(&ring, &longer, Channel::Outer, only(HYBRID)).is_err());
+    assert_eq!(
+        noise::initiate_suite(
+            &client.id,
+            &v2,
+            Channel::Outer,
+            HYBRID,
+            &vec![0; zt_domain::limits::MAX_ANY_CERT_LEN + 1]
+        )
+        .err(),
+        Some(CryptoError::MessageTooLarge)
+    );
+    let (msg2, _) = noise::respond_suites(&ring, &msg1, Channel::Outer, only(HYBRID))
+        .unwrap()
+        .accept()
+        .unwrap();
+    assert!(waiting.complete(&msg2[..msg2.len() - 1]).is_err());
+}
+
 /// The v2 public key a test pins is the one the identity derives.
 #[test]
 fn hybrid_public_keys_match_the_derivation() {
