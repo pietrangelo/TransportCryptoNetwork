@@ -1,6 +1,6 @@
-//! Fase 6, passo 5: configurazione dei certificati (PROTOCOL §15.8, §15.9; OPERATIONS §10):
-//! `[[authorities]]` nella policy e nei `clients.toml`, la denylist `revoked.toml`, il file del
-//! certificato del client e il file della chiave della CA.
+//! Phase 6, step 5: certificate configuration (PROTOCOL §15.8, §15.9; OPERATIONS §10):
+//! `[[authorities]]` in the policy and in `clients.toml`, the `revoked.toml` denylist, the
+//! client certificate file and the CA key file.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,7 +24,7 @@ use zt_net::config::{
     parse_certificate_file, parse_client_settings, parse_policy, parse_revocations,
 };
 
-/// Il vettore di riferimento di PROTOCOL §15.13 (formato valido).
+/// The reference vector from PROTOCOL §15.13 (valid format).
 const REF_CERT_HEX: &str = concat!(
     "54434e4301018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf374",
     "8801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df6",
@@ -34,15 +34,15 @@ const REF_CERT_HEX: &str = concat!(
     "203e4a03a87dd2cffca22d964126ae7d5b26a9d16067697e5b530f",
 );
 
-/// Chiavi Ed25519 deboli o non canoniche, in esadecimale.
+/// Weak or non-canonical Ed25519 keys, in hexadecimal.
 const BAD_KEYS: [&str; 4] = [
-    // Identità (ordine 1).
+    // Identity (order 1).
     "0100000000000000000000000000000000000000000000000000000000000000",
-    // Identità non canonica (y = p + 1).
+    // Non-canonical identity (y = p + 1).
     "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
-    // Identità con il bit di segno (x = 0): non canonica.
+    // Identity with the sign bit set (x = 0): non-canonical.
     "0100000000000000000000000000000000000000000000000000000000000080",
-    // Ordine 8.
+    // Order 8.
     "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
 ];
 
@@ -55,7 +55,7 @@ fn node(n: &str) -> NodeId {
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Directory temporanea `0755`, cancellata alla fine.
+/// Temporary `0755` directory, deleted at the end.
 struct Dir(PathBuf);
 
 impl Dir {
@@ -102,7 +102,7 @@ fn authority(name: &str, keys: &[&str], allow: &str, extra: &str) -> String {
     format!("[[authorities]]\nname = \"{name}\"\n{keys}\nallow = {allow}\n{extra}\n")
 }
 
-/// Policy con un agent `web-01`, un client della whitelist e `authorities`.
+/// Policy with a `web-01` agent, a whitelisted client and `authorities`.
 fn policy_text(authorities: &str) -> String {
     format!(
         "[[agents]]\nnode = \"web-01\"\npublic_key = \"{}\"\n\n[[clients]]\nname = \"ansible\"\npublic_key = \"{}\"\nallow = [\"web-01\"]\n\n{authorities}",
@@ -122,7 +122,7 @@ fn serial_hex(b: u8) -> String {
     hex::encode([b; 16])
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[test]
 fn authorities_parse_with_one_or_two_keys() {
@@ -164,7 +164,7 @@ fn authorities_parse_with_one_or_two_keys() {
     assert_eq!(deploy.allowed(), &AllowedNodes::All);
     assert_eq!(trust.rotations_pending().count(), 1);
 
-    // Mai entrambe le forme, mai nessuna.
+    // Never both forms, never neither.
     let k = key();
     for bad in [
         format!(
@@ -205,7 +205,7 @@ fn revocations_parse_serials_and_keys() {
     assert!(!revoked.is_serial_revoked(&CertSerial::try_from([0x41; 16]).unwrap()));
     assert!(revoked.is_key_revoked(&lost.fingerprint()));
     assert!(!revoked.is_key_revoked(&Identity::generate().unwrap().fingerprint()));
-    // Il file vuoto e quello con gli elenchi vuoti di OPERATIONS §10.2 sono validi.
+    // The empty file and the one with the empty lists from OPERATIONS §10.2 are valid.
     for empty in ["", "serials = []\nkeys = []\n"] {
         assert_eq!(
             parse_revocations("revoked.toml", empty).unwrap().counts(),
@@ -229,7 +229,7 @@ fn the_same_authorities_block_works_for_relay_and_agent() {
     let agent_side = clients.cert_trust().authorities().next().unwrap();
     assert_eq!(relay_side, agent_side);
     assert_eq!(agent_side.keys()[0].fingerprint, ca.fingerprint());
-    // Nei `clients.toml` `allow` dei client resta ignorato, quello delle CA no.
+    // In `clients.toml` the clients' `allow` is still ignored, the CAs' is not.
     assert_eq!(
         agent_side.allowed(),
         &AllowedNodes::Only([node("web-01")].into_iter().collect())
@@ -248,7 +248,7 @@ fn client_settings_resolve_the_certificate_next_to_the_file() {
     let abs = text.replace("\"client.cert\"", "\"/etc/tcn/alice.cert\"");
     let s = parse_client_settings("client.toml", base, &abs).unwrap();
     assert_eq!(s.certificate, Some(PathBuf::from("/etc/tcn/alice.cert")));
-    // Senza la voce: nessun certificato.
+    // Without the entry: no certificate.
     let none = text.replace("certificate = \"client.cert\"\n", "");
     assert_eq!(
         parse_client_settings("client.toml", base, &none)
@@ -256,7 +256,7 @@ fn client_settings_resolve_the_certificate_next_to_the_file() {
             .certificate,
         None
     );
-    // Vuota: errore, come per `key`.
+    // Empty: error, as for `key`.
     let empty = text.replace("\"client.cert\"", "\"\"");
     assert!(parse_client_settings("client.toml", base, &empty).is_err());
 }
@@ -276,24 +276,24 @@ fn ca_key_files_are_created_private_and_never_overwritten() {
         load_ca_key(&path).unwrap().public_key(),
         created.public_key()
     );
-    // Mai sovrascritto: il contenuto resta quello di prima.
+    // Never overwritten: the contents remain the previous ones.
     assert!(create_ca_key(&path).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-    // Le regole delle chiavi segrete valgono anche qui.
+    // The secret key rules apply here too.
     set_mode(&path, 0o640);
     assert!(matches!(
         load_ca_key(&path),
         Err(ConfigError::InsecurePermissions(_))
     ));
     set_mode(&path, 0o600);
-    // Non è una chiave di nodo, e una chiave di nodo non è una CA.
+    // It is not a node key, and a node key is not a CA.
     assert!(load_identity(&path).is_err());
     let node_key = dir.0.join("node.key");
     zt_net::config::create_identity(&node_key).unwrap();
     assert!(load_ca_key(&node_key).is_err());
 }
 
-// ======================= attacchi =======================
+// ======================= attacks =======================
 
 #[test]
 fn authorities_require_a_revocation_list() {
@@ -314,13 +314,13 @@ fn authorities_require_a_revocation_list() {
         load_authorized_clients(&clients, None),
         Err(ConfigError::RevocationsRequired(_))
     ));
-    // Con la denylist (anche vuota) si carica, e la denylist è in vigore.
+    // With the denylist (even empty) it loads, and the denylist is in force.
     let p = load_relay_policy(&policy, Some(&revoked)).unwrap();
     assert!(!p.cert_trust().needs_revocations());
     assert_eq!(p.cert_trust().revocations().unwrap().counts(), (0, 0));
     let c = load_authorized_clients(&clients, Some(&revoked)).unwrap();
     assert!(!c.cert_trust().needs_revocations());
-    // Senza CA la denylist resta facoltativa, e si può già dare.
+    // Without a CA the denylist remains optional, and can already be provided.
     let plain = dir.write("plain.toml", &policy_text(""));
     assert!(load_relay_policy(&plain, None).is_ok());
     assert!(load_relay_policy(&plain, Some(&revoked)).is_ok());
@@ -331,27 +331,27 @@ fn authority_typos_and_bad_values_are_refused() {
     let k = key();
     let agent = Identity::generate().unwrap().public_key().to_string();
     let mut cases = vec![
-        // Campo sconosciuto.
+        // Unknown field.
         format!(
             "[[authorities]]\nname = \"a\"\npublic_key = \"{k}\"\nallow = [\"*\"]\nscope = \"x\"\n"
         ),
-        // Sezione sbagliata.
+        // Wrong section.
         format!("[[authority]]\nname = \"a\"\npublic_key = \"{k}\"\nallow = [\"*\"]\n"),
-        // Nome non valido.
+        // Invalid name.
         authority("Ops", &[&k], "[\"*\"]", ""),
         authority("", &[&k], "[\"*\"]", ""),
-        // Nodo non valido in `allow`.
+        // Invalid node in `allow`.
         authority("a", &[&k], "[\"../etc\"]", ""),
         authority("a", &[&k], "[\"Web-01\"]", ""),
-        // `max_lifetime` fuori da 60..=86400.
+        // `max_lifetime` outside 60..=86400.
         authority("a", &[&k], "[\"*\"]", "max_lifetime = 59"),
         authority("a", &[&k], "[\"*\"]", "max_lifetime = 86401"),
         authority("a", &[&k], "[\"*\"]", "max_lifetime = 0"),
         authority("a", &[&k], "[\"*\"]", "max_lifetime = -1"),
-        // Tre chiavi, chiavi ripetute.
+        // Three keys, repeated keys.
         authority("a", &[&k, &key(), &key()], "[\"*\"]", ""),
         authority("a", &[&k, &k], "[\"*\"]", ""),
-        // Stesso nome due volte, stessa chiave in due voci.
+        // Same name twice, same key in two entries.
         format!(
             "{}{}",
             authority("a", &[&k], "[\"*\"]", ""),
@@ -362,14 +362,14 @@ fn authority_typos_and_bad_values_are_refused() {
             authority("a", &[&k], "[\"*\"]", ""),
             authority("b", &[&k], "[\"web-01\"]", "")
         ),
-        // Chiave corta.
+        // Short key.
         authority("a", &["00"], "[\"*\"]", ""),
     ];
-    // Chiavi deboli o non canoniche.
+    // Weak or non-canonical keys.
     for bad in BAD_KEYS {
         cases.push(authority("a", &[bad], "[\"*\"]", ""));
     }
-    // 17 CA.
+    // 17 CAs.
     let mut many = String::new();
     for i in 0..17 {
         many.push_str(&authority(&format!("ca-{i}"), &[&key()], "[\"*\"]", ""));
@@ -385,7 +385,7 @@ fn authority_typos_and_bad_values_are_refused() {
             "clients accepted:\n{block}"
         );
     }
-    // Una chiave di CA uguale alla chiave di un agent o di un client dello stesso file.
+    // A CA key equal to the key of an agent or of a client in the same file.
     let with_agent = format!(
         "[[agents]]\nnode = \"web-01\"\npublic_key = \"{agent}\"\n\n{}",
         authority("a", &[&agent], "[\"*\"]", "")
@@ -397,7 +397,7 @@ fn authority_typos_and_bad_values_are_refused() {
     );
     assert!(parse_policy("policy.toml", &with_client).is_err());
     assert!(parse_authorized_clients("clients.toml", &with_client).is_err());
-    // Controllo: 16 CA valide sono accettate.
+    // Check: 16 valid CAs are accepted.
     let mut sixteen = String::new();
     for i in 0..16 {
         sixteen.push_str(&authority(
@@ -443,7 +443,7 @@ fn revocation_files_reject_bad_entries() {
     for bad in BAD_KEYS {
         cases.push(format!("keys = [\"{bad}\"]\n"));
     }
-    // Oltre i limiti.
+    // Over the limits.
     let mut serials = String::from("serials = [");
     for i in 0..=MAX_REVOKED_SERIALS {
         let _ = write!(serials, "\"{:032x}\",", i + 1);
@@ -485,7 +485,7 @@ fn certificate_files_reject_other_formats() {
         format!("tcn-client-cert-v2:{REF_CERT_HEX}\n"),
         format!("tcn-ca-secret-v1:{REF_CERT_HEX}\n"),
         format!("{REF_CERT_HEX}\n"),
-        // Testo valido ma certificato malformato (versione 2).
+        // Valid text but malformed certificate (version 2).
         format!(
             "tcn-client-cert-v1:{}02{}\n",
             &REF_CERT_HEX[..8],
@@ -534,7 +534,7 @@ fn certificate_and_revocation_files_follow_trust_file_rules() {
     }
     set_mode(&cert, 0o644);
     set_mode(&revoked, 0o644);
-    // Un FIFO al posto del file è rifiutato senza bloccare.
+    // A FIFO in place of the file is rejected without blocking.
     let fifo = dir.0.join("fifo");
     assert!(
         std::process::Command::new("mkfifo")
@@ -558,7 +558,7 @@ fn certificate_and_revocation_files_follow_trust_file_rules() {
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("open blocked on a FIFO")
     );
-    // Directory scrivibile da altri.
+    // Directory writable by others.
     set_mode(&dir.0, 0o777);
     assert!(matches!(
         load_certificate(&cert),
@@ -569,7 +569,7 @@ fn certificate_and_revocation_files_follow_trust_file_rules() {
         Err(ConfigError::InsecureDirectory(_))
     ));
     set_mode(&dir.0, 0o755);
-    // Un file di un altro utente: lo stesso controllo puro dei file di trust (finding 0003-1).
+    // A file owned by another user: the same pure check as for trust files (finding 0003-1).
     let meta = std::fs::metadata(&cert).unwrap();
     if meta.uid() != 0 {
         assert!(matches!(
@@ -577,7 +577,7 @@ fn certificate_and_revocation_files_follow_trust_file_rules() {
             Err(ConfigError::UntrustedOwner(_))
         ));
     }
-    // Un certificato enorme è rifiutato senza leggerlo tutto.
+    // A huge certificate is rejected without reading all of it.
     let big = dir.write("big.cert", &"a".repeat(64 * 1024));
     assert!(load_certificate(&big).is_err());
 }
@@ -586,7 +586,7 @@ fn certificate_and_revocation_files_follow_trust_file_rules() {
 fn a_ca_secret_pasted_into_a_trust_file_is_not_echoed() {
     let secret_hex = "5c".repeat(32);
     let secret = format!("tcn-ca-secret-v1:{secret_hex}");
-    // Controllo: senza il segreto i file si leggono.
+    // Check: without the secret the files are readable.
     assert!(parse_revocations("revoked.toml", "serials = []\n").is_ok());
     assert!(
         parse_certificate_file("client.cert", &format!("tcn-client-cert-v1:{REF_CERT_HEX}"))
@@ -644,16 +644,15 @@ fn an_invalid_revocation_file_fails_the_whole_load() {
     let err = load_relay_policy(&policy, Some(&broken)).unwrap_err();
     assert!(err.to_string().contains("broken.toml"), "{err}");
     assert!(load_authorized_clients(&clients, Some(&broken)).is_err());
-    // E il contrario: denylist valida, policy rotta.
+    // And the reverse: valid denylist, broken policy.
     let bad_policy = dir.write("bad.toml", "[[agents]]\nnode = \"BAD\"\n");
     assert!(load_relay_policy(&bad_policy, Some(&good)).is_err());
-    // Una denylist che manca è un errore, non una denylist vuota.
+    // A missing denylist is an error, not an empty denylist.
     assert!(load_relay_policy(&policy, Some(&dir.0.join("missing.toml"))).is_err());
 }
 
-/// Finding 0006-1: una CA con la chiave di un relay pinnato (o dell'agent, corrente o
-/// precedente) è rifiutata; il messaggio dice quale ruolo ha la chiave. Controllo positivo:
-/// un'altra CA passa.
+/// Finding 0006-1: a CA with the key of a pinned relay (or of the agent, current or previous)
+/// is rejected; the message says which role the key has. Positive check: another CA passes.
 #[test]
 fn an_authority_equal_to_a_relay_or_own_key_is_refused() {
     use zt_net::config::{ForbiddenKey, own_keys, reject_infrastructure_keys_as_authority};
@@ -695,7 +694,7 @@ fn an_authority_equal_to_a_relay_or_own_key_is_refused() {
         .unwrap();
 }
 
-/// L'impronta dell'unica CA di un blocco `[[authorities]]`.
+/// The fingerprint of the only CA in an `[[authorities]]` block.
 fn ca_fp(block: &str) -> zt_domain::Fingerprint {
     let clients = parse_authorized_clients("clients.toml", &clients_text(block)).unwrap();
     clients.cert_trust().ca_fingerprints().next().unwrap()

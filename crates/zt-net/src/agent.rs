@@ -1,8 +1,8 @@
-//! L'agent: gira sui server target, non apre porte, si connette in uscita al relay.
+//! The agent: runs on the target servers, opens no ports, connects outbound to the relay.
 //!
-//! Difesa in profondità: anche se il relay autorizza uno stream, l'agent verifica da sé
-//! l'identità end-to-end del client contro il proprio elenco. Un relay compromesso non può
-//! quindi aprire sessioni SSH verso i nodi.
+//! Defense in depth: even if the relay authorizes a stream, the agent itself verifies the
+//! client's end-to-end identity against its own list. A compromised relay therefore cannot
+//! open SSH sessions to the nodes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,36 +24,36 @@ use crate::relay::{CertFields, audit};
 use crate::stream::{CONFIRM, STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
-/// Configurazione dell'agent.
+/// Agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Relay a cui restare connessi, tutti insieme (al massimo [`crate::MAX_RELAYS`]).
+    /// Relays to stay connected to, all at once (at most [`crate::MAX_RELAYS`]).
     pub relays: Vec<crate::RelayEndpoint>,
-    /// Nome di questo nodo.
+    /// Name of this node.
     pub node: NodeId,
-    /// Demone SSH locale.
+    /// Local SSH daemon.
     pub ssh_target: String,
-    /// Client accettati end-to-end.
+    /// Clients accepted end-to-end.
     pub authorized_clients: crate::Revocable<AuthorizedClients>,
-    /// Timeout di rete.
+    /// Network timeouts.
     pub timeouts: Timeouts,
-    /// Stream contemporanei, da 1 a [`MAX_STREAMS`].
+    /// Concurrent streams, from 1 to [`MAX_STREAMS`].
     pub max_streams: usize,
 }
 
-/// Massimo di `max_streams`: ben sotto il limite del semaforo di tokio, che oltre il suo
-/// massimo va in panic (finding 0005b-4).
+/// Maximum of `max_streams`: well below the limit of the tokio semaphore, which panics beyond
+/// its maximum (finding 0005b-4).
 pub const MAX_STREAMS: usize = 4096;
 
-/// Mantiene l'agent connesso a ogni relay dell'elenco per sempre, ciascuno con il proprio
-/// backoff esponenziale e jitter (PROTOCOL §13). Verso i relay usa la chiave corrente; sul
-/// canale end-to-end accetta anche quella precedente (PROTOCOL §14).
+/// Keeps the agent connected to every relay in the list forever, each with its own exponential
+/// backoff and jitter (PROTOCOL §13). Towards the relays it uses the current key; on the
+/// end-to-end channel it also accepts the previous one (PROTOCOL §14).
 ///
-/// `max_streams` limita due cose: gli stream di **ciascun** relay (anche quelli che non hanno
-/// ancora completato l'handshake end-to-end) e le sessioni verso sshd dell'agent **intero**.
-/// Il permesso globale si prende solo dopo la conferma del client, che un relay non sa
-/// falsificare: un relay compromesso esaurisce solo la propria quota e non blocca le
-/// sessioni che passano dagli altri (finding 0005-1).
+/// `max_streams` limits two things: the streams of **each** relay (including those that have
+/// not yet completed the end-to-end handshake) and the sshd sessions of the **whole** agent.
+/// The global permit is taken only after the client's confirmation, which a relay cannot
+/// forge: a compromised relay exhausts only its own quota and does not block the sessions
+/// that go through the others (finding 0005-1).
 pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
     if config.relays.is_empty() || config.relays.len() > crate::MAX_RELAYS {
         tracing::error!(
@@ -62,7 +62,7 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
         );
         return;
     }
-    // La CLI lo valida già; qui si difende chi usa la libreria, senza panic.
+    // The CLI already validates it; here we protect library users, without panicking.
     if config.max_streams == 0 || config.max_streams > MAX_STREAMS {
         tracing::error!(
             max_streams = config.max_streams,
@@ -80,7 +80,7 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
             Arc::clone(&slots),
         ));
     }
-    // I cicli non terminano mai; se uno andasse in panic gli altri continuano.
+    // The loops never terminate; if one panicked the others would keep going.
     while sessions.join_next().await.is_some() {}
 }
 
@@ -101,7 +101,7 @@ async fn run_one(
         if started.elapsed() > MAX_DELAY {
             delay = Duration::from_secs(1);
         }
-        // Jitter fino a metà del ritardo, per non far riconnettere una flotta tutta insieme.
+        // Jitter up to half the delay, so that a whole fleet does not reconnect at once.
         let half = u64::try_from(delay.as_millis() / 2)
             .unwrap_or(u64::MAX)
             .max(1);
@@ -111,11 +111,11 @@ async fn run_one(
     }
 }
 
-/// Una singola sessione con il relay: si connette, si registra e serve gli stream finché la
-/// connessione resta in piedi.
+/// A single session with the relay: connects, registers and serves streams as long as the
+/// connection stays up.
 ///
 /// # Errors
-/// Qualsiasi errore di rete, handshake o protocollo del relay.
+/// Any network, handshake or protocol error from the relay.
 async fn run_session(
     identity: &Arc<Keyring>,
     relay: &crate::RelayEndpoint,
@@ -165,8 +165,8 @@ async fn run_session(
                 ch.send(&frame, t).await?;
             }
             Some(stream) = done_rx.recv() => {
-                // Gli id crescono e non si riusano (un id ripetuto chiude la sessione), e
-                // `done` è di questa sessione: non può togliere lo slot di uno stream più nuovo.
+                // Ids increase and are never reused (a repeated id closes the session), and
+                // `done` belongs to this session: it cannot remove the slot of a newer stream.
                 streams.slots.remove(&stream);
             }
             _ = keepalive.tick() => {
@@ -177,36 +177,36 @@ async fn run_session(
     }
 }
 
-/// Coda e credito in ingresso di uno stream.
+/// Inbound queue and credit of a stream.
 ///
-/// Lo slot vive quanto il task dello stream, non quanto lo stream sul filo: lo toglie solo il
-/// canale `done`, alla fine del task. Così la quota per relay conta i task davvero vivi e un
-/// relay compromesso che alterna `Open`, `msg1` spazzatura e `Close` non può accumulare task
-/// oltre `max_streams` (finding 0005b-1).
+/// The slot lives as long as the stream's task, not as long as the stream on the wire: only
+/// the `done` channel removes it, at the end of the task. This way the per-relay quota counts
+/// the tasks that are actually alive, and a compromised relay that alternates `Open`, garbage
+/// `msg1` and `Close` cannot accumulate tasks beyond `max_streams` (finding 0005b-1).
 struct Slot {
-    /// `None` dopo il `Close` del relay (o una sua violazione): il task ha già ricevuto tutto
-    /// quello che doveva e i frame successivi per questo id si scartano.
+    /// `None` after the relay's `Close` (or a violation by it): the task has already received
+    /// everything it was due, and later frames for this id are discarded.
     tx: Option<mpsc::Sender<Frame>>,
-    /// Credito che il relay ha verso questo stream: si applica **prima** di accodare, così un
-    /// relay compromesso non può riempire la coda oltre la finestra (finding 0002-14).
+    /// Credit the relay has towards this stream: it is enforced **before** enqueuing, so a
+    /// compromised relay cannot fill the queue beyond the window (finding 0002-14).
     recv: Window,
 }
 
-/// Gli stream aperti sulla connessione con il relay.
+/// The streams open on the connection with the relay.
 #[derive(Default)]
 struct Streams {
     slots: HashMap<StreamId, Slot>,
-    /// L'ultimo id accettato: il relay assegna id crescenti e non li riusa.
+    /// The last accepted id: the relay assigns increasing ids and never reuses them.
     last: u32,
 }
 
 impl Streams {
-    /// Restituisce credito al relay quando lo stream lo concede.
+    /// Returns credit to the relay when the stream grants it.
     fn on_outbound(&mut self, frame: &Frame) {
         if let Frame::WindowUpdate { stream, credit } = frame
             && let Some(slot) = self.slots.get_mut(stream)
         {
-            // Il task dello stream applica gli stessi limiti: qui non può fallire.
+            // The stream's task enforces the same limits: this cannot fail here.
             let _ = slot.recv.grant(credit.get());
         }
     }
@@ -233,7 +233,7 @@ fn on_relay_frame(
                 return Err(NetError::Protocol("relay reused a stream id"));
             }
             streams.last = stream.get();
-            // Quota per relay: conta anche gli stream non ancora confermati.
+            // Per-relay quota: it also counts streams not yet confirmed.
             if streams.slots.len() >= config.max_streams {
                 return Ok(Some(Frame::Reject {
                     stream,
@@ -268,8 +268,8 @@ fn on_relay_frame(
         | Frame::WindowUpdate { stream, .. }
         | Frame::Close { stream, .. } => {
             let closing = matches!(frame, Frame::Close { .. });
-            // Stream già chiuso da questa parte (slot tolto da `done`) o già chiuso dal relay
-            // (coda staccata): frame in volo o ripetuto, si scarta.
+            // Stream already closed on this side (slot removed by `done`) or already closed by
+            // the relay (queue detached): an in-flight or repeated frame, discard it.
             let Some(slot) = streams.slots.get_mut(&stream) else {
                 return Ok(None);
             };
@@ -283,16 +283,17 @@ fn on_relay_frame(
             let queued = within_credit
                 && match tx.try_send(frame) {
                     Ok(()) => true,
-                    // Il task dello stream ha già finito e il suo `Close` è in viaggio: il
-                    // frame era in volo, si scarta. Rispondere `ProtocolViolation` qui poteva
-                    // sorpassare quel `Close` e nascondere al client il motivo vero (es.
-                    // `Drained` per il limite di sessioni). Lo slot lo toglie `done`.
+                    // The stream's task has already finished and its `Close` is on its way:
+                    // the frame was in flight, discard it. Replying `ProtocolViolation` here
+                    // could overtake that `Close` and hide the real reason from the client
+                    // (e.g. `Drained` for the session limit). `done` removes the slot.
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(None),
                     Err(mpsc::error::TrySendError::Full(_)) => false,
                 };
             if !queued {
-                // Solo un relay che non applica il credito può arrivare qui. Staccare la coda
-                // fa finire il task; lo slot resta (e conta nella quota) finché non finisce.
+                // Only a relay that does not enforce the credit can get here. Detaching the
+                // queue makes the task finish; the slot stays (and counts against the quota)
+                // until it finishes.
                 slot.tx = None;
                 return Ok(Some(Frame::Close {
                     stream,
@@ -300,8 +301,9 @@ fn on_relay_frame(
                 }));
             }
             if closing {
-                // Il `Close` è già in coda: il task lo legge, poi vede la coda chiusa. Lo slot
-                // lo toglie solo `done`, quando il task è davvero finito (finding 0005b-1).
+                // The `Close` is already queued: the task reads it, then sees the queue closed.
+                // Only `done` removes the slot, when the task has really finished (finding
+                // 0005b-1).
                 slot.tx = None;
             }
             Ok(None)
@@ -317,17 +319,17 @@ fn on_relay_frame(
 struct StreamTask {
     io: StreamIo,
     identity: Arc<Keyring>,
-    /// Sessioni verso sshd dell'agent intero (tutti i relay).
+    /// Sessions to sshd for the whole agent (all relays).
     sessions: Arc<Semaphore>,
     authorized: crate::Revocable<AuthorizedClients>,
-    /// Il nodo di questo agent: deve essere nell'ambito effettivo di un certificato.
+    /// This agent's node: it must be within the effective scope of a certificate.
     node: NodeId,
     ssh_target: String,
     timeouts: Timeouts,
 }
 
-/// Passi 1–10 e 12 di PROTOCOL §15.4 sul canale end-to-end, con le CA, la denylist e
-/// l'orologio di questo agent (non quelli del relay).
+/// Steps 1–10 and 12 of PROTOCOL §15.4 on the end-to-end channel, with this agent's CAs,
+/// denylist and clock (not the relay's).
 fn admit_client(
     clients: &AuthorizedClients,
     client: &Fingerprint,
@@ -338,7 +340,8 @@ fn admit_client(
     if trust.is_key_revoked(client) {
         return Err((AuthFailureReason::KeyRevoked, None));
     }
-    // Un rifiuto prima della firma verificata non nomina mai CA e serie (PROTOCOL §15.11).
+    // A rejection before the signature is verified never names the CA and serial (PROTOCOL
+    // §15.11).
     let certificate: Option<Arc<CertClaims>> = if payload.is_empty() {
         None
     } else {
@@ -346,7 +349,7 @@ fn admit_client(
             .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
         Some(Arc::new(claims))
     };
-    // Dopo la firma, il rifiuto porta il certificato (finding 0006-3).
+    // After the signature, the rejection carries the certificate (finding 0006-3).
     clients
         .admit(client, certificate.as_ref(), node, crate::unix_now())
         .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))
@@ -364,9 +367,8 @@ impl StreamTask {
             timeouts,
         } = self;
         let pending = match io.recv_message(&timeouts).await {
-            // Un messaggio 1 più lungo di quello con il certificato più grande non si
-            // interpreta nemmeno (PROTOCOL §15.3): è un certificato rifiutato, non un handshake
-            // da tentare.
+            // A message 1 longer than the one with the largest certificate is not even parsed
+            // (PROTOCOL §15.3): it is a rejected certificate, not a handshake to attempt.
             Ok(msg1) if msg1.len() > MAX_MSG1_LEN => {
                 audit(&DomainEvent::AuthenticationFailed {
                     peer: None,
@@ -377,7 +379,8 @@ impl StreamTask {
                 return;
             }
             Ok(msg1) => noise::respond_any(&identity, &msg1, Channel::EndToEnd),
-            // Il client ha già chiuso: rispondere con un altro `Close` non serve (finding 0002-1).
+            // The client has already closed: replying with another `Close` is pointless
+            // (finding 0002-1).
             Err(NetError::StreamClosed(_)) => return,
             Err(err) => {
                 tracing::debug!(error = %err, "stream ended before handshake");
@@ -395,8 +398,8 @@ impl StreamTask {
             return;
         };
         let client = pending.peer();
-        // Prima del messaggio 2: un client rifiutato non completa l'handshake e non raggiunge
-        // sshd (come un client sconosciuto, PROTOCOL §8 punto 3).
+        // Before message 2: a rejected client does not complete the handshake and does not
+        // reach sshd (like an unknown client, PROTOCOL §8 item 3).
         let credential =
             match admit_client(&authorized.current(), &client, pending.payload(), &node) {
                 Ok(credential) => credential,
@@ -417,9 +420,9 @@ impl StreamTask {
         if io.send_data(msg2).await.is_err() {
             return;
         }
-        // Il primo messaggio IK si può ripetere: un relay compromesso che lo registra può
-        // rigiocarlo. Solo il vero client sa produrre un messaggio di trasporto valido, quindi
-        // sshd si contatta e la sessione si registra solo dopo la conferma (finding 0002-3).
+        // The first IK message can be replayed: a compromised relay that records it can replay
+        // it. Only the real client can produce a valid transport message, so sshd is contacted
+        // and the session is registered only after the confirmation (finding 0002-3).
         match io.recv_message(&timeouts).await {
             Ok(confirm) if transport.decrypt(&confirm).is_ok_and(|p| p == CONFIRM) => {}
             Ok(_) => {
@@ -437,8 +440,8 @@ impl StreamTask {
                 return;
             }
         }
-        // Solo ora, con un client vero, si occupa uno dei `max_streams` posti globali; resta
-        // occupato fino alla fine di questa funzione.
+        // Only now, with a real client, is one of the `max_streams` global slots taken; it
+        // stays taken until the end of this function.
         let Ok(_session) = sessions.try_acquire_owned() else {
             tracing::warn!(peer = %client, "too many sessions on this agent");
             io.close(CloseReason::Drained).await;
@@ -460,28 +463,28 @@ impl StreamTask {
     }
 }
 
-/// Il messaggio 1 end-to-end più lungo possibile: quello con il certificato più grande.
+/// The longest possible end-to-end message 1: the one with the largest certificate.
 const MAX_MSG1_LEN: usize = NOISE_MSG1_OVERHEAD.saturating_add(MAX_HANDSHAKE_PAYLOAD_LEN);
 
-/// Chi è il client di una sessione end-to-end e con quale credenziale è stato ammesso.
+/// Who the client of an end-to-end session is and with which credential it was admitted.
 struct Session {
     client: Fingerprint,
     credential: ClientCredential,
     node: NodeId,
 }
 
-/// Al più ogni quanto si rilegge l'orologio di sistema per la scadenza di un certificato
-/// (PROTOCOL §15.7): un salto dell'orologio o una VM sospesa non allungano la sessione di più.
+/// The maximum interval at which the system clock is re-read for a certificate's expiry
+/// (PROTOCOL §15.7): a clock jump or a suspended VM does not extend the session by more.
 const EXPIRY_RECHECK: Duration = Duration::from_secs(60);
 
-/// Perché una sessione deve finire prima che lo decidano le parti.
+/// Why a session must end before the parties decide so.
 enum Cut {
     Revoked,
     Expired,
 }
 
-/// Attende che la credenziale della sessione smetta di valere: a ogni cambio dei client
-/// autorizzati e, per un certificato, a `min(not_after, adesso + 60 s)`.
+/// Waits until the session's credential stops being valid: on every change of the authorized
+/// clients and, for a certificate, at `min(not_after, now + 60 s)`.
 async fn until_cut(session: &Session, authorized: &mut crate::Revocable<AuthorizedClients>) -> Cut {
     loop {
         let now = crate::unix_now();
@@ -506,7 +509,7 @@ async fn until_cut(session: &Session, authorized: &mut crate::Revocable<Authoriz
     }
 }
 
-/// Collega la sessione end-to-end a sshd fino alla fine, o fino alla revoca del client.
+/// Connects the end-to-end session to sshd until the end, or until the client is revoked.
 async fn bridge(
     io: StreamIo,
     transport: zt_crypto::noise::Transport,
@@ -535,9 +538,10 @@ async fn bridge(
         "end-to-end session started"
     );
     let closer = io.closer();
-    // Revoca a caldo e scadenza: se la credenziale smette di valere la sessione si chiude
-    // subito, senza aspettare il relay (che potrebbe non farlo mai). Si controlla il valore
-    // attuale prima di ogni attesa, quindi una revoca arrivata durante l'handshake non si perde.
+    // Hot revocation and expiry: if the credential stops being valid the session is closed
+    // immediately, without waiting for the relay (which might never do so). The current value
+    // is checked before every wait, so a revocation that arrives during the handshake is not
+    // lost.
     let cut = until_cut(&session, &mut authorized);
     let outcome = tokio::select! {
         result = pump(io, transport, ssh, Some(timeouts.write)) => match result {

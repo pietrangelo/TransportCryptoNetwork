@@ -1,5 +1,5 @@
-//! Fase 6, passo 6: il relay core con i client certificati (PROTOCOL §15.4 ricontrollo nel
-//! core, §15.5, §15.7 scadenza in sessione, §15.8 revoca alla ricarica).
+//! Phase 6, step 6: the relay core with certified clients (PROTOCOL §15.4 recheck in the
+//! core, §15.5, §15.7 in-session expiry, §15.8 revocation on reload).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -48,7 +48,7 @@ fn nodes(list: &[&str]) -> BTreeSet<NodeId> {
     list.iter().map(|n| node(n)).collect()
 }
 
-/// Claims «verificate» di un certificato della CA per `subject`.
+/// "Verified" claims of a certificate from the CA for `subject`.
 fn claims_with(subject: u8, list: &[&str], nb: u64, na: u64) -> Arc<CertClaims> {
     let body = CertBody::new(
         CertKey::from_bytes([CA; 32]),
@@ -66,7 +66,7 @@ fn claims(subject: u8, list: &[&str]) -> Arc<CertClaims> {
     claims_with(subject, list, NB, NA)
 }
 
-/// Come è configurata la CA in una versione della policy.
+/// How the CA is configured in a version of the policy.
 #[derive(Clone)]
 struct Ca {
     present: bool,
@@ -88,7 +88,7 @@ impl Default for Ca {
     }
 }
 
-/// Agent web-01 e db-01, `ansible` nella whitelist (web-01, db-01), la CA come indicato.
+/// Agents web-01 and db-01, `ansible` in the whitelist (web-01, db-01), the CA as specified.
 fn policy(ca: &Ca) -> Arc<AccessPolicy> {
     let mut p = AccessPolicy::new();
     p.add_agent(fp(WEB_AGENT), node("web-01")).unwrap();
@@ -139,7 +139,7 @@ struct H {
 }
 
 impl H {
-    /// Agent web-01 (conn 1) e db-01 (conn 3) registrati.
+    /// Agents web-01 (conn 1) and db-01 (conn 3) registered.
     fn new() -> Self {
         let mut h = Self {
             core: RelayCore::new(policy(&Ca::default()), RelayLimits::default(), Counter(0)),
@@ -181,8 +181,8 @@ impl H {
     fn reload(&mut self, ca: &Ca) -> Vec<Output> {
         self.input(Input::PolicyUpdated { policy: policy(ca) })
     }
-    /// Apre `stream` da `conn` verso `target` (servito da `agent`) e conferma: restituisce lo
-    /// stream lato agent e le uscite dell'`OpenAck`.
+    /// Opens `stream` from `conn` toward `target` (served by `agent`) and confirms: returns the
+    /// agent-side stream and the outputs of the `OpenAck`.
     fn open(
         &mut self,
         conn: u64,
@@ -243,8 +243,8 @@ fn unauthorized(stream: StreamId) -> Frame {
     }
 }
 fn refused_with(out: &[Output], peer: u8, rejection: CertRejection) {
-    // Finding 0006-3: un rifiuto dopo la firma (passi 7–12) riporta il certificato, uno
-    // precedente mai.
+    // Finding 0006-3: a rejection after the signature (steps 7–12) reports the certificate, an
+    // earlier one never does.
     assert!(
         audits(out).iter().any(|e| matches!(
             e,
@@ -261,7 +261,7 @@ fn refused_with(out: &[Output], peer: u8, rejection: CertRejection) {
     assert_eq!(closed(out), [7], "{out:?}");
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[test]
 fn a_certified_client_opens_streams_within_its_effective_scope() {
@@ -272,7 +272,7 @@ fn a_certified_client_opens_streams_within_its_effective_scope() {
     assert_eq!(h.core.connection_count(), 3);
     let (_, ack) = h.open(2, 7, "web-01", 1);
     assert_eq!(sent_to(&ack, 2), [Frame::OpenAck { stream: sid(7) }]);
-    // db-01 è nella CA ma non nel certificato.
+    // db-01 is in the CA but not in the certificate.
     let out = h.recv(
         2,
         Frame::Open {
@@ -319,7 +319,7 @@ fn session_established_carries_the_certificate_reference() {
         }
         other => panic!("expected SessionEstablished, got {other:?}"),
     }
-    // La whitelist non porta un certificato, anche se il client ne ha presentato uno valido.
+    // The whitelist does not carry a certificate, even if the client presented a valid one.
     h.connect(4, ANSIBLE, Some(claims(ANSIBLE, &["web-01"])));
     let (_, ack) = h.open(4, 7, "web-01", 1);
     assert!(matches!(
@@ -339,10 +339,10 @@ fn a_certified_connection_closes_at_not_after() {
     let (web, _) = h.open(2, 7, "web-01", 1);
     let (db, _) = h.open(2, 9, "db-01", 3);
     assert_eq!(h.core.route_count(), 4);
-    // Un secondo prima: niente.
+    // One second before: nothing.
     let out = h.tick_at(NA - 1);
     assert!(out.is_empty(), "{out:?}");
-    // Alla scadenza: Close Unauthorized a entrambi i lati di ogni stream, poi la connessione.
+    // At expiry: Close Unauthorized on both sides of every stream, then the connection.
     let out = h.tick_at(NA);
     let mut to_client = sent_to(&out, 2);
     to_client.sort_by_key(|f| f.stream().map(StreamId::get));
@@ -370,14 +370,14 @@ fn a_certified_connection_closes_at_not_after() {
     assert_eq!(closed(&out), [2]);
     assert_eq!(h.core.route_count(), 0);
     assert_eq!(h.core.connection_count(), 2, "only the agents remain");
-    // Una volta sola.
+    // Only once.
     assert!(h.tick_at(NA + 1).is_empty());
 }
 
 #[test]
 fn a_whitelisted_client_never_expires() {
     let mut h = H::new();
-    // `ansible` è nella whitelist e presenta anche un certificato valido: vale la whitelist.
+    // `ansible` is in the whitelist and also presents a valid certificate: the whitelist wins.
     h.connect(2, ANSIBLE, Some(claims(ANSIBLE, &["web-01"])));
     h.open(2, 7, "web-01", 1);
     h.connect(4, ANSIBLE, None);
@@ -389,19 +389,19 @@ fn a_whitelisted_client_never_expires() {
     assert_eq!(h.core.route_count(), 4);
 }
 
-// ======================= attacchi =======================
+// ======================= attacks =======================
 
 #[test]
 fn expiry_follows_wall_time_not_monotonic_time() {
     let mut h = H::new();
     h.connect(2, ALICE, Some(claims(ALICE, &["web-01"])));
     h.open(2, 7, "web-01", 1);
-    // L'orologio monotono non si muove (VM sospesa, test): conta solo quello di sistema.
+    // The monotonic clock does not move (suspended VM, test): only the system one counts.
     let frozen = h.instant;
     let out = h.tick_at(NA + 3_600);
     assert_eq!(h.instant, frozen);
     assert_eq!(closed(&out), [2], "{out:?}");
-    // Ogni input porta l'orologio: anche un frame dopo la scadenza non passa.
+    // Every input carries the clock: even a frame after expiry does not pass.
     let mut h = H::new();
     h.connect(2, ALICE, Some(claims(ALICE, &["web-01"])));
     h.unix = NA;
@@ -421,12 +421,12 @@ fn a_certificate_already_expired_when_it_reaches_the_core_is_refused() {
     h.unix = NA;
     let out = h.connect(7, ALICE, Some(claims(ALICE, &["web-01"])));
     refused_with(&out, ALICE, CertRejection::Expired);
-    // E uno non ancora valido oltre la tolleranza.
+    // And one not yet valid beyond the tolerance.
     let mut h = H::new();
     h.unix = NB - 121;
     let out = h.connect(7, ALICE, Some(claims(ALICE, &["web-01"])));
     refused_with(&out, ALICE, CertRejection::NotYetValid);
-    // Controllo: entro la tolleranza passa.
+    // Control: within the tolerance it passes.
     let mut h = H::new();
     h.unix = NB - 120;
     assert!(closed(&h.connect(7, ALICE, Some(claims(ALICE, &["web-01"])))).is_empty());
@@ -435,8 +435,8 @@ fn a_certificate_already_expired_when_it_reaches_the_core_is_refused() {
 #[test]
 fn a_connection_racing_a_reload_that_removes_its_authority_is_refused() {
     let mut h = H::new();
-    // Il task di rete ha verificato il certificato con la policy vecchia; la ricarica arriva
-    // al core prima della connessione.
+    // The network task verified the certificate with the old policy; the reload reaches the
+    // core before the connection.
     let verified = claims(ALICE, &["web-01"]);
     h.reload(&Ca {
         present: false,
@@ -444,7 +444,7 @@ fn a_connection_racing_a_reload_that_removes_its_authority_is_refused() {
     });
     let out = h.connect(7, ALICE, Some(verified));
     refused_with(&out, ALICE, CertRejection::UnknownAuthority);
-    // Lo stesso per una serie revocata nel frattempo.
+    // The same for a serial revoked in the meantime.
     let mut h = H::new();
     h.reload(&Ca {
         serials: vec![ALICE],
@@ -473,7 +473,7 @@ fn revoking_a_serial_on_reload_cuts_the_connection() {
     }));
     assert!(sent_to(&out, 1).contains(&unauthorized(web)), "{out:?}");
     assert_eq!(closed(&out), [2]);
-    // Bob ha un'altra serie: resta.
+    // Bob has another serial: he stays.
     assert!(sent_to(&out, 4).is_empty());
     assert_eq!(h.core.route_count(), 2);
 }
@@ -505,7 +505,7 @@ fn revoking_a_key_on_reload_cuts_static_and_certified_clients() {
     }));
     assert_eq!(closed(&out), [2, 4]);
     assert_eq!(h.core.route_count(), 2, "bob survives");
-    // Una riconnessione della chiave revocata è rifiutata, con o senza certificato.
+    // A reconnection of the revoked key is rejected, with or without a certificate.
     let out = h.connect(9, ANSIBLE, None);
     assert!(audits(&out).contains(&DomainEvent::AuthenticationFailed {
         peer: Some(fp(ANSIBLE)),
@@ -564,7 +564,7 @@ fn narrowing_the_authority_allow_closes_only_the_lost_streams() {
         certificate: Some(alice.reference()),
     }));
     assert_eq!(h.core.route_count(), 2);
-    // E un nuovo Open verso db-01 è negato.
+    // And a new Open toward db-01 is denied.
     let out = h.recv(
         2,
         Frame::Open {
@@ -587,7 +587,7 @@ fn shrinking_max_lifetime_below_the_certificate_cuts_it() {
     let alice = claims(ALICE, &["web-01"]);
     h.connect(2, ALICE, Some(Arc::clone(&alice)));
     h.open(2, 7, "web-01", 1);
-    // Il certificato dura un'ora; la CA ora ne ammette 60 secondi.
+    // The certificate lasts one hour; the CA now allows 60 seconds.
     let out = h.reload(&Ca {
         max_lifetime: 60,
         ..Ca::default()
@@ -598,7 +598,7 @@ fn shrinking_max_lifetime_below_the_certificate_cuts_it() {
         target: None,
         certificate: Some(alice.reference()),
     }));
-    // Controllo: con un'ora esatta resta.
+    // Control: with exactly one hour it stays.
     let mut h = H::new();
     h.connect(2, ALICE, Some(claims(ALICE, &["web-01"])));
     h.open(2, 7, "web-01", 1);
@@ -616,7 +616,7 @@ fn a_certificate_for_an_agent_key_is_refused_in_the_core() {
     let mut h = H::new();
     let out = h.connect(7, WEB_AGENT, Some(claims(WEB_AGENT, &["web-01"])));
     refused_with(&out, WEB_AGENT, CertRejection::RoleConflict);
-    // La connessione non esiste: un Register successivo non produce nulla.
+    // The connection does not exist: a subsequent Register produces nothing.
     let out = h.recv(
         7,
         Frame::Register {
@@ -626,11 +626,11 @@ fn a_certificate_for_an_agent_key_is_refused_in_the_core() {
     assert!(out.is_empty(), "{out:?}");
 }
 
-/// Finding 0006-4: l'operatore aggiunge alla whitelist la chiave di un client già connesso con
-/// certificato, con un `allow` più stretto (§15.5: la whitelist ha la precedenza). La
-/// connessione aperta passa alla credenziale `Key`: perde gli stream fuori dalla whitelist
-/// (`Close Unauthorized`, `access_revoked`), un nuovo `Open` fuori è negato, quelli dentro
-/// restano, e la scadenza del certificato non la chiude più.
+/// Finding 0006-4: the operator adds to the whitelist the key of a client already connected
+/// with a certificate, with a narrower `allow` (§15.5: the whitelist takes precedence). The
+/// open connection switches to the `Key` credential: it loses the streams outside the
+/// whitelist (`Close Unauthorized`, `access_revoked`), a new `Open` outside is denied, those
+/// inside stay, and the certificate expiry no longer closes it.
 #[test]
 fn whitelisting_a_certified_connection_applies_the_whitelist_scope() {
     let mut h = H::new();
@@ -638,7 +638,7 @@ fn whitelisting_a_certified_connection_applies_the_whitelist_scope() {
     h.connect(2, ALICE, Some(Arc::clone(&alice)));
     let _ = h.open(2, 5, "web-01", 1);
     let (db, _) = h.open(2, 7, "db-01", 3);
-    // Nuova policy: alice nella whitelist solo per web-01, CA invariata.
+    // New policy: alice in the whitelist only for web-01, CA unchanged.
     let base = policy(&Ca::default());
     let mut p = AccessPolicy::new();
     p.add_agent(fp(WEB_AGENT), node("web-01")).unwrap();
@@ -664,7 +664,7 @@ fn whitelisting_a_certified_connection_applies_the_whitelist_scope() {
         target: Some(node("db-01")),
         certificate: Some(alice.reference()),
     }));
-    // Un nuovo Open verso db-01 sulla stessa connessione è negato, verso web-01 no.
+    // A new Open toward db-01 on the same connection is denied, toward web-01 it is not.
     let out = h.recv(
         2,
         Frame::Open {
@@ -681,7 +681,7 @@ fn whitelisting_a_certified_connection_applies_the_whitelist_scope() {
         }]
     );
     let _ = h.open(2, 11, "web-01", 1);
-    // Come una connessione nuova con lo stesso certificato.
+    // Like a new connection with the same certificate.
     h.connect(4, ALICE, Some(Arc::clone(&alice)));
     let out = h.recv(
         4,
@@ -691,7 +691,7 @@ fn whitelisting_a_certified_connection_applies_the_whitelist_scope() {
         },
     );
     assert!(sent_to(&out, 3).is_empty(), "{out:?}");
-    // La whitelist non scade in sessione (§15.5): la scadenza del certificato non la chiude.
+    // The whitelist does not expire in session (§15.5): the certificate expiry does not close it.
     let out = h.tick_at(NA + 10);
     assert!(!closed(&out).contains(&2), "{out:?}");
 }

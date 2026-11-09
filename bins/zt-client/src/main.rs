@@ -1,12 +1,12 @@
-//! `zt-client`: bridge stdio per OpenSSH `ProxyCommand` verso un nodo, attraverso il relay.
+//! `zt-client`: stdio bridge for OpenSSH `ProxyCommand` to a node, through the relay.
 //!
 //! ```text
 //! Host web-01 db-01
 //!     ProxyCommand zt-client connect %n
 //! ```
 //!
-//! stdout è il canale SSH: ogni log e ogni errore vanno su stderr, e in caso di errore su
-//! stdout non arriva nulla.
+//! stdout is the SSH channel: every log and every error goes to stderr, and on error nothing
+//! reaches stdout.
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
@@ -21,16 +21,16 @@ use zt_domain::{CertBody, CertScope, CloseReason, NodeId, RejectReason, UnixTime
 use zt_net::config::{self, ClientSettings};
 use zt_net::{NetError, Timeouts, client};
 
-/// Variabile d'ambiente con il percorso della configurazione.
+/// Environment variable with the configuration path.
 const CONFIG_ENV: &str = "TCN_CLIENT_CONFIG";
 
-/// Client TCN.
+/// TCN client.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Configurazione del client. Default: `$TCN_CLIENT_CONFIG`, poi
-    /// `$XDG_CONFIG_HOME/tcn/client.toml`, poi `~/.config/tcn/client.toml`.
-    /// Va indicata prima del comando: dopo il nome del nodo non si legge nessuna opzione.
+    /// Client configuration. Default: `$TCN_CLIENT_CONFIG`, then
+    /// `$XDG_CONFIG_HOME/tcn/client.toml`, then `~/.config/tcn/client.toml`.
+    /// Must be given before the command: no option is read after the node name.
     #[arg(long)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -39,32 +39,32 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Genera la chiave del client (file nuovo, permessi 0600) e stampa la chiave pubblica.
+    /// Generates the client key (new file, 0600 permissions) and prints the public key.
     Keygen {
-        /// File da creare.
+        /// File to create.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Collega stdin/stdout al demone SSH del nodo (uso: `ProxyCommand zt-client connect %n`).
+    /// Connects stdin/stdout to the node's SSH daemon (usage: `ProxyCommand zt-client connect %n`).
     Connect {
-        /// Suffisso da togliere dal nome host prima di cercarlo tra i nodi (es. `.tcn` per
-        /// `Host *.tcn`). Se indicato, il nome deve terminare con esso.
+        /// Suffix to strip from the host name before looking it up among the nodes (e.g. `.tcn` for
+        /// `Host *.tcn`). If given, the name must end with it.
         #[arg(long)]
         strip_suffix: Option<String>,
-        /// Nodo di destinazione. È l'ultimo argomento: tutto ciò che segue finisce qui e
-        /// viene rifiutato, così un nome host con spazi passato da `ssh` tramite `sh -c` non
-        /// può aggiungere opzioni (finding 0003-4).
+        /// Destination node. It is the last argument: everything that follows ends up here and is
+        /// rejected, so a host name with spaces passed by `ssh` through `sh -c` cannot add
+        /// options (finding 0003-4).
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         node: Vec<String>,
     },
-    /// Stampa nome, nodi, CA, numero di serie e validità del certificato configurato
+    /// Prints name, nodes, CA, serial number and validity of the configured certificate
     /// (`certificate` in `client.toml`, PROTOCOL §15).
     Certificate,
 }
 
 fn main() -> ExitCode {
-    // I log vanno sempre su stderr: in modalità ProxyCommand stdout è il canale SSH.
-    // Default `warn`, per non sporcare l'output di ssh.
+    // Logs always go to stderr: in ProxyCommand mode stdout is the SSH channel.
+    // Default `warn`, so as not to clutter ssh's output.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -83,17 +83,17 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            // Su stderr OpenSSH lo mostra all'utente, che è il destinatario giusto.
+            // On stderr OpenSSH shows it to the user, who is the right recipient.
             let _ = writeln!(std::io::stderr(), "zt-client: {message}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Sotto questa durata residua `zt-client` avvisa che il certificato sta per scadere.
+/// Below this remaining lifetime `zt-client` warns that the certificate is about to expire.
 const EXPIRY_WARNING_SECS: u64 = 15 * 60;
 
-/// `zt-client certificate`: i campi del certificato configurato, senza rete.
+/// `zt-client certificate`: the fields of the configured certificate, without network.
 fn certificate(flag: Option<&Path>) -> Result<(), String> {
     let path = config_path(flag.map(Path::to_path_buf))?;
     let settings = config::load_client_settings(&path).map_err(|e| e.to_string())?;
@@ -147,7 +147,7 @@ fn certificate(flag: Option<&Path>) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Stato di un certificato secondo l'orologio locale.
+/// State of a certificate according to the local clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Validity {
     Valid,
@@ -168,9 +168,9 @@ fn check_validity(body: &CertBody, now: UnixTime) -> Validity {
     }
 }
 
-/// Carica il certificato configurato e controlla, prima di qualsiasi connessione, che sia per
-/// `identity` e non sia scaduto. Un certificato non ancora valido o vicino alla scadenza
-/// provoca solo un avviso su stderr (gli orologi di relay e agent decidono).
+/// Loads the configured certificate and checks, before any connection, that it is for
+/// `identity` and has not expired. A certificate not yet valid or close to expiry only
+/// causes a warning on stderr (the relay and agent clocks decide).
 fn load_own_certificate(
     path: &Path,
     identity: &Identity,
@@ -210,10 +210,10 @@ fn load_own_certificate(
     Ok(cert)
 }
 
-/// Un certificato il cui `subject_key` è il **segreto** del client (`--subject` di `zt-ca` con
-/// il contenuto del file della chiave, 64 caratteri esadecimali come una chiave pubblica):
-/// il segreto è ormai in un file pubblico e nel registro della CA, quindi la chiave va
-/// rigenerata (finding 0006-6). Il messaggio non riporta mai il segreto.
+/// A certificate whose `subject_key` is the client's **secret** (`--subject` of `zt-ca` with
+/// the content of the key file, 64 hex characters like a public key): the secret is now in a
+/// public file and in the CA log, so the key must be regenerated (finding 0006-6). The
+/// message never reports the secret.
 fn reject_leaked_secret(path: &Path, body: &CertBody, identity: &Identity) -> Result<(), String> {
     if identity.is_own_secret(body.subject_key().as_bytes()) {
         return Err(format!(
@@ -240,8 +240,8 @@ fn keygen(out: &Path) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// Risolve il nome host passato da ssh nel nodo. Nessuna normalizzazione oltre al suffisso:
-/// un nome che non è già un `NodeId` valido viene rifiutato.
+/// Resolves the host name passed by ssh into the node. No normalization beyond the suffix:
+/// a name that is not already a valid `NodeId` is rejected.
 fn target(name: &str, strip_suffix: Option<&str>) -> Result<NodeId, String> {
     let bare = match strip_suffix {
         None => name,
@@ -260,7 +260,7 @@ fn config_path(flag: Option<PathBuf>) -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os(CONFIG_ENV).filter(|p| !p.is_empty()) {
         return Ok(p.into());
     }
-    // Per la specifica XDG un valore relativo va ignorato.
+    // Per the XDG specification a relative value must be ignored.
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -275,7 +275,7 @@ fn config_path(flag: Option<PathBuf>) -> Result<PathBuf, String> {
 }
 
 fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Result<(), String> {
-    // Tutto ciò che è locale si valida prima di aprire qualsiasi connessione.
+    // Everything local is validated before opening any connection.
     let node = target(name, strip_suffix)?;
     let settings: ClientSettings =
         config::load_client_settings(&config_path(flag)?).map_err(|e| e.to_string())?;
@@ -301,14 +301,14 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
         let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
         client::connect(&identity, &config, local).await
     });
-    // La lettura di stdin gira su un thread bloccante che non si può interrompere: se la
-    // sessione è finita dal lato del nodo non si aspetta che ssh chiuda stdin.
+    // Reading stdin runs on a blocking thread that cannot be interrupted: if the session
+    // has ended on the node side we do not wait for ssh to close stdin.
     runtime.shutdown_background();
     result.map_err(|e| describe(&e, &node, not_after))
 }
 
-/// Messaggio per l'utente di ssh. Non contiene mai byte ricevuti dalla rete. `not_after` è la
-/// scadenza del certificato usato, se c'è.
+/// Message for the ssh user. It never contains bytes received from the network. `not_after`
+/// is the expiry of the certificate used, if any.
 fn describe(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> String {
     let expired = not_after.is_some_and(|na| zt_net::unix_now() >= na);
     match err {

@@ -1,11 +1,11 @@
-//! Rate limiting a token bucket, con orologio iniettato.
+//! Token bucket rate limiting, with an injected clock.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-/// Token bucket: fino a `capacity` eventi a raffica, poi uno ogni `refill_every`.
+/// Token bucket: up to `capacity` events in a burst, then one every `refill_every`.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     capacity: u32,
@@ -15,7 +15,7 @@ pub struct TokenBucket {
 }
 
 impl TokenBucket {
-    /// Un bucket pieno.
+    /// A full bucket.
     #[must_use]
     pub const fn new(capacity: u32, refill_every: Duration, now: Instant) -> Self {
         Self {
@@ -29,7 +29,7 @@ impl TokenBucket {
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last).as_nanos();
         let Some(earned) = elapsed.checked_div(self.refill_every.as_nanos()) else {
-            // refill_every == 0: nessun limite di frequenza oltre la capacità.
+            // refill_every == 0: no rate limit beyond the capacity.
             self.tokens = self.capacity;
             self.last = now;
             return;
@@ -39,7 +39,7 @@ impl TokenBucket {
         }
         let earned = u32::try_from(earned).unwrap_or(u32::MAX);
         self.tokens = self.tokens.saturating_add(earned).min(self.capacity);
-        // Avanza `last` solo dei periodi interi consumati, oppure fino a `now` se il bucket è pieno.
+        // Advance `last` only by the whole periods consumed, or up to `now` if the bucket is full.
         self.last = if self.tokens == self.capacity {
             now
         } else {
@@ -50,7 +50,7 @@ impl TokenBucket {
         };
     }
 
-    /// Consuma un token se disponibile.
+    /// Consumes a token if available.
     pub fn try_take(&mut self, now: Instant) -> bool {
         self.refill(now);
         match self.tokens.checked_sub(1) {
@@ -62,18 +62,18 @@ impl TokenBucket {
         }
     }
 
-    /// `true` se il bucket è pieno (equivalente a uno nuovo, quindi eliminabile).
+    /// `true` if the bucket is full (equivalent to a new one, hence removable).
     pub fn is_full(&mut self, now: Instant) -> bool {
         self.refill(now);
         self.tokens == self.capacity
     }
 }
 
-/// Chiave di rate limiting per un indirizzo sorgente.
+/// Rate-limiting key for a source address.
 ///
-/// IPv4 (anche nella forma IPv4-mapped) per indirizzo; IPv6 per prefisso /64, perché un
-/// singolo cliente riceve tipicamente un intero /64 e potrebbe altrimenti presentarsi con
-/// 2^64 indirizzi diversi (finding 0002-5).
+/// IPv4 (also in IPv4-mapped form) per address; IPv6 per /64 prefix, because a single
+/// customer typically receives a whole /64 and could otherwise show up with 2^64 different
+/// addresses (finding 0002-5).
 #[must_use]
 pub fn source_key(addr: IpAddr) -> [u8; 9] {
     let mut key = [0_u8; 9];
@@ -95,11 +95,11 @@ pub fn source_key(addr: IpAddr) -> [u8; 9] {
     key
 }
 
-/// Un token bucket per chiave (per esempio per indirizzo IP), con numero di chiavi limitato.
+/// One token bucket per key (for example per IP address), with a bounded number of keys.
 ///
-/// Quando la tabella è piena si eliminano i bucket già pieni; se non basta, le chiavi nuove
-/// vengono **rifiutate** (fail closed): un attaccante con molti indirizzi non può far crescere
-/// la memoria del relay.
+/// When the table is full the already-full buckets are removed; if that is not enough, new
+/// keys are **rejected** (fail closed): an attacker with many addresses cannot make the
+/// relay's memory grow.
 #[derive(Debug)]
 pub struct KeyedRateLimiter<K> {
     buckets: HashMap<K, TokenBucket>,
@@ -109,7 +109,7 @@ pub struct KeyedRateLimiter<K> {
 }
 
 impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
-    /// Un limiter vuoto.
+    /// An empty limiter.
     #[must_use]
     pub fn new(max_keys: usize, capacity: u32, refill_every: Duration) -> Self {
         Self {
@@ -120,7 +120,7 @@ impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
         }
     }
 
-    /// `true` se l'evento per `key` è ammesso.
+    /// `true` if the event for `key` is allowed.
     pub fn check(&mut self, key: &K, now: Instant) -> bool {
         if let Some(bucket) = self.buckets.get_mut(key) {
             return bucket.try_take(now);
@@ -137,19 +137,19 @@ impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
         allowed
     }
 
-    /// `true` se `key` ha già un bucket.
+    /// `true` if `key` already has a bucket.
     #[must_use]
     pub fn contains(&self, key: &K) -> bool {
         self.buckets.contains_key(key)
     }
 
-    /// Numero di chiavi tracciate.
+    /// Number of tracked keys.
     #[must_use]
     pub fn len(&self) -> usize {
         self.buckets.len()
     }
 
-    /// `true` se non traccia nessuna chiave.
+    /// `true` if it tracks no keys.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.buckets.is_empty()
@@ -206,18 +206,18 @@ mod tests {
         assert!(l.check(&2, t0));
         assert!(!l.check(&3, t0), "no room and nothing to evict");
         assert_eq!(l.len(), 2);
-        // Dopo il refill i bucket pieni vengono eliminati e c'è di nuovo spazio.
+        // After the refill the full buckets are removed and there is room again.
         assert!(l.check(&3, t0 + Duration::from_secs(60)));
         assert!(l.len() <= 2);
     }
 }
 
-/// Chiave «larga» del rate limiter: il prefisso /48 per IPv6, nessuna per IPv4.
+/// "Wide" key of the rate limiter: the /48 prefix for IPv6, none for IPv4.
 ///
-/// Un /48 è l'assegnazione tipica di un sito: chi lo controlla ha 65 536 prefissi /64 e con
-/// la sola chiave per /64 potrebbe riempire la tabella del limiter e bloccare gli indirizzi
-/// nuovi di tutti (residuo del finding 0002-5). Per IPv4 non serve: un attaccante con molti
-/// indirizzi IPv4 è già limitato dalla dimensione della tabella e dal costo degli indirizzi.
+/// A /48 is the typical allocation of a site: whoever controls it has 65,536 /64 prefixes and
+/// with only the per-/64 key could fill the limiter table and block new addresses for
+/// everyone (residue of finding 0002-5). For IPv4 it is not needed: an attacker with many
+/// IPv4 addresses is already limited by the table size and by the cost of addresses.
 #[must_use]
 pub fn wide_source_key(addr: IpAddr) -> Option<[u8; 7]> {
     match addr.to_canonical() {
@@ -231,13 +231,13 @@ pub fn wide_source_key(addr: IpAddr) -> Option<[u8; 7]> {
     }
 }
 
-/// Cancello degli handshake del relay: un bucket per indirizzo IPv4 o prefisso /64 IPv6 e, per
-/// IPv6, un secondo bucket per prefisso /48 che limita la comparsa di /64 **nuovi**, così un /48
-/// ostile non può riempire la tabella dei /64.
+/// Handshake gate of the relay: one bucket per IPv4 address or IPv6 /64 prefix and, for
+/// IPv6, a second bucket per /48 prefix that limits the appearance of **new** /64s, so a
+/// hostile /48 cannot fill the /64 table.
 ///
-/// Il bucket /48 si consuma solo per un /64 che il limiter non conosce già: un singolo host
-/// insistente è frenato dal proprio bucket e non può esaurire quello del /48, bloccando i vicini
-/// (finding 0004-1).
+/// The /48 bucket is consumed only for a /64 the limiter does not already know: a single
+/// persistent host is throttled by its own bucket and cannot exhaust the /48 one, blocking
+/// its neighbors (finding 0004-1).
 #[derive(Debug)]
 pub struct HandshakeGate {
     narrow: KeyedRateLimiter<[u8; 9]>,
@@ -245,7 +245,7 @@ pub struct HandshakeGate {
 }
 
 impl HandshakeGate {
-    /// `burst`/`refill` per indirizzo o /64; `wide_burst`/`wide_refill` per /48.
+    /// `burst`/`refill` per address or /64; `wide_burst`/`wide_refill` per /48.
     #[must_use]
     pub fn new(
         max_keys: usize,
@@ -261,7 +261,7 @@ impl HandshakeGate {
         }
     }
 
-    /// `true` se l'handshake da `addr` è ammesso ora.
+    /// `true` if the handshake from `addr` is allowed now.
     pub fn admit(&mut self, addr: IpAddr, now: Instant) -> bool {
         let narrow = source_key(addr);
         if !self.narrow.contains(&narrow)

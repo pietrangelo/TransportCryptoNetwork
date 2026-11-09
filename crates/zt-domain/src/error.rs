@@ -1,96 +1,96 @@
 use thiserror::Error;
 
-/// Violazione di un'invariante di dominio.
+/// Violation of a domain invariant.
 ///
-/// Gli errori non contengono mai il contenuto dei dati rifiutati (che potrebbe essere
-/// segreto o controllato da un attaccante), solo metadati come lunghezze e posizioni.
+/// Errors never contain the content of the rejected data (which might be secret or
+/// attacker-controlled), only metadata such as lengths and positions.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DomainError {
-    /// Il `NodeId` è vuoto.
+    /// The `NodeId` is empty.
     #[error("node id is empty")]
     NodeIdEmpty,
-    /// Il `NodeId` supera la lunghezza massima.
+    /// The `NodeId` exceeds the maximum length.
     #[error("node id is {len} bytes, maximum is {max}")]
     NodeIdTooLong {
-        /// Lunghezza ricevuta.
+        /// Received length.
         len: usize,
-        /// Lunghezza massima ammessa.
+        /// Maximum allowed length.
         max: usize,
     },
-    /// Il `NodeId` contiene un byte fuori dall'alfabeto `[a-z0-9-]`.
+    /// The `NodeId` contains a byte outside the `[a-z0-9-]` alphabet.
     #[error("node id has a forbidden byte at position {position}")]
     NodeIdInvalidByte {
-        /// Posizione (0-based) del primo byte non valido.
+        /// Position (0-based) of the first invalid byte.
         position: usize,
     },
-    /// Il `NodeId` inizia o finisce con `-`.
+    /// The `NodeId` starts or ends with `-`.
     #[error("node id must not start or end with '-'")]
     NodeIdHyphenAtEdge,
-    /// Identificativo di sessione tutto a zero (riservato come valore sentinella).
+    /// All-zero session identifier (reserved as a sentinel value).
     #[error("session id must not be all zeros")]
     SessionIdZero,
-    /// Lo stream 0 è riservato al controllo della connessione.
+    /// Stream 0 is reserved for connection control.
     #[error("stream id 0 is reserved for connection control")]
     StreamIdZero,
-    /// Lunghezza errata per un valore a dimensione fissa.
+    /// Wrong length for a fixed-size value.
     #[error("{what} must be {expected} bytes, got {actual}")]
     InvalidLength {
-        /// Il tipo di valore.
+        /// The kind of value.
         what: &'static str,
-        /// Lunghezza attesa.
+        /// Expected length.
         expected: usize,
-        /// Lunghezza ricevuta.
+        /// Received length.
         actual: usize,
     },
-    /// Un frame `Data` non può avere payload vuoto.
+    /// A `Data` frame cannot have an empty payload.
     #[error("payload must not be empty")]
     PayloadEmpty,
-    /// Payload oltre il limite.
+    /// Payload over the limit.
     #[error("payload is {len} bytes, maximum is {max}")]
     PayloadTooLarge {
-        /// Lunghezza ricevuta.
+        /// Received length.
         len: usize,
-        /// Lunghezza massima ammessa.
+        /// Maximum allowed length.
         max: usize,
     },
-    /// Un aggiornamento di finestra a credito zero non ha senso ed è rifiutato.
+    /// A window update with zero credit is meaningless and is rejected.
     #[error("window credit must be greater than zero")]
     CreditZero,
-    /// Codice di rifiuto sconosciuto.
+    /// Unknown reject code.
     #[error("unknown reject reason code {0:#04x}")]
     UnknownRejectReason(u8),
-    /// Codice di chiusura sconosciuto.
+    /// Unknown close code.
     #[error("unknown close reason code {0:#04x}")]
     UnknownCloseReason(u8),
-    /// La stessa chiave compare due volte nella policy.
+    /// The same key appears twice in the policy.
     #[error("peer {0} appears more than once in the access policy")]
     DuplicatePeer(crate::Fingerprint),
-    /// Due agent dichiarano lo stesso nome di nodo.
+    /// Two agents declare the same node name.
     #[error("node {0} is assigned to more than one agent key")]
     DuplicateNode(crate::NodeId),
-    /// Un nodo ha zero chiavi di agent, più di [`crate::MAX_AGENT_KEYS`], o chiavi ripetute.
+    /// A node has zero agent keys, more than [`crate::MAX_AGENT_KEYS`], or duplicate keys.
     #[error("node {0} must have one or two distinct agent keys")]
     AgentKeys(crate::NodeId),
-    /// Una CA ha zero chiavi, più di [`crate::limits::MAX_AUTHORITY_KEYS`], o chiavi ripetute.
+    /// A CA has zero keys, more than [`crate::limits::MAX_AUTHORITY_KEYS`], or duplicate keys.
     #[error("authority {0} must have one or two distinct keys")]
     AuthorityKeys(crate::NodeId),
-    /// Due voci `[[authorities]]` con lo stesso nome.
+    /// Two `[[authorities]]` entries with the same name.
     #[error("authority {0} appears more than once")]
     DuplicateAuthority(crate::NodeId),
-    /// `max_lifetime` di una CA fuori da `60..=86400` secondi.
+    /// A CA's `max_lifetime` is outside `60..=86400` seconds.
     #[error("authority max_lifetime is {secs} s, must be between 60 and 86400")]
     AuthorityLifetime {
-        /// Il valore rifiutato.
+        /// The rejected value.
         secs: u64,
     },
-    /// Più di [`crate::limits::MAX_AUTHORITIES`] CA.
+    /// More than [`crate::limits::MAX_AUTHORITIES`] CAs.
     #[error("too many authorities (maximum 16)")]
     TooManyAuthorities,
-    /// Denylist oltre i limiti.
+    /// Denylist over the limits.
     #[error("too many revoked {what}")]
     TooManyRevocations {
-        /// `serials` o `keys`.
+        /// `serials` or `keys`.
         what: &'static str,
     },
 }

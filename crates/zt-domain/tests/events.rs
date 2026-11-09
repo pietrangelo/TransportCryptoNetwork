@@ -1,5 +1,5 @@
-//! Nomi stabili degli eventi di audit (Fase 4): sono l'interfaccia verso SIEM e alerting, quindi
-//! non devono dipendere dal formato `Debug` di Rust.
+//! Stable names of the audit events (Phase 4): they are the interface to SIEM and alerting, so
+//! they must not depend on Rust's `Debug` format.
 #![allow(clippy::unwrap_used)]
 
 use zt_domain::{AuthFailureReason, CloseReason, DomainEvent, Fingerprint, NodeId, SessionId};

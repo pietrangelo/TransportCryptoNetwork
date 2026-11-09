@@ -1,5 +1,5 @@
-//! `zt-relay`: punto d'incontro pubblico. Autentica i peer, applica la policy e inoltra flussi
-//! cifrati end-to-end senza poterli leggere.
+//! `zt-relay`: public rendezvous point. It authenticates peers, enforces the policy and
+//! forwards end-to-end encrypted flows without being able to read them.
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -14,11 +14,11 @@ use zt_net::relay::{RelayConfig, RelayServer};
 use zt_net::reload::{self, Hangups, ReloadEvents};
 use zt_net::{Revocable, config, systemd};
 
-/// Relay TCN.
+/// TCN relay.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Formato dei log su stderr.
+    /// Log format on stderr.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     log_format: Format,
     #[command(subcommand)]
@@ -27,40 +27,40 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum Format {
-    /// Testo leggibile.
+    /// Human-readable text.
     Text,
-    /// Una riga JSON per evento (per SIEM e `jq`).
+    /// One JSON line per event (for SIEM and `jq`).
     Json,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Genera la chiave del relay (file nuovo, permessi 0600) e stampa la chiave pubblica.
+    /// Generates the relay key (new file, 0600 permissions) and prints the public key.
     Keygen {
-        /// File da creare.
+        /// File to create.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Avvia il relay.
+    /// Starts the relay.
     Run {
-        /// Indirizzo di ascolto.
+        /// Listen address.
         #[arg(long, default_value = "0.0.0.0:7443")]
         listen: std::net::SocketAddr,
-        /// Chiave segreta del relay. `SIGHUP` la ricarica: vale per le connessioni nuove.
+        /// Secret key of the relay. `SIGHUP` reloads it: it applies to new connections.
         #[arg(long)]
         key: PathBuf,
-        /// Chiave segreta precedente, durante una rotazione: i peer che pinnano ancora la
-        /// vecchia chiave pubblica restano accettati (PROTOCOL §14). `SIGHUP` ricarica anche
-        /// questa; per toglierla serve un riavvio senza l'opzione.
+        /// Previous secret key, during a rotation: peers that still pin the old public key
+        /// remain accepted (PROTOCOL §14). `SIGHUP` reloads this one too; removing it requires
+        /// a restart without the option.
         #[arg(long)]
         previous_key: Option<PathBuf>,
-        /// Policy di accesso (TOML). `SIGHUP` la ricarica e la applica anche alle connessioni
-        /// aperte; un file non valido lascia in vigore quella precedente.
+        /// Access policy (TOML). `SIGHUP` reloads it and also applies it to open connections; an
+        /// invalid file leaves the previous one in force.
         #[arg(long)]
         policy: PathBuf,
-        /// Denylist di certificati e chiavi (`revoked.toml`, PROTOCOL §15.8). Obbligatoria se
-        /// la policy pinna una CA (`[[authorities]]`), anche vuota. `SIGHUP` la ricarica
-        /// insieme alla policy: se uno dei due file non è valido restano entrambi i precedenti.
+        /// Denylist of certificates and keys (`revoked.toml`, PROTOCOL §15.8). Mandatory if the
+        /// policy pins a CA (`[[authorities]]`), even if empty. `SIGHUP` reloads it together with
+        /// the policy: if either file is invalid, both previous ones remain.
         #[arg(long)]
         revocations: Option<PathBuf>,
     },
@@ -82,7 +82,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// I file che servono a ricaricare le chiavi del relay.
+/// The files needed to reload the relay keys.
 struct KeyFiles {
     key: PathBuf,
     previous_key: Option<PathBuf>,
@@ -90,12 +90,11 @@ struct KeyFiles {
     revocations: Option<PathBuf>,
 }
 
-/// Ricarica le chiavi del relay (`SIGHUP`, PROTOCOL §14) e rifiuta una chiave uguale a una CA
-/// (§15.9, finding 0006-2). Lo stesso `SIGHUP` ricarica policy e chiavi in due task, quindi la
-/// chiave nuova si confronta sia con la policy in vigore sia con quella sul disco: una rotazione
-/// della chiave e una CA nuova uguali, nella stessa ricarica, non entrano insieme. La policy si
-/// confronta solo con le chiavi in vigore: un file di chiave sbagliato non blocca una revoca
-/// urgente.
+/// Reloads the relay keys (`SIGHUP`, PROTOCOL §14) and rejects a key equal to a CA (§15.9,
+/// finding 0006-2). The same `SIGHUP` reloads policy and keys in two tasks, so the new key is
+/// compared both with the policy in force and with the one on disk: a key rotation and a new
+/// CA that are equal, in the same reload, do not get in together. The policy is compared only
+/// with the keys in force: a wrong key file does not block an urgent revocation.
 fn reload_keys(
     files: &KeyFiles,
     policy_in_force: &Revocable<AccessPolicy>,
@@ -138,13 +137,13 @@ fn run(command: Command) -> Result<(), String> {
                 .build()
                 .map_err(|e| e.to_string())?;
             runtime.block_on(async {
-                // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
+                // Before reading the files: a SIGHUP during the read is not lost.
                 let hangups = Hangups::listen().map_err(|e| e.to_string())?;
                 let key_hangups = Hangups::listen().map_err(|e| e.to_string())?;
                 let keys = config::load_keyring(&key, previous_key.as_deref())
                     .map_err(|e| e.to_string())?;
-                // Rotazione della chiave del relay senza riavvio (PROTOCOL §14): le chiavi nuove
-                // valgono per gli handshake successivi; le connessioni aperte restano.
+                // Relay key rotation without restart (PROTOCOL §14): the new keys apply to
+                // subsequent handshakes; open connections remain.
                 let (keys, key_updater) = Revocable::new(keys);
                 tokio::spawn(zt_net::keys::watch(
                     "relay",
@@ -153,9 +152,9 @@ fn run(command: Command) -> Result<(), String> {
                 ));
                 let path = policy;
                 let (path_for_keys, revocations_for_keys) = (path.clone(), revocations.clone());
-                // Policy e denylist in un solo passo; una CA uguale alla chiave del relay
-                // (corrente o precedente, quella in vigore al momento) è rifiutata (PROTOCOL
-                // §15.9), all'avvio e a ogni ricarica.
+                // Policy and denylist in a single step; a CA equal to the relay key (current or
+                // previous, the one in force at that moment) is rejected (PROTOCOL §15.9), at
+                // startup and on every reload.
                 let relay_keys = keys.clone();
                 let load = move || {
                     let policy = config::load_relay_policy(&path, revocations.as_deref())?;
@@ -168,7 +167,7 @@ fn run(command: Command) -> Result<(), String> {
                 };
                 let policy = load().map_err(|e: config::ConfigError| e.to_string())?;
                 let (policy, updater) = Revocable::new(policy);
-                // Lo stesso controllo nel verso opposto (finding 0006-2), vedi `reload_keys`.
+                // The same check in the opposite direction (finding 0006-2), see `reload_keys`.
                 let key_events = ReloadEvents {
                     reloaded: "relay_keys_reloaded",
                     failed: "relay_keys_reload_failed",
@@ -186,8 +185,8 @@ fn run(command: Command) -> Result<(), String> {
                     key_events,
                     move || reload_keys(&files, &policy_in_force),
                 ));
-                // Rotazioni di agent non completate (due chiavi per un nodo): segnalate
-                // all'avvio, a ogni ricarica e ogni ora finché restano (finding 0005b-2).
+                // Unfinished agent rotations (two keys for one node): reported at startup, on
+                // every reload and every hour while they remain (finding 0005b-2).
                 tokio::spawn(zt_net::keys::watch_agent_rotations(
                     policy.clone(),
                     zt_net::keys::ROTATION_REMINDER,
@@ -201,8 +200,8 @@ fn run(command: Command) -> Result<(), String> {
                 let server = RelayServer::bind(listen, keys, policy, RelayConfig::default())
                     .await
                     .map_err(|e| e.to_string())?;
-                // CA pinnate e denylist annunciate dopo «relay listening» e a ogni ricarica; le
-                // rotazioni di CA non completate ogni ora (PROTOCOL §15.11).
+                // Pinned CAs and denylist announced after "relay listening" and on every reload;
+                // unfinished CA rotations every hour (PROTOCOL §15.11).
                 tokio::spawn(zt_net::keys::watch_authorities(
                     "relay",
                     authorities,

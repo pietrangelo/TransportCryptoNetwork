@@ -1,5 +1,5 @@
-//! Banco di prova condiviso: relay e agent nello stesso processo del test, `zt-client` come
-//! processo figlio (come lo lancia OpenSSH).
+//! Shared test bench: relay and agent in the same process as the test, `zt-client` as a
+//! child process (as OpenSSH launches it).
 #![allow(
     dead_code,
     unreachable_pub,
@@ -44,7 +44,7 @@ pub fn fast_timeouts() -> Timeouts {
     }
 }
 
-/// Listener TCP che conta le connessioni ricevute. Con `echo` rimanda indietro i byte.
+/// TCP listener that counts the connections received. With `echo` it sends the bytes back.
 pub struct Counting {
     pub addr: SocketAddr,
     pub accepted: Arc<AtomicUsize>,
@@ -78,7 +78,7 @@ impl Counting {
     }
 }
 
-/// Finto sshd che invia un banner e chiude subito.
+/// Fake sshd that sends a banner and closes immediately.
 pub async fn banner_then_close() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -105,8 +105,8 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    /// Relay con policy: agent `web-01`; client `ansible` ammesso a `web-01`; `outsider`
-    /// presente in policy ma senza nodi.
+    /// Relay with policy: agent `web-01`; client `ansible` admitted to `web-01`; `outsider`
+    /// present in the policy but without nodes.
     pub async fn start() -> Self {
         let relay_id = Arc::new(Identity::generate().unwrap());
         let agent_id = Arc::new(Identity::generate().unwrap());
@@ -156,7 +156,7 @@ impl Fleet {
         }
     }
 
-    /// Avvia l'agent di `web-01` verso `ssh` e attende che sia registrato.
+    /// Starts the `web-01` agent toward `ssh` and waits until it is registered.
     pub async fn start_agent(&self, ssh: SocketAddr) {
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
@@ -179,11 +179,11 @@ impl Fleet {
             )),
             config,
         ));
-        // La registrazione è asincrona: lascia il tempo all'agent di completarla.
+        // Registration is asynchronous: give the agent time to complete it.
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    /// Directory di configurazione per il client `who`, con i pin corretti.
+    /// Configuration directory for client `who`, with the correct pins.
     pub fn client_dir(&self, who: &Identity) -> ClientDir {
         ClientDir::new(
             who,
@@ -196,7 +196,7 @@ impl Fleet {
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Directory temporanea con `client.key` (0600) e `client.toml`.
+/// Temporary directory with `client.key` (0600) and `client.toml`.
 pub struct ClientDir {
     pub dir: PathBuf,
 }
@@ -229,7 +229,7 @@ impl ClientDir {
         Self { dir }
     }
 
-    /// Come [`Self::new`], con un elenco `[[relays]]` (Fase 5).
+    /// Like [`Self::new`], with a `[[relays]]` list (Phase 5).
     pub fn with_relays(
         who: &Identity,
         relays: &[(String, PublicKey)],
@@ -257,7 +257,7 @@ impl ClientDir {
         self.dir.join("client.toml")
     }
 
-    /// `zt-client --config <dir>/client.toml connect <node>` con stdio in pipe.
+    /// `zt-client --config <dir>/client.toml connect <node>` with piped stdio.
     pub fn spawn(&self, target: &str) -> Child {
         spawn_with(
             &[
@@ -297,14 +297,14 @@ pub fn spawn_with(args: &[&str], env: &[(&str, &str)]) -> Child {
     cmd.spawn().unwrap()
 }
 
-/// Esito di un processo terminato.
+/// Outcome of a terminated process.
 pub struct Outcome {
     pub success: bool,
     pub stdout: Vec<u8>,
     pub stderr: String,
 }
 
-/// Chiude stdin e attende la fine del processo (al massimo `limit`).
+/// Closes stdin and waits for the process to finish (at most `limit`).
 pub async fn finish(mut child: Child, limit: Duration) -> Outcome {
     drop(child.stdin.take());
     let out = tokio::time::timeout(limit, child.wait_with_output())
@@ -318,7 +318,7 @@ pub async fn finish(mut child: Child, limit: Duration) -> Outcome {
     }
 }
 
-/// Scrive `data` su stdin del figlio e legge esattamente `data.len()` byte da stdout.
+/// Writes `data` to the child's stdin and reads exactly `data.len()` bytes from stdout.
 pub async fn echo_through(child: &mut Child, data: &[u8]) -> Vec<u8> {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
@@ -337,9 +337,9 @@ pub async fn echo_through(child: &mut Child, data: &[u8]) -> Vec<u8> {
     got
 }
 
-// ---------- Fase 6: certificati client ----------
+// ---------- Phase 6: client certificates ----------
 
-/// L'orologio di sistema in secondi Unix.
+/// The system clock in Unix seconds.
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -347,7 +347,7 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Un certificato emesso da una CA nuova: (byte, chiave della CA, serie).
+/// A certificate issued by a new CA: (bytes, CA key, serial).
 pub fn issue(
     subject: &PublicKey,
     nodes: &[&str],
@@ -371,7 +371,7 @@ pub fn issue(
 }
 
 impl ClientDir {
-    /// Scrive `client.cert` con `mode` e aggiunge `certificate = "client.cert"` a
+    /// Writes `client.cert` with `mode` and adds `certificate = "client.cert"` to
     /// `client.toml`.
     pub fn add_certificate(&self, bytes: &[u8], mode: u32) {
         let path = self.dir.join("client.cert");
@@ -387,13 +387,13 @@ impl ClientDir {
     }
 }
 
-/// Un indirizzo su cui non ascolta nessuno (connessione rifiutata subito).
+/// An address nobody listens on (connection refused immediately).
 pub async fn closed_port() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap()
 }
 
-/// Attende che `bait` riceva una connessione da `child` (entro `limit`), poi lo ferma.
+/// Waits until `bait` receives a connection from `child` (within `limit`), then stops it.
 pub async fn reaches(bait: &Counting, mut child: Child, limit: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     while tokio::time::Instant::now() < deadline {
@@ -409,7 +409,7 @@ pub async fn reaches(bait: &Counting, mut child: Child, limit: Duration) -> bool
     bait.count() > 0
 }
 
-/// La data UTC `AAAA-MM-GG` di un istante Unix (algoritmo dei giorni civili).
+/// The UTC date `YYYY-MM-DD` of a Unix instant (civil days algorithm).
 pub fn utc_date(secs: u64) -> String {
     let days = i64::try_from(secs / 86_400).unwrap() + 719_468;
     let era = days.div_euclid(146_097);

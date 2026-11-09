@@ -8,17 +8,17 @@ use crate::events::AuthFailureReason;
 use crate::ids::NodeId;
 use crate::trust::CertTrust;
 
-/// Nodi che un client può raggiungere.
+/// Nodes a client can reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllowedNodes {
-    /// Tutti i nodi registrati (da usare solo per l'amministratore della flotta).
+    /// All registered nodes (to be used only for the fleet administrator).
     All,
-    /// Solo questi nodi. Un insieme vuoto non concede nulla.
+    /// Only these nodes. An empty set grants nothing.
     Only(BTreeSet<NodeId>),
 }
 
 impl AllowedNodes {
-    /// `true` se `node` è concesso.
+    /// `true` if `node` is granted.
     #[must_use]
     pub fn permits(&self, node: &NodeId) -> bool {
         match self {
@@ -28,61 +28,61 @@ impl AllowedNodes {
     }
 }
 
-/// Ciò che la policy concede a un client.
+/// What the policy grants a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientGrant {
-    /// Nome leggibile per gli audit log (stesse regole di un [`NodeId`]).
+    /// Human-readable name for the audit logs (same rules as a [`NodeId`]).
     pub name: NodeId,
-    /// I nodi raggiungibili.
+    /// The reachable nodes.
     pub allowed: AllowedNodes,
 }
 
-/// Il ruolo di un peer autenticato.
+/// The role of an authenticated peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRole<'a> {
-    /// Un agent, che può registrarsi solo con questo nome.
+    /// An agent, which can register only under this name.
     Agent {
-        /// Il nome assegnato alla chiave.
+        /// The name assigned to the key.
         node: &'a NodeId,
     },
-    /// Un client, con i suoi permessi.
+    /// A client, with its permissions.
     Client {
-        /// I permessi.
+        /// The permissions.
         grant: &'a ClientGrant,
     },
 }
 
-/// Con quale credenziale un client è stato ammesso (PROTOCOL §15.5).
+/// With which credential a client was admitted (PROTOCOL §15.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientCredential {
-    /// La whitelist per chiave: nessuna scadenza in sessione.
+    /// The per-key whitelist: no in-session expiry.
     Key,
-    /// Un certificato verificato: vale fino a `not_after`.
+    /// A verified certificate: valid until `not_after`.
     Certificate(Arc<CertClaims>),
 }
 
-/// Esito positivo di [`AccessPolicy::admit`].
+/// Successful outcome of [`AccessPolicy::admit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission<'a> {
-    /// Un agent, che può registrarsi solo con questo nome.
+    /// An agent, which can register only under this name.
     Agent {
-        /// Il nome assegnato alla chiave.
+        /// The name assigned to the key.
         node: &'a NodeId,
     },
-    /// Un client, con la credenziale che lo ha ammesso.
+    /// A client, with the credential that admitted it.
     Client {
-        /// La credenziale.
+        /// The credential.
         credential: ClientCredential,
     },
 }
 
-/// Chiavi di agent ammesse per un nodo: la corrente e, durante una rotazione, la nuova.
+/// Agent keys admitted for a node: the current one and, during a rotation, the new one.
 pub const MAX_AGENT_KEYS: usize = 2;
 
-/// Whitelist del relay: chi può connettersi, con quale ruolo, e verso quali nodi.
+/// The relay's whitelist: who may connect, with which role, and towards which nodes.
 ///
-/// Principio del minimo privilegio: una chiave ha **un solo** ruolo, un agent ha **un solo**
-/// nome, un client vede solo i nodi elencati. Tutto ciò che non è concesso è negato.
+/// Principle of least privilege: a key has **exactly one** role, an agent has **exactly one**
+/// name, a client sees only the listed nodes. Everything not granted is denied.
 #[derive(Debug, Clone, Default)]
 pub struct AccessPolicy {
     agents: HashMap<Fingerprint, NodeId>,
@@ -92,7 +92,7 @@ pub struct AccessPolicy {
 }
 
 impl AccessPolicy {
-    /// Una policy vuota, che nega tutto.
+    /// An empty policy, which denies everything.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -108,11 +108,11 @@ impl AccessPolicy {
         Ok(())
     }
 
-    /// Autorizza la chiave `peer` a registrarsi come agent del nodo `node`.
+    /// Authorizes the key `peer` to register as the agent of node `node`.
     ///
     /// # Errors
-    /// [`DomainError::DuplicatePeer`] se la chiave ha già un ruolo,
-    /// [`DomainError::DuplicateNode`] se il nodo ha già un agent.
+    /// [`DomainError::DuplicatePeer`] if the key already has a role,
+    /// [`DomainError::DuplicateNode`] if the node already has an agent.
     pub fn add_agent(&mut self, peer: Fingerprint, node: NodeId) -> Result<(), DomainError> {
         self.ensure_new_peer(&peer)?;
         if !self.nodes.insert(node.clone()) {
@@ -122,13 +122,13 @@ impl AccessPolicy {
         Ok(())
     }
 
-    /// Autorizza come agent del nodo `node` una o due chiavi: due durante la rotazione della
-    /// chiave dell'agent (PROTOCOL §14). Vale l'ultima che si registra.
+    /// Authorizes one or two keys as the agent of node `node`: two during the rotation of the
+    /// agent key (PROTOCOL §14). Whichever registers last wins.
     ///
     /// # Errors
-    /// [`DomainError::AgentKeys`] se le chiavi sono zero, più di [`MAX_AGENT_KEYS`] o
-    /// ripetute; [`DomainError::DuplicatePeer`] e [`DomainError::DuplicateNode`] come
-    /// [`Self::add_agent`]. In caso d'errore la policy non cambia.
+    /// [`DomainError::AgentKeys`] if there are zero keys, more than [`MAX_AGENT_KEYS`], or
+    /// duplicate keys; [`DomainError::DuplicatePeer`] and [`DomainError::DuplicateNode`] as in
+    /// [`Self::add_agent`]. On error the policy is unchanged.
     pub fn add_agent_keys(
         &mut self,
         node: NodeId,
@@ -142,7 +142,7 @@ impl AccessPolicy {
         if !distinct || keys.len() > MAX_AGENT_KEYS {
             return Err(DomainError::AgentKeys(node));
         }
-        // Tutti i controlli prima di qualsiasi modifica: nessun effetto parziale.
+        // All checks before any modification: no partial effects.
         for key in keys {
             self.ensure_new_peer(key)?;
         }
@@ -156,17 +156,17 @@ impl AccessPolicy {
         Ok(())
     }
 
-    /// Autorizza la chiave `peer` come client con i permessi `grant`.
+    /// Authorizes the key `peer` as a client with the permissions `grant`.
     ///
     /// # Errors
-    /// [`DomainError::DuplicatePeer`] se la chiave ha già un ruolo.
+    /// [`DomainError::DuplicatePeer`] if the key already has a role.
     pub fn add_client(&mut self, peer: Fingerprint, grant: ClientGrant) -> Result<(), DomainError> {
         self.ensure_new_peer(&peer)?;
         self.clients.insert(peer, grant);
         Ok(())
     }
 
-    /// Il ruolo di una chiave, o `None` se sconosciuta.
+    /// The role of a key, or `None` if unknown.
     #[must_use]
     pub fn role(&self, peer: &Fingerprint) -> Option<PeerRole<'_>> {
         if let Some(node) = self.agents.get(peer) {
@@ -177,9 +177,9 @@ impl AccessPolicy {
             .map(|grant| PeerRole::Client { grant })
     }
 
-    /// Le chiavi di agent ammesse per ogni nodo, in ordine di nodo: due per i nodi la cui
-    /// rotazione non è ancora completata (PROTOCOL §14). L'ordine delle chiavi non è
-    /// significativo.
+    /// The agent keys admitted for each node, in node order: two for the nodes whose
+    /// rotation has not yet completed (PROTOCOL §14). The order of the keys is not
+    /// significant.
     #[must_use]
     pub fn agent_keys(&self) -> BTreeMap<&NodeId, Vec<Fingerprint>> {
         let mut by_node: BTreeMap<&NodeId, Vec<Fingerprint>> = BTreeMap::new();
@@ -189,10 +189,10 @@ impl AccessPolicy {
         by_node
     }
 
-    /// Imposta le CA pinnate e la denylist (PROTOCOL §15.8, §15.9).
+    /// Sets the pinned CAs and the denylist (PROTOCOL §15.8, §15.9).
     ///
     /// # Errors
-    /// [`DomainError::DuplicatePeer`] se una chiave di CA è anche la chiave di un peer.
+    /// [`DomainError::DuplicatePeer`] if a CA key is also a peer's key.
     pub fn set_cert_trust(&mut self, trust: CertTrust) -> Result<(), DomainError> {
         for ca in trust.ca_fingerprints() {
             if self.agents.contains_key(&ca) || self.clients.contains_key(&ca) {
@@ -203,30 +203,30 @@ impl AccessPolicy {
         Ok(())
     }
 
-    /// Le CA pinnate e la denylist.
+    /// The pinned CAs and the denylist.
     #[must_use]
     pub const fn cert_trust(&self) -> &CertTrust {
         &self.cert_trust
     }
 
-    /// Passi 1, 2, 5, 7–11 di PROTOCOL §15.4 e la tabella di §15.5.
+    /// Steps 1, 2, 5, 7–11 of PROTOCOL §15.4 and the table in §15.5.
     ///
     /// # Errors
-    /// Il motivo del rifiuto, per l'audit.
+    /// The rejection reason, for the audit.
     pub fn admit(
         &self,
         peer: &Fingerprint,
         cert: Option<&Arc<CertClaims>>,
         now: UnixTime,
     ) -> Result<Admission<'_>, AuthFailureReason> {
-        // Passo 1: la denylist vale per qualsiasi credenziale e qualsiasi ruolo.
+        // Step 1: the denylist applies to any credential and any role.
         if self.cert_trust.is_key_revoked(peer) {
             return Err(AuthFailureReason::KeyRevoked);
         }
-        // Passi 5 e 7–10: un certificato presentato si verifica sempre (fail closed), anche
-        // per una chiave della whitelist.
+        // Steps 5 and 7–10: a presented certificate is always verified (fail closed), even
+        // for a whitelisted key.
         if let Some(claims) = cert {
-            // Difesa in profondità: il binding (passo 4) è già stato verificato in `zt-crypto`.
+            // Defense in depth: the binding (step 4) has already been verified in `zt-crypto`.
             if claims.subject() != peer {
                 return Err(AuthFailureReason::Certificate(CertRejection::KeyMismatch));
             }
@@ -235,12 +235,12 @@ impl AccessPolicy {
                 .map_err(AuthFailureReason::Certificate)?;
         }
         match self.role(peer) {
-            // Passo 11: una chiave ha un solo ruolo.
+            // Step 11: a key has exactly one role.
             Some(PeerRole::Agent { .. }) if cert.is_some() => {
                 Err(AuthFailureReason::Certificate(CertRejection::RoleConflict))
             }
             Some(PeerRole::Agent { node }) => Ok(Admission::Agent { node }),
-            // La whitelist ha la precedenza: nessuna unione dei permessi.
+            // The whitelist takes precedence: no union of permissions.
             Some(PeerRole::Client { .. }) => Ok(Admission::Client {
                 credential: ClientCredential::Key,
             }),
@@ -253,7 +253,7 @@ impl AccessPolicy {
         }
     }
 
-    /// [`Self::may_open`] generalizzato: nodi della policy ∩ ambito effettivo della credenziale.
+    /// [`Self::may_open`] generalized: policy nodes ∩ effective scope of the credential.
     #[must_use]
     pub fn may_open_with(
         &self,
@@ -278,9 +278,10 @@ impl AccessPolicy {
         }
     }
 
-    /// `true` se il client `peer` può aprire uno stream verso `target`.
+    /// `true` if the client `peer` may open a stream towards `target`.
     ///
-    /// Un nodo che non esiste nella policy non è mai concesso, nemmeno con [`AllowedNodes::All`].
+    /// A node that does not exist in the policy is never granted, not even with
+    /// [`AllowedNodes::All`].
     #[must_use]
     pub fn may_open(&self, peer: &Fingerprint, target: &NodeId) -> bool {
         self.nodes.contains(target)
@@ -355,7 +356,7 @@ mod tests {
         assert!(p.may_open(&fp(10), &node("web-01")));
         assert!(!p.may_open(&fp(10), &node("db-01")));
         assert!(p.may_open(&fp(11), &node("db-01")));
-        // `All` non inventa nodi inesistenti.
+        // `All` does not invent nonexistent nodes.
         assert!(!p.may_open(&fp(11), &node("ghost")));
     }
 

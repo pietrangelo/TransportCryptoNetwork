@@ -1,84 +1,84 @@
-# Metodologia di sviluppo
+# Development methodology
 
-TCN è un componente di sicurezza esposto in rete: ogni riga di codice è scritta assumendo che
-dall'altra parte del socket ci sia un attaccante. La metodologia unisce tre pratiche.
+TCN is a network-exposed security component: every line of code is written on the assumption that
+there is an attacker on the other end of the socket. The methodology combines three practices.
 
-## 1. Architettura: DDD esagonale
+## 1. Architecture: hexagonal DDD
 
-| Crate | Strato | Regola |
+| Crate | Layer | Rule |
 | :- | :- | :- |
-| `zt-domain` | Domain core | puro: niente async, niente I/O, niente orologio, niente casualità |
-| `zt-application` | Application layer | casi d'uso sans-IO (relay core); tempo e casualità entrano come parametri o porte |
-| `zt-proto` | Adapter (wire format) | sans-IO; l'integrazione con tokio è dietro la feature `codec` |
-| `zt-crypto` | Adapter (crittografia) | sans-IO; handshake con typestate |
-| `zt-net` | Adapter (rete, file) | tokio; ogni I/O ha un timeout, ogni coda è limitata |
-| `zt-relay`, `zt-agent`, `zt-client` | Composition root | CLI e wiring |
+| `zt-domain` | Domain core | pure: no async, no I/O, no clock, no randomness |
+| `zt-application` | Application layer | sans-IO use cases (relay core); time and randomness come in as parameters or ports |
+| `zt-proto` | Adapter (wire format) | sans-IO; tokio integration is behind the `codec` feature |
+| `zt-crypto` | Adapter (cryptography) | sans-IO; typestate handshake |
+| `zt-net` | Adapter (network, files) | tokio; every I/O has a timeout, every queue is bounded |
+| `zt-relay`, `zt-agent`, `zt-client` | Composition root | CLI and wiring |
 
-**Invalid states are unrepresentable**: i value object si costruiscono solo tramite
-`TryFrom`/factory che validano; un `Frame` esistente è valido per costruzione, quindi
-l'encoder è infallibile e il decoder è l'unico punto in cui si rifiuta input.
+**Invalid states are unrepresentable**: value objects can only be built through validating
+`TryFrom`/factories; an existing `Frame` is valid by construction, so the encoder is infallible
+and the decoder is the only place where input is rejected.
 
-## 2. Ciclo di sviluppo: Adversarial TDD
+## 2. Development cycle: Adversarial TDD
 
-Ogni funzionalità segue cinque passi. I primi due producono test che falliscono, e devono
-essere committati **prima** dell'implementazione (la cronologia git lo dimostra).
+Every feature follows five steps. The first two produce failing tests, which must be committed
+**before** the implementation (the git history proves it).
 
 ```
- 1. RED (specifica)   test del comportamento atteso
- 2. RED (avversario)  test d'attacco: input che l'attaccante userebbe
- 3. GREEN             implementazione minima che li fa passare tutti
- 4. REFACTOR          pulizia a test verdi
- 5. ADVERSARY REVIEW  revisione indipendente che prova a rompere il codice;
-                      ogni finding diventa un test di regressione o un item di backlog
+ 1. RED (specification)  tests of the expected behaviour
+ 2. RED (adversary)      attack tests: input an attacker would use
+ 3. GREEN                minimal implementation that makes them all pass
+ 4. REFACTOR             clean-up with tests green
+ 5. ADVERSARY REVIEW     independent review that tries to break the code;
+                         every finding becomes a regression test or a backlog item
 ```
 
-### L'adversary pattern
+### The adversary pattern
 
-Il ruolo dell'avversario è separato da quello dell'implementatore: chi scrive i test d'attacco
-o la revisione non deve partire dalle assunzioni di chi ha scritto il codice.
+The adversary's role is separate from the implementer's: whoever writes the attack tests or the
+review must not start from the assumptions of whoever wrote the code.
 
-**Passo 2: catalogo d'attacco.** Per ogni superficie che accetta input esterno, l'avversario
-compila una tabella e scrive almeno un test per riga:
+**Step 2: attack catalogue.** For every surface that accepts external input, the adversary
+fills in a table and writes at least one test per row:
 
-| Categoria | Domande guida |
+| Category | Guiding questions |
 | :- | :- |
-| Parsing | lunghezze ai bordi (0, 1, max, max+1, `u16::MAX`), tipi sconosciuti, versioni, campi incoerenti tra loro |
-| Risorse | posso far allocare, bufferizzare o tenere vivo più di quanto invio? posso tenere aperto senza inviare? |
-| Stato | posso inviare un messaggio nello stato sbagliato, due volte, o dopo la chiusura? |
-| Identità | posso dichiararmi qualcun altro, riusare una sessione, confondere due nomi simili? |
-| Canali laterali | tempi di confronto, messaggi d'errore, log: rivelano qualcosa? |
-| Malleabilità | lo stesso messaggio ha più codifiche valide? |
+| Parsing | boundary lengths (0, 1, max, max+1, `u16::MAX`), unknown types, versions, mutually inconsistent fields |
+| Resources | can I make it allocate, buffer or keep alive more than I send? can I keep it open without sending? |
+| State | can I send a message in the wrong state, twice, or after close? |
+| Identity | can I claim to be someone else, reuse a session, confuse two similar names? |
+| Side channels | comparison timing, error messages, logs: do they reveal anything? |
+| Malleability | does the same message have more than one valid encoding? |
 
-**Passo 5: adversary review.** A test verdi, una revisione indipendente (una persona diversa o
-un agente separato a cui si fornisce il codice, non le conclusioni dell'autore) cerca di
-violare le garanzie dichiarate. L'esito si registra in `docs/adversary/NNNN-<area>.md` con:
-superficie, ipotesi d'attacco, esito (*mitigato da test X*, *accettato con motivazione*,
-*aperto → backlog*). Un finding aperto blocca il merge se è di gravità alta.
+**Step 5: adversary review.** With tests green, an independent review (a different person or a
+separate agent given the code, not the author's conclusions) tries to violate the stated
+guarantees. The outcome is recorded in `docs/adversary/NNNN-<area>.md` with: surface, attack
+hypothesis, outcome (*mitigated by test X*, *accepted with rationale*, *open → backlog*). An open
+finding blocks the merge if its severity is high.
 
-**Fuzzing continuo.** I test di proprietà (`proptest`) sono la versione automatica
-dell'avversario: generano input arbitrari e input strutturati che superano i primi filtri.
-`cargo-fuzz` (in `fuzz/`) copre decoder, handshake, trasporto e parser di configurazione; la
-CI lo esegue a ogni pull request. Un crash diventa prima un test di regressione, poi una
-correzione.
+**Continuous fuzzing.** Property tests (`proptest`) are the automated version of the adversary:
+they generate arbitrary input and structured input that gets past the first filters.
+`cargo-fuzz` (in `fuzz/`) covers decoder, handshake, transport and configuration parser; CI runs
+it on every pull request. A crash first becomes a regression test, then a fix.
 
-## 3. Regole di codice
+## 3. Code rules
 
-- `#![forbid(unsafe_code)]` in ogni crate e `unsafe_code = "forbid"` a livello di workspace.
-- Vietati in produzione: `unwrap`, `expect`, `panic!`, `todo!`, indicizzazione con `[]`,
-  aritmetica che può andare in overflow, cast con troncamento (lint clippy a livello `deny`).
-  I test li riabilitano localmente.
-- Release: `panic = "abort"`, `overflow-checks = true`, LTO fat, un solo codegen unit, simboli
-  rimossi.
-- Segreti: niente `Clone`, `ZeroizeOnDrop`, `Debug` redatto, confronti con `subtle`.
-- Log: solo metadati. Nessun payload, nessun segreto, nessun byte ricevuto in un messaggio
-  d'errore. Tutti i log su stderr (stdout di `zt-client` è il canale SSH).
+- `#![forbid(unsafe_code)]` in every crate and `unsafe_code = "forbid"` at workspace level.
+- Forbidden in production: `unwrap`, `expect`, `panic!`, `todo!`, indexing with `[]`,
+  arithmetic that can overflow, truncating casts (clippy lints at `deny` level).
+  Tests re-enable them locally.
+- Release: `panic = "abort"`, `overflow-checks = true`, fat LTO, a single codegen unit, symbols
+  stripped.
+- Secrets: no `Clone`, `ZeroizeOnDrop`, redacted `Debug`, comparisons with `subtle`.
+- Logs: metadata only. No payload, no secret, no received byte in an error message. All logs go
+  to stderr (`zt-client`'s stdout is the SSH channel).
 
 ## 4. Definition of done
 
-- [ ] test di specifica e d'attacco committati prima dell'implementazione
-- [ ] `cargo test --workspace --all-features` verde
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` pulito
-- [ ] `cargo fmt --check` pulito
-- [ ] adversary review registrata in `docs/adversary/`
-- [ ] `cargo deny check` pulito (advisories, licenze, sorgenti)
-- [ ] documentazione del protocollo aggiornata se il formato cambia
+- [ ] specification and attack tests committed before the implementation
+- [ ] `cargo test --workspace --all-features` green
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean
+- [ ] `cargo fmt --check` clean
+- [ ] adversary review recorded in `docs/adversary/`
+- [ ] `cargo deny check` clean (advisories, licences, sources)
+- [ ] protocol documentation updated if the format changes
+- [ ] comments, docs, commit message and PR description in English (see `CONTRIBUTING.md`)

@@ -1,4 +1,4 @@
-//! Specifica del bridge stdio di `zt-client` (modalità `ProxyCommand` di OpenSSH).
+//! Specification of the `zt-client` stdio bridge (OpenSSH `ProxyCommand` mode).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -29,7 +29,7 @@ async fn bridges_stdin_and_stdout_to_the_node() {
     let mut child = dir.spawn("web-01");
     let data = pattern(1024 * 1024 + 17);
     assert_eq!(echo_through(&mut child, &data).await, data);
-    // OpenSSH chiude stdin a fine sessione: il bridge termina con successo.
+    // OpenSSH closes stdin at the end of the session: the bridge exits successfully.
     let out = finish(child, Duration::from_secs(10)).await;
     assert!(out.success, "stderr: {}", out.stderr);
     assert!(out.stdout.is_empty());
@@ -43,7 +43,7 @@ async fn exits_when_the_node_closes_even_if_stdin_stays_open() {
     let dir = fleet.client_dir(&fleet.ansible);
 
     let mut child = dir.spawn("web-01");
-    let _stdin = child.stdin.take(); // resta aperto, come fa ssh
+    let _stdin = child.stdin.take(); // stays open, as ssh does
     let mut stdout = child.stdout.take().unwrap();
     let mut got = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), stdout.read_to_end(&mut got))
@@ -66,7 +66,7 @@ async fn config_path_comes_from_flag_env_or_xdg_default() {
     let dir = fleet.client_dir(&fleet.ansible);
     let config = dir.config();
 
-    // 1. variabile d'ambiente
+    // 1. environment variable
     let mut child = spawn_with(
         &["connect", "web-01"],
         &[("TCN_CLIENT_CONFIG", config.to_str().unwrap())],
@@ -133,8 +133,8 @@ async fn parallel_sessions_are_independent() {
     assert_eq!(ssh.count(), 8);
 }
 
-/// Fase 5 (PROTOCOL §13): con più relay in `client.toml`, se il primo è giù `ssh` passa dal
-/// successivo senza che l'utente se ne accorga.
+/// Phase 5 (PROTOCOL §13): with multiple relays in `client.toml`, if the first one is down
+/// `ssh` goes through the next one without the user noticing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn falls_back_to_the_next_relay_when_the_first_is_down() {
     let fleet = Fleet::start().await;
@@ -160,10 +160,10 @@ async fn falls_back_to_the_next_relay_when_the_first_is_down() {
     assert!(out.success, "stderr: {}", out.stderr);
 }
 
-// ---------- Fase 6, passo 9: certificati (OPERATIONS §10.4, PROTOCOL §15.6) ----------
+// ---------- Phase 6, step 9: certificates (OPERATIONS §10.4, PROTOCOL §15.6) ----------
 
-/// Spec: `zt-client certificate` stampa nome, nodi, CA, serie e validità del certificato
-/// configurato, senza toccare la rete.
+/// Spec: `zt-client certificate` prints name, nodes, CA, serial and validity of the
+/// configured certificate, without touching the network.
 #[tokio::test]
 async fn certificate_subcommand_prints_status() {
     use common::{ClientDir, issue, now_secs, utc_date};
@@ -174,7 +174,7 @@ async fn certificate_subcommand_prints_status() {
         &me,
         &bait.addr.to_string(),
         &relay_key,
-        // Il nodo ha una chiave sua: una chiave di relay non può essere anche quella di un nodo.
+        // The node has its own key: a relay key cannot also be that of a node.
         &[(
             "web-01",
             zt_crypto::Identity::generate().unwrap().public_key(),
@@ -207,8 +207,8 @@ async fn certificate_subcommand_prints_status() {
     assert_eq!(bait.count(), 0);
 }
 
-/// Spec: un certificato che scade entro 15 minuti, o non ancora valido, provoca un avviso su
-/// stderr; stdout (il canale SSH) resta vuoto. Un certificato lontano dalla scadenza no.
+/// Spec: a certificate that expires within 15 minutes, or is not yet valid, causes a warning
+/// on stderr; stdout (the SSH channel) stays empty. A certificate far from expiry does not.
 #[tokio::test]
 async fn a_certificate_expiring_soon_warns_on_stderr_only() {
     use common::{ClientDir, closed_port, issue, now_secs};
@@ -241,19 +241,20 @@ async fn a_certificate_expiring_soon_warns_on_stderr_only() {
         } else {
             assert!(stderr.contains(warns), "{what}: {stderr}");
         }
-        // Il problema è la rete (porta chiusa), non il certificato: l'avviso non è un errore.
+        // The problem is the network (closed port), not the certificate: the warning is not
+        // an error.
         assert!(!stderr.contains("not supported"), "{what}: {stderr}");
     }
 }
 
-/// Finding 0006-6: un certificato il cui `subject_key` è il **segreto** del client (`--subject`
-/// di `zt-ca` con il contenuto del file della chiave) è rifiutato da `zt-client certificate` e
-/// prima di qualsiasi connessione, con un messaggio che dice di rigenerare la chiave e non
-/// riporta il segreto.
+/// Finding 0006-6: a certificate whose `subject_key` is the client's **secret** (`--subject`
+/// of `zt-ca` with the content of the key file) is rejected by `zt-client certificate` and
+/// before any connection, with a message that says to regenerate the key and does not
+/// report the secret.
 #[tokio::test]
 async fn a_certificate_carrying_the_client_secret_is_refused() {
     use common::{ClientDir, issue, now_secs};
-    // Un client il cui seme (32 byte) è anche una chiave pubblica valida, come serve a zt-ca.
+    // A client whose seed (32 bytes) is also a valid public key, as zt-ca requires.
     let (me, leaked) = loop {
         let id = zt_crypto::Identity::generate().unwrap();
         let secret = id.to_secret_hex();
@@ -293,7 +294,7 @@ async fn a_certificate_carrying_the_client_secret_is_refused() {
         assert!(!out.stderr.contains(&secret), "the secret was echoed");
     }
     assert_eq!(bait.count(), 0, "a connection was attempted");
-    // Controllo positivo: lo stesso client con un certificato per la sua chiave pubblica.
+    // Positive control: the same client with a certificate for its public key.
     let (cert, _, _) = issue(&me.public_key(), &["web-01"], now - 60, now + 3_600);
     std::fs::write(
         dir.config().with_file_name("client.cert"),

@@ -1,8 +1,8 @@
-//! Fase 6, passo 2: fiducia nelle CA, denylist e autorizzazione con i certificati
-//! (PROTOCOL §15.4 passi 1, 2, 5, 7–12; §15.5; §15.6; §15.8; §15.9).
+//! Phase 6, step 2: CA trust, denylist and authorization with certificates
+//! (PROTOCOL §15.4 steps 1, 2, 5, 7–12; §15.5; §15.6; §15.8; §15.9).
 //!
-//! Il dominio riceve i dati di certificati già verificati (`CertClaims::from_verified`): qui le
-//! chiavi sono byte arbitrari, la crittografia è in `zt-crypto`.
+//! The domain receives the data of already-verified certificates (`CertClaims::from_verified`):
+//! here the keys are arbitrary bytes; the cryptography is in `zt-crypto`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,7 +24,7 @@ use zt_domain::{
     DomainError, Fingerprint, NodeId, UnixTime,
 };
 
-// ---------- fixture ----------
+// ---------- fixtures ----------
 
 const WEB_AGENT: u8 = 1;
 const DB_AGENT: u8 = 2;
@@ -59,7 +59,7 @@ fn at(secs: u64) -> UnixTime {
 fn serial(b: u8) -> CertSerial {
     CertSerial::try_from([b; 16]).unwrap()
 }
-/// La chiave pinnata della CA `b`: 32 byte `[b; 32]`, fingerprint `[b; 32]`.
+/// The pinned key of CA `b`: 32 bytes `[b; 32]`, fingerprint `[b; 32]`.
 fn ca(b: u8) -> TrustedCaKey {
     TrustedCaKey {
         key: CertKey::from_bytes([b; 32]),
@@ -67,7 +67,7 @@ fn ca(b: u8) -> TrustedCaKey {
     }
 }
 
-/// Parametri di un certificato; `claims()` lo «verifica».
+/// Parameters of a certificate; `claims()` "verifies" it.
 #[derive(Clone)]
 struct Cert {
     ca: u8,
@@ -121,7 +121,7 @@ fn revocations(serials: &[u8], keys: &[u8]) -> Revocations {
     .unwrap()
 }
 
-/// `web-ca` (allow web-01, app-01; 8 h) e `db-ca` (allow db-01; 8 h), denylist vuota.
+/// `web-ca` (allow web-01, app-01; 8 h) and `db-ca` (allow db-01; 8 h), empty denylist.
 fn standard_trust() -> CertTrust {
     trust_with(revocations(&[], &[]))
 }
@@ -141,7 +141,7 @@ fn trust_with(revoked: Revocations) -> CertTrust {
     t
 }
 
-/// Policy del relay: agent web-01, db-01, app-01; client `ansible` ammesso a web-01.
+/// Relay policy: agents web-01, db-01, app-01; client `ansible` admitted to web-01.
 fn policy_with(trust: CertTrust) -> AccessPolicy {
     let mut p = AccessPolicy::new();
     p.add_agent(fp(WEB_AGENT), node("web-01")).unwrap();
@@ -159,7 +159,7 @@ fn policy_with(trust: CertTrust) -> AccessPolicy {
     p
 }
 
-/// Client autorizzati di un agent: `ansible` e le stesse CA.
+/// Authorized clients of an agent: `ansible` and the same CAs.
 fn clients_with(trust: CertTrust) -> AuthorizedClients {
     let mut c = AuthorizedClients::new();
     c.add_client(fp(ANSIBLE)).unwrap();
@@ -184,23 +184,23 @@ fn reachable(p: &AccessPolicy, peer: u8, credential: &ClientCredential, now: u64
         .collect()
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[test]
 fn a_valid_certificate_grants_its_nodes_within_the_authority() {
     let p = policy_with(standard_trust());
-    // Il certificato elenca web-01, db-01 e un nodo che non esiste; la CA concede web-01 e
-    // app-01. Effettivo: solo web-01.
+    // The certificate lists web-01, db-01 and a node that does not exist; the CA grants web-01 and
+    // app-01. Effective: only web-01.
     let claims = Cert::for_nodes(WEB_CA, ALICE, &["db-01", "ghost", "web-01"]).claims();
     let credential = certified(p.admit(&fp(ALICE), Some(&claims), at(NOW)));
     assert_eq!(reachable(&p, ALICE, &credential, NOW), ["web-01"]);
-    // La CA che conta è quella pinnata: `permits` è `ambito(cert) ∩ allow`.
+    // The CA that counts is the pinned one: `permits` is `scope(cert) ∩ allow`.
     let authority = p.cert_trust().check(&claims, at(NOW)).unwrap();
     assert_eq!(authority.name(), &node("web-ca"));
     assert!(authority.permits(&claims, &node("web-01")));
     assert!(!authority.permits(&claims, &node("db-01")));
     assert!(!authority.permits(&claims, &node("app-01")));
-    // Il riferimento per l'audit porta CA, serie, nome e scadenza.
+    // The audit reference carries CA, serial, name and expiry.
     let reference = claims.reference();
     assert_eq!(reference.ca, fp(WEB_CA));
     assert_eq!(reference.serial, serial(ALICE));
@@ -223,7 +223,7 @@ fn scope_all_means_the_authority_allow_list() {
     let claims = Cert::new(WEB_CA, ALICE, CertScope::All).claims();
     let credential = certified(p.admit(&fp(ALICE), Some(&claims), at(NOW)));
     assert_eq!(reachable(&p, ALICE, &credential, NOW), ["web-01"]);
-    // Lato agent: solo il nodo in `allow`.
+    // Agent side: only the node in `allow`.
     let c = clients_with(t);
     assert!(
         c.admit(&fp(ALICE), Some(&claims), &node("web-01"), at(NOW))
@@ -251,7 +251,7 @@ fn authority_allow_all_means_every_policy_node() {
     let p = policy_with(t);
     let claims = Cert::new(WEB_CA, ALICE, CertScope::All).claims();
     let credential = certified(p.admit(&fp(ALICE), Some(&claims), at(NOW)));
-    // `["*"]` non inventa nodi inesistenti: `ghost` non c'è nella policy.
+    // `["*"]` does not invent nonexistent nodes: `ghost` is not in the policy.
     assert_eq!(
         reachable(&p, ALICE, &credential, NOW),
         ["web-01", "db-01", "app-01"]
@@ -278,7 +278,7 @@ fn validity_has_skew_only_on_not_before() {
         Some(CertRejection::Expired),
         "no skew on not_after"
     );
-    // Lo stesso tramite la policy e il lato agent.
+    // The same through the policy and the agent side.
     let p = policy_with(t.clone());
     assert_eq!(
         p.admit(&fp(ALICE), Some(&claims), at(NB - 121)).err(),
@@ -297,7 +297,7 @@ fn validity_has_skew_only_on_not_before() {
         c.admit(&fp(ALICE), Some(&claims), &node("web-01"), at(NA)),
         Err(AuthFailureReason::Certificate(CertRejection::Expired))
     );
-    // Un certificato che parte vicino a 0: nessun underflow.
+    // A certificate starting close to 0: no underflow.
     let early = Cert {
         not_before: 10,
         not_after: 100,
@@ -314,7 +314,7 @@ fn t_check_ok(claims: &CertClaims, now: u64) -> bool {
 #[test]
 fn whitelisted_keys_keep_their_grant_and_the_certificate_adds_nothing() {
     let p = policy_with(standard_trust());
-    // `ansible` ha allow = [web-01]; presenta un certificato valido per app-01.
+    // `ansible` has allow = [web-01]; it presents a valid certificate for app-01.
     let claims = Cert::for_nodes(WEB_CA, ANSIBLE, &["app-01"]).claims();
     let admission = p.admit(&fp(ANSIBLE), Some(&claims), at(NOW)).unwrap();
     assert_eq!(
@@ -327,19 +327,19 @@ fn whitelisted_keys_keep_their_grant_and_the_certificate_adds_nothing() {
         reachable(&p, ANSIBLE, &ClientCredential::Key, NOW),
         ["web-01"]
     );
-    // Senza certificato: stessa credenziale.
+    // Without a certificate: same credential.
     assert_eq!(
         p.admit(&fp(ANSIBLE), None, at(NOW)).unwrap(),
         Admission::Client {
             credential: ClientCredential::Key
         }
     );
-    // Nessuna scadenza in sessione per la whitelist.
+    // No in-session expiry for the whitelist.
     assert_eq!(
         reachable(&p, ANSIBLE, &ClientCredential::Key, NA + 1_000_000),
         ["web-01"]
     );
-    // Lato agent: la whitelist ammette con `Key`, anche con il certificato.
+    // Agent side: the whitelist admits with `Key`, even with the certificate.
     let c = clients_with(standard_trust());
     assert_eq!(
         c.admit(&fp(ANSIBLE), Some(&claims), &node("web-01"), at(NOW)),
@@ -361,7 +361,7 @@ fn agent_side_accepts_only_its_own_node_in_scope() {
         .admit(&fp(ALICE), Some(&claims), &node("web-01"), at(NOW))
         .unwrap();
     assert!(matches!(credential, ClientCredential::Certificate(_)));
-    // app-01 è in `allow` della CA ma non nel certificato; db-01 in nessuno dei due.
+    // app-01 is in the CA's `allow` but not in the certificate; db-01 is in neither.
     for other in ["app-01", "db-01", "ghost"] {
         assert_eq!(
             c.admit(&fp(ALICE), Some(&claims), &node(other), at(NOW)),
@@ -371,11 +371,11 @@ fn agent_side_accepts_only_its_own_node_in_scope() {
             "{other}"
         );
     }
-    // La credenziale vale fino a `not_after` escluso.
+    // The credential is valid until `not_after`, exclusive.
     assert!(c.still_admits(&fp(ALICE), &credential, &node("web-01"), at(NA - 1)));
     assert!(!c.still_admits(&fp(ALICE), &credential, &node("web-01"), at(NA)));
     assert!(!c.still_admits(&fp(ALICE), &credential, &node("app-01"), at(NOW)));
-    // Senza certificato una chiave sconosciuta resta sconosciuta.
+    // Without a certificate an unknown key stays unknown.
     assert_eq!(
         c.admit(&fp(ALICE), None, &node("web-01"), at(NOW)),
         Err(AuthFailureReason::UnknownPeer)
@@ -385,7 +385,7 @@ fn agent_side_accepts_only_its_own_node_in_scope() {
 #[test]
 fn an_empty_effective_scope_admits_but_grants_nothing() {
     let p = policy_with(standard_trust());
-    // db-ca concede solo db-01; il certificato elenca solo web-01.
+    // db-ca grants only db-01; the certificate lists only web-01.
     let claims = Cert::for_nodes(DB_CA, ALICE, &["web-01"]).claims();
     let credential = certified(p.admit(&fp(ALICE), Some(&claims), at(NOW)));
     assert!(reachable(&p, ALICE, &credential, NOW).is_empty());
@@ -408,7 +408,7 @@ fn rotations_pending_lists_authorities_with_two_keys() {
     assert_eq!(pending[0].0, node("web-ca"));
     assert_eq!(pending[0].1.len(), 2);
     assert!(pending[0].1.contains(&new) && pending[0].1.contains(&old));
-    // Entrambe le chiavi valgono, con lo stesso nome, `allow` e `max_lifetime`.
+    // Both keys are valid, with the same name, `allow` and `max_lifetime`.
     for key in [0xb1, 0xb2] {
         let claims = Cert::for_nodes(key, ALICE, &["web-01"]).claims();
         let authority = t.check(&claims, at(NOW)).unwrap();
@@ -424,19 +424,19 @@ fn rotations_pending_lists_authorities_with_two_keys() {
     for f in [fp(0xb1), fp(0xb2), fp(DB_CA)] {
         assert!(fingerprints.contains(&f));
     }
-    // Rotazione completata: niente più.
+    // Rotation completed: nothing more.
     let mut done = CertTrust::new();
     done.add_authority(node("web-ca"), &[new], only(&["web-01"]), EIGHT_HOURS)
         .unwrap();
     assert_eq!(done.rotations_pending().count(), 0);
 }
 
-// ======================= attacchi =======================
+// ======================= attacks =======================
 
 #[test]
 fn a_certificate_cannot_grant_nodes_of_another_authority() {
     let p = policy_with(standard_trust());
-    // web-ca firma un certificato per db-01, che appartiene a db-ca.
+    // web-ca signs a certificate for db-01, which belongs to db-ca.
     let claims = Cert::for_nodes(WEB_CA, ALICE, &["db-01"]).claims();
     let credential = certified(p.admit(&fp(ALICE), Some(&claims), at(NOW)));
     assert!(!p.may_open_with(&fp(ALICE), &credential, &node("db-01"), at(NOW)));
@@ -447,7 +447,7 @@ fn a_certificate_cannot_grant_nodes_of_another_authority() {
             CertRejection::NodeOutOfScope
         ))
     );
-    // Controllo: lo stesso certificato firmato da db-ca concede db-01.
+    // Control: the same certificate signed by db-ca grants db-01.
     let good = Cert::for_nodes(DB_CA, BOB, &["db-01"]).claims();
     let credential = certified(p.admit(&fp(BOB), Some(&good), at(NOW)));
     assert!(p.may_open_with(&fp(BOB), &credential, &node("db-01"), at(NOW)));
@@ -472,13 +472,13 @@ fn an_unpinned_authority_is_rejected() {
             CertRejection::UnknownAuthority
         ))
     );
-    // Il passo 5 viene prima del 9: un certificato di CA ignota e scaduto è `UnknownAuthority`.
+    // Step 5 comes before step 9: an expired certificate from an unknown CA is `UnknownAuthority`.
     assert_eq!(
         t.check(&rogue, at(NA + 10)).err(),
         Some(CertRejection::UnknownAuthority)
     );
 
-    // Una ricarica toglie web-ca: le claims verificate prima non valgono più.
+    // A reload removes web-ca: claims verified earlier are no longer valid.
     let good = Cert::for_nodes(WEB_CA, ALICE, &["web-01"]).claims();
     let credential = certified(p.admit(&fp(ALICE), Some(&good), at(NOW)));
     let mut reduced = CertTrust::new();
@@ -548,12 +548,12 @@ fn a_revoked_serial_is_rejected() {
         t.check(&revoked, at(NOW)).err(),
         Some(CertRejection::SerialRevoked)
     );
-    // Il passo 7 viene prima dell'8 e del 9.
+    // Step 7 comes before steps 8 and 9.
     assert_eq!(
         t.check(&revoked, at(NA + 10)).err(),
         Some(CertRejection::SerialRevoked)
     );
-    // Un'altra serie della stessa chiave non è revocata.
+    // Another serial of the same key is not revoked.
     let other = Cert {
         serial: 0x77,
         ..Cert::for_nodes(WEB_CA, ALICE, &["web-01"])
@@ -578,13 +578,13 @@ fn a_revoked_key_is_rejected_with_any_credential() {
     assert!(t.is_key_revoked(&fp(ALICE)));
     assert!(!t.is_key_revoked(&fp(BOB)));
     let p = policy_with(t.clone());
-    // Certificato valido di una chiave revocata.
+    // Valid certificate of a revoked key.
     let alice = Cert::for_nodes(WEB_CA, ALICE, &["web-01"]).claims();
     assert_eq!(
         p.admit(&fp(ALICE), Some(&alice), at(NOW)).err(),
         Some(AuthFailureReason::KeyRevoked)
     );
-    // Voce della whitelist, con e senza certificato.
+    // Whitelist entry, with and without a certificate.
     assert_eq!(
         p.admit(&fp(ANSIBLE), None, at(NOW)).err(),
         Some(AuthFailureReason::KeyRevoked)
@@ -600,16 +600,16 @@ fn a_revoked_key_is_rejected_with_any_credential() {
         &node("web-01"),
         at(NOW)
     ));
-    // Chiave di agent.
+    // Agent key.
     assert_eq!(
         p.admit(&fp(WEB_AGENT), None, at(NOW)).err(),
         Some(AuthFailureReason::KeyRevoked)
     );
-    // Controllo: una chiave non revocata passa.
+    // Control: a non-revoked key passes.
     let bob = Cert::for_nodes(WEB_CA, BOB, &["web-01"]).claims();
     assert!(p.admit(&fp(BOB), Some(&bob), at(NOW)).is_ok());
     assert!(p.admit(&fp(DB_AGENT), None, at(NOW)).is_ok());
-    // Lato agent.
+    // Agent side.
     let c = clients_with(t);
     assert_eq!(
         c.admit(&fp(ANSIBLE), None, &node("web-01"), at(NOW)),
@@ -691,7 +691,7 @@ fn authority_keys_cannot_double_as_peer_keys_in_any_order() {
         t.set_revocations(revocations(&[], &[]));
         t
     };
-    // Prima i peer, poi la CA.
+    // First the peers, then the CA.
     for peer in [WEB_AGENT, ANSIBLE] {
         let mut p = AccessPolicy::new();
         p.add_agent(fp(WEB_AGENT), node("web-01")).unwrap();
@@ -708,7 +708,7 @@ fn authority_keys_cannot_double_as_peer_keys_in_any_order() {
             Err(DomainError::DuplicatePeer(fp(peer)))
         );
     }
-    // Prima la CA, poi i peer.
+    // First the CA, then the peers.
     let mut p = AccessPolicy::new();
     p.set_cert_trust(trust_on(0xc1)).unwrap();
     assert_eq!(
@@ -729,9 +729,9 @@ fn authority_keys_cannot_double_as_peer_keys_in_any_order() {
         ),
         Err(DomainError::DuplicatePeer(fp(0xc1)))
     );
-    // Controllo: chiavi diverse vanno bene.
+    // Control: different keys are fine.
     p.add_agent(fp(WEB_AGENT), node("web-01")).unwrap();
-    // Lato agent, nei due ordini.
+    // Agent side, in both orders.
     let mut c = AuthorizedClients::new();
     c.add_client(fp(ANSIBLE)).unwrap();
     assert_eq!(
@@ -757,12 +757,12 @@ fn a_ca_key_cannot_appear_in_two_authorities() {
         EIGHT_HOURS,
     )
     .unwrap();
-    // Stessa chiave, nome e ambito diversi.
+    // Same key, different name and scope.
     assert_eq!(
         t.add_authority(node("db-ca"), &[ca(WEB_CA)], only(&["db-01"]), EIGHT_HOURS),
         Err(DomainError::DuplicatePeer(fp(WEB_CA)))
     );
-    // Anche come seconda chiave di una rotazione.
+    // Also as the second key of a rotation.
     assert_eq!(
         t.add_authority(
             node("db-ca"),
@@ -772,7 +772,7 @@ fn a_ca_key_cannot_appear_in_two_authorities() {
         ),
         Err(DomainError::DuplicatePeer(fp(WEB_CA)))
     );
-    // Il fallimento non lascia effetti: db-ca non esiste e DB_CA non è pinnata.
+    // The failure leaves no effects: db-ca does not exist and DB_CA is not pinned.
     assert!(
         t.authority_for_key(&CertKey::from_bytes([DB_CA; 32]))
             .is_none()
@@ -780,7 +780,7 @@ fn a_ca_key_cannot_appear_in_two_authorities() {
     let claims = Cert::for_nodes(WEB_CA, ALICE, &["web-01"]).claims();
     t.set_revocations(revocations(&[], &[]));
     assert_eq!(t.check(&claims, at(NOW)).unwrap().name(), &node("web-ca"));
-    // Controllo: una chiave nuova con quel nome va bene.
+    // Control: a new key with that name is fine.
     t.add_authority(node("db-ca"), &[ca(DB_CA)], only(&["db-01"]), EIGHT_HOURS)
         .unwrap();
 }
@@ -826,7 +826,7 @@ fn authority_entries_are_validated() {
         t.add_authority(name.clone(), &[ca(0xd2)], AllowedNodes::All, 86_400),
         Err(DomainError::DuplicateAuthority(name))
     );
-    // Al massimo 16 CA.
+    // At most 16 CAs.
     let mut t = CertTrust::new();
     for i in 0..16_u8 {
         t.add_authority(
@@ -881,8 +881,8 @@ fn revocation_lists_are_bounded() {
 #[test]
 fn certificate_names_never_affect_authorization() {
     let p = policy_with(standard_trust());
-    // Nomi uguali a un client della whitelist, a un nodo, a una CA: stessi permessi di
-    // qualsiasi altro nome.
+    // Names equal to a whitelisted client, to a node, to a CA: same permissions as
+    // any other name.
     for name in ["ansible", "web-01", "web-ca", "db-ca", "bob"] {
         let claims = Cert {
             name,

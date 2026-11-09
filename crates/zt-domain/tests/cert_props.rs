@@ -1,4 +1,4 @@
-//! Fase 6, passo 1: proprietà del decoder dei certificati su input arbitrari e strutturati.
+//! Phase 6, step 1: properties of the certificate decoder on arbitrary and structured inputs.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,12 +15,12 @@ use proptest::prelude::*;
 use zt_domain::decode_certificate;
 use zt_domain::limits::{MAX_CERT_LEN, MIN_CERT_LEN};
 
-/// Un `NodeId` valido qualsiasi.
+/// Any valid `NodeId`.
 fn node_id() -> impl Strategy<Value = Vec<u8>> {
     "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?".prop_map(String::into_bytes)
 }
 
-/// Un certificato valido per il formato.
+/// A certificate valid for the format.
 fn valid_raw() -> impl Strategy<Value = Raw> {
     (
         any::<[u8; 32]>(),
@@ -59,7 +59,7 @@ fn valid_raw() -> impl Strategy<Value = Raw> {
         )
 }
 
-/// Modifiche puntuali a un certificato valido, per superare i primi filtri.
+/// Targeted modifications to a valid certificate, to get past the first filters.
 fn mutated() -> impl Strategy<Value = Vec<u8>> {
     (
         valid_raw(),
@@ -104,13 +104,13 @@ proptest! {
         noise in vec(any::<u8>(), 0..5000),
         near in mutated(),
     ) {
-        // Strutturato: ogni certificato valido è accettato, con lo stesso corpo, ed è canonico.
+        // Structured: every valid certificate is accepted, with the same body, and is canonical.
         let bytes = valid.bytes();
         let parsed = decode_certificate(&bytes);
         prop_assert!(parsed.is_ok(), "valid certificate refused: {:?}", parsed.err());
         prop_assert_eq!(parsed.unwrap().body, valid.body());
         check_canonical(&bytes)?;
-        // Arbitrario e quasi valido: nessun panic; se accettato, canonico.
+        // Arbitrary and near-valid: no panic; if accepted, canonical.
         check_canonical(&noise)?;
         check_canonical(&near)?;
     }

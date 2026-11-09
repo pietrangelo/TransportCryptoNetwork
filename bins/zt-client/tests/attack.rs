@@ -1,5 +1,5 @@
-//! Test d'attacco su `zt-client`. Regola trasversale: in caso di errore stdout resta vuoto
-//! (è il canale SSH) e, quando il problema è locale, non parte nessuna connessione.
+//! Attack tests on `zt-client`. Cross-cutting rule: on error stdout stays empty (it is the
+//! SSH channel) and, when the problem is local, no connection is started.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,7 +17,7 @@ use zt_crypto::Identity;
 
 const LIMIT: Duration = Duration::from_secs(15);
 
-/// Un relay "esca" che conta le connessioni: deve restare a zero.
+/// A "bait" relay that counts connections: it must stay at zero.
 async fn bait_dir(who: &Identity, nodes: &[(&str, zt_crypto::PublicKey)]) -> (Counting, ClientDir) {
     let bait = Counting::start(false).await;
     let relay_key = Identity::generate().unwrap().public_key();
@@ -31,7 +31,7 @@ fn some_key() -> zt_crypto::PublicKey {
 
 #[tokio::test]
 async fn unknown_node_is_refused_without_touching_the_network() {
-    // Niente trust-on-first-use: senza chiave pinnata non si contatta il relay.
+    // No trust-on-first-use: without a pinned key the relay is not contacted.
     let me = Identity::generate().unwrap();
     let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
     let out = finish(dir.spawn("db-01"), LIMIT).await;
@@ -43,7 +43,7 @@ async fn unknown_node_is_refused_without_touching_the_network() {
 
 #[tokio::test]
 async fn malformed_node_names_are_refused_without_touching_the_network() {
-    // %n/%h arrivano da ciò che l'utente (o un inventario Ansible) scrive.
+    // %n/%h come from what the user (or an Ansible inventory) writes.
     let me = Identity::generate().unwrap();
     let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
     let long = "a".repeat(64);
@@ -73,7 +73,7 @@ async fn strip_suffix_does_not_widen_the_accepted_names() {
     let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
     let config = dir.config();
     let c = config.to_str().unwrap();
-    // Il suffisso si toglie una volta sola e solo se presente per intero.
+    // The suffix is stripped only once and only if present in full.
     for name in ["web-01.tcn.tcn", "web-01tcn", ".tcn", "WEB-01.tcn"] {
         let out = finish(
             spawn_with(
@@ -91,7 +91,7 @@ async fn strip_suffix_does_not_widen_the_accepted_names() {
 
 #[tokio::test]
 async fn trust_file_writable_by_others_is_refused() {
-    // Chi può scrivere client.toml può sostituire il pin del nodo e fare MITM.
+    // Whoever can write client.toml can replace the node's pin and perform a MITM.
     let me = Identity::generate().unwrap();
     let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;
     for mode in [0o664, 0o646, 0o666] {
@@ -135,7 +135,7 @@ async fn missing_or_garbage_config_is_refused() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn impostor_relay_is_detected_and_nothing_reaches_stdout() {
-    // Il client parla con il relay vero, ma ha pinnato un'altra chiave (DNS/BGP hijack).
+    // The client talks to the real relay, but has pinned another key (DNS/BGP hijack).
     let fleet = Fleet::start().await;
     let ssh = Counting::start(true).await;
     fleet.start_agent(ssh.addr).await;
@@ -153,8 +153,8 @@ async fn impostor_relay_is_detected_and_nothing_reaches_stdout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn impostor_agent_is_detected_and_sshd_is_never_dialed() {
-    // Il relay instrada verso un agent la cui chiave non è quella pinnata dal client
-    // (relay compromesso o agent sostituito).
+    // The relay routes toward an agent whose key is not the one pinned by the client
+    // (compromised relay or replaced agent).
     let fleet = Fleet::start().await;
     let ssh = Counting::start(true).await;
     fleet.start_agent(ssh.addr).await;
@@ -213,9 +213,9 @@ async fn trace_logging_never_reaches_stdout_nor_leaks_the_secret() {
     assert!(!out.stderr.contains("payload marker"), "payload in logs");
 }
 
-// ======================= regressioni adversary review 0003 =======================
+// ======================= regressions from adversary review 0003 =======================
 
-/// 0003-3: se l'agent non raggiunge sshd il client usciva con 0 e senza messaggi.
+/// 0003-3: if the agent could not reach sshd the client exited with 0 and no messages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unreachable_sshd_is_an_error_with_a_message() {
     let fleet = Fleet::start().await;
@@ -240,8 +240,8 @@ async fn unreachable_sshd_is_an_error_with_a_message() {
     );
 }
 
-/// 0003-4: ssh esegue `sh -c "exec zt-client ... %n"`. Con un OpenSSH vecchio un nome host
-/// con spazi diventa argomenti in più: nessuna opzione dopo il nome del nodo viene letta.
+/// 0003-4: ssh runs `sh -c "exec zt-client ... %n"`. With an old OpenSSH a host name with
+/// spaces becomes extra arguments: no option after the node name is read.
 #[tokio::test]
 async fn options_after_the_node_name_are_never_parsed() {
     let me = Identity::generate().unwrap();
@@ -264,9 +264,9 @@ async fn options_after_the_node_name_are_never_parsed() {
     assert_eq!(evil_relay.count(), 0);
 }
 
-// ---------- Fase 6, passo 9: certificati (PROTOCOL §15.6, OPERATIONS §10.4) ----------
+// ---------- Phase 6, step 9: certificates (PROTOCOL §15.6, OPERATIONS §10.4) ----------
 
-/// Controllo positivo comune: lo stesso banco, con un certificato valido, contatta il relay.
+/// Common positive control: the same test bench, with a valid certificate, contacts the relay.
 async fn a_valid_certificate_reaches_the_relay() {
     let me = Identity::generate().unwrap();
     let (bait, dir) = bait_dir(&me, &[("web-01", some_key())]).await;

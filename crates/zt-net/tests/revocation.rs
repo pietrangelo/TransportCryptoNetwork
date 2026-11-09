@@ -1,5 +1,5 @@
-//! Revoca a caldo end-to-end (Fase 4): relay e agent applicano una nuova policy alle sessioni
-//! già aperte, senza riavvio.
+//! End-to-end hot revocation (Phase 4): relay and agent apply a new policy to sessions that
+//! are already open, without restart.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -155,7 +155,7 @@ impl Lab {
         }
     }
 
-    /// Apre una sessione e verifica che l'eco funzioni.
+    /// Opens a session and checks that the echo works.
     async fn session(
         &self,
         who: &Arc<Identity>,
@@ -226,7 +226,7 @@ async fn relay_grant_narrowing_closes_the_stream_as_unauthorized() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_revocation_cuts_the_session_even_if_the_relay_still_allows_it() {
-    // Difesa in profondità: l'agent non aspetta il relay (che potrebbe essere compromesso).
+    // Defense in depth: the agent does not wait for the relay (which might be compromised).
     let lab = Lab::start().await;
     let (_app, revoked) = lab.session(&lab.ansible).await;
     let (mut other, _survivor) = lab.session(&lab.admin).await;
@@ -240,7 +240,7 @@ async fn agent_revocation_cuts_the_session_even_if_the_relay_still_allows_it() {
         Err(NetError::StreamClosed(CloseReason::Unauthorized))
     ));
     assert_alive(&mut other).await;
-    // Una nuova sessione del client revocato viene rifiutata dall'agent.
+    // A new session of the revoked client is rejected by the agent.
     let (_app, local) = tokio::io::duplex(1024);
     let again = tokio::time::timeout(
         Duration::from_secs(5),

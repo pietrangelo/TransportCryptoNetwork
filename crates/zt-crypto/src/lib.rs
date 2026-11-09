@@ -1,13 +1,13 @@
 //! # zt-crypto
 //!
-//! Adapter crittografico di TCN.
+//! Cryptographic adapter of TCN.
 //!
-//! - [`Identity`] / [`PublicKey`]: identità a lungo termine Ed25519. Per Noise se ne usa la
-//!   forma X25519 (mappa birazionale Edwards → Montgomery), così una sola chiave per nodo
-//!   basta per whitelist, fingerprint e handshake.
-//! - [`noise`]: handshake `Noise_IK_25519_ChaChaPoly_BLAKE2s` **sans-IO** con typestate:
-//!   un [`noise::Transport`] esiste solo dopo un handshake completato e, lato responder,
-//!   solo dopo una decisione esplicita di autorizzazione.
+//! - [`Identity`] / [`PublicKey`]: long-term Ed25519 identity. For Noise its X25519 form is
+//!   used (birational map Edwards → Montgomery), so a single key per node suffices for the
+//!   whitelist, fingerprints and handshake.
+//! - [`noise`]: `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake, **sans-IO** with typestate:
+//!   a [`noise::Transport`] exists only after a completed handshake and, on the responder
+//!   side, only after an explicit authorization decision.
 #![forbid(unsafe_code)]
 
 pub mod cert;

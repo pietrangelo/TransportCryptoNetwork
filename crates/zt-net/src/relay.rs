@@ -1,14 +1,14 @@
-//! Server del relay.
+//! Relay server.
 //!
 //! ```text
-//!  accept ─▶ limiti (connessioni, rate per IP) ─▶ task connessione: handshake, policy,
-//!                                                  recv/send con timeout
-//!                         Input ▼  ▲ Frame (coda limitata per connessione)
-//!                          hub: RelayCore (unico proprietario dello stato)
+//!  accept ─▶ limits (connections, per-IP rate) ─▶ connection task: handshake, policy,
+//!                                                  recv/send with timeouts
+//!                         Input ▼  ▲ Frame (bounded queue per connection)
+//!                          hub: RelayCore (sole owner of the state)
 //! ```
 //!
-//! L'hub non attende mai una connessione: se la coda di una connessione è piena (impossibile
-//! per un peer che rispetta il credito) quella connessione viene chiusa.
+//! The hub never waits on a connection: if a connection's queue is full (impossible for a peer
+//! that respects the credit) that connection is closed.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,26 +30,26 @@ use zt_domain::{
 
 use crate::{NetError, Timeouts, channel};
 
-/// Configurazione del relay.
+/// Relay configuration.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
-    /// Limiti del relay core.
+    /// Relay core limits.
     pub limits: RelayLimits,
-    /// Timeout di rete.
+    /// Network timeouts.
     pub timeouts: Timeouts,
-    /// Connessioni contemporanee (incluse quelle in handshake).
+    /// Concurrent connections (including those in the handshake).
     pub max_connections: usize,
-    /// Handshake ammessi a raffica per indirizzo IP.
+    /// Handshakes allowed in a burst per IP address.
     pub handshake_burst: u32,
-    /// Un handshake in più per IP ogni `handshake_refill`.
+    /// One more handshake per IP every `handshake_refill`.
     pub handshake_refill: Duration,
-    /// Indirizzi IP tracciati dal rate limiter.
+    /// IP addresses tracked by the rate limiter.
     pub max_tracked_ips: usize,
-    /// Handshake ammessi a raffica per prefisso IPv6 /48.
+    /// Handshakes allowed in a burst per IPv6 /48 prefix.
     pub wide_handshake_burst: u32,
-    /// Un handshake in più per /48 ogni `wide_handshake_refill`.
+    /// One more handshake per /48 every `wide_handshake_refill`.
     pub wide_handshake_refill: Duration,
-    /// Prefissi /48 tracciati.
+    /// Tracked /48 prefixes.
     pub max_tracked_wide: usize,
 }
 
@@ -69,7 +69,7 @@ impl Default for RelayConfig {
     }
 }
 
-/// Una riga di audit (`target: "zt_audit"`), a livello WARN per un allarme e INFO altrimenti.
+/// An audit line (`target: "zt_audit"`), at WARN level for an alarm and INFO otherwise.
 macro_rules! audit_line {
     ($alert:expr, $kind:expr, $($fields:tt)*) => {
         if $alert {
@@ -80,8 +80,8 @@ macro_rules! audit_line {
     };
 }
 
-/// `authentication_failed`: i campi del certificato solo dopo la firma verificata (PROTOCOL
-/// §15.11, finding 0006-3); senza certificato sono vuoti e non compaiono.
+/// `authentication_failed`: the certificate fields only after the signature has been verified
+/// (PROTOCOL §15.11, finding 0006-3); without a certificate they are empty and do not appear.
 fn authentication_failed(
     alert: bool,
     kind: &'static str,
@@ -106,11 +106,11 @@ fn authentication_failed(
     );
 }
 
-/// Registra un evento di audit. Gli eventi contengono solo identità e metadati.
+/// Logs an audit event. Events contain only identities and metadata.
 ///
-/// `event_kind` è il nome stabile dell'evento ([`DomainEvent::kind`]), su cui filtrare un SIEM;
-/// gli altri dati sono campi separati (`peer`, `node`, `session`, `reason`, `rule`), non una
-/// stringa `Debug` da analizzare (finding 0004-4).
+/// `event_kind` is the stable name of the event ([`DomainEvent::kind`]), for a SIEM to filter
+/// on; the other data are separate fields (`peer`, `node`, `session`, `reason`, `rule`), not a
+/// `Debug` string to be parsed (finding 0004-4).
 pub(crate) fn audit(event: &DomainEvent) {
     let kind = event.kind();
     let alert = event.is_security_alert();
@@ -197,15 +197,15 @@ pub(crate) fn audit(event: &DomainEvent) {
                 "certificate expired"
             );
         }
-        // `DomainEvent` è `non_exhaustive`: un evento nuovo resta almeno leggibile.
+        // `DomainEvent` is `non_exhaustive`: a new event at least stays readable.
         other => emit!(event = ?other, "audit event"),
     }
 }
 
-/// I campi di audit di una credenziale (PROTOCOL §15.11): mai i byte del certificato, solo
-/// la CA, la serie, il nome e la scadenza.
+/// The audit fields of a credential (PROTOCOL §15.11): never the certificate bytes, only the
+/// CA, the serial, the name and the expiry.
 pub(crate) struct CertFields {
-    /// `key` o `certificate`.
+    /// `key` or `certificate`.
     pub(crate) credential: &'static str,
     pub(crate) ca: Option<String>,
     pub(crate) serial: Option<String>,
@@ -234,8 +234,8 @@ impl CertFields {
     }
 }
 
-/// `reason` e `cert_check` di un `authentication_failed`. I motivi precedenti alla Fase 6
-/// restano nella forma di sempre (`UnknownPeer`, ...), per non rompere i filtri esistenti.
+/// `reason` and `cert_check` of an `authentication_failed`. Reasons that predate Phase 6 keep
+/// their usual form (`UnknownPeer`, ...), so as not to break existing filters.
 fn failure_fields(reason: AuthFailureReason) -> (String, Option<&'static str>) {
     match reason {
         AuthFailureReason::KeyRevoked => ("key_revoked".into(), None),
@@ -244,7 +244,7 @@ fn failure_fields(reason: AuthFailureReason) -> (String, Option<&'static str>) {
     }
 }
 
-/// Il session id in esadecimale, come compare nei log.
+/// The session id in hexadecimal, as it appears in the logs.
 pub(crate) fn session_hex(session: &SessionId) -> String {
     session
         .as_bytes()
@@ -256,7 +256,7 @@ pub(crate) fn session_hex(session: &SessionId) -> String {
         })
 }
 
-/// Session id dal CSPRNG del sistema.
+/// Session id from the system CSPRNG.
 struct RandomIds {
     fallback: u64,
 }
@@ -266,8 +266,8 @@ impl SessionIds for RandomIds {
         let mut bytes = [0_u8; SessionId::LEN];
         loop {
             if getrandom::fill(&mut bytes).is_err() {
-                // Senza CSPRNG si usa un contatore: unico nel processo, non segreto (il session
-                // id è un identificativo di audit, non una credenziale).
+                // Without a CSPRNG a counter is used: unique within the process, not secret
+                // (the session id is an audit identifier, not a credential).
                 self.fallback = self.fallback.wrapping_add(1);
                 bytes = [0; SessionId::LEN];
                 if let Some(head) = bytes.get_mut(..8) {
@@ -291,7 +291,7 @@ enum HubEvent {
     Core(Input),
 }
 
-/// Coda in uscita di una connessione: il massimo che il credito permette di accodare.
+/// Outbound queue of a connection: the most that the credit allows to be enqueued.
 fn outbound_capacity(limits: &RelayLimits) -> usize {
     let per_stream = MAX_WINDOW / MIN_CHARGE + MAX_WINDOW / MIN_WINDOW_UPDATE;
     let streams = limits
@@ -302,7 +302,7 @@ fn outbound_capacity(limits: &RelayLimits) -> usize {
         .saturating_add(1024)
 }
 
-/// Il relay, pronto ad accettare connessioni.
+/// The relay, ready to accept connections.
 pub struct RelayServer {
     listener: TcpListener,
     keys: crate::Revocable<Keyring>,
@@ -311,10 +311,10 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
-    /// Apre il socket di ascolto.
+    /// Opens the listening socket.
     ///
     /// # Errors
-    /// Errore di bind.
+    /// Bind error.
     pub async fn bind(
         addr: SocketAddr,
         keys: impl Into<crate::Revocable<Keyring>>,
@@ -324,8 +324,8 @@ impl RelayServer {
         let policy = policy.into();
         let keys = keys.into();
         let listener = TcpListener::bind(addr).await?;
-        // Il socket accetta già connessioni (in coda fino a `run`): lo si dichiara qui, così
-        // ciò che il processo registra dopo `bind` viene sempre dopo questa riga.
+        // The socket already accepts connections (queued until `run`): it is announced here,
+        // so whatever the process logs after `bind` always comes after this line.
         if let Ok(addr) = listener.local_addr() {
             tracing::info!(%addr, relay = %keys.current().current().fingerprint(), "relay listening");
         }
@@ -337,18 +337,18 @@ impl RelayServer {
         })
     }
 
-    /// L'indirizzo effettivo di ascolto.
+    /// The actual listening address.
     ///
     /// # Errors
-    /// Errore del sistema operativo.
+    /// Operating system error.
     pub fn local_addr(&self) -> Result<SocketAddr, NetError> {
         Ok(self.listener.local_addr()?)
     }
 
-    /// Serve connessioni fino alla chiusura del processo.
+    /// Serves connections until the process exits.
     ///
     /// # Errors
-    /// Solo errori fatali del socket di ascolto.
+    /// Only fatal errors of the listening socket.
     pub async fn run(self) -> Result<(), NetError> {
         let Self {
             listener,
@@ -379,7 +379,7 @@ impl RelayServer {
             let (tcp, addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    // Per esempio EMFILE: si rallenta invece di girare a vuoto.
+                    // E.g. EMFILE: back off instead of spinning.
                     tracing::warn!(error = %err, "accept failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -398,8 +398,8 @@ impl RelayServer {
             let conn = ConnId(next_conn);
             let task = Connection {
                 conn,
-                // Le chiavi in vigore al momento dell'accept: una ricarica vale per le
-                // connessioni successive.
+                // The keys in force at accept time: a reload applies to subsequent
+                // connections.
                 keys: keys.current(),
                 policy: policy.clone(),
                 hub: hub_tx.clone(),
@@ -438,8 +438,8 @@ impl Connection {
             }
         };
         let peer = pending.peer();
-        // PROTOCOL §15.4, prima del messaggio 2: un rifiuto equivale a una chiave sconosciuta,
-        // che non riceve nemmeno il secondo messaggio dell'handshake.
+        // PROTOCOL §15.4, before message 2: a rejection is equivalent to an unknown key, which
+        // does not even receive the second handshake message.
         let certificate = match admit(&self.policy.current(), &peer, pending.payload()) {
             Ok(certificate) => certificate,
             Err((reason, certificate)) => {
@@ -507,10 +507,10 @@ impl Connection {
     }
 }
 
-/// Passi 1–11 di PROTOCOL §15.4 sul canale esterno: denylist della chiave, verifica del
-/// certificato (se il payload non è vuoto) e decisione della policy. Restituisce i dati
-/// verificati del certificato, che il core ricontrolla con la policy del momento.
-/// Il rifiuto di [`admit`]: il motivo e, dopo la verifica della firma, il certificato
+/// Steps 1–11 of PROTOCOL §15.4 on the outer channel: key denylist, certificate verification
+/// (if the payload is not empty) and policy decision. Returns the verified certificate data,
+/// which the core re-checks against the current policy.
+/// The rejection from [`admit`]: the reason and, after signature verification, the certificate
 /// (PROTOCOL §15.11).
 type Refusal = (AuthFailureReason, Option<CertRef>);
 
@@ -520,12 +520,12 @@ fn admit(
     payload: &[u8],
 ) -> Result<Option<Arc<CertClaims>>, Refusal> {
     let trust = policy.cert_trust();
-    // Passo 1, anche senza certificato.
+    // Step 1, even without a certificate.
     if trust.is_key_revoked(peer) {
         return Err((AuthFailureReason::KeyRevoked, None));
     }
-    // Passi 3–6 (passo 2: payload vuoto, nessun certificato). Un rifiuto qui non nomina mai
-    // CA e serie: la firma non è verificata.
+    // Steps 3–6 (step 2: empty payload, no certificate). A rejection here never names the CA
+    // and serial: the signature has not been verified.
     let certificate = if payload.is_empty() {
         None
     } else {
@@ -533,7 +533,7 @@ fn admit(
             .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
         Some(Arc::new(claims))
     };
-    // Passi 5 e 7–11 e la precedenza della whitelist.
+    // Steps 5 and 7–11 and the precedence of the whitelist.
     policy
         .admit(peer, certificate.as_ref(), crate::unix_now())
         .map_err(|reason| (reason, reason.certificate_ref(certificate.as_deref())))?;
@@ -549,8 +549,8 @@ async fn hub(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let input = tokio::select! {
-            // Prima la policy: una connessione autenticata con la policy nuova non deve
-            // arrivare al core prima della policy stessa.
+            // Policy first: a connection authenticated under the new policy must not reach the
+            // core before the policy itself.
             biased;
             () = policy.changed() => Input::PolicyUpdated { policy: policy.current() },
             event = events.recv() => match event {
@@ -579,14 +579,15 @@ async fn hub(
                     Output::Send { conn, frame } => {
                         let Some(tx) = peers.get(&conn) else { continue };
                         if tx.try_send(frame).is_err() {
-                            // Coda piena o connessione già chiusa: la si stacca.
+                            // Queue full or connection already closed: detach it.
                             tracing::warn!(conn = conn.0, "outbound queue overflow");
                             peers.remove(&conn);
                             pending.push(Input::Disconnected { conn });
                         }
                     }
                     Output::Close { conn } => {
-                        // Lasciar cadere il sender chiude la connessione dopo i frame già in coda.
+                        // Dropping the sender closes the connection after the frames already
+                        // queued.
                         peers.remove(&conn);
                     }
                     Output::Audit(event) => audit(&event),

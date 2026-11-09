@@ -1,9 +1,9 @@
-//! File di configurazione: chiavi segrete, policy del relay, client autorizzati di un agent,
-//! nodi noti a un client.
+//! Configuration files: secret keys, relay policy, authorized clients of an agent, nodes known
+//! to a client.
 //!
-//! Formato TOML. Ogni file è letto con un limite di dimensione e validato per intero: una
-//! voce non valida fa fallire il caricamento (meglio non partire che partire con una policy
-//! diversa da quella scritta).
+//! TOML format. Every file is read with a size limit and validated in full: an invalid entry
+//! makes loading fail (better not to start than to start with a policy different from the one
+//! written).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
@@ -23,107 +23,108 @@ use zt_domain::{
     ClientGrant, DomainError, NodeId, decode_certificate,
 };
 
-/// Dimensione massima di un file di configurazione.
+/// Maximum size of a configuration file.
 const MAX_FILE_LEN: u64 = 1024 * 1024;
 
-/// Dimensione massima di un file di certificato: il certificato più grande in esadecimale sta
-/// ampiamente in 16 KiB.
+/// Maximum size of a certificate file: the largest certificate in hexadecimal fits comfortably
+/// in 16 KiB.
 const MAX_CERT_FILE_LEN: u64 = 16 * 1024;
 
-/// Errore di configurazione. Non riporta mai il contenuto di un segreto.
+/// Configuration error. It never reports the contents of a secret.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// Errore di I/O sul file.
+    /// I/O error on the file.
     #[error("{path}: {source}")]
     Io {
-        /// Il file.
+        /// The file.
         path: String,
-        /// L'errore.
+        /// The error.
         source: std::io::Error,
     },
-    /// File oltre il limite di dimensione.
+    /// File over the size limit.
     #[error("{0}: file too large")]
     TooLarge(String),
-    /// Il file della chiave segreta è leggibile da altri utenti.
+    /// The secret key file is readable by other users.
     #[error("{0}: secret key file must not be accessible by group or others (chmod 600)")]
     InsecurePermissions(String),
-    /// Un file di trust (pin delle chiavi, policy, client autorizzati) è scrivibile da gruppo
-    /// o altri: chi può scriverlo può sostituire una chiave.
+    /// A trust file (key pins, policy, authorized clients) is writable by group or others:
+    /// whoever can write it can replace a key.
     #[error("{0}: trust file must not be writable by group or others (chmod go-w)")]
     WritableByOthers(String),
-    /// Il file non è un file regolare (FIFO, dispositivo, directory).
+    /// The file is not a regular file (FIFO, device, directory).
     #[error("{0}: not a regular file")]
     NotRegular(String),
-    /// Il file appartiene a un utente diverso da quello corrente e da root.
+    /// The file belongs to a user other than the current one and root.
     #[error("{0}: must be owned by the current user or root")]
     UntrustedOwner(String),
-    /// La directory che contiene il file è di un altro utente o scrivibile da gruppo o altri.
+    /// The directory containing the file belongs to another user or is writable by group or
+    /// others.
     #[error(
         "{0}: directory must be owned by the current user or root and not writable by group or others"
     )]
     InsecureDirectory(String),
-    /// Nodo senza chiave pinnata nella configurazione del client.
+    /// Node without a pinned key in the client configuration.
     #[error("unknown node {0}: no pinned key in the client configuration")]
     UnknownNode(String),
-    /// TOML non valido.
+    /// Invalid TOML.
     #[error("{path}: {message}")]
     Syntax {
-        /// Il file.
+        /// The file.
         path: String,
-        /// Il messaggio del parser.
+        /// The parser's message.
         message: String,
     },
-    /// Chiave non valida.
+    /// Invalid key.
     #[error("{path}: entry {entry}: {source}")]
     Key {
-        /// Il file.
+        /// The file.
         path: String,
-        /// La voce.
+        /// The entry.
         entry: String,
-        /// L'errore.
+        /// The error.
         source: CryptoError,
     },
-    /// Violazione di un'invariante di dominio.
+    /// Violation of a domain invariant.
     #[error("{path}: entry {entry}: {source}")]
     Domain {
-        /// Il file.
+        /// The file.
         path: String,
-        /// La voce.
+        /// The entry.
         entry: String,
-        /// L'errore.
+        /// The error.
         source: DomainError,
     },
-    /// La configurazione pinna almeno una CA ma non ha una denylist (`--revocations`,
+    /// The configuration pins at least one CA but has no denylist (`--revocations`,
     /// PROTOCOL §15.8).
     #[error("{0}: [[authorities]] require a revocation list (--revocations, may be empty)")]
     RevocationsRequired(String),
-    /// Una CA ha la chiave del processo o di un relay pinnato (PROTOCOL §15.9).
+    /// A CA has the key of the process or of a pinned relay (PROTOCOL §15.9).
     #[error("{path}: authority {ca}: authority key equals the {role} key")]
     AuthorityIsInfrastructureKey {
-        /// Il file (o l'opzione) che pinna la CA.
+        /// The file (or the option) that pins the CA.
         path: String,
-        /// L'impronta della CA.
+        /// The fingerprint of the CA.
         ca: zt_domain::Fingerprint,
-        /// Il ruolo della chiave uguale: `relay` o `agent`.
+        /// The role of the matching key: `relay` or `agent`.
         role: &'static str,
     },
-    /// File di certificato non valido.
+    /// Invalid certificate file.
     #[error("{path}: {source}")]
     Certificate {
-        /// Il file.
+        /// The file.
         path: String,
-        /// L'errore di formato.
+        /// The format error.
         source: CertFormatError,
     },
 }
 
-/// Apre un file di trust o una chiave segreta e verifica, sul file **già aperto** (nessuna
-/// finestra tra controllo e lettura), ciò che verifica OpenSSH con `StrictModes`
-/// (finding 0003-1): file regolare, proprietario l'utente corrente o root, nessun permesso di
-/// scrittura per gruppo e altri (per una chiave segreta: nessun permesso per gruppo e altri).
-/// La directory che lo contiene deve rispettare le stesse regole di proprietà e scrittura,
-/// perché chi può scriverci può sostituire il file.
+/// Opens a trust file or a secret key and checks, on the **already open** file (no window
+/// between check and read), what OpenSSH checks with `StrictModes` (finding 0003-1): regular
+/// file, owned by the current user or root, no write permission for group and others (for a
+/// secret key: no permissions at all for group and others). The directory containing it must
+/// satisfy the same ownership and write rules, because whoever can write to it can replace
+/// the file.
 fn open_trusted(path: &Path, private: bool) -> Result<std::fs::File, ConfigError> {
     let display = || path.display().to_string();
     let io = |source| ConfigError::Io {
@@ -134,7 +135,7 @@ fn open_trusted(path: &Path, private: bool) -> Result<std::fs::File, ConfigError
     options.read(true);
     #[cfg(unix)]
     {
-        // Un FIFO aperto senza O_NONBLOCK blocca finché qualcuno non lo apre in scrittura.
+        // A FIFO opened without O_NONBLOCK blocks until someone opens it for writing.
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
     }
@@ -156,12 +157,12 @@ fn current_uid() -> u32 {
     0
 }
 
-/// Controllo puro sui metadati di un file di configurazione aperto: `uid` è l'utente per cui
-/// il file deve essere affidabile. `private` vale per le chiavi segrete.
+/// Pure check on the metadata of an open configuration file: `uid` is the user for whom the
+/// file must be trustworthy. `private` applies to secret keys.
 ///
 /// # Errors
 /// [`ConfigError::NotRegular`], [`ConfigError::UntrustedOwner`],
-/// [`ConfigError::InsecurePermissions`] (solo `private`), [`ConfigError::WritableByOthers`].
+/// [`ConfigError::InsecurePermissions`] (only `private`), [`ConfigError::WritableByOthers`].
 pub fn check_trusted(
     meta: &std::fs::Metadata,
     uid: u32,
@@ -214,7 +215,7 @@ fn check_directory(_path: &Path, _uid: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Legge un file di trust (vedi [`open_trusted`]).
+/// Reads a trust file (see [`open_trusted`]).
 fn read_limited(path: &Path) -> Result<String, ConfigError> {
     read_file_limited(open_trusted(path, false)?, path)
 }
@@ -238,11 +239,11 @@ fn read_file_bounded(file: std::fs::File, path: &Path, max: u64) -> Result<Strin
     Ok(text)
 }
 
-/// Carica un'identità da file, con le stesse verifiche di OpenSSH sulle chiavi private.
+/// Loads an identity from a file, with the same checks OpenSSH applies to private keys.
 ///
 /// # Errors
-/// File illeggibile, non regolare, di un altro utente, con permessi insicuri o in una
-/// directory insicura; contenuto non valido.
+/// Unreadable file, not regular, owned by another user, with insecure permissions or in an
+/// insecure directory; invalid contents.
 pub fn load_identity(path: &Path) -> Result<Identity, ConfigError> {
     let file = open_trusted(path, true)?;
     let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
@@ -253,10 +254,10 @@ pub fn load_identity(path: &Path) -> Result<Identity, ConfigError> {
     })
 }
 
-/// Carica la chiave corrente e, durante una rotazione, quella precedente (PROTOCOL §14).
+/// Loads the current key and, during a rotation, the previous one (PROTOCOL §14).
 ///
 /// # Errors
-/// Come [`load_identity`] per ciascun file; [`ConfigError::Key`] se le due chiavi coincidono.
+/// Like [`load_identity`] for each file; [`ConfigError::Key`] if the two keys are identical.
 pub fn load_keyring(current: &Path, previous: Option<&Path>) -> Result<Keyring, ConfigError> {
     let key = load_identity(current)?;
     match previous {
@@ -271,11 +272,11 @@ pub fn load_keyring(current: &Path, previous: Option<&Path>) -> Result<Keyring, 
     }
 }
 
-/// Genera una nuova identità e la scrive in un file nuovo con permessi `0600`.
-/// Non sovrascrive mai un file esistente.
+/// Generates a new identity and writes it to a new file with `0600` permissions.
+/// Never overwrites an existing file.
 ///
 /// # Errors
-/// File già esistente, errore di I/O, RNG non disponibile.
+/// File already exists, I/O error, RNG unavailable.
 pub fn create_identity(path: &Path) -> Result<Identity, ConfigError> {
     let identity = Identity::generate().map_err(|source| ConfigError::Key {
         path: path.display().to_string(),
@@ -288,7 +289,7 @@ pub fn create_identity(path: &Path) -> Result<Identity, ConfigError> {
     Ok(identity)
 }
 
-/// Scrive `contents` in un file **nuovo** con permessi `0600` e lo sincronizza su disco.
+/// Writes `contents` to a **new** file with `0600` permissions and syncs it to disk.
 fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     use std::io::Write;
     let display = path.display().to_string();
@@ -313,7 +314,7 @@ fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
 #[serde(deny_unknown_fields)]
 struct AgentEntry {
     node: String,
-    /// Una chiave; durante una rotazione si usa `public_keys` (PROTOCOL §14).
+    /// A single key; during a rotation `public_keys` is used (PROTOCOL §14).
     #[serde(default)]
     public_key: Option<String>,
     #[serde(default)]
@@ -343,8 +344,8 @@ struct NodeEntry {
     public_key: String,
 }
 
-/// Una voce `[[authorities]]` (PROTOCOL §15.9, OPERATIONS §10.2), uguale nella policy del
-/// relay e nei `clients.toml` degli agent.
+/// An `[[authorities]]` entry (PROTOCOL §15.9, OPERATIONS §10.2), identical in the relay policy
+/// and in the agents' `clients.toml`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorityEntry {
@@ -390,27 +391,27 @@ struct NodesFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientFile {
-    /// Forma con un solo relay.
+    /// Form with a single relay.
     #[serde(default)]
     relay: Option<String>,
     #[serde(default)]
     relay_key: Option<String>,
-    /// Forma con più relay, in ordine di preferenza (PROTOCOL §13).
+    /// Form with several relays, in order of preference (PROTOCOL §13).
     #[serde(default)]
     relays: Vec<RelayEntry>,
     key: String,
-    /// File del certificato del client (PROTOCOL §15), relativo a questo file.
+    /// Client certificate file (PROTOCOL §15), relative to this file.
     #[serde(default)]
     certificate: Option<String>,
     #[serde(default)]
     nodes: Vec<NodeEntry>,
 }
 
-/// Sostituisce le sequenze esadecimali lunghe (32 caratteri o più) di un messaggio del parser.
+/// Replaces long hexadecimal sequences (32 characters or more) in a parser message.
 ///
-/// serde riporta nomi di campo e valori sbagliati: una chiave privata incollata per errore in un
-/// file di trust finirebbe nel messaggio, e da lì nel journal (finding 0004-6, trovato dal
-/// fuzzer `config_parsers`).
+/// serde reports field names and wrong values: a private key pasted by mistake into a trust
+/// file would end up in the message, and from there in the journal (finding 0004-6, found by
+/// the `config_parsers` fuzzer).
 fn redact_hex(message: &str) -> String {
     const MIN: usize = 32;
     let mut out = String::with_capacity(message.len());
@@ -451,21 +452,21 @@ impl Ctx<'_> {
             source,
         })
     }
-    /// Una chiave che DEVE essere la codifica canonica di un punto valido e non debole: le
-    /// chiavi di CA e della denylist (il confronto byte per byte del passo 5 di PROTOCOL §15.4
-    /// presuppone pin canonici).
+    /// A key that MUST be the canonical encoding of a valid, non-weak point: the CA and
+    /// denylist keys (the byte-by-byte comparison in step 5 of PROTOCOL §15.4 assumes
+    /// canonical pins).
     fn canonical_key(&self, entry: &str, text: &str) -> Result<PublicKey, ConfigError> {
         let fail = |source| ConfigError::Key {
             path: self.0.into(),
             entry: entry.into(),
             source,
         };
-        // Esattamente 64 caratteri esadecimali, senza spazi (`FromStr` li toglierebbe).
+        // Exactly 64 hexadecimal characters, no spaces (`FromStr` would strip them).
         if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(fail(CryptoError::InvalidKey));
         }
         let parsed: PublicKey = text.parse().map_err(fail)?;
-        // `to_bytes` restituisce i 32 byte scritti, non la ricodifica del punto.
+        // `to_bytes` returns the 32 bytes as written, not the re-encoding of the point.
         PublicKey::from_canonical_bytes(&parsed.to_bytes()).map_err(fail)
     }
     fn allowed(&self, entry: &str, allow: &[String]) -> Result<AllowedNodes, ConfigError> {
@@ -490,28 +491,28 @@ impl Ctx<'_> {
     }
 }
 
-/// Interpreta la policy del relay.
+/// Parses the relay policy.
 ///
 /// ```toml
 /// [[agents]]
 /// node = "web-01"
-/// public_key = "<64 hex>"    # in rotazione: public_keys = ["<nuova>", "<vecchia>"]
+/// public_key = "<64 hex>"    # during rotation: public_keys = ["<new>", "<old>"]
 ///
 /// [[clients]]
 /// name = "ansible"
 /// public_key = "<64 hex>"
-/// allow = ["web-01"]      # oppure ["*"] per tutti i nodi
+/// allow = ["web-01"]      # or ["*"] for every node
 /// ```
 ///
 /// # Errors
-/// Qualsiasi voce non valida, duplicata o in conflitto.
+/// Any invalid, duplicate or conflicting entry.
 pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigError> {
     let ctx = Ctx(origin);
     let file: PolicyFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
     let mut policy = AccessPolicy::new();
     for entry in &file.agents {
         let node = ctx.node(&entry.node, &entry.node)?;
-        // `public_key` oppure `public_keys` (rotazione), mai entrambi né nessuno.
+        // `public_key` or `public_keys` (rotation), never both nor neither.
         let texts: Vec<&str> = match (&entry.public_key, entry.public_keys.as_slice()) {
             (Some(one), []) => vec![one.as_str()],
             (None, many) if !many.is_empty() => many.iter().map(String::as_str).collect(),
@@ -533,7 +534,7 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
             .add_client(key.fingerprint(), ClientGrant { name, allowed })
             .map_err(|e| ctx.domain(&entry.name, e))?;
     }
-    // Le CA per ultime: `set_cert_trust` rifiuta una chiave di CA uguale a quella di un peer.
+    // The CAs last: `set_cert_trust` rejects a CA key equal to that of a peer.
     let trust = parse_authorities(&ctx, &file.authorities)?;
     policy
         .set_cert_trust(trust)
@@ -541,12 +542,12 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
     Ok(policy)
 }
 
-/// Le voci `[[authorities]]` (PROTOCOL §15.9), senza denylist.
+/// The `[[authorities]]` entries (PROTOCOL §15.9), without a denylist.
 fn parse_authorities(ctx: &Ctx<'_>, entries: &[AuthorityEntry]) -> Result<CertTrust, ConfigError> {
     let mut trust = CertTrust::new();
     for entry in entries {
         let name = ctx.node(&entry.name, &entry.name)?;
-        // `public_key` oppure `public_keys` (rotazione), mai entrambi né nessuno.
+        // `public_key` or `public_keys` (rotation), never both nor neither.
         let texts: Vec<&str> = match (&entry.public_key, entry.public_keys.as_slice()) {
             (Some(one), []) => vec![one.as_str()],
             (None, many) if !many.is_empty() => many.iter().map(String::as_str).collect(),
@@ -570,11 +571,11 @@ fn parse_authorities(ctx: &Ctx<'_>, entries: &[AuthorityEntry]) -> Result<CertTr
     Ok(trust)
 }
 
-/// Interpreta l'elenco dei client che un agent accetta end-to-end (stesso formato della
-/// sezione `[[clients]]` della policy; `allow` è ignorato).
+/// Parses the list of clients an agent accepts end-to-end (same format as the `[[clients]]`
+/// section of the policy; `allow` is ignored).
 ///
 /// # Errors
-/// Qualsiasi voce non valida.
+/// Any invalid entry.
 pub fn parse_authorized_clients(
     origin: &str,
     text: &str,
@@ -584,7 +585,7 @@ pub fn parse_authorized_clients(
     let mut clients = AuthorizedClients::new();
     for entry in &file.clients {
         let key = ctx.key(&entry.name, &entry.public_key)?;
-        // Una chiave ripetuta non è un errore (era un insieme prima della Fase 6).
+        // A repeated key is not an error (it was a set before Phase 6).
         if !clients.contains_key(&key.fingerprint()) {
             clients
                 .add_client(key.fingerprint())
@@ -598,10 +599,10 @@ pub fn parse_authorized_clients(
     Ok(clients)
 }
 
-/// Interpreta la denylist `revoked.toml` (`serials`, `keys`; PROTOCOL §15.8).
+/// Parses the `revoked.toml` denylist (`serials`, `keys`; PROTOCOL §15.8).
 ///
 /// # Errors
-/// Qualsiasi voce non valida, o oltre i limiti.
+/// Any invalid entry, or one over the limits.
 pub fn parse_revocations(origin: &str, text: &str) -> Result<Revocations, ConfigError> {
     let ctx = Ctx(origin);
     let file: RevocationsFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
@@ -623,7 +624,7 @@ pub fn parse_revocations(origin: &str, text: &str) -> Result<Revocations, Config
     Revocations::new(serials, keys).map_err(|e| ctx.domain("revocations", e))
 }
 
-/// 32 caratteri esadecimali → 16 byte.
+/// 32 hexadecimal characters → 16 bytes.
 fn decode_hex16(text: &str) -> Option<[u8; CertSerial::LEN]> {
     fn nibble(c: u8) -> Option<u8> {
         match c {
@@ -645,8 +646,8 @@ fn decode_hex16(text: &str) -> Option<[u8; CertSerial::LEN]> {
     Some(out)
 }
 
-/// Un numero di serie: esattamente 32 caratteri esadecimali, mai tutto zero. L'errore non
-/// riporta il valore.
+/// A serial number: exactly 32 hexadecimal characters, never all zero. The error does not
+/// report the value.
 fn parse_serial(ctx: &Ctx<'_>, index: usize, text: &str) -> Result<CertSerial, ConfigError> {
     let fail = |message: &str| ConfigError::Syntax {
         path: ctx.0.into(),
@@ -657,19 +658,19 @@ fn parse_serial(ctx: &Ctx<'_>, index: usize, text: &str) -> Result<CertSerial, C
     CertSerial::try_from(bytes).map_err(|_| fail("a serial must not be all zeros"))
 }
 
-/// Un file di certificato letto e decodificato (la firma la verificano relay e agent).
+/// A certificate file, read and decoded (relay and agent verify the signature).
 #[derive(Debug, Clone)]
 pub struct CertificateFile {
-    /// I byte del certificato, da inviare nel messaggio 1.
+    /// The certificate bytes, to be sent in message 1.
     pub bytes: Arc<[u8]>,
-    /// Il corpo decodificato.
+    /// The decoded body.
     pub body: CertBody,
 }
 
-/// Interpreta un file di certificato (`tcn-client-cert-v1:<hex>`, PROTOCOL §15.1).
+/// Parses a certificate file (`tcn-client-cert-v1:<hex>`, PROTOCOL §15.1).
 ///
 /// # Errors
-/// [`ConfigError::Certificate`] per un testo o un certificato non validi.
+/// [`ConfigError::Certificate`] for an invalid text or certificate.
 pub fn parse_certificate_file(origin: &str, text: &str) -> Result<CertificateFile, ConfigError> {
     let fail = |source| ConfigError::Certificate {
         path: origin.into(),
@@ -683,20 +684,20 @@ pub fn parse_certificate_file(origin: &str, text: &str) -> Result<CertificateFil
     })
 }
 
-/// Legge un file di certificato, con le regole dei file di trust.
+/// Reads a certificate file, with the trust file rules.
 ///
 /// # Errors
-/// Come [`parse_certificate_file`]; file insicuro, illeggibile o troppo grande.
+/// Like [`parse_certificate_file`]; insecure, unreadable or too large file.
 pub fn load_certificate(path: &Path) -> Result<CertificateFile, ConfigError> {
     let text = read_file_bounded(open_trusted(path, false)?, path, MAX_CERT_FILE_LEN)?;
     parse_certificate_file(&path.display().to_string(), &text)
 }
 
-/// Genera la chiave di una CA e la scrive in un file nuovo con permessi `0600`. Non
-/// sovrascrive mai un file esistente.
+/// Generates a CA key and writes it to a new file with `0600` permissions. Never overwrites
+/// an existing file.
 ///
 /// # Errors
-/// File già esistente, errore di I/O, RNG non disponibile.
+/// File already exists, I/O error, RNG unavailable.
 pub fn create_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
     let ca = CaSigningKey::generate().map_err(|source| ConfigError::Key {
         path: path.display().to_string(),
@@ -707,10 +708,10 @@ pub fn create_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
     Ok(ca)
 }
 
-/// Carica la chiave di una CA, con le regole delle chiavi segrete.
+/// Loads a CA key, with the secret key rules.
 ///
 /// # Errors
-/// Come [`load_identity`]; un file di chiave di nodo è rifiutato.
+/// Like [`load_identity`]; a node key file is rejected.
 pub fn load_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
     let file = open_trusted(path, true)?;
     let text = zeroize::Zeroizing::new(read_file_limited(file, path)?);
@@ -721,10 +722,10 @@ pub fn load_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
     })
 }
 
-/// Interpreta l'elenco dei nodi noti a un client (`[[nodes]] node, public_key`).
+/// Parses the list of nodes known to a client (`[[nodes]] node, public_key`).
 ///
 /// # Errors
-/// Qualsiasi voce non valida o duplicata.
+/// Any invalid or duplicate entry.
 pub fn parse_known_nodes(
     origin: &str,
     text: &str,
@@ -742,27 +743,27 @@ pub fn parse_known_nodes(
     Ok(nodes)
 }
 
-/// Legge e interpreta la policy del relay. Una policy con `[[authorities]]` richiede
-/// [`load_relay_policy`] con una denylist.
+/// Reads and parses the relay policy. A policy with `[[authorities]]` requires
+/// [`load_relay_policy`] with a denylist.
 ///
 /// # Errors
-/// Vedi [`parse_policy`]; [`ConfigError::RevocationsRequired`] con una CA.
+/// See [`parse_policy`]; [`ConfigError::RevocationsRequired`] with a CA.
 pub fn load_policy(path: &Path) -> Result<AccessPolicy, ConfigError> {
     load_relay_policy(path, None)
 }
 
-/// Legge la policy del relay e, se c'è, la denylist, in un solo passo: se uno dei due file non
-/// è valido non si carica nulla (PROTOCOL §15.8).
+/// Reads the relay policy and, if present, the denylist, in a single step: if either file is
+/// invalid nothing is loaded (PROTOCOL §15.8).
 ///
 /// # Errors
-/// Vedi [`parse_policy`] e [`parse_revocations`]; [`ConfigError::RevocationsRequired`] con una
-/// CA e senza denylist.
+/// See [`parse_policy`] and [`parse_revocations`]; [`ConfigError::RevocationsRequired`] with a
+/// CA and no denylist.
 pub fn load_relay_policy(
     policy: &Path,
     revocations: Option<&Path>,
 ) -> Result<AccessPolicy, ConfigError> {
     let origin = policy.display().to_string();
-    // Entrambi i file letti e validati prima di costruire il risultato: nessun effetto parziale.
+    // Both files read and validated before building the result: no partial effect.
     let text = read_limited(policy)?;
     let revoked = revocations.map(load_revocations).transpose()?;
     let mut parsed = parse_policy(&origin, &text)?;
@@ -773,8 +774,8 @@ pub fn load_relay_policy(
     Ok(parsed)
 }
 
-/// Le chiavi di un keyring (corrente e precedente) come chiavi vietate alle CA, con il ruolo
-/// da riportare nell'errore (es. `"relay"`, `"agent"`).
+/// The keys of a keyring (current and previous) as keys forbidden to CAs, with the role to
+/// report in the error (e.g. `"relay"`, `"agent"`).
 #[must_use]
 pub fn own_keys(keys: &Keyring, role: &'static str) -> Vec<ForbiddenKey> {
     std::iter::once(keys.current())
@@ -786,24 +787,23 @@ pub fn own_keys(keys: &Keyring, role: &'static str) -> Vec<ForbiddenKey> {
         .collect()
 }
 
-/// Una chiave che nessuna CA della configurazione può avere (PROTOCOL §15.9): la chiave del
-/// processo o quella di un relay pinnato.
+/// A key that no CA in the configuration may have (PROTOCOL §15.9): the process's key or
+/// that of a pinned relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForbiddenKey {
-    /// L'impronta della chiave.
+    /// The fingerprint of the key.
     pub fingerprint: zt_domain::Fingerprint,
-    /// Il ruolo della chiave, per il messaggio d'errore.
+    /// The role of the key, for the error message.
     pub role: &'static str,
 }
 
-/// Rifiuta una CA la cui chiave è una di `forbidden` (PROTOCOL §15.9, finding 0006-1): un
-/// relay o un agent non è mai anche una CA della propria configurazione (chiave corrente o
-/// precedente, [`own_keys`]) e un agent non accetta come CA nessun `--relay-key`. Un relay
-/// compromesso non deve poter firmare certificati che l'agent ammette con il proprio seme di
-/// nodo.
+/// Rejects a CA whose key is one of `forbidden` (PROTOCOL §15.9, finding 0006-1): a relay or
+/// an agent is never also a CA of its own configuration (current or previous key,
+/// [`own_keys`]) and an agent does not accept any `--relay-key` as a CA. A compromised relay
+/// must not be able to sign certificates that the agent admits with its own node seed.
 ///
 /// # Errors
-/// [`ConfigError::AuthorityIsInfrastructureKey`] per la prima CA vietata.
+/// [`ConfigError::AuthorityIsInfrastructureKey`] for the first forbidden CA.
 pub fn reject_infrastructure_keys_as_authority(
     origin: &str,
     trust: &CertTrust,
@@ -821,12 +821,12 @@ pub fn reject_infrastructure_keys_as_authority(
     Ok(())
 }
 
-/// Legge una denylist con le regole dei file di trust.
+/// Reads a denylist with the trust file rules.
 fn load_revocations(path: &Path) -> Result<Revocations, ConfigError> {
     parse_revocations(&path.display().to_string(), &read_limited(path)?)
 }
 
-/// Le CA di `trust` con la denylist; una CA senza denylist non è avviabile (PROTOCOL §15.8).
+/// The CAs of `trust` with the denylist; a CA without a denylist cannot start (PROTOCOL §15.8).
 fn with_revocations(
     trust: &CertTrust,
     revoked: Option<Revocations>,
@@ -842,10 +842,10 @@ fn with_revocations(
     Ok(trust)
 }
 
-/// Legge e interpreta i client autorizzati di un agent e, se c'è, la denylist.
+/// Reads and parses the authorized clients of an agent and, if present, the denylist.
 ///
 /// # Errors
-/// Vedi [`parse_authorized_clients`] e [`load_relay_policy`].
+/// See [`parse_authorized_clients`] and [`load_relay_policy`].
 pub fn load_authorized_clients(
     path: &Path,
     revocations: Option<&Path>,
@@ -861,36 +861,36 @@ pub fn load_authorized_clients(
     Ok(clients)
 }
 
-/// Legge e interpreta i nodi noti a un client.
+/// Reads and parses the nodes known to a client.
 ///
 /// # Errors
-/// Vedi [`parse_known_nodes`].
+/// See [`parse_known_nodes`].
 pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PublicKey>, ConfigError> {
     parse_known_nodes(&path.display().to_string(), &read_limited(path)?)
 }
 
-/// Lunghezza massima dell'indirizzo del relay (nome DNS completo più porta).
+/// Maximum length of the relay address (full DNS name plus port).
 const MAX_RELAY_LEN: usize = 261;
 
-/// Configurazione di `zt-client`.
+/// `zt-client` configuration.
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
-    /// Relay da provare nell'ordine, ciascuno con la chiave pinnata (PROTOCOL §13).
+    /// Relays to try in order, each with its pinned key (PROTOCOL §13).
     pub relays: Vec<crate::RelayEndpoint>,
-    /// File della chiave segreta del client.
+    /// The client's secret key file.
     pub key: std::path::PathBuf,
-    /// Nodi raggiungibili, ciascuno con la chiave pinnata del suo agent. Un nodo assente non
-    /// è raggiungibile: non esiste trust-on-first-use.
+    /// Reachable nodes, each with the pinned key of its agent. A missing node is not
+    /// reachable: there is no trust-on-first-use.
     pub nodes: HashMap<NodeId, PublicKey>,
-    /// File del certificato del client, se configurato (PROTOCOL §15).
+    /// The client certificate file, if configured (PROTOCOL §15).
     pub certificate: Option<std::path::PathBuf>,
 }
 
 impl ClientSettings {
-    /// Configurazione di connessione verso `node`.
+    /// Connection configuration towards `node`.
     ///
     /// # Errors
-    /// [`ConfigError::UnknownNode`] se il nodo non ha una chiave pinnata.
+    /// [`ConfigError::UnknownNode`] if the node has no pinned key.
     pub fn client_config(
         &self,
         node: &NodeId,
@@ -910,12 +910,12 @@ impl ClientSettings {
     }
 }
 
-/// Elenco dei relay da indirizzi e chiavi appaiati per posizione (opzioni ripetute di
-/// `zt-agent`, o voci `[[relays]]` del client). Da 1 a [`crate::MAX_RELAYS`] voci, stesso
-/// numero di indirizzi e di chiavi, nessun indirizzo e nessuna chiave ripetuti.
+/// List of relays from addresses and keys paired by position (repeated `zt-agent` options, or
+/// the client's `[[relays]]` entries). From 1 to [`crate::MAX_RELAYS`] entries, the same number
+/// of addresses and keys, no repeated address and no repeated key.
 ///
 /// # Errors
-/// [`ConfigError::Syntax`] per un elenco che non rispetta le regole.
+/// [`ConfigError::Syntax`] for a list that does not follow the rules.
 pub fn relay_endpoints(
     origin: &str,
     addresses: &[String],
@@ -950,7 +950,7 @@ pub fn relay_endpoints(
     Ok(out)
 }
 
-/// `host:porta` con porta numerica non nulla, senza spazi né caratteri di controllo.
+/// `host:port` with a non-zero numeric port, without spaces or control characters.
 fn valid_relay(text: &str) -> bool {
     if text.is_empty()
         || text.len() > MAX_RELAY_LEN
@@ -966,13 +966,13 @@ fn valid_relay(text: &str) -> bool {
     }
 }
 
-/// Interpreta la configurazione del client. `base` è la directory del file: un percorso
-/// relativo della chiave si risolve rispetto a essa.
+/// Parses the client configuration. `base` is the directory of the file: a relative key path
+/// is resolved against it.
 ///
 /// ```toml
 /// relay = "relay.example.org:7443"
 /// relay_key = "<64 hex>"
-/// # oppure, con più relay provati nell'ordine (PROTOCOL §13):
+/// # or, with several relays tried in order (PROTOCOL §13):
 /// # [[relays]]
 /// # address = "r1.example.org:7443"
 /// # public_key = "<64 hex>"
@@ -984,7 +984,7 @@ fn valid_relay(text: &str) -> bool {
 /// ```
 ///
 /// # Errors
-/// Qualsiasi voce non valida, duplicata o in conflitto.
+/// Any invalid, duplicate or conflicting entry.
 pub fn parse_client_settings(
     origin: &str,
     base: &Path,
@@ -992,7 +992,7 @@ pub fn parse_client_settings(
 ) -> Result<ClientSettings, ConfigError> {
     let ctx = Ctx(origin);
     let file: ClientFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
-    // `relay` + `relay_key` oppure `[[relays]]`, mai entrambi.
+    // `relay` + `relay_key` or `[[relays]]`, never both.
     let (addresses, key_texts): (Vec<String>, Vec<String>) =
         match (&file.relay, &file.relay_key, file.relays.as_slice()) {
             (Some(relay), Some(key), []) => (vec![relay.clone()], vec![key.clone()]),
@@ -1046,10 +1046,10 @@ pub fn parse_client_settings(
     })
 }
 
-/// Legge e interpreta la configurazione del client.
+/// Reads and parses the client configuration.
 ///
 /// # Errors
-/// Vedi [`parse_client_settings`]; inoltre file scrivibile da gruppo o altri.
+/// See [`parse_client_settings`]; also a file writable by group or others.
 pub fn load_client_settings(path: &Path) -> Result<ClientSettings, ConfigError> {
     let base = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,

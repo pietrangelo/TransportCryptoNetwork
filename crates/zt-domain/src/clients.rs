@@ -1,4 +1,4 @@
-//! I client che un agent accetta end-to-end: whitelist per chiave e CA pinnate
+//! The clients an agent accepts end-to-end: per-key whitelist and pinned CAs
 //! (PROTOCOL §15.4, §15.5).
 
 use std::collections::HashSet;
@@ -12,7 +12,7 @@ use crate::ids::NodeId;
 use crate::policy::ClientCredential;
 use crate::trust::CertTrust;
 
-/// Client autorizzati di un agent.
+/// Authorized clients of an agent.
 #[derive(Debug, Clone, Default)]
 pub struct AuthorizedClients {
     keys: HashSet<Fingerprint>,
@@ -20,16 +20,16 @@ pub struct AuthorizedClients {
 }
 
 impl AuthorizedClients {
-    /// Nessun client.
+    /// No clients.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Aggiunge una chiave alla whitelist.
+    /// Adds a key to the whitelist.
     ///
     /// # Errors
-    /// [`DomainError::DuplicatePeer`] se la chiave è già presente o è la chiave di una CA.
+    /// [`DomainError::DuplicatePeer`] if the key is already present or is a CA key.
     pub fn add_client(&mut self, key: Fingerprint) -> Result<(), DomainError> {
         if self.trust.ca_fingerprints().any(|ca| ca == key) || !self.keys.insert(key) {
             return Err(DomainError::DuplicatePeer(key));
@@ -37,10 +37,10 @@ impl AuthorizedClients {
         Ok(())
     }
 
-    /// Imposta le CA pinnate e la denylist.
+    /// Sets the pinned CAs and the denylist.
     ///
     /// # Errors
-    /// [`DomainError::DuplicatePeer`] se una chiave di CA è anche una chiave di client.
+    /// [`DomainError::DuplicatePeer`] if a CA key is also a client key.
     pub fn set_cert_trust(&mut self, trust: CertTrust) -> Result<(), DomainError> {
         if let Some(ca) = trust.ca_fingerprints().find(|ca| self.keys.contains(ca)) {
             return Err(DomainError::DuplicatePeer(ca));
@@ -49,22 +49,22 @@ impl AuthorizedClients {
         Ok(())
     }
 
-    /// Le CA pinnate e la denylist.
+    /// The pinned CAs and the denylist.
     #[must_use]
     pub const fn cert_trust(&self) -> &CertTrust {
         &self.trust
     }
 
-    /// `true` se la chiave è nella whitelist (senza considerare la denylist).
+    /// `true` if the key is in the whitelist (without considering the denylist).
     #[must_use]
     pub fn contains_key(&self, key: &Fingerprint) -> bool {
         self.keys.contains(key)
     }
 
-    /// Passi 1, 2, 5, 7–10 e 12 di PROTOCOL §15.4.
+    /// Steps 1, 2, 5, 7–10 and 12 of PROTOCOL §15.4.
     ///
     /// # Errors
-    /// Il motivo del rifiuto, per l'audit.
+    /// The rejection reason, for the audit.
     pub fn admit(
         &self,
         peer: &Fingerprint,
@@ -72,12 +72,12 @@ impl AuthorizedClients {
         node: &NodeId,
         now: UnixTime,
     ) -> Result<ClientCredential, AuthFailureReason> {
-        // Passo 1.
+        // Step 1.
         if self.trust.is_key_revoked(peer) {
             return Err(AuthFailureReason::KeyRevoked);
         }
         let Some(claims) = cert else {
-            // Passo 2: solo la whitelist decide.
+            // Step 2: only the whitelist decides.
             return if self.keys.contains(peer) {
                 Ok(ClientCredential::Key)
             } else {
@@ -87,16 +87,16 @@ impl AuthorizedClients {
         if claims.subject() != peer {
             return Err(AuthFailureReason::Certificate(CertRejection::KeyMismatch));
         }
-        // Passi 5 e 7–10, anche per una chiave della whitelist (fail closed).
+        // Steps 5 and 7–10, even for a whitelisted key (fail closed).
         let authority = self
             .trust
             .check(claims, now)
             .map_err(AuthFailureReason::Certificate)?;
-        // La whitelist ha la precedenza: il certificato è solo verificato.
+        // The whitelist takes precedence: the certificate is only verified.
         if self.keys.contains(peer) {
             return Ok(ClientCredential::Key);
         }
-        // Passo 12.
+        // Step 12.
         if !authority.permits(claims, node) {
             return Err(AuthFailureReason::Certificate(
                 CertRejection::NodeOutOfScope,
@@ -105,7 +105,7 @@ impl AuthorizedClients {
         Ok(ClientCredential::Certificate(Arc::clone(claims)))
     }
 
-    /// Per la revoca a caldo e la scadenza: la credenziale vale ancora?
+    /// For hot revocation and expiry: is the credential still valid?
     #[must_use]
     pub fn still_admits(
         &self,
@@ -131,7 +131,7 @@ impl AuthorizedClients {
 }
 
 impl FromIterator<Fingerprint> for AuthorizedClients {
-    /// Una whitelist da un elenco di chiavi (duplicati ignorati), senza CA.
+    /// A whitelist from a list of keys (duplicates ignored), without CAs.
     fn from_iter<I: IntoIterator<Item = Fingerprint>>(keys: I) -> Self {
         Self {
             keys: keys.into_iter().collect(),

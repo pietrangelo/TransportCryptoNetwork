@@ -1,4 +1,4 @@
-//! Configurazione: input validi e input malevoli o sbagliati.
+//! Configuration: valid inputs and malicious or wrong inputs.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -46,17 +46,17 @@ fn policy_grants_what_it_says_and_nothing_more() {
 fn rejects_typos_unknown_fields_and_bad_values() {
     let k = key();
     let cases = [
-        format!("[[agent]]\nnode = \"web\"\npublic_key = \"{k}\""), // sezione sbagliata
-        format!("[[agents]]\nnode = \"web\"\npublic_key = \"{k}\"\nrole = \"x\""), // campo sconosciuto
-        format!("[[agents]]\nnode = \"Web\"\npublic_key = \"{k}\""), // NodeId non valido
-        "[[agents]]\nnode = \"web\"\npublic_key = \"00\"".to_string(), // chiave corta
+        format!("[[agent]]\nnode = \"web\"\npublic_key = \"{k}\""), // wrong section
+        format!("[[agents]]\nnode = \"web\"\npublic_key = \"{k}\"\nrole = \"x\""), // unknown field
+        format!("[[agents]]\nnode = \"Web\"\npublic_key = \"{k}\""), // invalid NodeId
+        "[[agents]]\nnode = \"web\"\npublic_key = \"00\"".to_string(), // short key
         format!("[[clients]]\nname = \"a\"\npublic_key = \"{k}\"\nallow = [\"../etc\"]"),
         format!(
             "[[agents]]\nnode = \"a\"\npublic_key = \"{k}\"\n[[agents]]\nnode = \"b\"\npublic_key = \"{k}\""
-        ), // chiave duplicata
+        ), // duplicate key
         format!(
             "[[agents]]\nnode = \"a\"\npublic_key = \"{k}\"\n[[clients]]\nname = \"c\"\npublic_key = \"{k}\""
-        ), // due ruoli
+        ), // two roles
     ];
     for text in cases {
         assert!(parse_policy("t", &text).is_err(), "accepted:\n{text}");
@@ -138,7 +138,7 @@ fn secret_keys_require_private_permissions_and_are_never_overwritten() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-// ======================= Fase 3: configurazione del client =======================
+// ======================= Phase 3: client configuration =======================
 
 fn client_toml(relay_key: &str, extra: &str) -> String {
     format!(
@@ -164,7 +164,7 @@ fn client_settings_parse_and_resolve_the_key_next_to_the_file() {
     assert_eq!(cfg.node, web);
     assert_eq!(cfg.node_key.to_string(), n);
 
-    // Un percorso assoluto resta tale.
+    // An absolute path stays as it is.
     let abs = text.replace("key = \"client.key\"", "key = \"/secrets/c.key\"");
     let s = zt_net::config::parse_client_settings("t", base, &abs).unwrap();
     assert_eq!(s.key, std::path::PathBuf::from("/secrets/c.key"));
@@ -172,7 +172,7 @@ fn client_settings_parse_and_resolve_the_key_next_to_the_file() {
 
 #[test]
 fn client_settings_have_no_trust_on_first_use() {
-    // Un nodo che non è in [[nodes]] non ha chiave pinnata: niente connessione.
+    // A node that is not in [[nodes]] has no pinned key: no connection.
     let text = client_toml(
         &key(),
         &format!("[[nodes]]\nnode = \"web-01\"\npublic_key = \"{}\"", key()),
@@ -190,16 +190,16 @@ fn client_settings_reject_typos_and_bad_values() {
     let (r, n) = (key(), key());
     let node = format!("[[nodes]]\nnode = \"web-01\"\npublic_key = \"{n}\"");
     let cases = [
-        client_toml(&r, &format!("{node}\nport = 22")), // campo sconosciuto nel nodo
-        format!("{}\nproxy = \"x\"", client_toml(&r, "")), // campo sconosciuto in radice
-        client_toml("00", &node),                       // chiave del relay corta
-        client_toml(&r, &node.replace("web-01", "Web-01")), // NodeId non valido
-        client_toml(&r, &format!("{node}\n{node}")),    // nodo duplicato
-        client_toml(&r, &node).replace("relay.example.org:7443", ""), // relay vuoto
-        client_toml(&r, &node).replace("relay.example.org:7443", "relay.example.org"), // senza porta
-        client_toml(&r, &node).replace("key = \"client.key\"\n", ""), // chiave mancante
-        client_toml(&r, &node).replace("key = \"client.key\"", "key = \"\""), // chiave vuota
-        client_toml(&r, &node).replace(&format!("relay_key = \"{r}\"\n"), ""), // niente pin del relay
+        client_toml(&r, &format!("{node}\nport = 22")), // unknown field in node
+        format!("{}\nproxy = \"x\"", client_toml(&r, "")), // unknown field at root
+        client_toml("00", &node),                       // short relay key
+        client_toml(&r, &node.replace("web-01", "Web-01")), // invalid NodeId
+        client_toml(&r, &format!("{node}\n{node}")),    // duplicate node
+        client_toml(&r, &node).replace("relay.example.org:7443", ""), // empty relay
+        client_toml(&r, &node).replace("relay.example.org:7443", "relay.example.org"), // no port
+        client_toml(&r, &node).replace("key = \"client.key\"\n", ""), // missing key
+        client_toml(&r, &node).replace("key = \"client.key\"", "key = \"\""), // empty key
+        client_toml(&r, &node).replace(&format!("relay_key = \"{r}\"\n"), ""), // no relay pin
     ];
     for text in cases {
         assert!(
@@ -211,7 +211,7 @@ fn client_settings_reject_typos_and_bad_values() {
 
 #[test]
 fn client_relay_key_cannot_be_reused_as_a_node_key() {
-    // Una chiave pinnata due volte con ruoli diversi è quasi certamente un errore di copia.
+    // A key pinned twice with different roles is almost certainly a copy-paste error.
     let r = key();
     let text = client_toml(
         &r,
@@ -220,9 +220,9 @@ fn client_relay_key_cannot_be_reused_as_a_node_key() {
     assert!(zt_net::config::parse_client_settings("t", std::path::Path::new("/"), &text).is_err());
 }
 
-/// Attacco: chi può scrivere un file di trust (pin delle chiavi, policy, client autorizzati)
-/// può sostituire una chiave e mettersi in mezzo. Come OpenSSH con `StrictModes`, un file
-/// scrivibile da gruppo o altri viene rifiutato.
+/// Attack: whoever can write a trust file (key pins, policy, authorized clients) can replace a
+/// key and put themselves in the middle. Like OpenSSH with `StrictModes`, a file writable by
+/// group or others is rejected.
 #[cfg(unix)]
 #[test]
 fn trust_files_writable_by_others_are_refused() {
@@ -278,10 +278,10 @@ fn trust_files_writable_by_others_are_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-// ======================= regressioni adversary review 0003 =======================
+// ======================= adversary review 0003 regressions =======================
 
-/// 0003-1: un file di trust di un altro utente (non root) viene rifiutato anche se i bit di
-/// modo sono corretti. Il controllo è puro, così si prova senza `chown`.
+/// 0003-1: a trust file owned by another user (not root) is rejected even if the mode bits are
+/// correct. The check is pure, so it can be tested without `chown`.
 #[cfg(unix)]
 #[test]
 fn trust_files_owned_by_another_user_are_refused() {
@@ -303,7 +303,7 @@ fn trust_files_owned_by_another_user_are_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// 0003-1: un FIFO al posto del file bloccava per sempre `open`; ora è rifiutato subito.
+/// 0003-1: a FIFO in place of the file blocked `open` forever; now it is rejected immediately.
 #[cfg(unix)]
 #[test]
 fn non_regular_trust_and_key_files_are_refused_without_blocking() {
@@ -340,7 +340,7 @@ fn non_regular_trust_and_key_files_are_refused_without_blocking() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("open blocked on a FIFO");
     assert!(ok);
-    // Anche una directory non è un file di configurazione.
+    // A directory is not a configuration file either.
     assert!(matches!(
         zt_net::config::load_policy(&dir),
         Err(ConfigError::NotRegular(_))
@@ -348,8 +348,8 @@ fn non_regular_trust_and_key_files_are_refused_without_blocking() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// 0003-1: chi può scrivere nella directory può sostituire il file (rename), quindi la
-/// directory che lo contiene deve essere protetta quanto il file.
+/// 0003-1: whoever can write to the directory can replace the file (rename), so the directory
+/// containing it must be protected as much as the file.
 #[cfg(unix)]
 #[test]
 fn trust_files_in_a_directory_writable_by_others_are_refused() {
@@ -385,8 +385,8 @@ fn trust_files_in_a_directory_writable_by_others_are_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Finding 0004-6 (dal fuzzer `config_parsers`): una chiave privata incollata per errore in un
-/// file di trust non deve finire nel messaggio d'errore, e quindi nel journal.
+/// Finding 0004-6 (from the `config_parsers` fuzzer): a private key pasted by mistake into a
+/// trust file must not end up in the error message, and thus in the journal.
 #[test]
 fn a_secret_pasted_into_a_trust_file_is_not_echoed_in_the_error() {
     let secret = Identity::generate().unwrap().to_secret_hex();
@@ -412,7 +412,7 @@ fn a_secret_pasted_into_a_trust_file_is_not_echoed_in_the_error() {
     }
 }
 
-// ======================= Fase 5: più relay e rotazione =======================
+// ======================= Phase 5: multiple relays and rotation =======================
 
 fn relays_toml(entries: &[(&str, &str)], extra: &str) -> String {
     use std::fmt::Write as _;
@@ -453,7 +453,7 @@ fn a_client_lists_several_relays_in_order() {
 #[test]
 fn a_relay_list_must_be_unambiguous_and_bounded() {
     let (a, b) = (key(), key());
-    // Entrambe le forme insieme, o nessuna.
+    // Both forms together, or neither.
     let both = format!(
         "relay = \"r0.example.org:7443\"\nrelay_key = \"{a}\"\n{}",
         relays_toml(&[("r1.example.org:7443", &b)], "")
@@ -467,7 +467,7 @@ fn a_relay_list_must_be_unambiguous_and_bounded() {
         parse_client("relay = \"r.example.org:7443\"\nkey = \"client.key\"\n").is_err(),
         "relay without relay_key"
     );
-    // Indirizzo o chiave ripetuti.
+    // Repeated address or key.
     assert!(
         parse_client(&relays_toml(
             &[("r1.example.org:7443", &a), ("r1.example.org:7443", &b)],
@@ -482,9 +482,9 @@ fn a_relay_list_must_be_unambiguous_and_bounded() {
         ))
         .is_err()
     );
-    // Indirizzo non valido.
+    // Invalid address.
     assert!(parse_client(&relays_toml(&[("r1.example.org", &a)], "")).is_err());
-    // Al massimo MAX_RELAYS.
+    // At most MAX_RELAYS.
     let many: Vec<(String, String)> = (0..=zt_net::MAX_RELAYS)
         .map(|i| (format!("r{i}.example.org:7443"), key()))
         .collect();

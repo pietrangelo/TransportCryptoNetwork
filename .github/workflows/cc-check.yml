@@ -2,7 +2,7 @@ name: Encrypted Claude configuration
 
 on: [push, pull_request]
 
-# Il controllo legge soltanto i file del commit.
+# The check only reads the files in the commit.
 permissions:
   contents: read
 

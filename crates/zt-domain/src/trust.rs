@@ -1,4 +1,4 @@
-//! Fiducia nei certificati: CA pinnate, denylist, controlli 5 e 7–10 di PROTOCOL §15.4.
+//! Certificate trust: pinned CAs, denylist, checks 5 and 7–10 of PROTOCOL §15.4.
 
 use std::collections::HashSet;
 
@@ -12,17 +12,17 @@ use crate::limits::{
 };
 use crate::policy::AllowedNodes;
 
-/// Una chiave pubblica di CA pinnata: i 32 byte (confronto byte per byte con `ca_key`) e la
-/// fingerprint (forma X25519, per i conflitti con le chiavi dei peer e per i log).
+/// A pinned CA public key: the 32 bytes (byte-by-byte comparison with `ca_key`) and the
+/// fingerprint (X25519 form, for conflicts with peer keys and for the logs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedCaKey {
-    /// I 32 byte Ed25519, già validati come punto canonico e non debole da `zt-crypto`.
+    /// The 32 Ed25519 bytes, already validated by `zt-crypto` as a canonical, non-weak point.
     pub key: CertKey,
-    /// La fingerprint della chiave.
+    /// The fingerprint of the key.
     pub fingerprint: Fingerprint,
 }
 
-/// Una voce `[[authorities]]`.
+/// An `[[authorities]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authority {
     name: NodeId,
@@ -32,31 +32,31 @@ pub struct Authority {
 }
 
 impl Authority {
-    /// Nome della CA (solo per i log).
+    /// Name of the CA (for the logs only).
     #[must_use]
     pub const fn name(&self) -> &NodeId {
         &self.name
     }
 
-    /// Una o due chiavi.
+    /// One or two keys.
     #[must_use]
     pub fn keys(&self) -> &[TrustedCaKey] {
         &self.keys
     }
 
-    /// I nodi che la CA può concedere.
+    /// The nodes the CA may grant.
     #[must_use]
     pub const fn allowed(&self) -> &AllowedNodes {
         &self.allowed
     }
 
-    /// Durata massima dei certificati di questa CA.
+    /// Maximum lifetime of this CA's certificates.
     #[must_use]
     pub const fn max_lifetime_secs(&self) -> u64 {
         self.max_lifetime_secs
     }
 
-    /// `true` se `node` è in `ambito(cert) ∩ allow` (PROTOCOL §15.5).
+    /// `true` if `node` is in `scope(cert) ∩ allow` (PROTOCOL §15.5).
     #[must_use]
     pub fn permits(&self, claims: &CertClaims, node: &NodeId) -> bool {
         let in_cert = match claims.scope() {
@@ -66,13 +66,13 @@ impl Authority {
         in_cert && self.allowed.permits(node)
     }
 
-    /// `true` se `key` è una delle chiavi pinnate di questa CA (byte per byte).
+    /// `true` if `key` is one of this CA's pinned keys (byte by byte).
     fn pins(&self, key: &CertKey) -> bool {
         self.keys.iter().any(|k| k.key == *key)
     }
 }
 
-/// La denylist (`revoked.toml`, PROTOCOL §15.8).
+/// The denylist (`revoked.toml`, PROTOCOL §15.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Revocations {
     serials: HashSet<CertSerial>,
@@ -80,16 +80,16 @@ pub struct Revocations {
 }
 
 impl Revocations {
-    /// Una denylist entro i limiti.
+    /// A denylist within the limits.
     ///
     /// # Errors
-    /// [`DomainError::TooManyRevocations`] oltre `MAX_REVOKED_SERIALS` o `MAX_REVOKED_KEYS`.
+    /// [`DomainError::TooManyRevocations`] beyond `MAX_REVOKED_SERIALS` or `MAX_REVOKED_KEYS`.
     pub fn new(
         serials: impl IntoIterator<Item = CertSerial>,
         keys: impl IntoIterator<Item = Fingerprint>,
     ) -> Result<Self, DomainError> {
-        // L'insieme non supera mai il limite di più di una voce: memoria limitata qualunque
-        // sia l'iteratore.
+        // The set never exceeds the limit by more than one entry: bounded memory whatever
+        // the iterator.
         let mut set_serials = HashSet::new();
         for serial in serials {
             set_serials.insert(serial);
@@ -110,26 +110,26 @@ impl Revocations {
         })
     }
 
-    /// `true` se la chiave è revocata.
+    /// `true` if the key is revoked.
     #[must_use]
     pub fn is_key_revoked(&self, key: &Fingerprint) -> bool {
         self.keys.contains(key)
     }
 
-    /// `true` se il numero di serie è revocato.
+    /// `true` if the serial number is revoked.
     #[must_use]
     pub fn is_serial_revoked(&self, serial: &CertSerial) -> bool {
         self.serials.contains(serial)
     }
 
-    /// `(serials, keys)`: quante voci.
+    /// `(serials, keys)`: how many entries.
     #[must_use]
     pub fn counts(&self) -> (usize, usize) {
         (self.serials.len(), self.keys.len())
     }
 }
 
-/// Le CA pinnate di una configurazione e la sua denylist.
+/// The pinned CAs of a configuration and its denylist.
 #[derive(Debug, Clone, Default)]
 pub struct CertTrust {
     authorities: Vec<Authority>,
@@ -137,18 +137,18 @@ pub struct CertTrust {
 }
 
 impl CertTrust {
-    /// Nessuna CA, nessuna denylist.
+    /// No CAs, no denylist.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Aggiunge una CA (PROTOCOL §15.9: vincoli di caricamento).
+    /// Adds a CA (PROTOCOL §15.9: loading constraints).
     ///
     /// # Errors
     /// [`DomainError::AuthorityKeys`], [`DomainError::DuplicateAuthority`],
     /// [`DomainError::AuthorityLifetime`], [`DomainError::TooManyAuthorities`],
-    /// [`DomainError::DuplicatePeer`] per una chiave già in un'altra CA.
+    /// [`DomainError::DuplicatePeer`] for a key already in another CA.
     pub fn add_authority(
         &mut self,
         name: NodeId,
@@ -156,7 +156,7 @@ impl CertTrust {
         allowed: AllowedNodes,
         max_lifetime_secs: u64,
     ) -> Result<(), DomainError> {
-        // Tutti i controlli prima di qualsiasi modifica: nessun effetto parziale.
+        // All checks before any modification: no partial effects.
         let distinct = match keys {
             [_] => true,
             [a, b] => a.key != b.key && a.fingerprint != b.fingerprint,
@@ -176,8 +176,8 @@ impl CertTrust {
         if self.authorities.iter().any(|a| a.name == name) {
             return Err(DomainError::DuplicateAuthority(name));
         }
-        // Una chiave di CA in una sola voce, confrontata sia per byte sia per fingerprint
-        // (`P` e `−P` hanno la stessa fingerprint).
+        // A CA key in a single entry only, compared both by bytes and by fingerprint
+        // (`P` and `−P` have the same fingerprint).
         for key in keys {
             let taken = self
                 .authorities
@@ -197,37 +197,37 @@ impl CertTrust {
         Ok(())
     }
 
-    /// Imposta la denylist.
+    /// Sets the denylist.
     pub fn set_revocations(&mut self, revocations: Revocations) {
         self.revocations = Some(revocations);
     }
 
-    /// `true` se non c'è nessuna CA.
+    /// `true` if there is no CA.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.authorities.is_empty()
     }
 
-    /// `true` se ci sono CA ma nessuna denylist: la configurazione non è avviabile.
+    /// `true` if there are CAs but no denylist: the configuration cannot be started.
     #[must_use]
     pub fn needs_revocations(&self) -> bool {
         !self.authorities.is_empty() && self.revocations.is_none()
     }
 
-    /// La CA che pinna esattamente questi 32 byte.
+    /// The CA that pins exactly these 32 bytes.
     #[must_use]
     pub fn authority_for_key(&self, key: &CertKey) -> Option<&Authority> {
         self.authorities.iter().find(|a| a.pins(key))
     }
 
-    /// Le fingerprint di tutte le chiavi di CA.
+    /// The fingerprints of all CA keys.
     pub fn ca_fingerprints(&self) -> impl Iterator<Item = Fingerprint> + '_ {
         self.authorities
             .iter()
             .flat_map(|a| a.keys.iter().map(|k| k.fingerprint))
     }
 
-    /// `true` se la chiave è nella denylist (`keys`).
+    /// `true` if the key is in the denylist (`keys`).
     #[must_use]
     pub fn is_key_revoked(&self, key: &Fingerprint) -> bool {
         self.revocations
@@ -235,17 +235,17 @@ impl CertTrust {
             .is_some_and(|r| r.is_key_revoked(key))
     }
 
-    /// Passi 5 e 7–10 di PROTOCOL §15.4, nell'ordine.
+    /// Steps 5 and 7–10 of PROTOCOL §15.4, in order.
     ///
     /// # Errors
-    /// Il primo controllo che fallisce.
+    /// The first check that fails.
     pub fn check(&self, claims: &CertClaims, now: UnixTime) -> Result<&Authority, CertRejection> {
-        // Passo 5: la CA che pinna esattamente `ca_key`.
+        // Step 5: the CA that pins exactly `ca_key`.
         let authority = self
             .authority_for_key(claims.ca_key())
             .ok_or(CertRejection::UnknownAuthority)?;
-        // Passo 7. Senza denylist (configurazione non avviabile, `needs_revocations`) nessuna
-        // serie si può dire non revocata: fail closed.
+        // Step 7. Without a denylist (configuration cannot be started, `needs_revocations`) no
+        // serial can be said to be unrevoked: fail closed.
         let serial_revoked = self
             .revocations
             .as_ref()
@@ -253,15 +253,15 @@ impl CertTrust {
         if serial_revoked {
             return Err(CertRejection::SerialRevoked);
         }
-        // Passo 8: tolleranza solo su `not_before`, senza underflow.
+        // Step 8: tolerance on `not_before` only, without underflow.
         if now < claims.not_before().saturating_sub(CERT_CLOCK_SKEW_SECS) {
             return Err(CertRejection::NotYetValid);
         }
-        // Passo 9: `not_after` escluso, mai esteso.
+        // Step 9: `not_after` excluded, never extended.
         if now >= claims.not_after() {
             return Err(CertRejection::Expired);
         }
-        // Passo 10.
+        // Step 10.
         let lifetime = claims
             .not_after()
             .as_secs()
@@ -272,7 +272,7 @@ impl CertTrust {
         Ok(authority)
     }
 
-    /// Le CA con due chiavi (rotazione non completata).
+    /// The CAs with two keys (rotation not completed).
     pub fn rotations_pending(&self) -> impl Iterator<Item = (&NodeId, &[TrustedCaKey])> {
         self.authorities
             .iter()
@@ -280,12 +280,12 @@ impl CertTrust {
             .map(|a| (&a.name, a.keys.as_slice()))
     }
 
-    /// Le CA, in ordine d'inserimento.
+    /// The CAs, in insertion order.
     pub fn authorities(&self) -> impl Iterator<Item = &Authority> {
         self.authorities.iter()
     }
 
-    /// La denylist, se impostata.
+    /// The denylist, if set.
     #[must_use]
     pub const fn revocations(&self) -> Option<&Revocations> {
         self.revocations.as_ref()

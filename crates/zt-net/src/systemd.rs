@@ -1,13 +1,14 @@
-//! Notifica di avvio a systemd (`Type=notify`), senza dipendenze e senza codice `unsafe`.
+//! Startup notification to systemd (`Type=notify`), with no dependencies and no `unsafe` code.
 //!
-//! Il servizio si dichiara pronto solo quando ha caricato chiave e file di trust e gestisce già
-//! `SIGHUP`: così systemd non invia un `reload` a un processo che ne morirebbe (finding 0004-2).
+//! The service declares itself ready only once it has loaded its key and trust files and already
+//! handles `SIGHUP`: this way systemd never sends a `reload` to a process that would die from it
+//! (finding 0004-2).
 
-/// Variabile d'ambiente con il socket di notifica, impostata da systemd.
+/// Environment variable holding the notification socket, set by systemd.
 const NOTIFY_SOCKET: &str = "NOTIFY_SOCKET";
 
-/// Invia `READY=1` a systemd se il servizio è stato avviato con `Type=notify`; altrimenti non
-/// fa nulla. Un errore non è fatale: lo registra e basta.
+/// Sends `READY=1` to systemd if the service was started with `Type=notify`; otherwise does
+/// nothing. An error is not fatal: it is just logged.
 pub fn notify_ready() {
     let Some(socket) = std::env::var_os(NOTIFY_SOCKET).filter(|s| !s.is_empty()) else {
         return;

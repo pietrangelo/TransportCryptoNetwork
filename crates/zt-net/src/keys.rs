@@ -1,12 +1,12 @@
-//! Visibilità delle chiavi in uso (PROTOCOL §14, finding 0005-3).
+//! Visibility of the keys in use (PROTOCOL §14, finding 0005-3).
 //!
-//! Una chiave precedente lasciata attiva per errore allunga la vita di una chiave che si voleva
-//! ritirare: per questo il processo dichiara all'avvio (e a ogni ricarica) quali fingerprint
-//! accetta, e ricorda periodicamente finché una precedente è ancora accettata.
+//! A previous key left active by mistake extends the life of a key that was meant to be
+//! retired: for this reason the process declares at startup (and on every reload) which
+//! fingerprints it accepts, and periodically reminds while a previous one is still accepted.
 //!
-//! Lo stesso vale per le chiavi di agent nella policy del relay: un nodo con due chiavi
-//! (`public_keys = [nuova, vecchia]`) ha una rotazione non completata, e la chiave vecchia
-//! resta valida per registrarsi come quel nodo (finding 0005b-2).
+//! The same applies to agent keys in the relay policy: a node with two keys
+//! (`public_keys = [new, old]`) has an incomplete rotation, and the old key remains valid for
+//! registering as that node (finding 0005b-2).
 
 use std::time::Duration;
 
@@ -16,10 +16,10 @@ use zt_domain::{AccessPolicy, AuthorizedClients};
 
 use crate::Revocable;
 
-/// Ogni quanto si ricorda che una chiave precedente è ancora accettata.
+/// How often to remind that a previous key is still accepted.
 pub const ROTATION_REMINDER: Duration = Duration::from_secs(60 * 60);
 
-/// Registra le fingerprint delle chiavi accettate (evento `keys_in_use`).
+/// Logs the fingerprints of the accepted keys (`keys_in_use` event).
 pub fn announce(role: &'static str, keys: &Keyring) {
     let current = keys.current().fingerprint().to_string();
     if let Some(previous) = keys.previous() {
@@ -43,8 +43,8 @@ pub fn announce(role: &'static str, keys: &Keyring) {
     }
 }
 
-/// Annuncia le chiavi, poi le riannuncia a ogni sostituzione; finché c'è una chiave precedente,
-/// ogni `every` registra `previous_key_still_accepted`. Non ritorna.
+/// Announces the keys, then re-announces them on every replacement; while there is a previous
+/// key, logs `previous_key_still_accepted` every `every`. Never returns.
 pub async fn watch(role: &'static str, mut keys: Revocable<Keyring>, every: Duration) {
     loop {
         let current = keys.current();
@@ -72,15 +72,15 @@ pub async fn watch(role: &'static str, mut keys: Revocable<Keyring>, every: Dura
     }
 }
 
-/// Registra un `agent_rotation_pending` per ogni nodo della policy con due chiavi di agent.
-/// Restituisce quanti sono.
+/// Logs an `agent_rotation_pending` for every node in the policy with two agent keys.
+/// Returns how many there are.
 pub fn announce_agent_rotations(policy: &AccessPolicy) -> usize {
     let mut pending: usize = 0;
     for (node, keys) in policy.agent_keys() {
         if keys.len() < 2 {
             continue;
         }
-        // Ordine stabile nei log: le fingerprint non hanno un ordine proprio.
+        // Stable order in the logs: fingerprints have no natural order.
         let mut fingerprints: Vec<String> = keys.iter().map(ToString::to_string).collect();
         fingerprints.sort_unstable();
         tracing::warn!(
@@ -95,8 +95,8 @@ pub fn announce_agent_rotations(policy: &AccessPolicy) -> usize {
     pending
 }
 
-/// Segnala le rotazioni di agent non completate nella policy all'avvio e a ogni ricarica;
-/// finché ne resta una, le ripete ogni `every`. Non ritorna.
+/// Reports incomplete agent rotations in the policy at startup and on every reload; while one
+/// remains, repeats them every `every`. Never returns.
 pub async fn watch_agent_rotations(mut policy: Revocable<AccessPolicy>, every: Duration) {
     loop {
         let current = policy.current();
@@ -116,9 +116,9 @@ pub async fn watch_agent_rotations(mut policy: Revocable<AccessPolicy>, every: D
     }
 }
 
-/// Una configurazione che pinna CA: la policy del relay o i client autorizzati di un agent.
+/// A configuration that pins CAs: the relay policy or the authorized clients of an agent.
 pub trait CertTrustSource {
-    /// Le CA pinnate e la denylist.
+    /// The pinned CAs and the denylist.
     fn cert_trust(&self) -> &CertTrust;
 }
 
@@ -140,16 +140,15 @@ impl CertTrustSource for AuthorizedClients {
     }
 }
 
-/// Le fingerprint delle chiavi di una CA, in ordine stabile.
+/// The fingerprints of a CA's keys, in a stable order.
 fn fingerprints(keys: &[zt_domain::trust::TrustedCaKey]) -> String {
     let mut all: Vec<String> = keys.iter().map(|k| k.fingerprint.to_string()).collect();
     all.sort_unstable();
     all.join(",")
 }
 
-/// Registra `authorities_in_use` per ogni CA e `revocations_in_use` con i conteggi della
-/// denylist (PROTOCOL §15.11). Solo nomi, fingerprint e conteggi: mai chiavi, serie o
-/// certificati.
+/// Logs `authorities_in_use` for every CA and `revocations_in_use` with the denylist counts
+/// (PROTOCOL §15.11). Only names, fingerprints and counts: never keys, serials or certificates.
 pub fn announce_authorities(role: &'static str, trust: &CertTrust) {
     for authority in trust.authorities() {
         let fingerprints = fingerprints(authority.keys());
@@ -189,7 +188,7 @@ pub fn announce_authorities(role: &'static str, trust: &CertTrust) {
     }
 }
 
-/// Registra un `ca_rotation_pending` per ogni CA con due chiavi. Restituisce quante sono.
+/// Logs a `ca_rotation_pending` for every CA with two keys. Returns how many there are.
 fn announce_ca_rotations(role: &'static str, trust: &CertTrust) -> usize {
     let mut pending: usize = 0;
     for (name, keys) in trust.rotations_pending() {
@@ -206,8 +205,8 @@ fn announce_ca_rotations(role: &'static str, trust: &CertTrust) -> usize {
     pending
 }
 
-/// Annuncia CA e denylist all'avvio e a ogni sostituzione; finché una CA ha due chiavi
-/// registra `ca_rotation_pending` subito e ogni `every`. Non ritorna.
+/// Announces CAs and denylist at startup and on every replacement; while a CA has two keys,
+/// logs `ca_rotation_pending` immediately and every `every`. Never returns.
 pub async fn watch_authorities<T: CertTrustSource>(
     role: &'static str,
     mut config: Revocable<T>,

@@ -1,5 +1,5 @@
-//! Adapter infrastrutturale per `tokio-util`: collega il decoder sans-IO a qualsiasi
-//! `AsyncRead`/`AsyncWrite` (TCP, stream Noise, stdio) tramite `FramedRead`/`FramedWrite`.
+//! Infrastructure adapter for `tokio-util`: connects the sans-IO decoder to any
+//! `AsyncRead`/`AsyncWrite` (TCP, Noise stream, stdio) via `FramedRead`/`FramedWrite`.
 
 use bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
@@ -7,9 +7,9 @@ use zt_domain::Frame;
 
 use crate::{DecodeError, FrameDecoder, encode};
 
-/// `Decoder`/`Encoder` di `tokio-util` per i frame TCN.
+/// `tokio-util` `Decoder`/`Encoder` for TCN frames.
 ///
-/// Un EOF a metà frame produce [`DecodeError::Io`], non una chiusura silenziosa.
+/// An EOF in the middle of a frame produces [`DecodeError::Io`], not a silent close.
 #[derive(Debug, Default)]
 pub struct FrameCodec {
     decoder: FrameDecoder,

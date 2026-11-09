@@ -1,2 +1,2 @@
-# Utente di servizio di zt-relay e zt-agent (systemd-sysusers).
+# Service user for zt-relay and zt-agent (systemd-sysusers).
 u tcn - "TCN service" /var/empty /usr/sbin/nologin

@@ -1,4 +1,4 @@
-//! Più chiavi per lo stesso agent durante una rotazione (Fase 5, PROTOCOL §14).
+//! Multiple keys for the same agent during a rotation (Phase 5, PROTOCOL §14).
 #![allow(clippy::unwrap_used)]
 
 use zt_domain::{
@@ -13,7 +13,7 @@ fn node(n: &str) -> NodeId {
     NodeId::try_from(n).unwrap()
 }
 
-// ---------- specifica ----------
+// ---------- specification ----------
 
 #[test]
 fn both_keys_of_a_rotating_agent_map_to_its_node() {
@@ -41,7 +41,7 @@ fn a_single_key_is_the_same_as_add_agent() {
     assert_eq!(MAX_AGENT_KEYS, 2);
 }
 
-// ---------- attacchi ----------
+// ---------- attacks ----------
 
 #[test]
 fn more_than_two_keys_or_none_are_refused() {
@@ -54,7 +54,7 @@ fn more_than_two_keys_or_none_are_refused() {
         p.add_agent_keys(node("web-01"), &[]),
         Err(DomainError::AgentKeys(_))
     ));
-    // Nessun effetto parziale.
+    // No partial effects.
     assert!(p.role(&fp(1)).is_none());
     p.add_agent_keys(node("web-01"), &[fp(1)]).unwrap();
 }
@@ -80,7 +80,7 @@ fn a_key_of_another_peer_cannot_be_smuggled_in_as_a_second_key() {
         },
     )
     .unwrap();
-    // La chiave di un altro agent o di un client non diventa la seconda chiave di web-01.
+    // The key of another agent or of a client does not become web-01's second key.
     for stolen in [fp(1), fp(10)] {
         assert!(matches!(
             p.add_agent_keys(node("web-01"), &[fp(2), stolen]),

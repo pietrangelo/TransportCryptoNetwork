@@ -1,5 +1,5 @@
-//! `zt-agent`: gira sui server target senza porte in ascolto. Si connette in uscita al relay e
-//! inoltra al demone SSH locale solo gli stream di client autorizzati end-to-end.
+//! `zt-agent`: runs on target servers with no listening ports. It connects outbound to the
+//! relay and forwards to the local SSH daemon only streams of end-to-end authorized clients.
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -16,11 +16,11 @@ use zt_net::logging::{self, LogFormat};
 use zt_net::reload::{self, Hangups, ReloadEvents};
 use zt_net::{Revocable, config, systemd};
 
-/// Agent TCN.
+/// TCN agent.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Formato dei log su stderr.
+    /// Log format on stderr.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     log_format: Format,
     #[command(subcommand)]
@@ -29,61 +29,60 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum Format {
-    /// Testo leggibile.
+    /// Human-readable text.
     Text,
-    /// Una riga JSON per evento (per SIEM e `jq`).
+    /// One JSON line per event (for SIEM and `jq`).
     Json,
 }
 
 #[derive(Debug, Subcommand)]
-#[allow(clippy::large_enum_variant)] // valore costruito una volta, all'avvio
+#[allow(clippy::large_enum_variant)] // value built once, at startup
 enum Command {
-    /// Genera la chiave dell'agent (file nuovo, permessi 0600) e stampa la chiave pubblica.
+    /// Generates the agent key (new file, 0600 permissions) and prints the public key.
     Keygen {
-        /// File da creare.
+        /// File to create.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Avvia l'agent.
+    /// Starts the agent.
     Run {
-        /// Relay (`host:porta`). Ripetibile, o separati da virgole: l'agent resta connesso a
-        /// tutti (al massimo 8).
+        /// Relay (`host:port`). Repeatable, or comma-separated: the agent stays connected to all
+        /// of them (at most 8).
         #[arg(long, required = true, value_delimiter = ',')]
         relay: Vec<String>,
-        /// Chiave pubblica di ogni relay (64 caratteri esadecimali), nello stesso ordine di
-        /// `--relay`.
+        /// Public key of each relay (64 hex characters), in the same order as `--relay`.
         #[arg(long, required = true, value_delimiter = ',')]
         relay_key: Vec<PublicKey>,
-        /// Nome di questo nodo, come nella policy del relay.
+        /// Name of this node, as in the relay policy.
         #[arg(long)]
         node: String,
-        /// Chiave segreta dell'agent.
+        /// Secret key of the agent.
         #[arg(long)]
         key: PathBuf,
-        /// Chiave segreta precedente, durante una rotazione: il canale end-to-end la accetta
-        /// ancora, così i client si aggiornano un po' alla volta (PROTOCOL §14).
+        /// Previous secret key, during a rotation: the end-to-end channel still accepts it, so
+        /// clients can update gradually (PROTOCOL §14).
         #[arg(long)]
         previous_key: Option<PathBuf>,
-        /// Client accettati end-to-end (TOML, sezioni `[[clients]]`). `SIGHUP` lo ricarica e
-        /// chiude subito le sessioni dei client rimossi.
+        /// Clients accepted end-to-end (TOML, `[[clients]]` sections). `SIGHUP` reloads it and
+        /// immediately closes the sessions of removed clients.
         #[arg(long)]
         authorized_clients: PathBuf,
-        /// Denylist di certificati e chiavi (`revoked.toml`, PROTOCOL §15.8). Obbligatoria se
-        /// i client autorizzati pinnano una CA (`[[authorities]]`), anche vuota. `SIGHUP` la
-        /// ricarica insieme ai client autorizzati.
+        /// Denylist of certificates and keys (`revoked.toml`, PROTOCOL §15.8). Mandatory if the
+        /// authorized clients pin a CA (`[[authorities]]`), even if empty. `SIGHUP` reloads it
+        /// together with the authorized clients.
         #[arg(long)]
         revocations: Option<PathBuf>,
-        /// Demone SSH locale.
+        /// Local SSH daemon.
         #[arg(long, default_value = "127.0.0.1:22")]
         ssh_target: String,
-        /// Sessioni contemporanee (da 1 a 4096).
+        /// Concurrent sessions (from 1 to 4096).
         #[arg(long, default_value_t = 16, value_parser = parse_max_streams)]
         max_streams: usize,
     },
 }
 
-/// `--max-streams` entro i limiti dell'agent (finding 0005b-4: oltre il massimo del semaforo
-/// di tokio l'agent andava in panic all'avvio).
+/// `--max-streams` within the agent's limits (finding 0005b-4: beyond the maximum of the tokio
+/// semaphore the agent panicked at startup).
 fn parse_max_streams(value: &str) -> Result<usize, String> {
     let n: usize = value.parse().map_err(|e| format!("{e}"))?;
     if (1..=agent::MAX_STREAMS).contains(&n) {
@@ -137,7 +136,7 @@ fn run(command: Command) -> Result<(), String> {
                 .build()
                 .map_err(|e| e.to_string())?;
             runtime.block_on(async move {
-                // Prima di leggere i file: un SIGHUP durante la lettura non va perso.
+                // Before reading the files: a SIGHUP during the read is not lost.
                 let hangups = Hangups::listen().map_err(|e| e.to_string())?;
                 let relays = config::relay_endpoints("--relay", &relay, &relay_key)
                     .map_err(|e| e.to_string())?;
@@ -145,17 +144,17 @@ fn run(command: Command) -> Result<(), String> {
                     config::load_keyring(&key, previous_key.as_deref())
                         .map_err(|e| e.to_string())?,
                 );
-                // La chiave dell'agent cambia solo con un riavvio (PROTOCOL §14).
+                // The agent key changes only with a restart (PROTOCOL §14).
                 tokio::spawn(zt_net::keys::watch(
                     "agent",
                     Revocable::fixed_shared(Arc::clone(&keys)),
                     zt_net::keys::ROTATION_REMINDER,
                 ));
                 let path = authorized_clients;
-                // Client autorizzati e denylist in un solo passo; una CA uguale alla chiave
-                // dell'agent (corrente o precedente) o a un `--relay-key` è rifiutata, all'avvio
-                // e a ogni ricarica (PROTOCOL §15.9, finding 0006-1): un relay compromesso non
-                // firma certificati che l'agent ammette.
+                // Authorized clients and denylist in a single step; a CA equal to the agent's key
+                // (current or previous) or to a `--relay-key` is rejected, at startup and on every
+                // reload (PROTOCOL §15.9, finding 0006-1): a compromised relay cannot sign
+                // certificates that the agent admits.
                 let mut forbidden = config::own_keys(&keys, "agent");
                 forbidden.extend(relays.iter().map(|r| config::ForbiddenKey {
                     fingerprint: r.public_key.fingerprint(),

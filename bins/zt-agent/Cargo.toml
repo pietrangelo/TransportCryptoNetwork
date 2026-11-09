@@ -1,6 +1,6 @@
 [package]
 name = "zt-agent"
-description = "Binario zt-agent di TCN."
+description = "TCN zt-agent binary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

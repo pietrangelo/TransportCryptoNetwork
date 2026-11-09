@@ -1,16 +1,16 @@
-//! Handshake Noise IK sans-IO con typestate.
+//! Sans-IO Noise IK handshake with typestate.
 //!
 //! ```text
 //! initiator (agent/client)                          responder (relay/agent)
 //!   initiate() ── msg1: e, es, s, ss ──────────────▶ respond()  → AuthorizationPending
-//!                                                     peer() → decisione di policy
+//!                                                     peer() → policy decision
 //!   AwaitingResponse ◀───────── msg2: e, ee, se ──── accept()  → Transport
 //!   complete() → Transport
 //! ```
 //!
-//! IK: l'initiator conosce e **pinna** la chiave statica del responder; il responder impara
-//! quella dell'initiator dal primo messaggio. Se la decisione è negativa il responder
-//! semplicemente non risponde: l'initiator non impara nulla, nemmeno se la sua chiave esiste.
+//! IK: the initiator knows and **pins** the static key of the responder; the responder learns
+//! the initiator's key from the first message. If the decision is negative the responder
+//! simply does not reply: the initiator learns nothing, not even whether its key exists.
 
 use snow::{Builder, HandshakeState, TransportState};
 use zt_domain::Fingerprint;
@@ -21,22 +21,22 @@ use crate::keyring::Keyring;
 
 const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
-/// Lunghezza massima di un messaggio Noise.
+/// Maximum length of a Noise message.
 pub const MAX_MESSAGE_LEN: usize = 65_535;
 
-/// Tag AEAD aggiunto a ogni messaggio di trasporto.
+/// AEAD tag added to every transport message.
 pub const TAG_LEN: usize = 16;
 
-/// Plaintext massimo di un messaggio di trasporto.
+/// Maximum plaintext of a transport message.
 pub const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
 
-/// Su quale canale avviene l'handshake. Il valore entra nel *prologue* di Noise, quindi un
-/// messaggio di un canale non è mai valido sull'altro (separazione di dominio).
+/// Which channel the handshake takes place on. The value goes into the Noise *prologue*, so
+/// a message of one channel is never valid on the other (domain separation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// Peer ↔ relay.
     Outer,
-    /// Client ↔ agent, attraverso il relay (che non può leggerlo).
+    /// Client ↔ agent, through the relay (which cannot read it).
     EndToEnd,
 }
 
@@ -61,13 +61,13 @@ fn builder(
     Ok((builder, secret))
 }
 
-/// Payload massimo del messaggio 1: un certificato client (PROTOCOL §15.3).
+/// Maximum payload of message 1: a client certificate (PROTOCOL §15.3).
 pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = zt_domain::limits::MAX_CERT_LEN;
 
-/// Initiator: produce il primo messaggio verso un responder di cui conosce la chiave.
+/// Initiator: produces the first message toward a responder whose key it knows.
 ///
 /// # Errors
-/// [`CryptoError::Handshake`] se lo stato Noise non può essere costruito.
+/// [`CryptoError::Handshake`] if the Noise state cannot be built.
 pub fn initiate(
     local: &Identity,
     remote: &PublicKey,
@@ -76,12 +76,12 @@ pub fn initiate(
     initiate_with_payload(local, remote, channel, &[])
 }
 
-/// Come [`initiate`], con `payload` cifrato nel messaggio 1 (il certificato del client,
+/// Like [`initiate`], with `payload` encrypted in message 1 (the client certificate,
 /// PROTOCOL §15.3).
 ///
 /// # Errors
-/// [`CryptoError::MessageTooLarge`] oltre [`MAX_HANDSHAKE_PAYLOAD_LEN`],
-/// [`CryptoError::Handshake`] se lo stato Noise non può essere costruito.
+/// [`CryptoError::MessageTooLarge`] over [`MAX_HANDSHAKE_PAYLOAD_LEN`],
+/// [`CryptoError::Handshake`] if the Noise state cannot be built.
 pub fn initiate_with_payload(
     local: &Identity,
     remote: &PublicKey,
@@ -108,10 +108,10 @@ pub fn initiate_with_payload(
     ))
 }
 
-/// Responder: legge il primo messaggio e scopre chi è l'initiator.
+/// Responder: reads the first message and finds out who the initiator is.
 ///
 /// # Errors
-/// [`CryptoError::Handshake`] se il messaggio non è valido per questa identità e canale.
+/// [`CryptoError::Handshake`] if the message is not valid for this identity and channel.
 pub fn respond(
     local: &Identity,
     msg1: &[u8],
@@ -125,13 +125,13 @@ pub fn respond(
         .local_private_key(secret.as_ref())
         .and_then(Builder::build_responder)
         .map_err(|_| CryptoError::Handshake)?;
-    // Il payload decifrato non supera mai `msg1`.
+    // The decrypted payload never exceeds `msg1`.
     let mut buffer = vec![0_u8; msg1.len()];
     let len = state
         .read_message(msg1, &mut buffer)
         .map_err(|_| CryptoError::Handshake)?;
-    // Oltre il massimo il payload non è interpretato, e l'errore è lo stesso di un messaggio
-    // non valido (nessun oracolo).
+    // Over the maximum the payload is not interpreted, and the error is the same as for an
+    // invalid message (no oracle).
     if len > MAX_HANDSHAKE_PAYLOAD_LEN {
         return Err(CryptoError::Handshake);
     }
@@ -145,18 +145,18 @@ pub fn respond(
     })
 }
 
-/// Responder con un [`Keyring`]: accetta un `msg1` cifrato verso la chiave corrente o verso
-/// quella precedente (PROTOCOL §14).
+/// Responder with a [`Keyring`]: accepts a `msg1` encrypted to the current key or to the
+/// previous one (PROTOCOL §14).
 ///
 /// # Errors
-/// [`CryptoError::Handshake`] se `msg1` non è valido per nessuna delle due chiavi.
+/// [`CryptoError::Handshake`] if `msg1` is not valid for either of the two keys.
 pub fn respond_any(
     keys: &Keyring,
     msg1: &[u8],
     channel: Channel,
 ) -> Result<AuthorizationPending, CryptoError> {
-    // Un tentativo fallito non lascia stato: ogni `respond` costruisce un handshake nuovo.
-    // Il tempo rivela quale chiave ha funzionato; non è un segreto (sono entrambe pubbliche).
+    // A failed attempt leaves no state: each `respond` builds a new handshake.
+    // The timing reveals which key worked; that is not a secret (both are public).
     match (respond(keys.current(), msg1, channel), keys.previous()) {
         (Ok(pending), _) => Ok(pending),
         (Err(_), Some(previous)) => respond(previous, msg1, channel),
@@ -164,7 +164,7 @@ pub fn respond_any(
     }
 }
 
-/// L'initiator ha inviato `msg1` e attende la risposta.
+/// The initiator has sent `msg1` and awaits the response.
 #[derive(Debug)]
 #[must_use = "the handshake is not complete until `complete` is called"]
 pub struct AwaitingResponse {
@@ -173,10 +173,10 @@ pub struct AwaitingResponse {
 }
 
 impl AwaitingResponse {
-    /// Completa l'handshake con il secondo messaggio.
+    /// Completes the handshake with the second message.
     ///
     /// # Errors
-    /// [`CryptoError::Handshake`] se `msg2` non proviene dal responder pinnato.
+    /// [`CryptoError::Handshake`] if `msg2` does not come from the pinned responder.
     pub fn complete(mut self, msg2: &[u8]) -> Result<Transport, CryptoError> {
         if msg2.len() > MAX_MESSAGE_LEN {
             return Err(CryptoError::Handshake);
@@ -186,7 +186,7 @@ impl AwaitingResponse {
             .state
             .read_message(msg2, &mut payload)
             .map_err(|_| CryptoError::Handshake)?;
-        // Il messaggio 2 è sempre vuoto (PROTOCOL §15.3).
+        // Message 2 is always empty (PROTOCOL §15.3).
         if len != 0 {
             return Err(CryptoError::Handshake);
         }
@@ -194,10 +194,9 @@ impl AwaitingResponse {
     }
 }
 
-/// Il responder conosce l'identità dell'initiator e deve decidere se accettarla.
+/// The responder knows the identity of the initiator and must decide whether to accept it.
 ///
-/// Rifiutare significa semplicemente scartare questo valore: non esiste un messaggio di
-/// rifiuto.
+/// Rejecting simply means discarding this value: there is no rejection message.
 #[derive(Debug)]
 #[must_use = "drop to reject, or call `accept`"]
 pub struct AuthorizationPending {
@@ -207,23 +206,23 @@ pub struct AuthorizationPending {
 }
 
 impl AuthorizationPending {
-    /// L'identità autenticata dell'initiator.
+    /// The authenticated identity of the initiator.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.peer
     }
 
-    /// Il payload del messaggio 1, autenticato da Noise (vuoto se l'initiator non ne ha
-    /// inviato uno).
+    /// The payload of message 1, authenticated by Noise (empty if the initiator did not send
+    /// one).
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
-    /// Accetta l'initiator: produce `msg2` e il canale di trasporto.
+    /// Accepts the initiator: produces `msg2` and the transport channel.
     ///
     /// # Errors
-    /// [`CryptoError::Handshake`] se lo stato Noise non può avanzare.
+    /// [`CryptoError::Handshake`] if the Noise state cannot advance.
     pub fn accept(mut self) -> Result<(Vec<u8>, Transport), CryptoError> {
         let msg2 = write(&mut self.state, &[])?;
         let transport = Transport::from_handshake(self.state, self.peer)?;
@@ -231,16 +230,16 @@ impl AuthorizationPending {
     }
 }
 
-/// Messaggi per direzione dopo i quali entrambe le parti eseguono il rekey di Noise.
+/// Messages per direction after which both parties perform the Noise rekey.
 ///
-/// Il rekey è implicito: nessun messaggio sul filo, entrambe le parti lo eseguono allo stesso
-/// contatore (TCP consegna in ordine e un messaggio rifiutato chiude il canale). Ogni periodo ha
-/// una chiave derivata a senso unico dalla precedente: chi legge la memoria del processo non
-/// decifra il traffico dei periodi passati. Con il keepalive a 30 s un canale inattivo cambia
-/// chiave ogni ~8,5 ore; con traffico SSH ogni 16 MiB circa.
+/// The rekey is implicit: no message on the wire, both parties perform it at the same
+/// counter (TCP delivers in order and a rejected message closes the channel). Each period has
+/// a key derived one-way from the previous one: whoever reads the process memory cannot
+/// decrypt the traffic of past periods. With the 30 s keepalive an idle channel changes key
+/// every ~8.5 hours; with SSH traffic roughly every 16 MiB.
 pub const REKEY_INTERVAL: usize = 1024;
 
-/// Canale cifrato e autenticato dopo l'handshake.
+/// Encrypted and authenticated channel after the handshake.
 #[derive(Debug)]
 pub struct Transport {
     state: TransportState,
@@ -262,28 +261,28 @@ impl Transport {
         })
     }
 
-    /// L'identità autenticata dell'altra parte.
+    /// The authenticated identity of the other party.
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.peer
     }
 
-    /// Rekey eseguiti in invio.
+    /// Rekeys performed on send.
     #[must_use]
     pub const fn send_epoch(&self) -> usize {
         self.sent / REKEY_INTERVAL
     }
 
-    /// Rekey eseguiti in ricezione.
+    /// Rekeys performed on receive.
     #[must_use]
     pub const fn recv_epoch(&self) -> usize {
         self.received / REKEY_INTERVAL
     }
 
-    /// Cifra un messaggio.
+    /// Encrypts a message.
     ///
     /// # Errors
-    /// [`CryptoError::MessageTooLarge`] oltre [`MAX_PLAINTEXT_LEN`].
+    /// [`CryptoError::MessageTooLarge`] over [`MAX_PLAINTEXT_LEN`].
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if plaintext.len() > MAX_PLAINTEXT_LEN {
             return Err(CryptoError::MessageTooLarge);
@@ -301,13 +300,13 @@ impl Transport {
         Ok(out)
     }
 
-    /// Decifra un messaggio in un buffer **nuovo**, dimensionato sul messaggio.
+    /// Decrypts a message into a **new** buffer, sized to the message.
     ///
-    /// Un buffer per messaggio fa sì che un frame tenuto in coda trattenga solo la propria
-    /// memoria, mai un buffer di lettura condiviso (finding 10 della review 0001).
+    /// One buffer per message ensures that a queued frame retains only its own memory, never a
+    /// shared read buffer (finding 10 of review 0001).
     ///
     /// # Errors
-    /// [`CryptoError::Decrypt`] se il messaggio non è autentico, è fuori ordine o ripetuto.
+    /// [`CryptoError::Decrypt`] if the message is not authentic, is out of order or replayed.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if ciphertext.len() < TAG_LEN || ciphertext.len() > MAX_MESSAGE_LEN {
             return Err(CryptoError::Decrypt);
@@ -318,7 +317,7 @@ impl Transport {
             .read_message(ciphertext, &mut out)
             .map_err(|_| CryptoError::Decrypt)?;
         out.truncate(len);
-        // Solo i messaggi autentici contano: un falso non sposta il rekey.
+        // Only authentic messages count: a forged one does not move the rekey.
         self.received = self.received.wrapping_add(1);
         if self.received.is_multiple_of(REKEY_INTERVAL) {
             self.state.rekey_incoming();

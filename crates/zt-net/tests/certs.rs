@@ -1,5 +1,5 @@
-//! Fase 6, passo 7: client certificati su TCP reale, relay e agent veri (PROTOCOL §15.3–§15.8,
-//! §15.10, §15.11).
+//! Phase 6, step 7: client certificates over real TCP, real relay and agent (PROTOCOL
+//! §15.3–§15.8, §15.10, §15.11).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -29,8 +29,8 @@ fn id() -> Arc<Identity> {
     Arc::new(Identity::generate().unwrap())
 }
 
-/// Spec: un client che non è in nessuna whitelist arriva al nodo con il solo certificato, e
-/// relay e agent lo registrano come `credential = certificate` con CA e serie.
+/// Spec: a client that is in no whitelist reaches the node with just the certificate, and
+/// relay and agent log it as `credential = certificate` with CA and serial.
 #[tokio::test]
 async fn a_certified_client_reaches_its_node_through_relay_and_agent() {
     let log = Captured::default();
@@ -72,11 +72,11 @@ async fn a_certified_client_reaches_its_node_through_relay_and_agent() {
         Some("certificate")
     );
     assert_eq!(field(&started[0], "serial"), Some(serial.to_string()));
-    // Il certificato non compare mai nei log (§15.11).
+    // The certificate never appears in the logs (§15.11).
     assert!(!log.text().contains(&hex::encode(&cert[..])));
 }
 
-/// Spec: con una CA pinnata, un client della whitelist senza certificato funziona come prima.
+/// Spec: with a pinned CA, a whitelisted client without a certificate works as before.
 #[tokio::test]
 async fn a_whitelisted_client_without_certificate_still_works() {
     let log = Captured::default();
@@ -101,13 +101,14 @@ async fn a_whitelisted_client_without_certificate_still_works() {
     assert_eq!(established.len(), 1, "{}", log.text());
     assert_eq!(field(&established[0], "credential").as_deref(), Some("key"));
     assert!(field(&established[0], "serial").is_none());
-    // Nessuna scadenza in sessione per la whitelist.
+    // No in-session expiry for the whitelist.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!task.is_finished());
     assert_alive(&mut app).await;
 }
 
-/// Spec (§15.10): il primo relay non pinna la CA e tace; il client passa al secondo.
+/// Spec (§15.10): the first relay does not pin the CA and stays silent; the client moves on to
+/// the second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_certified_client_falls_back_past_a_relay_without_the_authority() {
     let ca = Ca::new();
@@ -127,8 +128,8 @@ async fn a_certified_client_falls_back_past_a_relay_without_the_authority() {
     assert_alive(&mut app).await;
 }
 
-/// Spec (§15.7): un certificato di pochi secondi chiude la sessione alla scadenza, con
-/// `Close Unauthorized` al client e `certificate_expired` nell'audit.
+/// Spec (§15.7): a certificate valid for a few seconds closes the session at expiry, with
+/// `Close Unauthorized` to the client and `certificate_expired` in the audit log.
 #[tokio::test]
 async fn the_session_ends_when_the_certificate_expires() {
     let log = Captured::default();
@@ -170,8 +171,8 @@ async fn the_session_ends_when_the_certificate_expires() {
     );
 }
 
-/// Spec (§15.8, difesa in profondità): solo l'agent riceve la denylist con la serie; la
-/// sessione cade anche se il relay la permette ancora, e un altro certificato resta valido.
+/// Spec (§15.8, defense in depth): only the agent receives the denylist with the serial; the
+/// session drops even if the relay still permits it, and another certificate remains valid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_revocation_of_a_serial_cuts_the_session_even_if_the_relay_still_allows_it() {
     let ca = Ca::new();
@@ -202,7 +203,7 @@ async fn agent_revocation_of_a_serial_cuts_the_session_even_if_the_relay_still_a
     ));
     assert_alive(&mut other).await;
     assert!(!survivor.is_finished());
-    // Una nuova sessione con la serie revocata è rifiutata dall'agent.
+    // A new session with the revoked serial is rejected by the agent.
     assert!(matches!(
         lab.refused(&alice, Some(&revoked_cert)).await,
         Err(NetError::StreamClosed(CloseReason::Unauthorized))

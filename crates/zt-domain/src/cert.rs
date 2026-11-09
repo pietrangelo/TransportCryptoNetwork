@@ -1,8 +1,8 @@
-//! Certificati client brevi firmati da una CA offline (PROTOCOL §15).
+//! Short-lived client certificates signed by an offline CA (PROTOCOL §15).
 //!
-//! Il dominio conosce solo la **sintassi** del formato (regole 1–7 di §15.1) e i dati di un
-//! certificato già verificato ([`CertClaims`]). Firma, canonicità dei punti e binding alla
-//! chiave Noise stanno in `zt-crypto`.
+//! The domain knows only the **syntax** of the format (rules 1–7 of §15.1) and the data of an
+//! already-verified certificate ([`CertClaims`]). Signature, point canonicity and binding to the
+//! Noise key live in `zt-crypto`.
 //!
 
 use core::fmt;
@@ -17,35 +17,35 @@ use crate::limits::{
     MAX_CERT_LEN, MAX_CERT_LIFETIME_SECS, MAX_CERT_NODES, MAX_NODE_ID_LEN, MIN_CERT_LEN,
 };
 
-/// I primi 4 byte di ogni certificato.
+/// The first 4 bytes of every certificate.
 pub const CERT_MAGIC: [u8; 4] = *b"TCNC";
-/// L'unica versione del formato.
+/// The only version of the format.
 pub const CERT_VERSION: u8 = 0x01;
-/// L'unico algoritmo di firma: Ed25519 puro (RFC 8032).
+/// The only signature algorithm: pure Ed25519 (RFC 8032).
 pub const CERT_SIG_ED25519: u8 = 0x01;
-/// Lunghezza della firma in coda al certificato.
+/// Length of the signature at the end of the certificate.
 pub const CERT_SIGNATURE_LEN: usize = 64;
-/// Stringa di contesto anteposta al TBS prima della firma (PROTOCOL §15.2).
+/// Context string prepended to the TBS before signing (PROTOCOL §15.2).
 pub const CERT_SIGNATURE_CONTEXT: &[u8] = b"TCN client certificate v1\0";
 
-/// Un istante in secondi Unix (UTC). Il dominio non ha orologio: il tempo entra come parametro.
+/// An instant in Unix seconds (UTC). The domain has no clock: time comes in as a parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnixTime(u64);
 
 impl UnixTime {
-    /// L'istante `secs` secondi dopo il 1970.
+    /// The instant `secs` seconds after 1970.
     #[must_use]
     pub const fn from_secs(secs: u64) -> Self {
         Self(secs)
     }
 
-    /// I secondi dal 1970.
+    /// The seconds since 1970.
     #[must_use]
     pub const fn as_secs(self) -> u64 {
         self.0
     }
 
-    /// `self + secs`, o `None` in overflow.
+    /// `self + secs`, or `None` on overflow.
     #[must_use]
     pub const fn checked_add(self, secs: u64) -> Option<Self> {
         match self.0.checked_add(secs) {
@@ -54,7 +54,7 @@ impl UnixTime {
         }
     }
 
-    /// `self - secs`, o `None` prima del 1970.
+    /// `self - secs`, or `None` before 1970.
     #[must_use]
     pub const fn checked_sub(self, secs: u64) -> Option<Self> {
         match self.0.checked_sub(secs) {
@@ -63,29 +63,29 @@ impl UnixTime {
         }
     }
 
-    /// `self + secs`, fermo a `u64::MAX`.
+    /// `self + secs`, saturating at `u64::MAX`.
     #[must_use]
     pub const fn saturating_add(self, secs: u64) -> Self {
         Self(self.0.saturating_add(secs))
     }
 
-    /// `self - secs`, fermo a 0.
+    /// `self - secs`, saturating at 0.
     #[must_use]
     pub const fn saturating_sub(self, secs: u64) -> Self {
         Self(self.0.saturating_sub(secs))
     }
 }
 
-/// Numero di serie di un certificato: 128 bit casuali, mai tutti zero. È l'identità del
-/// certificato (PROTOCOL §15.2).
+/// Serial number of a certificate: 128 random bits, never all zero. It is the identity of the
+/// certificate (PROTOCOL §15.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CertSerial([u8; Self::LEN]);
 
 impl CertSerial {
-    /// Lunghezza in byte.
+    /// Length in bytes.
     pub const LEN: usize = 16;
 
-    /// I byte del numero di serie.
+    /// The serial number bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
@@ -96,7 +96,7 @@ impl TryFrom<[u8; 16]> for CertSerial {
     type Error = CertFormatError;
 
     /// # Errors
-    /// [`CertFormatError::SerialZero`] per il valore tutto a zero.
+    /// [`CertFormatError::SerialZero`] for the all-zero value.
     fn try_from(bytes: [u8; 16]) -> Result<Self, Self::Error> {
         if bytes.iter().all(|&b| b == 0) {
             return Err(CertFormatError::SerialZero);
@@ -106,7 +106,7 @@ impl TryFrom<[u8; 16]> for CertSerial {
 }
 
 impl fmt::Display for CertSerial {
-    /// 32 caratteri esadecimali minuscoli, come nella denylist.
+    /// 32 lowercase hex characters, as in the denylist.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for b in &self.0 {
             write!(f, "{b:02x}")?;
@@ -115,39 +115,39 @@ impl fmt::Display for CertSerial {
     }
 }
 
-/// 32 byte di una chiave pubblica Ed25519 come compaiono nel certificato, **non** ancora
-/// validati come punto della curva (lo fa `zt-crypto`). Il confronto è byte per byte.
+/// 32 bytes of an Ed25519 public key as they appear in the certificate, **not** yet
+/// validated as a curve point (`zt-crypto` does that). Comparison is byte by byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CertKey([u8; Self::LEN]);
 
 impl CertKey {
-    /// Lunghezza in byte.
+    /// Length in bytes.
     pub const LEN: usize = 32;
 
-    /// Prende 32 byte.
+    /// Takes 32 bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
     }
 
-    /// I 32 byte.
+    /// The 32 bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
     }
 }
 
-/// Ambito di un certificato.
+/// Scope of a certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertScope {
-    /// `scope = 0x01`: tutti i nodi concessi alla CA (`allow`).
+    /// `scope = 0x01`: all nodes granted to the CA (`allow`).
     All,
-    /// `scope = 0x00`: questi nodi, da 1 a [`crate::limits::MAX_CERT_NODES`].
+    /// `scope = 0x00`: these nodes, from 1 to [`crate::limits::MAX_CERT_NODES`].
     Only(BTreeSet<NodeId>),
 }
 
-/// Il contenuto firmato di un certificato. Un `CertBody` esistente rispetta le regole 1–7 di
-/// PROTOCOL §15.1, quindi la sua codifica è infallibile.
+/// The signed content of a certificate. An existing `CertBody` satisfies rules 1–7 of
+/// PROTOCOL §15.1, so its encoding is infallible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertBody {
     ca_key: CertKey,
@@ -160,10 +160,10 @@ pub struct CertBody {
 }
 
 impl CertBody {
-    /// Costruisce un corpo valido.
+    /// Builds a valid body.
     ///
     /// # Errors
-    /// Una delle regole 3–6 di PROTOCOL §15.1 non è rispettata.
+    /// One of rules 3–6 of PROTOCOL §15.1 is not satisfied.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ca_key: CertKey,
@@ -196,7 +196,7 @@ impl CertBody {
         })
     }
 
-    /// I byte `[0, L-64)` del certificato (TBS, PROTOCOL §15.1).
+    /// Bytes `[0, L-64)` of the certificate (TBS, PROTOCOL §15.1).
     #[must_use]
     pub fn encode_tbs(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(MAX_CERT_LEN);
@@ -216,9 +216,9 @@ impl CertBody {
             }
             CertScope::Only(nodes) => {
                 out.push(SCOPE_LIST);
-                // 1..=MAX_CERT_NODES per costruzione.
+                // 1..=MAX_CERT_NODES by construction.
                 out.push(u8::try_from(nodes.len()).unwrap_or(u8::MAX));
-                // `BTreeSet` di `NodeId` (stringhe ASCII): l'ordine è quello dei byte.
+                // `BTreeSet` of `NodeId` (ASCII strings): the order is byte order.
                 for node in nodes {
                     push_label(&mut out, node);
                 }
@@ -227,49 +227,49 @@ impl CertBody {
         out
     }
 
-    /// Chiave della CA firmataria (non ancora confrontata con i pin).
+    /// Key of the signing CA (not yet compared against the pins).
     #[must_use]
     pub const fn ca_key(&self) -> &CertKey {
         &self.ca_key
     }
 
-    /// Chiave del client.
+    /// Key of the client.
     #[must_use]
     pub const fn subject_key(&self) -> &CertKey {
         &self.subject_key
     }
 
-    /// Numero di serie.
+    /// Serial number.
     #[must_use]
     pub const fn serial(&self) -> CertSerial {
         self.serial
     }
 
-    /// Inizio della validità.
+    /// Start of validity.
     #[must_use]
     pub const fn not_before(&self) -> UnixTime {
         self.not_before
     }
 
-    /// Fine della validità (esclusa).
+    /// End of validity (exclusive).
     #[must_use]
     pub const fn not_after(&self) -> UnixTime {
         self.not_after
     }
 
-    /// Nome del client, solo per gli audit log.
+    /// Name of the client, for the audit logs only.
     #[must_use]
     pub const fn name(&self) -> &NodeId {
         &self.name
     }
 
-    /// Ambito.
+    /// Scope.
     #[must_use]
     pub const fn scope(&self) -> &CertScope {
         &self.scope
     }
 
-    /// `not_after - not_before` in secondi.
+    /// `not_after - not_before` in seconds.
     #[must_use]
     pub const fn lifetime_secs(&self) -> u64 {
         self.not_after
@@ -278,29 +278,30 @@ impl CertBody {
     }
 }
 
-/// Un certificato decodificato: corpo, byte firmati e firma (non ancora verificata).
+/// A decoded certificate: body, signed bytes and signature (not yet verified).
 #[derive(Debug)]
 pub struct ParsedCert<'a> {
-    /// Il corpo.
+    /// The body.
     pub body: CertBody,
-    /// I byte `[0, L-64)`.
+    /// Bytes `[0, L-64)`.
     pub tbs: &'a [u8],
-    /// Gli ultimi 64 byte.
+    /// The last 64 bytes.
     pub signature: &'a [u8; CERT_SIGNATURE_LEN],
 }
 
-/// Decodifica un certificato secondo le regole 1–7 di PROTOCOL §15.1. Non verifica la firma.
+/// Decodes a certificate according to rules 1–7 of PROTOCOL §15.1. Does not verify the
+/// signature.
 ///
 /// # Errors
-/// La prima regola violata. Gli errori riportano solo metadati, mai byte del certificato.
+/// The first rule violated. Errors report only metadata, never certificate bytes.
 pub fn decode_certificate(bytes: &[u8]) -> Result<ParsedCert<'_>, CertFormatError> {
-    // Regola 1: la lunghezza prima di qualsiasi campo.
+    // Rule 1: the length before any field.
     let len = bytes.len();
     if !(MIN_CERT_LEN..=MAX_CERT_LEN).contains(&len) {
         return Err(CertFormatError::Length { len });
     }
     let mut r = Reader { bytes, pos: 0 };
-    // Regola 2.
+    // Rule 2.
     if r.array::<4>()? != CERT_MAGIC {
         return Err(CertFormatError::Magic);
     }
@@ -312,20 +313,20 @@ pub fn decode_certificate(bytes: &[u8]) -> Result<ParsedCert<'_>, CertFormatErro
     if sig_alg != CERT_SIG_ED25519 {
         return Err(CertFormatError::Algorithm(sig_alg));
     }
-    // Regola 3.
+    // Rule 3.
     let ca_key = CertKey::from_bytes(r.array::<32>()?);
     let subject_key = CertKey::from_bytes(r.array::<32>()?);
     let serial = CertSerial::try_from(r.array::<16>()?)?;
     if ca_key == subject_key {
         return Err(CertFormatError::SelfCertified);
     }
-    // Regola 4.
+    // Rule 4.
     let not_before = UnixTime::from_secs(u64::from_be_bytes(r.array::<8>()?));
     let not_after = UnixTime::from_secs(u64::from_be_bytes(r.array::<8>()?));
     check_validity(not_before, not_after)?;
-    // Regola 5.
+    // Rule 5.
     let name = r.label()?;
-    // Regola 6.
+    // Rule 6.
     let scope_code = r.byte()?;
     let node_count = r.byte()?;
     let scope = match scope_code {
@@ -355,7 +356,7 @@ pub fn decode_certificate(bytes: &[u8]) -> Result<ParsedCert<'_>, CertFormatErro
         }
         other => return Err(CertFormatError::Scope(other)),
     };
-    // Regola 7: esattamente 64 byte di firma.
+    // Rule 7: exactly 64 bytes of signature.
     let tbs_len = r.pos;
     let remaining = len.saturating_sub(tbs_len);
     if remaining < CERT_SIGNATURE_LEN {
@@ -388,7 +389,7 @@ pub fn decode_certificate(bytes: &[u8]) -> Result<ParsedCert<'_>, CertFormatErro
 const SCOPE_LIST: u8 = 0x00;
 const SCOPE_ALL: u8 = 0x01;
 
-/// Regola 4 di PROTOCOL §15.1, con aritmetica controllata.
+/// Rule 4 of PROTOCOL §15.1, with checked arithmetic.
 fn check_validity(not_before: UnixTime, not_after: UnixTime) -> Result<(), CertFormatError> {
     let Some(secs) = not_after.as_secs().checked_sub(not_before.as_secs()) else {
         return Err(CertFormatError::Validity);
@@ -402,13 +403,13 @@ fn check_validity(not_before: UnixTime, not_after: UnixTime) -> Result<(), CertF
     Ok(())
 }
 
-/// Scrive `len (u8) + byte` di un `NodeId` (1..=63 byte per costruzione).
+/// Writes `len (u8) + bytes` of a `NodeId` (1..=63 bytes by construction).
 fn push_label(out: &mut Vec<u8>, id: &NodeId) {
     out.push(u8::try_from(id.len()).unwrap_or(u8::MAX));
     out.extend_from_slice(id.as_bytes());
 }
 
-/// Lettore sequenziale con controllo dei limiti: mai un indice fuori dal buffer.
+/// Sequential reader with bounds checking: never an index outside the buffer.
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -441,7 +442,7 @@ impl<'a> Reader<'a> {
             .map_err(|_| CertFormatError::Truncated { at })
     }
 
-    /// `len (u8, 1..=63) + NodeId`. La lunghezza si controlla prima di leggere i byte.
+    /// `len (u8, 1..=63) + NodeId`. The length is checked before reading the bytes.
     fn label(&mut self) -> Result<NodeId, CertFormatError> {
         let len = usize::from(self.byte()?);
         if len == 0 {
@@ -458,99 +459,99 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Perché un certificato non rispetta il formato. Solo metadati (campo, posizione,
-/// lunghezza), mai byte del certificato.
+/// Why a certificate does not conform to the format. Only metadata (field, position,
+/// length), never certificate bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum CertFormatError {
-    /// Lunghezza totale fuori da `MIN_CERT_LEN..=MAX_CERT_LEN`.
+    /// Total length outside `MIN_CERT_LEN..=MAX_CERT_LEN`.
     #[error("certificate is {len} bytes, must be between 170 and 4328")]
     Length {
-        /// La lunghezza ricevuta.
+        /// The received length.
         len: usize,
     },
-    /// I primi 4 byte non sono `TCNC`.
+    /// The first 4 bytes are not `TCNC`.
     #[error("not a TCN client certificate")]
     Magic,
-    /// Versione diversa da 1.
+    /// Version other than 1.
     #[error("unsupported certificate version {0}")]
     Version(u8),
-    /// Algoritmo di firma diverso da Ed25519.
+    /// Signature algorithm other than Ed25519.
     #[error("unsupported signature algorithm {0}")]
     Algorithm(u8),
-    /// Numero di serie tutto a zero.
+    /// All-zero serial number.
     #[error("certificate serial must not be all zeros")]
     SerialZero,
-    /// `ca_key` uguale a `subject_key`: una CA non certifica sé stessa (regola 3).
+    /// `ca_key` equal to `subject_key`: a CA does not certify itself (rule 3).
     #[error("certificate subject key must differ from the authority key")]
     SelfCertified,
     /// `not_before >= not_after`.
     #[error("certificate validity window is empty")]
     Validity,
-    /// Durata oltre `MAX_CERT_LIFETIME_SECS`.
+    /// Lifetime beyond `MAX_CERT_LIFETIME_SECS`.
     #[error("certificate lifetime is {secs} s, maximum is 86400")]
     Lifetime {
-        /// La durata dichiarata.
+        /// The declared lifetime.
         secs: u64,
     },
-    /// Nome o nodo non valido.
+    /// Invalid name or node.
     #[error("invalid name in certificate: {0}")]
     Name(DomainError),
-    /// Codice di `scope` sconosciuto.
+    /// Unknown `scope` code.
     #[error("unknown certificate scope {0:#04x}")]
     Scope(u8),
-    /// `node_count` incoerente con `scope` o oltre il massimo.
+    /// `node_count` inconsistent with `scope` or beyond the maximum.
     #[error("invalid certificate node count {0}")]
     NodeCount(u8),
-    /// Nodi non in ordine strettamente crescente.
+    /// Nodes not in strictly increasing order.
     #[error("certificate nodes out of order at index {index}")]
     NodeOrder {
-        /// Indice del primo nodo fuori posto.
+        /// Index of the first out-of-order node.
         index: usize,
     },
-    /// Un campo supera la fine del certificato.
+    /// A field runs past the end of the certificate.
     #[error("certificate truncated at byte {at}")]
     Truncated {
-        /// Posizione del campo troncato.
+        /// Position of the truncated field.
         at: usize,
     },
-    /// Byte in più dopo la firma.
+    /// Extra bytes after the signature.
     #[error("certificate has {extra} trailing bytes")]
     Trailing {
-        /// Quanti.
+        /// How many.
         extra: usize,
     },
 }
 
-/// Perché un certificato presentato è stato rifiutato: il campo `cert_check` dell'audit
+/// Why a presented certificate was rejected: the `cert_check` field of the audit
 /// (PROTOCOL §15.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CertRejection {
-    /// Passo 3: lunghezza o formato.
+    /// Step 3: length or format.
     Malformed,
-    /// Passo 4: `subject_key` non canonica o diversa dalla chiave Noise.
+    /// Step 4: `subject_key` non-canonical or different from the Noise key.
     KeyMismatch,
-    /// Passo 5: `ca_key` non pinnata.
+    /// Step 5: `ca_key` not pinned.
     UnknownAuthority,
-    /// Passo 6: firma non valida.
+    /// Step 6: invalid signature.
     BadSignature,
-    /// Passo 7: numero di serie nella denylist.
+    /// Step 7: serial number in the denylist.
     SerialRevoked,
-    /// Passo 8: prima di `not_before - SKEW`.
+    /// Step 8: before `not_before - SKEW`.
     NotYetValid,
-    /// Passo 9: da `not_after` in poi.
+    /// Step 9: from `not_after` onwards.
     Expired,
-    /// Passo 10: durata oltre `max_lifetime` della CA.
+    /// Step 10: lifetime beyond the CA's `max_lifetime`.
     LifetimeExceedsAuthority,
-    /// Passo 11: la chiave è di un agent.
+    /// Step 11: the key belongs to an agent.
     RoleConflict,
-    /// Passo 12: il nodo dell'agent non è nell'ambito effettivo.
+    /// Step 12: the agent's node is not in the effective scope.
     NodeOutOfScope,
 }
 
 impl CertRejection {
-    /// Il valore di `cert_check` nell'audit log.
+    /// The value of `cert_check` in the audit log.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -567,8 +568,8 @@ impl CertRejection {
         }
     }
 
-    /// `true` per i controlli successivi alla verifica della firma (passi 7–12 di PROTOCOL
-    /// §15.4): solo per questi l'audit riporta CA e numero di serie (§15.11).
+    /// `true` for the checks after signature verification (steps 7–12 of PROTOCOL
+    /// §15.4): only for these does the audit report the CA and serial number (§15.11).
     #[must_use]
     pub const fn after_signature(self) -> bool {
         match self {
@@ -585,8 +586,8 @@ impl CertRejection {
     }
 }
 
-/// I dati di un certificato la cui firma è già stata verificata da `zt-crypto` con una chiave
-/// pinnata. Il relay core tiene solo questi, mai i byte del certificato.
+/// The data of a certificate whose signature has already been verified by `zt-crypto` with a
+/// pinned key. The relay core keeps only these, never the certificate bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertClaims {
     ca: Fingerprint,
@@ -600,7 +601,7 @@ pub struct CertClaims {
 }
 
 impl CertClaims {
-    /// Da un corpo verificato, con le fingerprint (forma X25519) della CA e del soggetto.
+    /// From a verified body, with the fingerprints (X25519 form) of the CA and the subject.
     #[must_use]
     pub fn from_verified(body: CertBody, ca: Fingerprint, subject: Fingerprint) -> Self {
         Self {
@@ -615,7 +616,7 @@ impl CertClaims {
         }
     }
 
-    /// Riferimento per gli eventi di audit.
+    /// Reference for audit events.
     #[must_use]
     pub fn reference(&self) -> CertRef {
         CertRef {
@@ -626,64 +627,64 @@ impl CertClaims {
         }
     }
 
-    /// Fingerprint della CA che ha firmato.
+    /// Fingerprint of the signing CA.
     #[must_use]
     pub const fn ca(&self) -> &Fingerprint {
         &self.ca
     }
 
-    /// Chiave della CA che ha firmato.
+    /// Key of the signing CA.
     #[must_use]
     pub const fn ca_key(&self) -> &CertKey {
         &self.ca_key
     }
 
-    /// Fingerprint del soggetto (uguale a quella della chiave Noise).
+    /// Fingerprint of the subject (equal to that of the Noise key).
     #[must_use]
     pub const fn subject(&self) -> &Fingerprint {
         &self.subject
     }
 
-    /// Numero di serie.
+    /// Serial number.
     #[must_use]
     pub const fn serial(&self) -> CertSerial {
         self.serial
     }
 
-    /// Nome del client.
+    /// Name of the client.
     #[must_use]
     pub const fn name(&self) -> &NodeId {
         &self.name
     }
 
-    /// Ambito dichiarato.
+    /// Declared scope.
     #[must_use]
     pub const fn scope(&self) -> &CertScope {
         &self.scope
     }
 
-    /// Inizio della validità.
+    /// Start of validity.
     #[must_use]
     pub const fn not_before(&self) -> UnixTime {
         self.not_before
     }
 
-    /// Fine della validità (esclusa).
+    /// End of validity (exclusive).
     #[must_use]
     pub const fn not_after(&self) -> UnixTime {
         self.not_after
     }
 }
 
-/// Ciò che un evento di audit dice di un certificato: mai i suoi byte.
+/// What an audit event says about a certificate: never its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertRef {
-    /// Fingerprint della CA.
+    /// Fingerprint of the CA.
     pub ca: Fingerprint,
-    /// Numero di serie.
+    /// Serial number.
     pub serial: CertSerial,
-    /// Nome del client.
+    /// Name of the client.
     pub name: NodeId,
-    /// Scadenza.
+    /// Expiry.
     pub not_after: UnixTime,
 }

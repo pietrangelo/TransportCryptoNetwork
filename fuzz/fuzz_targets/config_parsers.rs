@@ -1,12 +1,12 @@
-//! I parser dei file di configurazione (policy del relay, client autorizzati, nodi noti,
-//! configurazione del client) su testo arbitrario.
+//! The configuration file parsers (relay policy, authorized clients, known nodes, client
+//! configuration) on arbitrary text.
 //!
-//! Proprietà: nessun panic; un messaggio d'errore non riporta mai una sequenza esadecimale
-//! lunga presa dal file, dove starebbe una chiave segreta incollata per sbaglio. (Un controllo
-//! sulle righe intere darebbe falsi positivi: il fuzzer impara a scrivere il testo degli errori.)
+//! Properties: no panic; an error message never reports a long hex sequence taken from the
+//! file, where a secret key pasted by mistake would be. (A check on whole lines would give
+//! false positives: the fuzzer learns to write the text of the errors.)
 //!
-//! Fase 6: i blocchi `[[authorities]]` di policy e client autorizzati (arrivano dagli stessi
-//! parser), la denylist `revoked.toml` e il file del certificato del client.
+//! Phase 6: the `[[authorities]]` blocks of the policy and of the authorized clients (they come
+//! from the same parsers), the `revoked.toml` denylist and the client certificate file.
 #![no_main]
 
 use std::path::Path;
@@ -14,7 +14,7 @@ use std::path::Path;
 use libfuzzer_sys::fuzz_target;
 use zt_net::config;
 
-/// Le sequenze esadecimali di almeno 32 caratteri presenti nel testo.
+/// The hex sequences of at least 32 characters present in the text.
 fn hex_runs(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_ascii_hexdigit())
         .filter(|run| run.len() >= 32)
@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
         check(text, e);
     }
     match config::parse_certificate_file("f", text) {
-        // Un file accettato contiene un certificato che rispetta il formato.
+        // An accepted file contains a certificate that conforms to the format.
         Ok(file) => assert!(zt_domain::decode_certificate(&file.bytes).is_ok()),
         Err(e) => check(text, e),
     }

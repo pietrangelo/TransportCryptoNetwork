@@ -1,4 +1,4 @@
-//! Test dell'adapter `tokio-util` su stream in memoria: frammentazione reale dell'I/O.
+//! Tests of the `tokio-util` adapter on in-memory streams: real I/O fragmentation.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -36,7 +36,7 @@ fn sample_frames() -> Vec<Frame> {
 
 #[tokio::test]
 async fn frames_survive_a_tiny_duplex_pipe() {
-    // Buffer da 64 byte: ogni frame `Data` viene spezzato in decine di letture parziali.
+    // 64-byte buffer: every `Data` frame is split into dozens of partial reads.
     let (client, server) = tokio::io::duplex(64);
     let frames = sample_frames();
 

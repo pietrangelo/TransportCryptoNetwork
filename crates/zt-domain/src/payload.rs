@@ -5,36 +5,36 @@ use bytes::Bytes;
 use crate::error::DomainError;
 use crate::limits::MAX_PAYLOAD_LEN;
 
-/// Payload opaco di un frame `Data`: byte cifrati end-to-end che il relay inoltra senza leggerli.
+/// Opaque payload of a `Data` frame: end-to-end encrypted bytes the relay forwards without reading.
 ///
-/// Invariante: lunghezza in `1..=MAX_PAYLOAD_LEN`. Il payload vuoto è vietato perché un frame
-/// `Data` vuoto non trasporta nulla e sarebbe solo un vettore di amplificazione/DoS.
+/// Invariant: length in `1..=MAX_PAYLOAD_LEN`. An empty payload is forbidden because an empty
+/// `Data` frame carries nothing and would only be an amplification/DoS vector.
 ///
-/// Internamente usa [`Bytes`]: il decoder può consegnare il payload senza copiarlo
-/// (zero-copy) e l'inoltro sul relay condivide lo stesso buffer.
+/// Internally it uses [`Bytes`]: the decoder can hand over the payload without copying it
+/// (zero-copy) and forwarding on the relay shares the same buffer.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FramePayload(Bytes);
 
 impl FramePayload {
-    /// Lunghezza in byte (sempre in `1..=MAX_PAYLOAD_LEN`).
+    /// Length in bytes (always in `1..=MAX_PAYLOAD_LEN`).
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Sempre `false`: un payload vuoto non è costruibile.
+    /// Always `false`: an empty payload cannot be constructed.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         false
     }
 
-    /// I byte del payload.
+    /// The payload bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    /// Consuma il payload restituendo il buffer sottostante.
+    /// Consumes the payload, returning the underlying buffer.
     #[must_use]
     pub fn into_bytes(self) -> Bytes {
         self.0
@@ -73,7 +73,7 @@ impl TryFrom<Vec<u8>> for FramePayload {
 }
 
 impl fmt::Debug for FramePayload {
-    /// Mostra solo la lunghezza: il contenuto (traffico SSH) non deve mai finire nei log.
+    /// Shows only the length: the content (SSH traffic) must never end up in logs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FramePayload({} bytes)", self.0.len())
     }

@@ -1,6 +1,6 @@
 [package]
 name = "zt-client"
-description = "Binario zt-client di TCN."
+description = "TCN zt-client binary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

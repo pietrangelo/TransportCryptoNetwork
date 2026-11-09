@@ -1,6 +1,6 @@
 [package]
 name = "zt-proto"
-description = "Wire format di TCN: encoder/decoder sans-IO dei frame, più adapter tokio-util opzionale."
+description = "TCN wire format: sans-IO frame encoder/decoder, plus an optional tokio-util adapter."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ publish.workspace = true
 
 [features]
 default = []
-# Adapter infrastrutturale: implementa tokio_util::codec::{Decoder, Encoder}.
+# Infrastructure adapter: implements tokio_util::codec::{Decoder, Encoder}.
 codec = ["dep:tokio-util"]
 
 [dependencies]

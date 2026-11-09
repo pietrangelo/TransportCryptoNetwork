@@ -1,8 +1,8 @@
-//! Fase 6, passo 3: firma e verifica dei certificati client (PROTOCOL §15.1 regola 8, §15.2,
-//! §15.4 passi 3–6, §15.13).
+//! Phase 6, step 3: signing and verification of client certificates (PROTOCOL §15.1 rule 8,
+//! §15.2, §15.4 steps 3–6, §15.13).
 //!
-//! I certificati di prova si scrivono e si firmano anche **a mano** (`tbs()` e `ed25519-dalek`
-//! con `hazmat`), così i test d'attacco non dipendono dal codice che verificano.
+//! Test certificates are also written and signed **by hand** (`tbs()` and `ed25519-dalek`
+//! with `hazmat`), so the attack tests do not depend on the code they verify.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -28,7 +28,7 @@ use zt_domain::{
     AllowedNodes, CertBody, CertRejection, CertScope, CertSerial, Fingerprint, NodeId, UnixTime,
 };
 
-// ---------- vettore di riferimento (PROTOCOL §15.13) ----------
+// ---------- reference vector (PROTOCOL §15.13) ----------
 
 const CTX: &[u8] = b"TCN client certificate v1\0";
 const REF_CERT_HEX: &str = concat!(
@@ -71,13 +71,13 @@ fn nodes(list: &[&str]) -> BTreeSet<NodeId> {
 fn ed_public(seed: [u8; 32]) -> [u8; 32] {
     SigningKey::from_bytes(&seed).verifying_key().to_bytes()
 }
-/// Fingerprint (forma X25519) di 32 byte Ed25519 qualsiasi che si decomprimono.
+/// Fingerprint (X25519 form) of any 32 Ed25519 bytes that decompress.
 fn fingerprint_of_ed(bytes: &[u8; 32]) -> Fingerprint {
     let vk = VerifyingKey::from_bytes(bytes).unwrap();
     fingerprint_of_x25519(&vk.to_montgomery().to_bytes())
 }
 
-/// Il TBS scritto a mano (PROTOCOL §15.1).
+/// The TBS written by hand (PROTOCOL §15.1).
 fn tbs(
     ca: [u8; 32],
     subject: [u8; 32],
@@ -109,7 +109,7 @@ fn tbs(
     b
 }
 
-/// Firma Ed25519 pura di `CTX || tbs` con il seme `seed`, fatta a mano.
+/// Pure Ed25519 signature of `CTX || tbs` with the seed `seed`, made by hand.
 fn sign_raw(seed: [u8; 32], tbs: &[u8]) -> Vec<u8> {
     let mut message = CTX.to_vec();
     message.extend_from_slice(tbs);
@@ -118,7 +118,7 @@ fn sign_raw(seed: [u8; 32], tbs: &[u8]) -> Vec<u8> {
     cert
 }
 
-/// Le CA pinnate: la CA di riferimento, `allow = ["*"]`, 24 h, denylist vuota.
+/// The pinned CAs: the reference CA, `allow = ["*"]`, 24 h, empty denylist.
 fn trust() -> CertTrust {
     trust_for(&[ed_public(ca_seed())])
 }
@@ -152,11 +152,11 @@ fn reference_body(ca: &CaSigningKey) -> CertBody {
     .unwrap()
 }
 
-/// 32 byte non canonici: `y + p` per un `y` piccolo che è un punto valido e non debole.
+/// 32 non-canonical bytes: `y + p` for a small `y` that is a valid, non-weak point.
 fn non_canonical_valid_points() -> Vec<[u8; 32]> {
     let mut out = Vec::new();
     for y in 0_u8..19 {
-        // p = 2^255 - 19: little-endian ed ff..ff 7f. y + p non va in overflow per y < 19.
+        // p = 2^255 - 19: little-endian ed ff..ff 7f. y + p does not overflow for y < 19.
         let mut bytes = [0xff_u8; 32];
         bytes[0] = 0xed + y;
         bytes[31] = 0x7f;
@@ -174,7 +174,7 @@ fn non_canonical_valid_points() -> Vec<[u8; 32]> {
     out
 }
 
-/// Codifiche (canoniche e no) di punti di ordine piccolo.
+/// Encodings (canonical and not) of small-order points.
 const SMALL_ORDER: [&str; 11] = [
     "0100000000000000000000000000000000000000000000000000000000000000",
     "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
@@ -184,7 +184,7 @@ const SMALL_ORDER: [&str; 11] = [
     "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
     "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
     "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
-    // Non canoniche: y = p + 1 (identità), y = p (ordine 4), identità con il bit di segno.
+    // Non-canonical: y = p + 1 (identity), y = p (order 4), identity with the sign bit.
     "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
     "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
     "0100000000000000000000000000000000000000000000000000000000000080",
@@ -197,11 +197,11 @@ fn small_order() -> Vec<[u8; 32]> {
         .collect()
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[test]
 fn reference_vector_matches_the_protocol() {
-    // Verifiche indipendenti dal codice sotto test: il documento è coerente con Ed25519.
+    // Checks independent of the code under test: the document is consistent with Ed25519.
     let cert = reference_cert();
     assert_eq!(cert.len(), 187);
     assert_eq!(hex::encode(ed_public(ca_seed())), REF_CA_KEY);
@@ -219,7 +219,7 @@ fn reference_vector_matches_the_protocol() {
     assert_eq!(manual, cert[..123]);
     assert_eq!(sign_raw(ca_seed(), &manual), cert, "the document signature");
 
-    // Il codice sotto test produce e accetta gli stessi byte.
+    // The code under test produces and accepts the same bytes.
     let ca = reference_ca();
     assert_eq!(ca.public_key().to_string(), REF_CA_KEY);
     let body = reference_body(&ca);
@@ -267,7 +267,7 @@ fn sign_then_verify_yields_the_claims() {
     assert_eq!(claims.scope(), body.scope());
     assert_eq!(claims.not_before(), body.not_before());
     assert_eq!(claims.not_after(), body.not_after());
-    // La verifica non decide il tempo: un certificato scaduto da anni passa i passi 3–6.
+    // Verification does not decide time: a certificate expired years ago passes steps 3–6.
     assert!(verify_certificate(&cert, &subject.fingerprint(), &trust).is_ok());
 }
 
@@ -281,10 +281,10 @@ fn ca_secret_files_have_their_own_format() {
     assert!(hex_part.bytes().all(|b| b.is_ascii_hexdigit()));
     let restored = CaSigningKey::from_secret_text(&text).unwrap();
     assert_eq!(restored.public_key(), ca.public_key());
-    // A capo finale facoltativo.
+    // Optional trailing newline.
     let trimmed = CaSigningKey::from_secret_text(text.trim_end()).unwrap();
     assert_eq!(trimmed.public_key(), ca.public_key());
-    // Il prefisso è obbligatorio ed esatto.
+    // The prefix is mandatory and exact.
     for bad in [
         hex_part.to_owned(),
         format!("tcn-ca-secret-v2:{hex_part}"),
@@ -319,21 +319,21 @@ fn certificate_text_round_trips() {
     assert_eq!(decode_certificate_text(&format!("{line}\n")).unwrap(), cert);
 }
 
-// ======================= attacchi =======================
+// ======================= attacks =======================
 
 #[test]
 fn a_certificate_with_another_static_key_fails_before_the_signature() {
     let cert = reference_cert();
     let thief = Identity::generate().unwrap();
     let trust = trust();
-    // Controllo: il proprietario della chiave passa.
+    // Control: the owner of the key passes.
     assert!(verify_certificate(&cert, &client().fingerprint(), &trust).is_ok());
     assert_eq!(
         verify_certificate(&cert, &thief.fingerprint(), &trust).err(),
         Some(CertRejection::KeyMismatch)
     );
-    // Con la firma rotta: chi non è il soggetto riceve ancora `KeyMismatch` (la firma non è
-    // valutata), il soggetto riceve `BadSignature`.
+    // With the signature broken: whoever is not the subject still gets `KeyMismatch` (the
+    // signature is not evaluated), the subject gets `BadSignature`.
     let mut broken = cert.clone();
     let last = broken.len() - 1;
     broken[last] ^= 0x01;
@@ -345,7 +345,7 @@ fn a_certificate_with_another_static_key_fails_before_the_signature() {
         verify_certificate(&broken, &client().fingerprint(), &trust).err(),
         Some(CertRejection::BadSignature)
     );
-    // Anche con una CA non pinnata: il binding viene prima del passo 5.
+    // Even with a non-pinned CA: the binding comes before step 5.
     assert_eq!(
         verify_certificate(
             &cert,
@@ -404,7 +404,7 @@ fn non_canonical_or_small_order_keys_are_rejected() {
         !non_canonical.is_empty(),
         "fixture: no non-canonical valid point found"
     );
-    // Controllo: una chiave canonica e valida è accettata e ricodificata identica.
+    // Control: a canonical, valid key is accepted and re-encoded identically.
     let good = ed_public([7; 32]);
     assert_eq!(
         PublicKey::from_canonical_bytes(&good).unwrap().to_bytes(),
@@ -424,12 +424,12 @@ fn non_canonical_or_small_order_keys_are_rejected() {
             Err(CryptoError::WeakKey | CryptoError::InvalidKey)
         ));
     }
-    // y >= p che non si decomprime: chiave non valida.
+    // y >= p that does not decompress: invalid key.
     assert!(PublicKey::from_canonical_bytes(&[0xff; 32]).is_err());
 
     let trust = trust();
-    // `subject_key` non canonica o debole, firmata dalla CA vera, presentata dalla chiave
-    // Noise «corrispondente» (stessa forma X25519): `KeyMismatch`.
+    // Non-canonical or weak `subject_key`, signed by the real CA, presented by the
+    // "matching" Noise key (same X25519 form): `KeyMismatch`.
     for subject in non_canonical.iter().chain(&weak) {
         let t = tbs(
             ed_public(ca_seed()),
@@ -452,7 +452,7 @@ fn non_canonical_or_small_order_keys_are_rejected() {
             hex::encode(subject)
         );
     }
-    // `ca_key` non canonica o debole: mai uguale a un pin (i pin sono canonici).
+    // Non-canonical or weak `ca_key`: never equal to a pin (pins are canonical).
     for ca in non_canonical.iter().chain(&weak) {
         let t = tbs(
             *ca,
@@ -480,7 +480,7 @@ fn a_malleated_signature_is_rejected() {
     let trust = trust();
     let peer = client().fingerprint();
     assert!(verify_certificate(&cert, &peer, &trust).is_ok());
-    // S + ℓ: stesso valore modulo ℓ, codifica non canonica di S.
+    // S + ℓ: same value modulo ℓ, non-canonical encoding of S.
     const L: [u8; 32] = [
         0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
         0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -498,7 +498,7 @@ fn a_malleated_signature_is_rejected() {
         verify_certificate(&malleated, &peer, &trust).err(),
         Some(CertRejection::BadSignature)
     );
-    // R di ordine piccolo.
+    // Small-order R.
     for r in small_order() {
         let mut forged = cert.clone();
         forged[123..123 + 32].copy_from_slice(&r);
@@ -507,7 +507,7 @@ fn a_malleated_signature_is_rejected() {
             Some(CertRejection::BadSignature)
         );
     }
-    // Firma tutta a zero.
+    // All-zero signature.
     let mut zero = cert.clone();
     zero[123..].copy_from_slice(&[0; 64]);
     assert_eq!(
@@ -518,9 +518,9 @@ fn a_malleated_signature_is_rejected() {
 
 #[test]
 fn the_ca_key_must_match_a_pin_byte_for_byte() {
-    // Pin P; certificato con ca_key = -P firmato con -s. -P ha la stessa forma X25519 di P
-    // (quindi la stessa fingerprint), ed è una firma valida per -P: solo il confronto byte per
-    // byte con il pin lo ferma.
+    // Pin P; certificate with ca_key = -P signed with -s. -P has the same X25519 form as P
+    // (hence the same fingerprint), and it is a valid signature for -P: only the byte-for-byte
+    // comparison with the pin stops it.
     let seed = ca_seed();
     let p = VerifyingKey::from_bytes(&ed_public(seed)).unwrap();
     let minus_p = VerifyingKey::from_bytes(&(-p.to_edwards()).compress().to_bytes()).unwrap();
@@ -551,7 +551,7 @@ fn the_ca_key_must_match_a_pin_byte_for_byte() {
     let mut cert = t;
     cert.extend_from_slice(&signature.to_bytes());
 
-    // Controllo: lo stesso contenuto con ca_key = P, firmato con s, passa.
+    // Control: the same content with ca_key = P, signed with s, passes.
     let honest = sign_raw(
         seed,
         &tbs(
@@ -574,8 +574,8 @@ fn the_ca_key_must_match_a_pin_byte_for_byte() {
 
 #[test]
 fn a_ca_key_equal_to_the_subject_is_rejected() {
-    // La CA certifica la propria chiave come client (PROTOCOL §15.1 regola 3): è un errore di
-    // formato (passo 3, `malformed`), anche se la firma è valida e il peer è quella chiave.
+    // The CA certifies its own key as a client (PROTOCOL §15.1 rule 3): it is a format error
+    // (step 3, `malformed`), even though the signature is valid and the peer is that key.
     let seed = ca_seed();
     let ca_pub = ed_public(seed);
     let cert = sign_raw(seed, &tbs(ca_pub, ca_pub, REF_SERIAL, NB, NA, "ca", None));
@@ -584,7 +584,7 @@ fn a_ca_key_equal_to_the_subject_is_rejected() {
         verify_certificate(&cert, &peer, &trust()).err(),
         Some(CertRejection::Malformed)
     );
-    // Controllo: un soggetto diverso passa.
+    // Control: a different subject passes.
     assert!(verify_certificate(&reference_cert(), &client().fingerprint(), &trust()).is_ok());
 }
 
@@ -602,7 +602,7 @@ fn node_and_ca_key_files_are_not_interchangeable() {
     let ca = CaSigningKey::generate().unwrap();
     let ca_text = ca.to_secret_text();
     assert!(CaSigningKey::from_secret_text(&ca_text).is_ok());
-    // Una chiave di nodo non carica il file della CA, e viceversa.
+    // A node key does not load the CA file, and vice versa.
     assert!(Identity::from_secret_hex(&ca_text).is_err());
     let node_key = Identity::generate().unwrap();
     assert!(CaSigningKey::from_secret_text(&node_key.to_secret_hex()).is_err());
@@ -610,12 +610,12 @@ fn node_and_ca_key_files_are_not_interchangeable() {
         CaSigningKey::from_secret_text(&format!("{}\n", node_key.to_secret_hex().as_str()))
             .is_err()
     );
-    // Un certificato non è una chiave.
+    // A certificate is not a key.
     let cert_text = format!("{CERT_FILE_PREFIX}{REF_CERT_HEX}\n");
     assert!(Identity::from_secret_hex(&cert_text).is_err());
     assert!(cert_text.parse::<PublicKey>().is_err());
     assert!(CaSigningKey::from_secret_text(&cert_text).is_err());
-    // E una chiave della CA non è un certificato.
+    // And a CA key is not a certificate.
     assert!(decode_certificate_text(&ca_text).is_err());
     assert!(decode_certificate_text(&node_key.to_secret_hex()).is_err());
 }
@@ -638,8 +638,8 @@ fn ca_signing_key_debug_is_redacted() {
 
 #[test]
 fn certificate_text_rejects_other_shapes() {
-    // Aggiunto: il formato del file (PROTOCOL §15.1, ultimo paragrafo). I casi del caricatore
-    // sono in `zt-net/tests/cert_config.rs`.
+    // Added: the file format (PROTOCOL §15.1, last paragraph). The loader cases are in
+    // `zt-net/tests/cert_config.rs`.
     let line = format!("{CERT_FILE_PREFIX}{REF_CERT_HEX}");
     assert!(decode_certificate_text(&line).is_ok());
     for bad in [

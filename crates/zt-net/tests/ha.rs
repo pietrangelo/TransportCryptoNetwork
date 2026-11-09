@@ -1,4 +1,4 @@
-//! Più relay e rotazione delle chiavi (Fase 5, PROTOCOL §13 e §14), su TCP reale.
+//! Multiple relays and key rotation (Phase 5, PROTOCOL §13 and §14), over real TCP.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -58,13 +58,13 @@ async fn echo_server() -> SocketAddr {
     addr
 }
 
-/// Un indirizzo su cui nessuno ascolta.
+/// An address nobody listens on.
 async fn dead_address() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap()
 }
 
-/// Listener che conta le connessioni e non risponde: un relay che non deve essere contattato.
+/// Listener that counts connections and never answers: a relay that must not be contacted.
 async fn tripwire() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -80,7 +80,7 @@ async fn tripwire() -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, count)
 }
 
-/// Identità del banco di prova. `agent_new` è la chiave dopo una rotazione dell'agent.
+/// Test bench identities. `agent_new` is the key after an agent rotation.
 struct Keys {
     agent: Identity,
     agent_new: Identity,
@@ -100,8 +100,8 @@ impl Keys {
         }
     }
 
-    /// web-01 (con le chiavi `agent_keys`), ansible → web-01, admin → tutti,
-    /// outsider senza nodi.
+    /// web-01 (with the `agent_keys` keys), ansible → web-01, admin → all,
+    /// outsider with no nodes.
     fn policy(&self, agent_keys: &[&Identity]) -> AccessPolicy {
         let mut p = AccessPolicy::new();
         let fps: Vec<_> = agent_keys.iter().map(|k| k.fingerprint()).collect();
@@ -132,7 +132,7 @@ impl Keys {
     }
 }
 
-/// Avvia un relay con le chiavi date; restituisce l'indirizzo.
+/// Starts a relay with the given keys; returns its address.
 async fn relay(keys: Keyring, policy: AccessPolicy) -> SocketAddr {
     let server = RelayServer::bind(
         "127.0.0.1:0".parse().unwrap(),
@@ -157,7 +157,7 @@ fn endpoint(addr: SocketAddr, key: &PublicKey) -> RelayEndpoint {
     }
 }
 
-/// Avvia l'agent di web-01 verso `relays`; accetta end-to-end solo `ansible`.
+/// Starts the web-01 agent towards `relays`; accepts only `ansible` end-to-end.
 async fn start_agent(keys: Keyring, relays: Vec<RelayEndpoint>, ansible: &Identity) {
     start_agent_with(keys, relays, ansible, 16).await;
 }
@@ -194,8 +194,8 @@ fn client_config(relays: Vec<RelayEndpoint>, node_key: &PublicKey) -> ClientConf
     }
 }
 
-/// Apre una sessione e verifica un giro di eco. Riprova per qualche secondo finché l'agent
-/// non risulta registrato (`NodeOffline`), poi restituisce l'esito.
+/// Opens a session and checks one echo round trip. Retries for a few seconds while the agent
+/// is not yet registered (`NodeOffline`), then returns the outcome.
 async fn echo(who: &Identity, config: &ClientConfig) -> Result<(), NetError> {
     let mut last = Err(NetError::Closed);
     for _ in 0..60 {
@@ -226,7 +226,7 @@ async fn echo(who: &Identity, config: &ClientConfig) -> Result<(), NetError> {
     last
 }
 
-// ======================= specifica: più relay =======================
+// ======================= specification: multiple relays =======================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_serves_through_every_relay_of_its_list() {
@@ -314,7 +314,7 @@ async fn the_client_falls_back_when_the_node_is_offline_on_the_first_relay() {
     let (r1_id, r2_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
     let r1 = relay(copy(&r1_id).into(), k.policy(&[&k.agent])).await;
     let r2 = relay(copy(&r2_id).into(), k.policy(&[&k.agent])).await;
-    // L'agent è connesso solo al secondo relay.
+    // The agent is connected only to the second relay.
     start_agent(
         copy(&k.agent).into(),
         vec![endpoint(r2, &r2_id.public_key())],
@@ -351,8 +351,8 @@ async fn the_client_falls_back_when_the_node_is_offline_on_the_first_relay() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_falls_back_past_an_impostor_at_the_first_address() {
-    // DNS dirottato: il primo indirizzo porta a un relay con un'altra chiave. Il pin la
-    // smaschera e il client passa al relay successivo, anch'esso pinnato.
+    // Hijacked DNS: the first address leads to a relay with a different key. The pin exposes
+    // it and the client moves on to the next relay, also pinned.
     let k = Keys::new();
     let (real_id, fake_id, r2_id) = (
         Identity::generate().unwrap(),
@@ -379,10 +379,10 @@ async fn the_client_falls_back_past_an_impostor_at_the_first_address() {
         .expect("fallback past the impostor");
 }
 
-// ======================= attacchi: niente failover dove sarebbe pericoloso ===============
+// ======================= attacks: no failover where it would be dangerous ===============
 
-/// Il relay pinnato (con l'agent registrato) e, al secondo posto, una trappola che conta le
-/// connessioni: non deve mai riceverne.
+/// The pinned relay (with the agent registered) and, in second place, a trap that counts
+/// connections: it must never receive any.
 async fn primary_and_tripwire(k: &Keys) -> (Vec<RelayEndpoint>, Arc<AtomicUsize>) {
     let r_id = Identity::generate().unwrap();
     let r = relay(copy(&r_id).into(), k.policy(&[&k.agent])).await;
@@ -423,8 +423,8 @@ async fn a_policy_denial_is_final_and_never_retried_elsewhere() {
     );
     let mut ghost = client_config(relays, &k.agent.public_key());
     ghost.node = node("ghost");
-    // Il relay non rivela quali nodi esistono: un nodo assente è `NotAuthorized` come uno
-    // negato. Entrambi sono definitivi.
+    // The relay does not reveal which nodes exist: a missing node is `NotAuthorized` just like
+    // a denied one. Both are final.
     let unknown = echo(&k.admin, &ghost).await;
     assert!(
         matches!(
@@ -458,7 +458,7 @@ async fn an_impostor_agent_is_reported_and_never_retried_elsewhere() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_refusal_is_final_and_never_retried_elsewhere() {
-    // admin è ammesso dalla policy del relay ma non dall'elenco dell'agent.
+    // admin is admitted by the relay policy but not by the agent's list.
     let k = Keys::new();
     let (relays, trap) = primary_and_tripwire(&k).await;
     let result = echo(&k.admin, &client_config(relays, &k.agent.public_key())).await;
@@ -476,7 +476,7 @@ async fn an_agent_refusal_is_final_and_never_retried_elsewhere() {
     );
 }
 
-// ======================= specifica: rotazione delle chiavi =======================
+// ======================= specification: key rotation =======================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn during_a_relay_rotation_both_pins_work() {
@@ -484,7 +484,7 @@ async fn during_a_relay_rotation_both_pins_work() {
     let (old, new) = (Identity::generate().unwrap(), Identity::generate().unwrap());
     let keys = Keyring::rotating(copy(&new), copy(&old)).unwrap();
     let r = relay(keys, k.policy(&[&k.agent])).await;
-    // L'agent pinna ancora la chiave vecchia del relay.
+    // The agent still pins the relay's old key.
     start_agent(
         copy(&k.agent).into(),
         vec![endpoint(r, &old.public_key())],
@@ -518,7 +518,7 @@ async fn during_an_agent_rotation_both_pins_work() {
     }
 }
 
-// ======================= attacchi: rotazione =======================
+// ======================= attacks: rotation =======================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_a_rotation_the_dropped_relay_key_is_refused() {
@@ -538,8 +538,8 @@ async fn after_a_rotation_the_dropped_relay_key_is_refused() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_never_uses_its_previous_key_towards_the_relay() {
-    // La policy conosce solo la chiave vecchia: un agent che ruota deve presentarsi al relay
-    // con quella nuova, quindi qui non si registra mai.
+    // The policy knows only the old key: a rotating agent must present itself to the relay
+    // with the new one, so here it never registers.
     let k = Keys::new();
     let r_id = Identity::generate().unwrap();
     let r = relay(copy(&r_id).into(), k.policy(&[&k.agent])).await;
@@ -562,9 +562,9 @@ async fn an_agent_never_uses_its_previous_key_towards_the_relay() {
 
 // ======================= adversary 0005 =======================
 
-/// Finding 0005-1: un relay compromesso (uno di due) apre stream senza mai mandare `msg1`.
-/// Prima occupava tutti i posti dell'agent e i client onesti, anche attraverso l'altro relay,
-/// ricevevano `ResourceExhausted`. Ora esaurisce solo la propria quota.
+/// Finding 0005-1: a compromised relay (one of two) opens streams without ever sending `msg1`.
+/// Previously it took up all of the agent's slots and honest clients, even through the other
+/// relay, received `ResourceExhausted`. Now it exhausts only its own quota.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compromised_relay_cannot_starve_sessions_through_the_others() {
     use zt_crypto::noise::Channel;
@@ -595,7 +595,7 @@ async fn a_compromised_relay_cannot_starve_sessions_through_the_others() {
         ch.recv().await.unwrap(),
         Some(Frame::Register { .. })
     ));
-    // Più stream di quanti l'agent ne ammetta, nessuno mai confermato.
+    // More streams than the agent admits, none ever confirmed.
     for n in 1..=24_u32 {
         ch.send(
             &Frame::Open {
@@ -631,7 +631,7 @@ async fn a_compromised_relay_cannot_starve_sessions_through_the_others() {
     drop(ch);
 }
 
-/// Il limite delle sessioni verso sshd vale per l'agent intero: due relay non lo raddoppiano.
+/// The limit on sshd sessions applies to the whole agent: two relays do not double it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_session_limit_holds_for_the_whole_agent() {
     let k = Keys::new();
@@ -651,12 +651,12 @@ async fn the_session_limit_holds_for_the_whole_agent() {
     let via = |r: SocketAddr, id: &Identity| {
         client_config(vec![endpoint(r, &id.public_key())], &k.agent.public_key())
     };
-    // Attende che l'agent sia registrato su entrambi.
+    // Waits until the agent is registered on both.
     echo(&k.ansible, &via(r1, &r1_id)).await.unwrap();
     echo(&k.ansible, &via(r2, &r2_id)).await.unwrap();
-    // L'agent libera gli stream delle prove poco dopo che il client ha finito.
+    // The agent frees the probe streams shortly after the client has finished.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // Una sessione aperta attraverso r1 occupa l'unico posto.
+    // A session opened through r1 takes the only slot.
     let (mut held, local) = tokio::io::duplex(1024);
     let cfg = via(r1, &r1_id);
     let who = copy(&k.ansible);
@@ -667,8 +667,8 @@ async fn the_session_limit_holds_for_the_whole_agent() {
         .await
         .unwrap()
         .unwrap();
-    // Lo stream dell'echo di prova su r2 può non aver ancora liberato la quota di r2 (anche
-    // lei 1): finché la risposta è quella quota, si riprova. Poi deve parlare il limite globale.
+    // The test echo stream on r2 may not have freed r2's quota yet (also 1): as long as the
+    // response is that quota, retry. Then the global limit must be the one speaking.
     let mut second = echo(&k.ansible, &via(r2, &r2_id)).await;
     for _ in 0..20 {
         if !matches!(
@@ -690,7 +690,7 @@ async fn the_session_limit_holds_for_the_whole_agent() {
 
 // ======================= adversary 0005b =======================
 
-/// Relay finto: accetta l'agent e restituisce il canale dopo `Register`.
+/// Fake relay: accepts the agent and returns the channel after `Register`.
 async fn evil_session(
     listener: &TcpListener,
     evil_id: &Identity,
@@ -712,7 +712,7 @@ async fn evil_session(
     ch
 }
 
-/// Sonda: il massimo dei task vivi nel runtime finché `stop` non diventa `true`.
+/// Probe: the maximum number of live tasks in the runtime until `stop` becomes `true`.
 fn peak_alive_tasks(stop: Arc<std::sync::atomic::AtomicBool>) -> tokio::task::JoinHandle<usize> {
     let runtime = tokio::runtime::Handle::current();
     tokio::spawn(async move {
@@ -725,8 +725,8 @@ fn peak_alive_tasks(stop: Arc<std::sync::atomic::AtomicBool>) -> tokio::task::Jo
     })
 }
 
-/// Il relay compromesso apre gli stream `ids`, ciascuno con un `msg1` spazzatura subito
-/// seguito da `Close`; restituisce quanti `Reject` riceve.
+/// The compromised relay opens the `ids` streams, each with a garbage `msg1` immediately
+/// followed by `Close`; returns how many `Reject`s it receives.
 async fn open_junk_close(
     ch: &mut zt_net::channel::Established<tokio::net::TcpStream>,
     ids: std::ops::RangeInclusive<u32>,
@@ -758,7 +758,7 @@ async fn open_junk_close(
         ] {
             ch.send(&frame, &t).await.unwrap();
         }
-        // Si svuota ogni tanto la direzione opposta, così nessuno dei due resta bloccato.
+        // Drain the opposite direction from time to time, so that neither side stays blocked.
         if i % 256 == 0 {
             while let Ok(Ok(Some(f))) =
                 tokio::time::timeout(Duration::from_micros(200), ch.recv()).await
@@ -773,10 +773,10 @@ async fn open_junk_close(
     rejected
 }
 
-/// Finding 0005b-1: il `Close` del relay toglieva lo slot dello stream subito, mentre il suo
-/// task era ancora vivo. Un relay compromesso che alterna `Open`, `msg1` spazzatura e `Close`
-/// non riceveva mai `ResourceExhausted` e accumulava task senza limite. Ora lo slot resta
-/// finché il task non finisce: la quota per relay vale, e torna libera quando i task finiscono.
+/// Finding 0005b-1: the relay's `Close` removed the stream's slot immediately, while its task
+/// was still alive. A compromised relay that alternates `Open`, garbage `msg1` and `Close`
+/// never received `ResourceExhausted` and accumulated tasks without limit. Now the slot stays
+/// until the task finishes: the per-relay quota holds, and it frees up when the tasks finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_close_does_not_free_the_quota_before_the_stream_task_ends() {
     use zt_domain::{Frame, FramePayload, StreamId};
@@ -786,7 +786,7 @@ async fn a_relay_close_does_not_free_the_quota_before_the_stream_task_ends() {
     let evil_id = Identity::generate().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let evil = listener.local_addr().unwrap();
-    // Con la chiave precedente ogni `msg1` spazzatura costa due DH: i task durano di più.
+    // With the previous key every garbage `msg1` costs two DHs: the tasks last longer.
     let keys = Keyring::rotating(copy(&k.agent), copy(&k.agent_new)).unwrap();
     start_agent_with(
         keys,
@@ -805,18 +805,18 @@ async fn a_relay_close_does_not_free_the_quota_before_the_stream_task_ends() {
     let rejected = open_junk_close(&mut ch, 1..=FLOOD).await;
     stop.store(true, Ordering::SeqCst);
     let peak = probe.await.unwrap();
-    // Prima della correzione: zero rifiuti, sempre (lo slot spariva insieme al `Close`).
+    // Before the fix: zero rejections, always (the slot vanished together with the `Close`).
     assert!(
         rejected > 0,
         "the relay's Close bypassed the per-relay quota"
     );
-    // Task di stream vivi al massimo `MAX`; il resto è la sonda e un margine.
+    // Live stream tasks at most `MAX`; the rest is the probe and a margin.
     assert!(
         peak <= base + 1 + MAX + 2,
         "peak alive tasks {peak} with base {base}: more stream tasks than max_streams"
     );
 
-    // Frame per uno stream già chiuso dal relay: si scartano, la sessione resta.
+    // Frames for a stream already closed by the relay: they are discarded, the session stays.
     let t = timeouts();
     let old = StreamId::try_from(FLOOD).unwrap();
     for frame in [
@@ -831,7 +831,7 @@ async fn a_relay_close_does_not_free_the_quota_before_the_stream_task_ends() {
     ] {
         ch.send(&frame, &t).await.unwrap();
     }
-    // Finiti i task, la quota torna libera: un nuovo `Open` è accettato.
+    // Once the tasks are done, the quota frees up: a new `Open` is accepted.
     let fresh = StreamId::try_from(FLOOD + 1).unwrap();
     ch.send(
         &Frame::Open {
@@ -855,8 +855,8 @@ async fn a_relay_close_does_not_free_the_quota_before_the_stream_task_ends() {
     assert_eq!(reply, Ok(()), "the quota must come back once the tasks end");
 }
 
-/// Finding 0005b-4: `max_streams` oltre il limite del semaforo di tokio faceva andare in panic
-/// l'agent. Ora `run` rifiuta il valore e ritorna.
+/// Finding 0005b-4: `max_streams` beyond the limit of the tokio semaphore made the agent
+/// panic. Now `run` rejects the value and returns.
 #[tokio::test]
 async fn an_out_of_range_max_streams_is_refused_without_panic() {
     for max in [0, agent::MAX_STREAMS + 1, usize::MAX] {

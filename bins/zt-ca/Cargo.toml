@@ -1,6 +1,6 @@
 [package]
 name = "zt-ca"
-description = "Binario zt-ca di TCN: CA offline per i certificati client brevi (PROTOCOL §15)."
+description = "TCN zt-ca binary: offline CA for short-lived client certificates (PROTOCOL §15)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

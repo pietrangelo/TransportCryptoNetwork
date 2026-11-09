@@ -4,35 +4,35 @@ use crate::error::DomainError;
 use crate::ids::{NodeId, StreamId};
 use crate::payload::FramePayload;
 
-/// Tipo di un frame (la «T» di TLV). Il valore numerico è il codice sul filo.
+/// Type of a frame (the "T" in TLV). The numeric value is the code on the wire.
 ///
-/// L'insieme è **chiuso**: un codice sconosciuto è un errore di protocollo fatale, non un frame
-/// da ignorare. Nessuna estensione silenziosa: l'evoluzione passa dal byte di versione.
+/// The set is **closed**: an unknown code is a fatal protocol error, not a frame to be
+/// ignored. No silent extensions: evolution goes through the version byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FrameKind {
-    /// agent → relay: annuncia il nome logico del nodo (stream 0).
+    /// agent → relay: announces the node's logical name (stream 0).
     Register = 0x01,
-    /// client → relay → agent: apre uno stream verso un nodo.
+    /// client → relay → agent: opens a stream towards a node.
     Open = 0x02,
-    /// agent → relay → client: lo stream è stato accettato.
+    /// agent → relay → client: the stream has been accepted.
     OpenAck = 0x03,
-    /// relay/agent → client: lo stream è stato rifiutato.
+    /// relay/agent → client: the stream has been rejected.
     Reject = 0x04,
-    /// Dati opachi cifrati end-to-end.
+    /// Opaque end-to-end encrypted data.
     Data = 0x10,
-    /// Concede al peer altro credito di invio (controllo di flusso / backpressure).
+    /// Grants the peer more send credit (flow control / backpressure).
     WindowUpdate = 0x11,
-    /// Chiude uno stream.
+    /// Closes a stream.
     Close = 0x12,
     /// Keepalive (stream 0).
     Ping = 0x20,
-    /// Risposta al keepalive (stream 0).
+    /// Keepalive reply (stream 0).
     Pong = 0x21,
 }
 
 impl FrameKind {
-    /// Tutti i tipi, in ordine di codice.
+    /// All types, in code order.
     pub const ALL: [Self; 9] = [
         Self::Register,
         Self::Open,
@@ -45,13 +45,13 @@ impl FrameKind {
         Self::Pong,
     ];
 
-    /// Il codice sul filo.
+    /// The code on the wire.
     #[must_use]
     pub const fn code(self) -> u8 {
         self as u8
     }
 
-    /// Il tipo corrispondente a un codice, se esiste.
+    /// The type corresponding to a code, if any.
     #[must_use]
     pub const fn from_code(code: u8) -> Option<Self> {
         Some(match code {
@@ -68,27 +68,27 @@ impl FrameKind {
         })
     }
 
-    /// `true` se il frame appartiene a uno stream (`stream_id != 0`),
-    /// `false` se è un frame di controllo della connessione (`stream_id == 0`).
+    /// `true` if the frame belongs to a stream (`stream_id != 0`),
+    /// `false` if it is a connection control frame (`stream_id == 0`).
     #[must_use]
     pub const fn is_stream_scoped(self) -> bool {
         !matches!(self, Self::Register | Self::Ping | Self::Pong)
     }
 }
 
-/// Motivo del rifiuto di un `Open`.
+/// Reason for rejecting an `Open`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RejectReason {
-    /// Il client non è autorizzato verso quel nodo (whitelist).
+    /// The client is not authorized for that node (whitelist).
     NotAuthorized = 0x01,
-    /// Nessun nodo registrato con quel nome.
+    /// No node registered with that name.
     UnknownNode = 0x02,
-    /// Il nodo è noto ma non connesso.
+    /// The node is known but not connected.
     NodeOffline = 0x03,
-    /// Troppe richieste.
+    /// Too many requests.
     RateLimited = 0x04,
-    /// Limite di stream o memoria raggiunto.
+    /// Stream or memory limit reached.
     ResourceExhausted = 0x05,
 }
 
@@ -107,22 +107,22 @@ impl TryFrom<u8> for RejectReason {
     }
 }
 
-/// Motivo della chiusura di uno stream.
+/// Reason for closing a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum CloseReason {
-    /// Chiusura ordinata (EOF di una delle due parti).
+    /// Orderly close (EOF from one of the two sides).
     Normal = 0x00,
-    /// Timeout di inattività o di I/O.
+    /// Inactivity or I/O timeout.
     Timeout = 0x01,
-    /// Il peer ha violato il protocollo.
+    /// The peer violated the protocol.
     ProtocolViolation = 0x02,
-    /// Il nodo è in drain (manutenzione o shutdown).
+    /// The node is draining (maintenance or shutdown).
     Drained = 0x03,
-    /// L'altra estremità dello stream è scomparsa.
+    /// The other end of the stream has gone away.
     PeerGone = 0x04,
-    /// L'agent ha rifiutato l'identità end-to-end del client (difesa in profondità: il
-    /// relay l'aveva autorizzato, ma l'agent non si fida del relay).
+    /// The agent rejected the client's end-to-end identity (defense in depth: the
+    /// relay had authorized it, but the agent does not trust the relay).
     Unauthorized = 0x05,
 }
 
@@ -142,13 +142,13 @@ impl TryFrom<u8> for CloseReason {
     }
 }
 
-/// Credito di controllo di flusso: quanti byte di `Data` il peer può ancora inviare.
-/// Sempre `> 0`: un aggiornamento nullo è rifiutato.
+/// Flow-control credit: how many bytes of `Data` the peer may still send.
+/// Always `> 0`: a zero update is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Credit(NonZeroU32);
 
 impl Credit {
-    /// Il valore numerico (sempre `> 0`).
+    /// The numeric value (always `> 0`).
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0.get()
@@ -165,71 +165,71 @@ impl TryFrom<u32> for Credit {
     }
 }
 
-/// Un messaggio del protocollo TCN, dopo l'handshake.
+/// A TCN protocol message, after the handshake.
 ///
-/// Ogni variante contiene solo value object già validati: se un `Frame` esiste, è valido.
-/// Per questo l'encoder è infallibile e il decoder è l'unico punto in cui si rifiuta input.
+/// Every variant contains only already-validated value objects: if a `Frame` exists, it is valid.
+/// This is why the encoder is infallible and the decoder is the only place where input is rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// Annuncio del nome logico dell'agent (l'identità vera è la chiave Noise statica).
+    /// Announcement of the agent's logical name (the real identity is the static Noise key).
     Register {
-        /// Nome dichiarato, da verificare contro la whitelist chiave→nome.
+        /// Declared name, to be checked against the key→name whitelist.
         node: NodeId,
     },
-    /// Richiesta di apertura di uno stream verso `target`.
+    /// Request to open a stream towards `target`.
     Open {
-        /// Stream scelto dall'iniziatore.
+        /// Stream chosen by the initiator.
         stream: StreamId,
-        /// Nodo di destinazione.
+        /// Destination node.
         target: NodeId,
     },
-    /// Stream accettato.
+    /// Stream accepted.
     OpenAck {
-        /// Lo stream accettato.
+        /// The accepted stream.
         stream: StreamId,
     },
-    /// Stream rifiutato.
+    /// Stream rejected.
     Reject {
-        /// Lo stream rifiutato.
+        /// The rejected stream.
         stream: StreamId,
-        /// Il motivo.
+        /// The reason.
         reason: RejectReason,
     },
-    /// Dati opachi.
+    /// Opaque data.
     Data {
-        /// Lo stream.
+        /// The stream.
         stream: StreamId,
-        /// I byte cifrati end-to-end.
+        /// The end-to-end encrypted bytes.
         payload: FramePayload,
     },
-    /// Nuovo credito di invio per lo stream.
+    /// New send credit for the stream.
     WindowUpdate {
-        /// Lo stream.
+        /// The stream.
         stream: StreamId,
-        /// Byte aggiuntivi concessi.
+        /// Additional bytes granted.
         credit: Credit,
     },
-    /// Chiusura dello stream.
+    /// Stream close.
     Close {
-        /// Lo stream.
+        /// The stream.
         stream: StreamId,
-        /// Il motivo.
+        /// The reason.
         reason: CloseReason,
     },
     /// Keepalive.
     Ping {
-        /// Valore da restituire nel `Pong`.
+        /// Value to echo back in the `Pong`.
         nonce: u64,
     },
-    /// Risposta al keepalive.
+    /// Keepalive reply.
     Pong {
-        /// Il `nonce` del `Ping`.
+        /// The `nonce` of the `Ping`.
         nonce: u64,
     },
 }
 
 impl Frame {
-    /// Il tipo del frame.
+    /// The frame type.
     #[must_use]
     pub const fn kind(&self) -> FrameKind {
         match self {
@@ -245,7 +245,7 @@ impl Frame {
         }
     }
 
-    /// Lo stream del frame, o `None` per i frame di controllo della connessione.
+    /// The frame's stream, or `None` for connection control frames.
     #[must_use]
     pub const fn stream(&self) -> Option<StreamId> {
         match self {

@@ -1,6 +1,6 @@
-//! Fase 6, passo 7: attacchi ai certificati client su TCP reale (PROTOCOL §15.3, §15.4,
-//! §15.5, §15.6, §15.8, §15.14). Ogni rifiuto ha un controllo positivo nello stesso test, così
-//! un'implementazione che rifiuta tutto non lo fa passare.
+//! Phase 6, step 7: attacks on client certificates over real TCP (PROTOCOL §15.3, §15.4,
+//! §15.5, §15.6, §15.8, §15.14). Every rejection has a positive check in the same test, so an
+//! implementation that rejects everything does not pass.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -33,9 +33,9 @@ fn some_agent() -> Fingerprint {
     Identity::generate().unwrap().fingerprint()
 }
 
-/// A: un certificato rubato presentato con un'altra chiave statica non ottiene il messaggio 2
-/// né dal relay né dall'agent; l'audit dice `key_mismatch` e, non essendo verificata la firma,
-/// non nomina CA né serie (§15.4 passo 4, §15.11).
+/// A: a stolen certificate presented with a different static key does not get message 2 from
+/// either the relay or the agent; the audit log says `key_mismatch` and, since the signature
+/// has not been verified, names neither CA nor serial (§15.4 step 4, §15.11).
 #[tokio::test]
 async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
     let log = Captured::default();
@@ -51,7 +51,7 @@ async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
         trust(&[(&ca, AllowedNodes::All)], &[], &[]),
     ))
     .await;
-    // Controllo: il proprietario ottiene il messaggio 2.
+    // Check: the owner gets message 2.
     assert!(
         probe_relay(
             relay.addr,
@@ -81,10 +81,10 @@ async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
     assert_eq!(field(thief_line, "reason").as_deref(), Some("certificate"));
     assert!(field(thief_line, "serial").is_none(), "{thief_line}");
     assert!(field(thief_line, "ca").is_none(), "{thief_line}");
-    // Nessun rifiuto nomina la serie: il ladro non ne ha verificato la firma.
+    // No rejection names the serial: the thief's signature was never verified.
     assert!(failed.iter().all(|l| !l.contains(&serial.to_string())));
 
-    // Lo stesso sul canale end-to-end, verso l'agent.
+    // The same on the end-to-end channel, towards the agent.
     let mut fake = FakeRelay::start(agent_clients(
         &[],
         trust(&[(&ca, AllowedNodes::All)], &[], &[]),
@@ -110,7 +110,7 @@ async fn a_stolen_certificate_with_another_key_never_gets_msg2() {
     assert_eq!(fake.sshd_connections(), 0);
 }
 
-/// I payload malformati usati sia contro il relay sia contro l'agent.
+/// The malformed payloads used against both the relay and the agent.
 fn bad_payloads(cert: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     let max_in_data = MAX_PAYLOAD_LEN - NOISE_MSG1_OVERHEAD - NOISE_TAG_LEN;
     let mut bad_sig = cert.to_vec();
@@ -129,8 +129,8 @@ fn bad_payloads(cert: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// A: payload del messaggio 1 malformati o troppo lunghi non ottengono il messaggio 2, sul
-/// relay e sull'agent; il relay continua a servire gli altri.
+/// A: malformed or overlong message 1 payloads do not get message 2, on the relay and on the
+/// agent; the relay keeps serving the others.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn garbage_or_oversized_msg1_payloads_get_no_msg2() {
     let ca = Ca::new();
@@ -145,7 +145,7 @@ async fn garbage_or_oversized_msg1_payloads_get_no_msg2() {
     ))
     .await;
     for (what, payload) in bad_payloads(&cert) {
-        // Anche un client della whitelist: un certificato presentato si verifica sempre.
+        // Even a whitelisted client: a presented certificate is always verified.
         for seed in [alice_seed, static_seed] {
             assert!(
                 probe_relay(
@@ -158,7 +158,7 @@ async fn garbage_or_oversized_msg1_payloads_get_no_msg2() {
             );
         }
     }
-    // Il relay sopravvive: un client della whitelist e uno certificato passano ancora.
+    // The relay survives: a whitelisted client and a certified one still get through.
     assert!(
         probe_relay(
             relay.addr,
@@ -207,9 +207,9 @@ async fn garbage_or_oversized_msg1_payloads_get_no_msg2() {
     assert_eq!(fake.sshd_connections(), 0);
 }
 
-/// A: un relay compromesso inoltra all'agent di `web-01` un certificato che non concede
-/// `web-01` (fuori dall'elenco del certificato, o fuori da `allow` della CA): `Close
-/// Unauthorized` prima del messaggio 2 e sshd mai contattato.
+/// A: a compromised relay forwards to the `web-01` agent a certificate that does not grant
+/// `web-01` (outside the certificate's list, or outside the CA's `allow`): `Close
+/// Unauthorized` before message 2 and sshd never contacted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compromised_relay_cannot_open_a_node_outside_the_certificate_scope() {
     let ca = Ca::new();
@@ -236,8 +236,8 @@ async fn a_compromised_relay_cannot_open_a_node_outside_the_certificate_scope() 
     );
     assert_eq!(fake.sshd_connections(), 0);
 
-    // La CA vale solo per `db-01`: nemmeno un certificato che elenca `web-01` o `scope = 0x01`
-    // apre `web-01`.
+    // The CA is valid only for `db-01`: not even a certificate that lists `web-01` or
+    // `scope = 0x01` opens `web-01`.
     let mut fake = FakeRelay::start(agent_clients(
         &[],
         trust(&[(&ca, nodes(&["db-01"]))], &[], &[]),
@@ -254,10 +254,10 @@ async fn a_compromised_relay_cannot_open_a_node_outside_the_certificate_scope() 
     assert_eq!(fake.sshd_connections(), 0);
 }
 
-/// A: un relay compromesso con una CA sua firma certificati (per una chiave sua, o per la
-/// chiave di un client vero) e li presenta all'agent: rifiutati, sshd mai contattato. Non può
-/// nemmeno togliere il certificato da un messaggio 1 vero (lo tratterebbe come un client
-/// sconosciuto).
+/// A: a compromised relay with its own CA signs certificates (for a key of its own, or for a
+/// real client's key) and presents them to the agent: rejected, sshd never contacted. It
+/// cannot even strip the certificate from a real message 1 (the agent would treat it as an
+/// unknown client).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compromised_relay_cannot_substitute_a_certificate_toward_the_agent() {
     let (ca, rogue) = (Ca::new(), Ca::new());
@@ -305,8 +305,8 @@ async fn a_compromised_relay_cannot_substitute_a_certificate_toward_the_agent() 
     assert_eq!(fake.sshd_connections(), 0);
 }
 
-/// A (difesa in profondità): il relay pinna le CA X e Y, l'agent solo Y. Un certificato di X
-/// passa il relay ma non l'agent.
+/// A (defense in depth): the relay pins CAs X and Y, the agent only Y. A certificate from X
+/// passes the relay but not the agent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_rejects_an_authority_it_does_not_pin_even_if_the_relay_does() {
     let (x, y) = (Ca::new(), Ca::new());
@@ -337,9 +337,9 @@ async fn the_agent_rejects_an_authority_it_does_not_pin_even_if_the_relay_does()
     assert_eq!(lab.sshd.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-/// A (§15.3): un messaggio 1 esterno con certificato valido, rigiocato, ottiene al più un
-/// messaggio 2 inutile: nessun `session_established`, nessun evento con quella serie. Dopo,
-/// una sessione vera registra la serie (controllo positivo).
+/// A (§15.3): a replayed outer message 1 with a valid certificate gets at most a useless
+/// message 2: no `session_established`, no event with that serial. Afterwards, a real session
+/// logs the serial (positive check).
 #[tokio::test]
 async fn replaying_a_certified_msg1_logs_no_session() {
     let log = Captured::default();
@@ -381,8 +381,8 @@ async fn replaying_a_certified_msg1_logs_no_session() {
     assert_eq!(field(&established[0], "serial"), Some(serial.to_string()));
 }
 
-/// A (§15.6): scaduto (anche da poco) o non ancora valido oltre la tolleranza: rifiutato da
-/// relay e agent. Entro la tolleranza su `not_before`, accettato.
+/// A (§15.6): expired (even recently) or not yet valid beyond the tolerance: rejected by relay
+/// and agent. Within the tolerance on `not_before`, accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_and_not_yet_valid_certificates_are_refused_on_relay_and_agent() {
     let ca = Ca::new();
@@ -460,7 +460,7 @@ async fn expired_and_not_yet_valid_certificates_are_refused_on_relay_and_agent()
     assert_eq!(fake.sshd_connections(), 0);
 }
 
-/// Directory temporanea `0755` per i file di configurazione, cancellata alla fine.
+/// Temporary `0755` directory for the configuration files, deleted at the end.
 struct Dir(PathBuf);
 
 impl Dir {
@@ -490,9 +490,9 @@ fn set_mode(p: &Path, mode: u32) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// A (§15.8): con `[[authorities]]` e senza denylist, i caricatori di relay e agent falliscono
-/// (e quindi né `RelayServer` né `agent::run` partono). Con la denylist, relay e agent costruiti
-/// dai caricatori servono un client certificato.
+/// A (§15.8): with `[[authorities]]` and no denylist, the relay and agent loaders fail (and
+/// so neither `RelayServer` nor `agent::run` start). With the denylist, relay and agent built
+/// from the loaders serve a certified client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_without_revocations_for_its_authorities_does_not_start() {
     let dir = Dir::new("revocations");
@@ -530,7 +530,7 @@ async fn a_relay_without_revocations_for_its_authorities_does_not_start() {
         Err(ConfigError::RevocationsRequired(_))
     ));
 
-    // Controllo positivo: con una denylist vuota tutto parte e il certificato funziona.
+    // Positive check: with an empty denylist everything starts and the certificate works.
     let revoked = dir.write("revoked.toml", "serials = []\nkeys = []\n");
     let relay_policy = load_relay_policy(&policy, Some(&revoked)).unwrap();
     let agent_clients = load_authorized_clients(&clients, Some(&revoked)).unwrap();
@@ -542,9 +542,9 @@ async fn a_relay_without_revocations_for_its_authorities_does_not_start() {
     let (_app, _task) = lab.session(&alice, Some(&cert)).await.unwrap();
 }
 
-/// Finding 0006-3: un rifiuto dopo la verifica della firma (qui `serial_revoked` sul relay,
-/// `serial_revoked` e `node_out_of_scope` sull'agent) riporta `ca` e `serial` (§15.11); un
-/// rifiuto prima della firma (`bad_signature`) mai.
+/// Finding 0006-3: a rejection after signature verification (here `serial_revoked` on the
+/// relay, `serial_revoked` and `node_out_of_scope` on the agent) reports `ca` and `serial`
+/// (§15.11); a rejection before the signature (`bad_signature`) never does.
 #[tokio::test]
 async fn authentication_failed_after_the_signature_names_ca_and_serial() {
     let log = Captured::default();
@@ -594,11 +594,11 @@ async fn authentication_failed_after_the_signature_names_ca_and_serial() {
     let msg1 = raw_msg1(carol_seed, &relay.key, Channel::Outer, &forged);
     assert!(probe_relay(relay.addr, &msg1).await.is_none());
     names_nothing(&line_for(&carol));
-    // Controllo positivo: il certificato integro passa.
+    // Positive check: the intact certificate passes.
     let msg1 = raw_msg1(carol_seed, &relay.key, Channel::Outer, &good);
     assert!(probe_relay(relay.addr, &msg1).await.is_some());
 
-    // Agent: si ricomincia con un log pulito.
+    // Agent: start over with a clean log.
     log.clear();
     let mut fake = FakeRelay::start(agent_clients(
         &[],

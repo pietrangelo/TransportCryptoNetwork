@@ -6,25 +6,25 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::DomainError;
 
-/// Impronta crittografica (SHA-256, 32 byte) della chiave pubblica statica di un peer.
+/// Cryptographic fingerprint (SHA-256, 32 bytes) of a peer's static public key.
 ///
-/// È l'identità usata nelle whitelist. Il confronto è **a tempo costante** (`subtle`), così il
-/// tempo di risposta di un lookup non rivela quanti byte di un'impronta indovinata coincidono.
-/// Il calcolo dell'hash avviene nell'adapter crittografico: il dominio riceve solo i 32 byte.
+/// It is the identity used in whitelists. Comparison is **constant-time** (`subtle`), so the
+/// response time of a lookup does not reveal how many bytes of a guessed fingerprint match.
+/// The hash is computed in the crypto adapter: the domain receives only the 32 bytes.
 #[derive(Clone, Copy)]
 pub struct Fingerprint([u8; Self::LEN]);
 
 impl Fingerprint {
-    /// Lunghezza in byte.
+    /// Length in bytes.
     pub const LEN: usize = 32;
 
-    /// Costruisce un'impronta da 32 byte.
+    /// Builds a fingerprint from 32 bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
     }
 
-    /// I byte dell'impronta.
+    /// The fingerprint bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
@@ -67,7 +67,7 @@ impl Hash for Fingerprint {
 }
 
 impl fmt::Display for Fingerprint {
-    /// Formato `SHA256:` + esadecimale, come le impronte di OpenSSH.
+    /// `SHA256:` + hex format, like OpenSSH fingerprints.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SHA256:")?;
         for b in &self.0 {
@@ -83,36 +83,36 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// Segreto di autenticazione a 256 bit (per esempio un token di enrollment monouso).
+/// 256-bit authentication secret (for example a single-use enrollment token).
 ///
-/// Garanzie del tipo:
-/// - **niente `Clone`/`Copy`**: il segreto esiste in un solo punto della memoria;
-/// - **`ZeroizeOnDrop`**: i byte vengono azzerati quando il valore esce di scope (RAII);
-/// - **`Debug` redatto**: non può finire nei log neppure per sbaglio (OWASP A09);
-/// - **confronto a tempo costante** tramite [`AuthToken::verify`].
+/// Guarantees of the type:
+/// - **no `Clone`/`Copy`**: the secret exists in only one place in memory;
+/// - **`ZeroizeOnDrop`**: the bytes are zeroed when the value goes out of scope (RAII);
+/// - **redacted `Debug`**: it cannot end up in logs, not even by accident (OWASP A09);
+/// - **constant-time comparison** via [`AuthToken::verify`].
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AuthToken([u8; Self::LEN]);
 
 impl AuthToken {
-    /// Lunghezza in byte.
+    /// Length in bytes.
     pub const LEN: usize = 32;
 
-    /// Prende possesso di 32 byte segreti.
+    /// Takes ownership of 32 secret bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
     }
 
-    /// Accesso in sola lettura ai byte, da usare solo all'interno degli adapter crittografici.
+    /// Read-only access to the bytes, to be used only inside the crypto adapters.
     #[must_use]
     pub const fn expose_secret(&self) -> &[u8; Self::LEN] {
         &self.0
     }
 
-    /// Confronta il token con un candidato in tempo costante rispetto al contenuto.
+    /// Compares the token with a candidate in time that is constant with respect to the content.
     ///
-    /// Un candidato di lunghezza errata restituisce `false` senza confrontare i byte; la
-    /// lunghezza attesa è pubblica, quindi questo non rivela nulla.
+    /// A candidate of the wrong length returns `false` without comparing the bytes; the
+    /// expected length is public, so this reveals nothing.
     #[must_use]
     pub fn verify(&self, candidate: &[u8]) -> bool {
         candidate.len() == Self::LEN && bool::from(self.0.ct_eq(candidate))

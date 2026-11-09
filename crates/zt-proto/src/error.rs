@@ -1,45 +1,45 @@
 use thiserror::Error;
 use zt_domain::{DomainError, FrameKind};
 
-/// Violazione del protocollo rilevata durante la decodifica.
+/// Protocol violation detected during decoding.
 ///
-/// Ogni variante è **fatale** per la connessione: dopo un errore il
-/// [`FrameDecoder`](crate::FrameDecoder) resta avvelenato. I messaggi riportano solo metadati (codici,
-/// lunghezze), mai byte ricevuti, così possono finire negli audit log senza rischi.
+/// Every variant is **fatal** for the connection: after an error the
+/// [`FrameDecoder`](crate::FrameDecoder) stays poisoned. Messages report only metadata (codes,
+/// lengths), never received bytes, so they can safely end up in audit logs.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DecodeError {
-    /// Byte di versione diverso da [`wire::VERSION`](crate::wire::VERSION).
+    /// Version byte other than [`wire::VERSION`](crate::wire::VERSION).
     #[error("unsupported protocol version {0:#04x}")]
     UnsupportedVersion(u8),
-    /// Codice di tipo non definito.
+    /// Undefined kind code.
     #[error("unknown frame kind {0:#04x}")]
     UnknownKind(u8),
-    /// Frame di stream ricevuto sullo stream di controllo 0.
+    /// Stream frame received on control stream 0.
     #[error("{0:?} frame requires a non-zero stream id")]
     StreamIdRequired(FrameKind),
-    /// Frame di controllo ricevuto su uno stream diverso da 0.
+    /// Control frame received on a stream other than 0.
     #[error("{0:?} frame must use stream id 0")]
     StreamIdForbidden(FrameKind),
-    /// Lunghezza dichiarata fuori dall'intervallo ammesso per il tipo.
+    /// Declared length outside the range allowed for the kind.
     #[error("{kind:?} frame declares {len} payload bytes, allowed {min}..={max}")]
     LengthOutOfBounds {
-        /// Il tipo del frame.
+        /// The frame kind.
         kind: FrameKind,
-        /// La lunghezza dichiarata.
+        /// The declared length.
         len: usize,
-        /// Minimo ammesso.
+        /// Minimum allowed.
         min: usize,
-        /// Massimo ammesso.
+        /// Maximum allowed.
         max: usize,
     },
-    /// Il payload viola un'invariante di dominio.
+    /// The payload violates a domain invariant.
     #[error("invalid frame payload: {0}")]
     Invalid(#[from] DomainError),
-    /// Il decoder ha già rifiutato un frame: la connessione va chiusa.
+    /// The decoder has already rejected a frame: the connection must be closed.
     #[error("decoder already failed; the connection must be closed")]
     Poisoned,
-    /// Errore di I/O dall'adapter di trasporto (incluso EOF a metà frame).
+    /// I/O error from the transport adapter (including EOF in the middle of a frame).
     #[error("transport error: {0:?}")]
     Io(std::io::ErrorKind),
 }

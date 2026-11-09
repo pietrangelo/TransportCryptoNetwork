@@ -1,4 +1,4 @@
-//! Test di proprietà del framing: input generati e fuzzati, bordi esatti dei limiti.
+//! Framing property tests: generated and fuzzed inputs, exact edges of the limits.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,12 +24,12 @@ fn encode_to_vec(frame: &Frame) -> Vec<u8> {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        // 2 000 casi in locale; la CI ne chiede di più con PROPTEST_CASES.
+        // 2,000 cases locally; CI asks for more with PROPTEST_CASES.
         cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000),
         ..ProptestConfig::default()
     })]
 
-    /// decode(encode(f)) == f, e il buffer viene consumato per intero.
+    /// decode(encode(f)) == f, and the buffer is consumed entirely.
     #[test]
     fn round_trip(frame in arb_frame()) {
         let mut buf = BytesMut::from(&encode_to_vec(&frame)[..]);
@@ -40,8 +40,8 @@ proptest! {
         prop_assert!(buf.is_empty());
     }
 
-    /// Byte arbitrari: il decoder non va mai in panic, e se accetta un frame quel frame ha una
-    /// sola codifica possibile (encoding canonico: niente malleabilità del formato).
+    /// Arbitrary bytes: the decoder never panics, and if it accepts a frame that frame has only
+    /// one possible encoding (canonical encoding: no format malleability).
     #[test]
     fn arbitrary_bytes_never_panic_and_accepted_frames_are_canonical(
         bytes in proptest::collection::vec(any::<u8>(), 0..256)
@@ -53,8 +53,8 @@ proptest! {
         }
     }
 
-    /// Header plausibile (versione 1, tipo noto) con campi casuali: stesse garanzie, ma su
-    /// input che superano il primo filtro e arrivano alla validazione profonda.
+    /// Plausible header (version 1, known kind) with random fields: same guarantees, but on
+    /// inputs that get past the first filter and reach deep validation.
     #[test]
     fn structured_fuzz_never_panics(
         kind in proptest::sample::select(FrameKind::ALL.to_vec()),
@@ -74,7 +74,7 @@ proptest! {
         }
     }
 
-    /// Qualunque prefisso stretto di un frame valido significa «aspetta altri byte».
+    /// Any strict prefix of a valid frame means "wait for more bytes".
     #[test]
     fn every_strict_prefix_waits(frame in arb_frame(), cut in any::<prop::sample::Index>()) {
         let bytes = encode_to_vec(&frame);
@@ -84,7 +84,7 @@ proptest! {
         prop_assert_eq!(buf.len(), cut);
     }
 
-    /// Una sequenza di frame spezzata in chunk arbitrari viene ricostruita identica.
+    /// A sequence of frames split into arbitrary chunks is reconstructed identically.
     #[test]
     fn chunked_stream_reassembles(
         frames in proptest::collection::vec(arb_frame(), 1..16),
@@ -104,7 +104,7 @@ proptest! {
         prop_assert!(buf.is_empty());
     }
 
-    /// Per ogni tipo, ogni lunghezza dichiarata oltre il massimo è rifiutata dal solo header.
+    /// For each kind, every declared length beyond the maximum is rejected from the header alone.
     #[test]
     fn oversized_lengths_rejected_before_buffering(
         (kind, len) in proptest::sample::select(FrameKind::ALL.to_vec()).prop_flat_map(|kind| {

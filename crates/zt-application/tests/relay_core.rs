@@ -1,7 +1,7 @@
-//! Specifica e attacchi del relay core (Adversarial TDD, Fase 2).
+//! Specification and attacks for the relay core (Adversarial TDD, Phase 2).
 //!
-//! Il relay core è una macchina a stati sans-IO: riceve `Input` e produce `Output`. Questi test
-//! ne fissano il comportamento senza rete, orologio reale o casualità.
+//! The relay core is a sans-IO state machine: it receives `Input` and produces `Output`. These
+//! tests pin down its behavior without network, real clock or randomness.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -116,7 +116,7 @@ impl Harness {
         self.input(Input::Tick)
     }
 
-    /// Agent `web-01` su conn 1, registrato.
+    /// Agent `web-01` on conn 1, registered.
     fn with_web_agent() -> Self {
         let mut h = Self::new();
         assert!(h.connect(1, WEB_AGENT).is_empty());
@@ -129,8 +129,8 @@ impl Harness {
         h
     }
 
-    /// Agent web-01 (conn 1) + client ansible (conn 2) con lo stream 7 aperto.
-    /// Restituisce lo stream assegnato dal relay sul lato agent.
+    /// Agent web-01 (conn 1) + client ansible (conn 2) with stream 7 open.
+    /// Returns the stream assigned by the relay on the agent side.
     fn with_open_session() -> (Self, StreamId) {
         let mut h = Self::with_web_agent();
         h.connect(2, ANSIBLE);
@@ -189,7 +189,7 @@ fn is_violation_of(out: &[Output], conn: u64) -> bool {
             .any(|e| matches!(e, DomainEvent::ProtocolViolation { .. }))
 }
 
-// ======================= specifica =======================
+// ======================= specification =======================
 
 #[test]
 fn agent_registration_is_audited() {
@@ -248,7 +248,7 @@ fn full_session_lifecycle_is_routed_and_audited() {
         other => panic!("expected SessionEstablished, got {other:?}"),
     };
 
-    // Data nei due sensi, con traduzione degli stream id.
+    // Data in both directions, with stream id translation.
     let out = h.recv(
         2,
         Frame::Data {
@@ -278,7 +278,7 @@ fn full_session_lifecycle_is_routed_and_audited() {
         }]
     );
 
-    // WindowUpdate inoltrato.
+    // WindowUpdate forwarded.
     let credit = Credit::try_from(4096).unwrap();
     let out = h.recv(1, Frame::WindowUpdate { stream: a, credit });
     assert_eq!(
@@ -289,7 +289,7 @@ fn full_session_lifecycle_is_routed_and_audited() {
         }]
     );
 
-    // Chiusura ordinata.
+    // Orderly close.
     let out = h.recv(
         2,
         Frame::Close {
@@ -389,7 +389,7 @@ fn agent_disconnect_closes_its_streams_on_the_client_side() {
             .any(|e| matches!(e, DomainEvent::ConnectionDrained { .. }))
     );
     assert_eq!(h.core.route_count(), 0);
-    // Il nodo ora è offline.
+    // The node is now offline.
     let out = h.recv(
         2,
         Frame::Open {
@@ -438,7 +438,7 @@ fn reconnecting_agent_replaces_the_previous_connection() {
             reason: CloseReason::PeerGone
         }]
     );
-    // I nuovi stream vanno sulla nuova connessione.
+    // New streams go on the new connection.
     let out = h.recv(
         2,
         Frame::Open {
@@ -449,7 +449,7 @@ fn reconnecting_agent_replaces_the_previous_connection() {
     assert_eq!(sent_to(&out, 3).len(), 1);
 }
 
-// ======================= attacchi: identità e ruoli =======================
+// ======================= attacks: identity and roles =======================
 
 #[test]
 fn unknown_key_is_dropped_and_audited() {
@@ -554,7 +554,7 @@ fn unauthorized_and_nonexistent_nodes_are_indistinguishable() {
         },
     );
     h.connect(2, ANSIBLE);
-    // db-01 esiste ed è online ma non è concesso; ghost non esiste.
+    // db-01 exists and is online but is not granted; ghost does not exist.
     let denied = h.recv(
         2,
         Frame::Open {
@@ -594,7 +594,7 @@ fn unauthorized_and_nonexistent_nodes_are_indistinguishable() {
     );
 }
 
-// ======================= attacchi: stato degli stream =======================
+// ======================= attacks: stream state =======================
 
 #[test]
 fn reusing_an_open_stream_id_is_a_violation() {
@@ -738,7 +738,7 @@ fn agent_cannot_ack_unknown_streams_or_ack_twice() {
 #[test]
 fn agent_cannot_inject_into_streams_it_does_not_own() {
     let (mut h, _) = Harness::with_open_session();
-    // Un secondo agent (db-01) prova a scrivere sullo stream di web-01.
+    // A second agent (db-01) tries to write on web-01's stream.
     h.connect(4, DB_AGENT);
     h.recv(
         4,
@@ -757,7 +757,7 @@ fn agent_cannot_inject_into_streams_it_does_not_own() {
     assert!(sent_to(&out, 2).is_empty());
 }
 
-// ======================= attacchi: risorse =======================
+// ======================= attacks: resources =======================
 
 #[test]
 fn data_beyond_the_window_kills_the_sender() {
@@ -829,7 +829,7 @@ fn window_updates_restore_credit() {
             .is_empty()
         );
     }
-    // 240 KiB consumati: l'agent restituisce credito e il client può proseguire.
+    // 240 KiB consumed: the agent returns credit and the client can continue.
     let credit = Credit::try_from(u32::try_from(4 * chunk).unwrap()).unwrap();
     h.recv(1, Frame::WindowUpdate { stream: a, credit });
     for _ in 0..4 {
@@ -898,7 +898,7 @@ fn unsolicited_pong_is_a_violation() {
     assert!(is_violation_of(&out, 1));
 }
 
-// ======================= robustezza =======================
+// ======================= robustness =======================
 
 #[test]
 fn events_for_unknown_or_closed_connections_are_ignored() {
@@ -932,9 +932,9 @@ fn nothing_leaks_after_everyone_leaves() {
     assert_eq!(h.core.connection_count(), 0);
 }
 
-// ======================= regressioni dell'adversary review 0002 =======================
+// ======================= regressions from adversary review 0002 =======================
 
-/// Seconda sessione innocente: admin (conn 3) → web-01. Restituisce lo stream lato agent.
+/// Second innocent session: admin (conn 3) → web-01. Returns the agent-side stream.
 fn add_innocent_session(h: &mut Harness) -> StreamId {
     h.connect(3, ADMIN);
     let out = h.recv(
@@ -959,7 +959,7 @@ fn untouched(out: &[Output]) -> bool {
     closed(out).is_empty() && out.iter().all(|o| !matches!(o, Output::Send { .. }))
 }
 
-/// Finding 0002-1/2: un `Close` incrociato è normale e non deve far cadere l'agent.
+/// Finding 0002-1/2: a crossed `Close` is normal and must not make the agent drop.
 #[test]
 fn crossing_close_is_dropped_silently() {
     let (mut h, a) = Harness::with_open_session();
@@ -981,7 +981,7 @@ fn crossing_close_is_dropped_silently() {
     assert!(untouched(&out), "{out:?}");
 }
 
-/// Finding 0002-2: dati o credito dell'agent in volo dopo la chiusura del client.
+/// Finding 0002-2: agent data or credit in flight after the client closes.
 #[test]
 fn agent_frames_in_flight_after_client_close_are_dropped() {
     let (mut h, a) = Harness::with_open_session();
@@ -1006,7 +1006,7 @@ fn agent_frames_in_flight_after_client_close_are_dropped() {
     }
 }
 
-/// Finding 0002-2: `Open` seguito da `Close` prima dell'`OpenAck`.
+/// Finding 0002-2: `Open` followed by `Close` before the `OpenAck`.
 #[test]
 fn late_open_ack_or_reject_after_client_close_is_dropped() {
     for late in [true, false] {
@@ -1042,7 +1042,7 @@ fn late_open_ack_or_reject_after_client_close_is_dropped() {
     }
 }
 
-/// Finding 0002-6: dati del client in volo dopo la chiusura dell'agent.
+/// Finding 0002-6: client data in flight after the agent closes.
 #[test]
 fn client_frames_in_flight_after_agent_close_are_dropped() {
     let (mut h, a) = Harness::with_open_session();
@@ -1061,7 +1061,7 @@ fn client_frames_in_flight_after_agent_close_are_dropped() {
         },
     );
     assert!(untouched(&out), "{out:?}");
-    // Lo stesso id può poi essere riaperto.
+    // The same id can then be reopened.
     let out = h.recv(
         2,
         Frame::Open {
@@ -1072,7 +1072,7 @@ fn client_frames_in_flight_after_agent_close_are_dropped() {
     assert_eq!(sent_to(&out, 1).len(), 1);
 }
 
-/// Il perdono vale solo per stream davvero esistiti: id mai aperti restano violazioni.
+/// Forgiveness applies only to streams that really existed: never-opened ids remain violations.
 #[test]
 fn frames_on_never_opened_streams_are_still_violations() {
     let (mut h, _) = Harness::with_open_session();
@@ -1099,7 +1099,7 @@ fn frames_on_never_opened_streams_are_still_violations() {
     ));
 }
 
-/// Finding 0002-4: un flood di `Open`/`Close` non arriva all'agent oltre il rate concesso.
+/// Finding 0002-4: a flood of `Open`/`Close` does not reach the agent beyond the granted rate.
 #[test]
 fn open_floods_are_rate_limited() {
     let mut h = Harness::with_web_agent();

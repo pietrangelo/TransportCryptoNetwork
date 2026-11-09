@@ -1,16 +1,16 @@
 name: release
 
-# Un tag vN.N.N produce binari statici (musl) per x86_64 e aarch64, firmati con attestazione
-# di provenienza SLSA (verificabile con `gh attestation verify`), e una release in bozza.
+# A vN.N.N tag produces static binaries (musl) for x86_64 and aarch64, signed with an SLSA
+# provenance attestation (verifiable with `gh attestation verify`), and a draft release.
 on:
   push:
     tags: ["v*"]
 
-# Default senza permessi di scrittura; ogni job dichiara i propri.
+# Default without write permissions; each job declares its own.
 permissions:
   contents: read
 
-# Una sola release per tag alla volta; una run in corso non viene annullata a metà.
+# Only one release per tag at a time; a run in progress is not cancelled halfway.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -18,16 +18,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Le action sono fissate a un commit (il tag fra commenti è solo un promemoria). Compilazione e
-# test, che eseguono codice delle dipendenze (build script), girano senza permessi; il token
-# OIDC per l'attestazione esiste solo nel job `attest`, che non compila nulla (finding 0004-5).
+# Actions are pinned to a commit (the tag in the comment is only a reminder). Build and
+# tests, which run dependency code (build scripts), run without permissions; the OIDC
+# token for the attestation exists only in the `attest` job, which builds nothing (finding 0004-5).
 #
-# `attest` e `release` girano nell'environment protetto `release` (revisore obbligatorio, solo
-# tag v*): firma e pubblicazione partono solo dopo un'approvazione esplicita. Vedi
+# `attest` and `release` run in the protected `release` environment (required reviewer, v*
+# tags only): signing and publishing start only after explicit approval. See
 # docs/REPOSITORY_SECURITY.md.
 jobs:
   verify-tag:
-    # Si rilascia solo codice già revisionato: il commit del tag deve stare su main.
+    # Only already-reviewed code is released: the tag's commit must be on main.
     name: verify-tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -42,13 +42,13 @@ jobs:
         run: |
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::il tag $GITHUB_REF_NAME punta a $GITHUB_SHA, che non è su main"
+            echo "::error::tag $GITHUB_REF_NAME points to $GITHUB_SHA, which is not on main"
             exit 1
           fi
       - name: tag name is a semantic version
         run: |
           if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::nome di tag non valido: $GITHUB_REF_NAME"
+            echo "::error::invalid tag name: $GITHUB_REF_NAME"
             exit 1
           fi
 
@@ -102,8 +102,8 @@ jobs:
     environment: release
     permissions:
       contents: read
-      id-token: write # token OIDC per il certificato Sigstore dell'attestazione
-      attestations: write # salva l'attestazione SLSA nel repository
+      id-token: write # OIDC token for the attestation's Sigstore certificate
+      attestations: write # stores the SLSA attestation in the repository
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -121,7 +121,7 @@ jobs:
     timeout-minutes: 15
     environment: release
     permissions:
-      contents: write # crea la release in bozza e carica gli archivi
+      contents: write # creates the draft release and uploads the archives
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

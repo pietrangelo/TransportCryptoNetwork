@@ -1,6 +1,6 @@
-//! Adversary review 0006 (Fase 6, certificati client brevi): le ipotesi smentite o accettate,
-//! tenute come test di regressione (docs/adversary/0006-client-certs.md). I finding corretti
-//! hanno i loro test accanto al codice che li corregge.
+//! Adversary review 0006 (Phase 6, short-lived client certificates): the hypotheses that were
+//! disproved or accepted, kept as regression tests (docs/adversary/0006-client-certs.md). The
+//! fixed findings have their tests next to the code that fixes them.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -23,9 +23,9 @@ use zt_domain::trust::{CertTrust, Revocations, TrustedCaKey};
 use zt_domain::{AllowedNodes, CertRejection, CloseReason};
 use zt_net::NetError;
 
-/// Relay compromesso o non aggiornato: il relay ammette il client dalla whitelist (nessuna
-/// scadenza in sessione sul relay), l'agent solo con il certificato. L'agent chiude da solo la
-/// sessione alla scadenza (PROTOCOL §15.7): `Close Unauthorized` e `certificate_expired`.
+/// Compromised or outdated relay: the relay admits the client from the whitelist (no in-session
+/// expiry on the relay), the agent only with the certificate. The agent closes the session on
+/// its own at expiry (PROTOCOL §15.7): `Close Unauthorized` and `certificate_expired`.
 #[tokio::test(flavor = "current_thread")]
 async fn the_agent_alone_cuts_a_certified_session_at_not_after() {
     let log = Captured::default();
@@ -61,14 +61,14 @@ async fn the_agent_alone_cuts_a_certified_session_at_not_after() {
     );
 }
 
-/// Bypass della denylist con l'esadecimale maiuscolo nella serie o con la chiave `-P`:
-/// entrambe le voci revocano ancora.
+/// Bypassing the denylist with uppercase hexadecimal in the serial or with the `-P` key: both
+/// entries still revoke.
 #[test]
 fn uppercase_serials_and_negated_keys_still_revoke() {
     let serial = next_serial();
     let victim = Identity::generate().unwrap();
     let mut neg = victim.public_key().to_bytes();
-    neg[31] ^= 0x80; // -P: stessa y, segno di x invertito
+    neg[31] ^= 0x80; // -P: same y, sign of x flipped
     let text = format!(
         "serials = [\"{}\"]\nkeys = [\"{}\"]\n",
         serial.to_string().to_uppercase(),
@@ -79,8 +79,8 @@ fn uppercase_serials_and_negated_keys_still_revoke() {
     assert!(r.is_key_revoked(&victim.fingerprint()));
 }
 
-/// Due voci `[[authorities]]` (o due chiavi della stessa voce) con `P` e `-P`, stessa
-/// fingerprint e byte diversi, per avere due ambiti con la stessa CA: rifiutate.
+/// Two `[[authorities]]` entries (or two keys of the same entry) with `P` and `-P`, same
+/// fingerprint and different bytes, to get two scopes with the same CA: rejected.
 #[test]
 fn authorities_with_p_and_minus_p_are_refused() {
     let ca = CaSigningKey::generate().unwrap().public_key();
@@ -99,8 +99,8 @@ fn authorities_with_p_and_minus_p_are_refused() {
     assert!(zt_net::config::parse_policy("p.toml", &one).is_err());
 }
 
-/// Rotazione della CA: tolta la chiave vecchia da una voce con due chiavi, i certificati della
-/// vecchia non valgono più, anche se il nome della CA resta.
+/// CA rotation: once the old key is removed from an entry with two keys, certificates from the
+/// old one are no longer valid, even if the CA name stays the same.
 #[test]
 fn removing_the_old_ca_key_invalidates_its_certificates() {
     let (old, new) = (Ca::new(), Ca::new());
@@ -122,8 +122,8 @@ fn removing_the_old_ca_key_invalidates_its_certificates() {
     );
 }
 
-/// Accettata (fail closed, OPERATIONS §10.4): un client ancora nella whitelist che riceve un
-/// certificato prima che un agent pinni la CA viene rifiutato da quell'agent.
+/// Accepted (fail closed, OPERATIONS §10.4): a client still in the whitelist that receives a
+/// certificate before an agent pins the CA is rejected by that agent.
 #[test]
 fn a_certificate_from_an_unpinned_ca_is_refused_even_for_a_whitelisted_client() {
     let ca = Ca::new();

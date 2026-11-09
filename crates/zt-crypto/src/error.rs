@@ -1,28 +1,28 @@
 use thiserror::Error;
 
-/// Errore dell'adapter crittografico.
+/// Error of the cryptographic adapter.
 ///
-/// Volutamente povero di dettagli: un errore di handshake non dice *quale* controllo è
-/// fallito, per non offrire un oracolo a chi prova chiavi o messaggi.
+/// Deliberately poor in detail: a handshake error does not say *which* check failed, so as
+/// not to offer an oracle to whoever is trying keys or messages.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CryptoError {
-    /// Chiave malformata (lunghezza, esadecimale, punto non valido).
+    /// Malformed key (length, hex, invalid point).
     #[error("invalid key encoding")]
     InvalidKey,
-    /// Chiave pubblica di ordine piccolo: un DH con essa produrrebbe un segreto prevedibile.
+    /// Small-order public key: a DH with it would produce a predictable secret.
     #[error("weak (small-order) public key")]
     WeakKey,
-    /// Handshake Noise fallito.
+    /// Noise handshake failed.
     #[error("handshake failed")]
     Handshake,
-    /// Messaggio di trasporto non autentico, riordinato o ripetuto.
+    /// Transport message not authentic, reordered or replayed.
     #[error("message authentication failed")]
     Decrypt,
-    /// Plaintext oltre il massimo di un messaggio Noise.
+    /// Plaintext over the maximum of a Noise message.
     #[error("message too large")]
     MessageTooLarge,
-    /// Il generatore di numeri casuali del sistema non è disponibile.
+    /// The system random number generator is not available.
     #[error("system random generator unavailable")]
     Random,
 }

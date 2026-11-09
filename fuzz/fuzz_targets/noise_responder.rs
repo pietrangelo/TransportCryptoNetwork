@@ -1,15 +1,15 @@
-//! Il primo messaggio dell'handshake IK, così come arriva da una rete non autenticata, sul
-//! canale esterno e su quello end-to-end.
+//! The first message of the IK handshake, as it arrives from an unauthenticated network, on
+//! the outer channel and on the end-to-end one.
 //!
-//! Metà degli input sono byte arbitrari; l'altra metà è un msg1 **autentico** con byte
-//! modificati, così il fuzzer raggiunge anche il ramo che accetta (finding 0004-6).
-//! Proprietà: nessun panic; un msg1 accettato rivela l'identità vera dell'iniziatore, mai
-//! un'altra (Noise autentica la chiave statica); il msg1 autentico intatto è accettato.
+//! Half of the inputs are arbitrary bytes; the other half is a **genuine** msg1 with modified
+//! bytes, so the fuzzer also reaches the accepting branch (finding 0004-6).
+//! Properties: no panic; an accepted msg1 reveals the true identity of the initiator, never
+//! another one (Noise authenticates the static key); the intact genuine msg1 is accepted.
 //!
-//! Fase 6 (PROTOCOL §15.3): con il bit 1 del modo il msg1 autentico porta un payload (un
-//! certificato); con il bit 2 i byte restanti sono il payload di un msg1 nuovo. Il payload
-//! restituito dal responder è quello inviato; un payload oltre il massimo non è mai accettato
-//! né inviato.
+//! Phase 6 (PROTOCOL §15.3): with bit 1 of the mode the genuine msg1 carries a payload (a
+//! certificate); with bit 2 the remaining bytes are the payload of a new msg1. The payload
+//! returned by the responder is the one sent; a payload over the maximum is never accepted
+//! nor sent.
 #![no_main]
 
 use std::sync::OnceLock;
@@ -18,15 +18,15 @@ use libfuzzer_sys::fuzz_target;
 use zt_crypto::Identity;
 use zt_crypto::noise::{self, Channel, MAX_HANDSHAKE_PAYLOAD_LEN};
 
-/// Il payload dei msg1 autentici con payload: lungo quanto il vettore di §15.13.
+/// The payload of genuine msg1s with payload: as long as the vector of §15.13.
 const PAYLOAD: [u8; 187] = [0x54; 187];
 
 struct Fixture {
     responder: Identity,
     initiator: Identity,
-    /// Un msg1 autentico per canale: `[Outer, EndToEnd]`.
+    /// One genuine msg1 per channel: `[Outer, EndToEnd]`.
     msg1: [Vec<u8>; 2],
-    /// Un msg1 autentico con [`PAYLOAD`] per canale.
+    /// One genuine msg1 with [`PAYLOAD`] per channel.
     with_payload: [Vec<u8>; 2],
 }
 
@@ -60,7 +60,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     if mode & 4 != 0 {
-        // I byte restanti come payload di un msg1 nuovo.
+        // The remaining bytes as the payload of a new msg1.
         for channel in [Channel::Outer, Channel::EndToEnd] {
             match noise::initiate_with_payload(
                 &f.initiator,
@@ -91,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
         let msg = if mode & 1 == 0 {
             rest.to_vec()
         } else {
-            // Coppie (posizione, xor) sul msg1 autentico; un byte finale dispari tronca.
+            // (position, xor) pairs on the genuine msg1; an odd trailing byte truncates.
             let mut msg = genuine[i].clone();
             for pair in rest.chunks(2) {
                 match *pair {
