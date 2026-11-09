@@ -104,8 +104,11 @@ two options:
 - `--accept-client-suites <name>[,<name>…]` (or the environment variable
   `TCN_ACCEPT_CLIENT_SUITES`, same syntax): the suites accepted from clients on the end-to-end
   channel. Without it, the classical suite alone.
-- `--pq-only` (or `TCN_PQ_ONLY=true`): the pq-only profile of the classical sunset (§19). Off
-  by default.
+- `--pq-only` (`--pq-only=BOOL`, or the environment variable `TCN_PQ_ONLY`): the pq-only
+  profile of the classical sunset (§19). Off by default. The value is `true` or `false` (also
+  `1`/`0`, `yes`/`no`, `on`/`off`, any case); any other value, the empty one included, exits
+  78. Prefer the flag in a drop-in (§19.1): an agent older than Phase 7 refuses it, while it
+  silently ignores `TCN_PQ_ONLY`.
 
 The hybrid suite `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (ML-KEM-768 + X25519) runs on
 both channels. End to end (`--accept-client-suites`, a client's `[[nodes]] suite`) relays need
@@ -387,7 +390,9 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `admission_limits_in_use` | INFO | (relay) at startup: every admission limit in force (§4.1) |
 | `admission_refused` | WARN | (relay) a peer that confirmed its key was refused by `max_per_identity` (`reason = identity_limit`) or a full established pool (`established_pool_full`): `peer`. Its `Open` got `Reject RateLimited` |
 | `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay; agent: the first two) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
-| `outer_suites_confirmed` | INFO | (relay) every summary interval, if any outer handshake confirmed its key: `agents_classical`, `agents_hybrid`, `clients_classical`, `clients_hybrid` (absent when zero). No identities; replays never count. The sunset signal of §13 |
+| `outer_suites_confirmed` | INFO | (relay) every summary interval, if any outer handshake confirmed its key: one count per role and suite, absent when zero: `agents_ik`, `clients_ik` (the classical suite), `agents_ikhfs`, `clients_ikhfs` (`IKhfs`: hybrid key exchange, **classical authentication**), `agents_hybrid_ik`, `clients_hybrid_ik` (the hybrid IK suite). No identities; replays never count. The sunset signal of §13 and §19. Releases before review 0014 wrote `*_classical` and `*_hybrid` instead, where `*_hybrid` counted `IKhfs` and the hybrid IK suite was not counted: update saved searches |
+| `pq_only_profile` | INFO | (relay and agent) at startup and after every applied reload: `role`, `pq_only` (`true` when the profile of §19 is in force) and `classical_paths`, the number of classical paths the configuration still accepts |
+| `classical_paths_accepted` | INFO | (relay and agent) right after `pq_only_profile`, one line per classical path still accepted: `role`, `path` (the same text as `check`'s `classical still accepted:` lines). Never written under the profile |
 | `relay_registered` | INFO | (agent) registered with a relay: `node`, `relay` (address), `suite` (the pinned outer suite) |
 | `classical_identity_match` | WARN | (relay and agent) after key confirmation: a peer that proved a hybrid identity (hybrid IK suite) was admitted by an entry that checked only its X25519 key (a v1 key, a certificate v1, or a v2 certificate not bound to its hybrid identity): `peer`, `peer_v2`. Replace the entry with its `tcn-pub-v2:` key (§16) |
 | `agent_flapping` | WARN | (relay) one node changed hands between agent connections 3 times within 60 s (two agents with the same key, or a reconnect loop): `node`, `peer`, `count`. Reported once per window; each registration still goes through |
@@ -1056,7 +1061,7 @@ Rollout, in this order (pq.md §6.3):
    (§5) the attacker does not even need a reset: delaying the hybrid relay's handshake past
    the 2 s stagger is enough, and a hybrid handshake that is simply slower on that path has
    the same effect (review 0011, A11-7). Keep this window short, list the hybrid-pinned
-   relays first, and watch `clients_classical` fall in `outer_suites_confirmed`.
+   relays first, and watch `clients_ik` fall in `outer_suites_confirmed`.
    `zt-client` warns `failover to a relay pinned to another outer suite` on stderr when it
    happens (Ansible hides stderr unless the connection fails: run `-vvv` on a sample). Once every
    relay a client uses accepts the hybrid suite, add
@@ -1065,7 +1070,7 @@ Rollout, in this order (pq.md §6.3):
    can never land on a weaker hop (review 0010, A10-9). This is an explicit set of one suite,
    like the relays' accepted sets (there is still no "minimum suite" ordering).
 5. **Sunset, per role (optional, PQ-SUNSET).** When `outer_suites_confirmed` shows no
-   `agents_classical` (or `clients_classical`) for a period you choose on every relay, remove
+   `agents_ik` (or `clients_ik`) for a period you choose on every relay, remove
    the classical suite from that role's set, relay by relay. Agents usually get there first;
    laptops last.
 
@@ -1232,8 +1237,10 @@ fingerprint v2 than its own key's.
    Check `relay_registered` with that `suite`.
 2. Clients: the v2 keys and `suite` in `[[relays]]` and `[[nodes]]`; once every relay a client
    uses accepts it, `require_outer_suite` with that name.
-3. Watch `outer_suites_confirmed` and `e2e_session_started suite=…` for the remaining classical
-   handshakes, and `classical_identity_match` for hybrid peers still matched by v1 entries.
+3. Watch `outer_suites_confirmed` (`*_ik` and `*_ikhfs` are the handshakes still to move,
+   `*_hybrid_ik` those already moved) and `e2e_session_started suite=…` for the remaining
+   classical handshakes, and `classical_identity_match` for hybrid peers still matched by v1
+   entries.
 
 **Phase 5, pin the identities.** Replace v1 keys with `tcn-pin-v2:` pins (or `tcn-pub-v2:`
 keys) in the relay policy and in `clients.toml`, per peer, **only after** that peer runs the
@@ -1500,8 +1507,13 @@ both roles, an agent without `--relay-suite` and `--accept-client-suites` pins a
 a `client.toml` without `suite` pins it. No release changes them, so a mixed fleet keeps working
 across upgrades. The profile below is opt-in, per process.
 
-What the profile refuses, at startup, in `check` and on every reload (exit 78, `EX_CONFIG`,
-with `pq_only:` and the offending entry in the message):
+What the profile refuses, with `pq_only:` and the offending entry in the message:
+
+- `zt-relay` and `zt-agent`: at startup, in `check` and on every reload, exit 78 (`EX_CONFIG`,
+  which the units do not restart on). A refused reload keeps the configuration in force
+  (`policy_reload_failed`, `authorized_clients_reload_failed`).
+- `zt-client`: when it reads `client.toml` and its certificate, before any connection, exit 1
+  (it has neither `check` nor reload; OpenSSH and Ansible report the failed connection).
 
 | Classical path | Refused by |
 | :- | :- |
@@ -1514,7 +1526,13 @@ with `pq_only:` and the offending entry in the message):
 print one `classical still accepted: …` line per classical path after the digests (a suite
 in a set or a relay pin, a role missing from `require_hybrid_identity`, an authority with a v1
 key). Under the profile they print `pq-only profile in force`. Use it to plan the sunset and
-to confirm it.
+to confirm it. A release older than Phase 7 never prints that line.
+
+**The running process says it too.** At startup and after every applied reload, the relay and
+the agent write `pq_only_profile` (`pq_only=true|false`, `classical_paths=<n>`) and one
+`classical_paths_accepted` line per path (§6). Alert on `pq_only_profile` with `pq_only=false`
+from a host that should be in the end state: a unit that lost its `--config` or its drop-in
+runs classical while a hand-run `check` with the right options passes.
 
 ### 19.1 End state
 
@@ -1549,14 +1567,27 @@ public_key = "tcn-ca-pub-v2:…"       # composite keys only, also in public_key
 allow = ["*"]
 ```
 
-The agent (`agent.env`, §9):
+The agent: the profile goes on the command line, in a drop-in for `ExecStart=`, with the
+relay pins (§9; `systemctl edit zt-agent` writes the drop-in):
+
+```ini
+# /etc/systemd/system/zt-agent.service.d/pq-only.conf
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/zt-agent --log-format json run --relay ${TCN_RELAY} --relay-key ${TCN_RELAY_KEY} --node ${TCN_NODE} --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml --ssh-target 127.0.0.1:22 --relay-suite Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s --pq-only
+```
 
 ```sh
+# /etc/tcn/agent.env: TCN_RELAY_KEY holds the relays' tcn-pub-v2: keys
 TCN_ACCEPT_CLIENT_SUITES=Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s
-TCN_PQ_ONLY=true
-# and on the command line: --relay-key tcn-pub-v2:… (one per relay)
-#   --relay-suite Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s
 ```
+
+Use the flag, not `TCN_PQ_ONLY=true` in `agent.env`. An agent older than Phase 7 ignores an
+unknown environment variable and runs without the profile, and nothing on the wire tells the
+relay which release an agent runs. The same agent refuses `--pq-only` and does not start
+(clap's usage error, exit 2: `systemctl status zt-agent` shows `unexpected argument
+'--pq-only'`, and the node stops registering). `TCN_PQ_ONLY` still works on Phase 7 agents;
+an invalid value of either exits 78.
 
 ```toml
 # clients.toml of the agent
@@ -1597,20 +1628,47 @@ identity only.
 
 ### 19.2 Runbook
 
-Prerequisite: §16 is complete through Phase 6 for every role, and the audit has shown no
-classical or `IKhfs` handshake for long enough to cover your slowest peers (laptops on
-holiday): no `outer_suites_confirmed`, `relay_registered` or `e2e_session_started` with another
-`suite`, no `classical_identity_match`, no `cert_version=1`.
+Prerequisites:
+
+- Every relay and every agent runs the Phase 7 release or later (`zt-agent --version`). An
+  older agent does not know the profile (§19.1).
+- §16 is complete through Phase 6 for every role.
+- The audit has shown no classical or `IKhfs` handshake for long enough to cover your slowest
+  peers (laptops on holiday):
+  - in `outer_suites_confirmed`, only `agents_hybrid_ik` and `clients_hybrid_ik`, never
+    `agents_ik`, `agents_ikhfs`, `clients_ik` or `clients_ikhfs`. `IKhfs` has hybrid key
+    exchange but classical authentication, and the profile refuses it;
+  - every `relay_registered` (agent) and `e2e_session_started` (agent) with
+    `suite=Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s`;
+  - no `classical_identity_match`, no `cert_version=1`.
+
+`check` reads only its command line and the process environment, never `agent.env` or the
+unit's drop-ins: run it with exactly what the unit runs, or it validates another
+configuration. For the agent, as root (the unit's `ExecStart=` arguments, with `check` in
+place of `run`; `systemctl cat zt-agent` shows them):
+
+```sh
+( set -a; . /etc/tcn/agent.env; set +a
+  exec /usr/local/bin/zt-agent check --relay "$TCN_RELAY" --relay-key "$TCN_RELAY_KEY" \
+    --node "$TCN_NODE" --key /etc/tcn/agent.key --authorized-clients /etc/tcn/clients.toml \
+    --ssh-target 127.0.0.1:22 \
+    --relay-suite Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s --pq-only )
+```
 
 1. **Plan.** Run `zt-relay check` and `zt-agent check` with each unit's options. Every
-   `classical still accepted:` line is a step of §16 still to do; fix them first.
-2. **Agents.** Set `TCN_PQ_ONLY=true` in `agent.env`, run `zt-agent check`, then restart
-   with `--no-block` (§14), host by host. The agent now refuses a `clients.toml` reload that
-   reintroduces a v1 client or CA.
+   `classical still accepted:` line is a step of §16 still to do; fix them first. The same
+   lines are in the journal (`classical_paths_accepted`).
+2. **Agents.** Add `--pq-only` to the drop-in (§19.1) and run `zt-agent check` as above: it
+   must exit 0 and print `pq-only profile in force` (an older agent never prints it). Then
+   `systemctl daemon-reload` and restart with `--no-block` (§14), host by host, and check
+   `pq_only_profile` with `pq_only=true` and `role=agent` in the journal. The agent now refuses a
+   `clients.toml` reload that reintroduces a v1 client or CA.
 3. **Relays.** Add `pq_only = true` to `[handshake]`, run `zt-relay check --config …`, then
-   rolling restart (§14). Check `handshake_suites_in_use` and `pq-only profile in force` in
-   `check`. A later policy reload that would admit a v1 identity or CA is rejected and the
-   policy in force stays (`policy_reload_failed`, `zt-relay reload` exits 78).
+   rolling restart (§14). `check` must print `pq-only profile in force`, and the journal must
+   show `pq_only_profile` with `pq_only=true` and `role=relay` (a unit without `--config` runs
+   classical: the shipped unit has none, so add it in a drop-in, §4.1). A later policy reload that would admit a v1
+   identity or CA is rejected and the policy in force stays (`policy_reload_failed`,
+   `zt-relay reload` exits 78).
 4. **Clients.** Distribute `client.toml` with `pq_only = true`. This step is optional for the
    fleet's security (relays and agents already refuse everything classical); it makes a
    misconfigured client fail locally, naming the cause, instead of at the relay.
@@ -1624,10 +1682,17 @@ Every step is a configuration change, in reverse order:
 1. Clients: remove `pq_only` (or set it to `false`).
 2. Relays: set `pq_only = false` **and** put the classical suite (or `IKhfs`) back in the role's
    set, then rolling restart. Removing only the flag changes nothing on the wire.
-3. Agents: remove `TCN_PQ_ONLY` and add the suite back to `TCN_ACCEPT_CLIENT_SUITES`, restart.
+3. Agents: remove `--pq-only` from the drop-in (or `TCN_PQ_ONLY` from `agent.env`) and add the
+   suite back to `TCN_ACCEPT_CLIENT_SUITES`, then `systemctl daemon-reload` and restart.
 4. Only then, if peers must come back with v1 identities or certificates: §16 rollback steps 2
    and 5 (`require_hybrid_identity`, then the v1 CA key).
 
-The pq-only fleet, its refusals on both hops and end to end, and the rollback are tested in
-`crates/zt-net/tests/pq_sunset.rs`; the `check` output and exit codes in the binaries'
-`lifecycle.rs` and `cli.rs` tests.
+Steps 2 and 3 keep `require_hybrid_identity`, so there is no downgrade window: a client pinned
+by its v2 key is refused over the classical suite (`identity_downgrade`, by the relay after
+step 2 and by the agent after step 3), and a certificate bound to a hybrid identity stays
+`key_mismatch` over any other suite even after step 4.
+
+The end-state fleet (loaded through the binaries' loading code), its refusals on both hops and
+end to end, a reload under the profile and each rollback step are tested in
+`crates/zt-net/tests/pq_sunset.rs`; the `check` output, the reloads, the audit lines and the
+exit codes in the binaries' `lifecycle.rs` tests.

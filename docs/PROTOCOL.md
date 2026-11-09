@@ -293,9 +293,14 @@ decodes as a frame.
   `require_outer_suite` in `client.toml` makes any relay pinned to another suite a
   configuration error, so failover cannot leave the required suite (review 0010, A10-9).
 - **Audit.** Every summary interval the relay writes `outer_suites_confirmed` with the number
-  of key-confirmed handshakes per role and suite (`agents_classical`, `agents_hybrid`,
-  `clients_classical`, `clients_hybrid`, absent when zero), without identities: this is the
-  signal for the sunset of the classical suite (OPERATIONS §13), and replays never count. The
+  of key-confirmed handshakes per role and suite, one field per suite of §7.5, absent when
+  zero: `agents_ik` and `clients_ik` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`), `agents_ikhfs` and
+  `clients_ikhfs` (`Noise_IKhfs_25519+MLKEM768_…`: hybrid key exchange, **classical**
+  authentication), `agents_hybrid_ik` and `clients_hybrid_ik` (the hybrid IK suite of §7.5.3).
+  No identities. This is the signal for the sunset of the classical suite (OPERATIONS §13) and
+  for the pq-only profile (OPERATIONS §19), and replays never count. Before review 0014 (A14-1)
+  the line had `*_classical` and `*_hybrid` fields, where `*_hybrid` counted `IKhfs` and the
+  hybrid IK suite was not counted at all. The
   agent writes `relay_registered` with the pinned `suite` for every relay session, once
   `Register` is sent: message 2 proved that the relay accepts the suite for agents, but the
   relay can still refuse the registration itself and close.

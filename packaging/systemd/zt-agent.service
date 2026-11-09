@@ -9,6 +9,9 @@
 #                          and, for new installations, the end-to-end suites (OPERATIONS §9, §12):
 #                          TCN_ACCEPT_CLIENT_SUITES=Noise_IK_25519_ChaChaPoly_BLAKE2s,Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s
 #                          (read by zt-agent itself; without it, the classical suite alone)
+#   The pq-only profile (OPERATIONS §19) is the --pq-only flag in a drop-in for ExecStart=,
+#   not TCN_PQ_ONLY in agent.env: an agent older than Phase 7 refuses the flag but ignores the
+#   variable.
 [Unit]
 Description=TCN agent (zt-agent)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
