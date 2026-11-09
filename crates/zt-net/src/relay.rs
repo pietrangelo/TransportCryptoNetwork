@@ -687,13 +687,13 @@ impl Connection {
     }
 }
 
-/// Steps 1–11 of PROTOCOL §15.4 on the outer channel: key denylist, certificate verification
-/// (if the payload is not empty) and policy decision. Returns the verified certificate data,
-/// which the core re-checks against the current policy.
 /// The rejection from [`admit`]: the reason and, after signature verification, the certificate
 /// (PROTOCOL §15.11).
 type AdmitRefusal = (AuthFailureReason, Option<CertRef>);
 
+/// Steps 1–11 of PROTOCOL §15.4 on the outer channel: key denylist, certificate verification
+/// (if the payload is not empty) and policy decision. Returns the verified certificate data,
+/// which the core re-checks against the current policy.
 fn admit(
     policy: &AccessPolicy,
     peer: &Fingerprint,

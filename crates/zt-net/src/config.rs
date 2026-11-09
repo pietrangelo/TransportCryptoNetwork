@@ -812,8 +812,7 @@ pub fn load_relay_policy(
 /// report in the error (e.g. `"relay"`, `"agent"`).
 #[must_use]
 pub fn own_keys(keys: &Keyring, role: &'static str) -> Vec<ForbiddenKey> {
-    std::iter::once(keys.current())
-        .chain(keys.previous())
+    keys.identities()
         .map(|k| ForbiddenKey {
             fingerprint: k.fingerprint(),
             role,

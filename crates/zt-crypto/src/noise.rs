@@ -164,13 +164,10 @@ pub fn respond_suites(
         if msg1.len() < suite.msg1_overhead() || msg1.len() > suite.max_msg1_len() {
             continue;
         }
-        if let Ok(pending) = respond_one(keys.current(), msg1, channel, suite) {
-            return Ok(pending);
-        }
-        if let Some(previous) = keys.previous()
-            && let Ok(pending) = respond_one(previous, msg1, channel, suite)
-        {
-            return Ok(pending);
+        for local in keys.identities() {
+            if let Ok(pending) = respond_one(local, msg1, channel, suite) {
+                return Ok(pending);
+            }
         }
     }
     Err(CryptoError::Handshake)
