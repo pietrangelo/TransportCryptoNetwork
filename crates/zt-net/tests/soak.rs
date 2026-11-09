@@ -15,7 +15,9 @@ mod soak_support;
 
 use std::time::Duration;
 
-use soak_support::{Limits, Plan, Sample, check, duration_from_env, report, run};
+use soak_support::{
+    Counters, Limits, Plan, Sample, check, check_counters, duration_from_env, report, run,
+};
 
 fn series(n: usize, f: impl Fn(usize) -> (usize, usize, usize)) -> Vec<Sample> {
     (0..n)
@@ -99,6 +101,42 @@ fn the_gate_fails_when_resources_stay_after_the_load() {
     );
 }
 
+/// Review 0013, A13-7: the R-6 accounting must be back to zero once the load stops. A leaked
+/// reservation costs no memory, so only the counters can show it: it shrinks the budget until
+/// every stream is refused.
+#[test]
+fn the_gate_fails_when_the_budget_is_still_held_after_the_load() {
+    assert_eq!(check_counters(&Counters::default()), Ok(()));
+    let held = Counters {
+        agent_buffer_bytes: 4096.0,
+        ..Counters::default()
+    };
+    let err = check_counters(&held).unwrap_err();
+    assert!(err.contains("tcn_agent_buffer_bytes"), "{err}");
+    let queued = Counters {
+        relay_queue_bytes: 1.0,
+        relay_streams: 1.0,
+        ..Counters::default()
+    };
+    let err = check_counters(&queued).unwrap_err();
+    assert!(
+        err.contains("tcn_relay_queue_bytes") && err.contains("tcn_relay_streams"),
+        "{err}"
+    );
+    for c in [
+        Counters {
+            agent_sessions: 1.0,
+            ..Counters::default()
+        },
+        Counters {
+            relay_client_connections: 1.0,
+            ..Counters::default()
+        },
+    ] {
+        assert!(check_counters(&c).is_err());
+    }
+}
+
 /// The short soak, in every CI build: sessions in a loop for about fifteen seconds, the relay
 /// restarted and the policy reloaded meanwhile; no leak.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -110,6 +148,7 @@ async fn soak_short() {
         restart_every: Duration::from_secs(5),
         sample_every: Duration::from_millis(500),
         inject_leak: false,
+        bulk: true,
     })
     .await;
     eprintln!("{}", report(&r));
@@ -120,6 +159,14 @@ async fn soak_short() {
         r.failures
     );
     check(&r.under_load, &r.baseline, &r.quiescent, Limits::default()).unwrap();
+    // A13-7: the budgets are back to zero, and the bulk sessions made windows grow (the R-6
+    // paths ran).
+    check_counters(&r.counters).unwrap();
+    assert!(r.bulk_sessions >= 1, "no bulk session completed");
+    assert!(
+        r.window_grows >= 1.0,
+        "no window grew: the R-6 paths never ran"
+    );
 }
 
 /// The nightly soak: `TCN_SOAK_SECS` long (default 30 minutes), bounded by the workflow's
@@ -135,6 +182,7 @@ async fn soak_long() {
         restart_every: Duration::from_secs(60),
         sample_every: Duration::from_secs(5),
         inject_leak: false,
+        bulk: true,
     })
     .await;
     let csv = report(&r);
@@ -150,4 +198,5 @@ async fn soak_long() {
         r.failures
     );
     check(&r.under_load, &r.baseline, &r.quiescent, Limits::default()).unwrap();
+    check_counters(&r.counters).unwrap();
 }

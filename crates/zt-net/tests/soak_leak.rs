@@ -26,6 +26,7 @@ async fn the_gate_catches_an_injected_leak() {
         restart_every: Duration::from_secs(60),
         sample_every: Duration::from_millis(250),
         inject_leak: true,
+        bulk: false,
     })
     .await;
     assert!(
@@ -36,5 +37,10 @@ async fn the_gate_catches_an_injected_leak() {
     );
     let verdict = check(&r.under_load, &r.baseline, &r.quiescent, Limits::default());
     let err = verdict.expect_err(&format!("the gate missed the leak:\n{}", report(&r)));
-    assert!(err.contains("fds") && err.contains("tasks"), "{err}");
+    // Every resource the gate watches must fire: one that stopped firing would go unnoticed
+    // (review 0013, A13-10).
+    assert!(
+        err.contains("fds") && err.contains("tasks") && err.contains("rss"),
+        "{err}"
+    );
 }

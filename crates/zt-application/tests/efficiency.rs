@@ -11,7 +11,7 @@
 )]
 
 use proptest::prelude::*;
-use zt_application::efficiency::{WindowTuner, shed_victim};
+use zt_application::efficiency::{Backlog, ShedCause, ShedLimits, WindowTuner, shed_victim};
 use zt_application::relay::ConnId;
 use zt_domain::flow::{INITIAL_WINDOW, MAX_WINDOW};
 
@@ -98,33 +98,74 @@ proptest! {
 // Relay byte budget (D-13): which connection is shed
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn nothing_is_shed_within_the_budget() {
-    let backlogs = [(ConnId(1), 500), (ConnId(2), 400)];
-    assert_eq!(shed_victim(900, 1000, backlogs), None);
-    assert_eq!(shed_victim(1000, 1000, backlogs), None);
+/// Limits for the unit tests: a budget of 1000 bytes, a single connection may hold up to 100
+/// (so the identity cap is a quarter of the budget, 250), an agent's normal credit is 300.
+fn limits() -> ShedLimits {
+    ShedLimits::new(1000, 100, 300)
 }
 
-/// Over the budget the connection with the largest backlog (the slowest reader) is shed, never
-/// one of the others.
+fn client(conn: u64, identity: u8, bytes: usize) -> Backlog<u8> {
+    Backlog {
+        conn: ConnId(conn),
+        identity,
+        agent: false,
+        bytes,
+    }
+}
+
+#[test]
+fn nothing_is_shed_within_the_budget() {
+    let backlogs = [client(1, 1, 200), client(2, 2, 200)];
+    assert_eq!(shed_victim(400, &limits(), backlogs), None);
+    let backlogs = [
+        client(1, 1, 250),
+        client(2, 2, 250),
+        client(3, 3, 250),
+        client(4, 4, 250),
+    ];
+    assert_eq!(shed_victim(1000, &limits(), backlogs), None);
+}
+
+/// Over the budget the identity with the largest backlog (the slowest reader) is shed, never
+/// one of the others; with one connection per identity this is the largest connection.
 #[test]
 fn the_largest_backlog_is_shed() {
-    let backlogs = [(ConnId(1), 100), (ConnId(2), 900), (ConnId(3), 50)];
-    assert_eq!(shed_victim(1050, 1000, backlogs), Some(ConnId(2)));
+    let backlogs = [
+        client(1, 1, 200),
+        client(2, 2, 240),
+        client(3, 3, 230),
+        client(4, 4, 220),
+        client(5, 5, 160),
+    ];
+    let shed = shed_victim(1050, &limits(), backlogs).unwrap();
+    assert_eq!(
+        (shed.conn, shed.identity, shed.cause),
+        (ConnId(2), 2, ShedCause::Budget)
+    );
+    assert_eq!(shed.identity_bytes, 240);
 }
 
 /// Ties go to the newest connection: a long-lived one is not dropped for a newcomer's equal
 /// backlog.
 #[test]
 fn ties_shed_the_newest_connection() {
-    let backlogs = [(ConnId(7), 600), (ConnId(3), 600)];
-    assert_eq!(shed_victim(1200, 1000, backlogs), Some(ConnId(7)));
+    let backlogs = [
+        client(7, 1, 240),
+        client(3, 2, 240),
+        client(4, 3, 240),
+        client(5, 4, 240),
+        client(6, 5, 240),
+    ];
+    assert_eq!(
+        shed_victim(1200, &limits(), backlogs).unwrap().conn,
+        ConnId(7)
+    );
 }
 
 /// A connection with nothing queued is never shed, even over the budget (the total may lag
 /// behind the per-connection counts for an instant).
 #[test]
 fn an_empty_backlog_is_never_shed() {
-    let backlogs = [(ConnId(1), 0), (ConnId(2), 0)];
-    assert_eq!(shed_victim(2000, 1000, backlogs), None);
+    let backlogs = [client(1, 1, 0), client(2, 2, 0)];
+    assert_eq!(shed_victim(2000, &limits(), backlogs), None);
 }

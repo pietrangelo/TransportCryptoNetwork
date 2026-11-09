@@ -355,16 +355,33 @@ async fn one_bulk_stream_cannot_starve_new_streams() {
         let source = async { while wr.write_all(&junk).await.is_ok() {} };
         tokio::join!(sink, source);
     });
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Not a fixed sleep (review 0013, A13-10): under CPU contention the second doubling may
+    // come late. Wait until the hog's window grew and then hit the ceiling (a growth refused),
+    // or grew twice, which without the ceiling would take the whole budget.
+    let grown = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snap = Snapshot::parse(&metrics.render()).unwrap();
+            let grows = snap.get("tcn_agent_window_grows_total", &[]).unwrap();
+            let refused = snap
+                .get("tcn_agent_window_growth_refusals_total", &[])
+                .unwrap();
+            if grows >= 2.0 || (grows >= 1.0 && refused >= 1.0) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        grown.is_ok(),
+        "the hog's window never grew to the ceiling: the test proves nothing\n{}",
+        metrics.render()
+    );
     let snap = Snapshot::parse(&metrics.render()).unwrap();
     let used = snap.get("tcn_agent_buffer_bytes", &[]).unwrap() as usize;
     assert!(
         used <= budget - budget / 4,
         "the hog holds {used} of {budget}"
-    );
-    assert!(
-        snap.get("tcn_agent_window_grows_total", &[]).unwrap() >= 1.0,
-        "the hog's window never grew: the test proves nothing"
     );
     // Another client still gets sessions (an initial window each, from the reserve).
     let (_a, _ta) = lab.session(&other, None).await.unwrap();

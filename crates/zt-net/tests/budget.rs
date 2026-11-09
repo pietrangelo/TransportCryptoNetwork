@@ -27,8 +27,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zt_crypto::Identity;
 use zt_crypto::noise::Channel;
 use zt_domain::flow::{INITIAL_WINDOW, MAX_WINDOW};
+use zt_domain::limits::MAX_PAYLOAD_LEN;
 use zt_domain::trust::CertTrust;
-use zt_domain::{Frame, FramePayload, RejectReason};
+use zt_domain::{CloseReason, Frame, FramePayload};
 use zt_net::NetError;
 use zt_net::agent::Observed;
 use zt_net::budget::ByteBudget;
@@ -134,8 +135,9 @@ fn the_default_queue_budget_follows_the_memory() {
 // Agent: initial windows come from the budget (backpressure)
 // ---------------------------------------------------------------------------------------------
 
-/// A stream whose initial window does not fit in the agent's budget is rejected with
-/// `ResourceExhausted` before anything is buffered; the budget comes back when a session ends.
+/// A session whose initial window does not fit in the agent's budget is refused once the
+/// client is authenticated (review 0013, A13-2: before that, only the per-relay quota is
+/// charged), and nothing is buffered for it; the budget comes back when a session ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streams_beyond_the_agent_budget_are_rejected_then_admitted_again() {
     let client = Arc::new(Identity::generate().unwrap());
@@ -162,10 +164,7 @@ async fn streams_beyond_the_agent_budget_are_rejected_then_admitted_again() {
     let (_b, _tb) = lab.session(&client, None).await.unwrap();
     let refused = lab.refused(&client, None).await;
     assert!(
-        matches!(
-            refused,
-            Err(NetError::Rejected(RejectReason::ResourceExhausted))
-        ),
+        matches!(refused, Err(NetError::StreamClosed(CloseReason::Drained))),
         "{refused:?}"
     );
     let snap = Snapshot::parse(&metrics.render()).unwrap();
@@ -273,7 +272,13 @@ async fn without_budget_room_the_window_stays_and_the_transfer_completes() {
     bulk_upload(&lab, &client, Duration::from_millis(20), 2 * 1024 * 1024).await;
     let snap = Snapshot::parse(&metrics.render()).unwrap();
     assert_eq!(snap.get("tcn_agent_window_grows_total", &[]), Some(0.0));
-    assert!(snap.get("tcn_agent_buffer_refusals_total", &[]).unwrap() >= 1.0);
+    // A refused growth is benign: its own counter, not the stream refusals (A13-11).
+    assert!(
+        snap.get("tcn_agent_window_growth_refusals_total", &[])
+            .unwrap()
+            >= 1.0
+    );
+    assert_eq!(snap.get("tcn_agent_buffer_refusals_total", &[]), Some(0.0));
 }
 
 /// The relay reports its queue budget.
@@ -381,6 +386,17 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
                 stream,
                 payload: FramePayload::try_from(p).unwrap(),
             }),
+        // Near the largest message, where the hand-written two-byte length prefix of
+        // `Established::send` differs from the codec's own encoder (review 0013, A13-10).
+        (
+            stream.clone(),
+            (MAX_PAYLOAD_LEN - 64)..=MAX_PAYLOAD_LEN,
+            any::<u8>()
+        )
+            .prop_map(|(stream, len, b)| Frame::Data {
+                stream,
+                payload: FramePayload::try_from(vec![b; len]).unwrap(),
+            }),
         (stream.clone(), 512_u32..MAX_WINDOW).prop_map(|(stream, c)| Frame::WindowUpdate {
             stream,
             credit: zt_domain::Credit::try_from(c).unwrap(),
@@ -402,6 +418,7 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let (mut c, mut s) = pair().await;
+            s.confirmed();
             let t = common::timeouts();
             for f in &frames {
                 c.send(f, &t).await.unwrap();
@@ -412,4 +429,22 @@ proptest! {
             }
         });
     }
+}
+
+/// The largest frame goes through the channel, and its message is exactly at the limit of the
+/// two-byte length prefix or below it (A13-10); one byte more cannot be built.
+#[tokio::test]
+async fn the_largest_frame_fits_the_length_prefix() {
+    let (mut c, mut s) = pair().await;
+    s.confirmed();
+    let t = common::timeouts();
+    let big = Frame::Data {
+        stream: common::sid(1),
+        payload: FramePayload::try_from(vec![9_u8; MAX_PAYLOAD_LEN]).unwrap(),
+    };
+    let len = zt_proto::encoded_len(&big);
+    assert!(len + zt_crypto::noise::TAG_LEN <= usize::from(u16::MAX));
+    c.send(&big, &t).await.unwrap();
+    assert_eq!(s.recv().await.unwrap().unwrap(), big);
+    assert!(FramePayload::try_from(vec![9_u8; MAX_PAYLOAD_LEN + 1]).is_err());
 }

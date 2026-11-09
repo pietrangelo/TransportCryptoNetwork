@@ -43,9 +43,31 @@ expect_ok "the Ed25519 signature is 64 bytes" \
 # Only the public keys, as a user has them (from the repository at the release tag).
 mkdir -p "$rel/pub"
 cp "$rel/keys/"*.pub.pem "$rel/pub/" 2>/dev/null || true
-expect_ok "verify accepts both signatures" "$tool" verify "$rel/pub" "$rel/SHA256SUMS"
+# The keys are trusted only through their pinned fingerprints (review 0013, A13-4): here a pin
+# file, as `--pins` takes it; in a release, the fingerprints built into the script.
+"$tool" fingerprint "$rel/keys" >"$rel/pins" 2>/dev/null || true
+expect_ok "verify accepts both signatures by pinned keys" \
+  "$tool" verify --pins "$rel/pins" "$rel/pub" "$rel/SHA256SUMS"
 expect_ok "verify accepts signatures from another directory" \
-  sh -c 'mkdir -p "$1/sigs" && cp "$1"/SHA256SUMS.*.sig "$1/sigs/" && "$2" verify "$1/pub" "$1/SHA256SUMS" "$1/sigs"' _ "$rel" "$tool"
+  sh -c 'mkdir -p "$1/sigs" && cp "$1"/SHA256SUMS.*.sig "$1/sigs/" && "$2" verify --pins "$1/pins" "$1/pub" "$1/SHA256SUMS" "$1/sigs"' _ "$rel" "$tool"
+expect_ok "verify --tag accepts the archives of that tag" \
+  "$tool" verify --pins "$rel/pins" --tag v1.2.3 "$rel/pub" "$rel/SHA256SUMS"
+expect_ok "a pin file may list the keys of a rotation (old and new)" \
+  sh -c 'cat "$1" "$1" >"$1.two" && "$2" verify --pins "$1.two" "$3/pub" "$3/SHA256SUMS"' _ "$rel/pins" "$tool" "$rel"
+expect_ok "verify prints the fingerprints it checked" \
+  sh -c '"$1" verify --pins "$2/pins" "$2/pub" "$2/SHA256SUMS" | grep -Fq "$(head -n1 "$2/pins")"' _ "$tool" "$rel"
+
+# The pins are in three places, which must agree (A13-4): the script, the in-repo file and
+# SECURITY.md. Until the first release key exists, all three pin nothing and verify fails closed.
+repo=$(cd "$here/../../.." && pwd)
+pins_of() { grep -Eo '(slh-dsa-sha2-128s|ed25519) sha256:[0-9a-f]{64}' "$1" | sort || true; }
+expect_ok "release-keys.fingerprints exists" test -f "$repo/packaging/release/release-keys.fingerprints"
+expect_ok "the script pins the keys of release-keys.fingerprints" \
+  test "$(pins_of "$repo/packaging/release/tcn-release.sh")" = "$(pins_of "$repo/packaging/release/release-keys.fingerprints")"
+expect_ok "SECURITY.md publishes the keys of release-keys.fingerprints" \
+  test "$(pins_of "$repo/SECURITY.md")" = "$(pins_of "$repo/packaging/release/release-keys.fingerprints")"
+expect_ok "sign checks SHA256SUMS before signing a well-formed file" \
+  sh -c 'sample_sums() { printf "%s  tcn-v9.9.9-x.tar.gz\n" "$(printf z | sha256sum | cut -d" " -f1)"; }; mkdir -p "$1/s2" && sample_sums >"$1/s2/SHA256SUMS" && "$2" sign "$1/keys" "$1/s2/SHA256SUMS"' _ "$rel" "$tool"
 
 # AP-19: standard detached signatures that OpenSSL verifies with the documented commands,
 # without this script (OPERATIONS §9).
@@ -60,5 +82,9 @@ expect_ok "OpenSSL alone verifies the Ed25519 signature" \
 # The checksums still check the archives as before.
 expect_ok "SHA256SUMS keeps the sha256sum format" \
   sh -c 'grep -Eq "^[0-9a-f]{64}  tcn-v1\.2\.3-x86_64-unknown-linux-musl\.tar\.gz$" "$1"' _ "$rel/SHA256SUMS"
+
+# release-publish.yml (A13-6): bound to the tag it runs from, no write token while OpenSSL
+# builds, the assets checked again just before publishing.
+expect_ok "release-publish.yml passes its structural checks" python3 "$here/workflow_check.py"
 
 summary
