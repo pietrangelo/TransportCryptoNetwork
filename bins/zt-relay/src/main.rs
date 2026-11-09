@@ -232,7 +232,7 @@ fn load_startup(args: &RelayArgs) -> Result<Startup, Failure> {
     };
     let keys = config::load_keyring(&args.key, args.previous_key.as_deref())
         .map_err(|e| load_error(&e))?;
-    let (policy, d) = load_policy(
+    let (policy, d) = config::load_relay_policy_checked(
         &args.policy,
         args.revocations.as_deref(),
         &keys,
@@ -248,28 +248,6 @@ fn load_startup(args: &RelayArgs) -> Result<Startup, Failure> {
     })
 }
 
-/// The policy and denylist, with a CA equal to a relay key (current or previous) rejected
-/// (PROTOCOL §15.9) and, under the `pq_only` profile, a v1 identity or CA refused (PQ-SUNSET),
-/// and the digests of the bytes parsed.
-fn load_policy(
-    policy: &std::path::Path,
-    revocations: Option<&std::path::Path>,
-    keys: &Keyring,
-    pq_only: bool,
-) -> Result<(AccessPolicy, Digests), ConfigError> {
-    let (loaded, digests) = config::load_relay_policy_digested(policy, revocations)?;
-    let origin = policy.display().to_string();
-    config::reject_infrastructure_keys_as_authority(
-        &origin,
-        loaded.cert_trust(),
-        &config::own_keys(keys, "relay"),
-    )?;
-    if pq_only {
-        sunset::check_policy(&origin, &loaded)?;
-    }
-    Ok((loaded, digests))
-}
-
 /// What a `SIGHUP` reloads, and how it applies it.
 struct Reloader {
     key: PathBuf,
@@ -281,8 +259,9 @@ struct Reloader {
     policy: Revocable<AccessPolicy>,
     policy_updater: Updater<AccessPolicy>,
     metrics: std::sync::Arc<RelayMetrics>,
-    /// `[handshake] pq_only` of `relay.toml`: every reloaded policy is checked against it.
-    pq_only: bool,
+    /// `relay.toml` as read at startup: every reloaded policy is checked against its
+    /// `[handshake] pq_only`, and reported against its suites (review 0014, A14-3, A14-4).
+    settings: config::RelaySettings,
 }
 
 impl Reloader {
@@ -293,11 +272,11 @@ impl Reloader {
     /// `relay.toml` is read at startup only and is not part of a reload. One generation for
     /// both, taken only if something was applied.
     fn reload(&self, generation: &Generation) -> Outcome {
-        let policy = load_policy(
+        let policy = config::load_relay_policy_checked(
             &self.policy_path,
             self.revocations.as_deref(),
             &self.keys.current(),
-            self.pq_only,
+            self.settings.pq_only,
         );
         let keys = self.load_keys(policy.as_ref().ok().map(|(p, _)| p));
         let generation = (policy.is_ok() || keys.is_ok()).then(|| generation.next());
@@ -326,6 +305,7 @@ impl Reloader {
         }
         let result = match policy {
             Ok((policy, digests)) => {
+                let report = sunset::relay_report(&self.settings, &policy);
                 self.policy_updater.replace(policy);
                 tracing::info!(
                     target: "zt_audit",
@@ -334,6 +314,7 @@ impl Reloader {
                     files = %digests,
                     "configuration reloaded"
                 );
+                sunset::log_profile("relay", self.settings.pq_only, &report);
                 self.metrics
                     .process()
                     .reload_applied(generation.unwrap_or_default());
@@ -473,11 +454,18 @@ fn serve(
             policy,
             digests,
         } = load_startup(&args)?;
+        // The profile and what is still classical, in the journal and not only in `check`
+        // (review 0014, A14-4).
+        sunset::log_profile(
+            "relay",
+            settings.pq_only,
+            &sunset::relay_report(&settings, &policy),
+        );
         let metrics = RelayMetrics::new();
         let relay_config = RelayConfig {
             metrics: std::sync::Arc::clone(&metrics),
             queue_budget: metrics_args.budget(),
-            admission: settings.admission,
+            admission: settings.admission.clone(),
             suites: settings.suites,
             agent_idle: Some(settings.agent_idle),
             client_idle: Some(settings.client_idle),
@@ -511,7 +499,7 @@ fn serve(
             ..
         } = args;
         let reloader = Reloader {
-            pq_only: settings.pq_only,
+            settings,
             key,
             previous_key,
             policy_path,

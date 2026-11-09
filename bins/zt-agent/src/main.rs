@@ -69,8 +69,18 @@ struct AgentArgs {
     /// `--accept-client-suites` must be the hybrid IK suite, and the authorized clients must
     /// require hybrid identities and pin composite CA keys only, at startup, in `check` and on
     /// every reload. Off by default: the defaults stay compatible with a mixed fleet.
-    #[arg(long, env = "TCN_PQ_ONLY")]
-    pq_only: bool,
+    /// `--pq-only` alone turns it on; `--pq-only=BOOL` takes true/false, 1/0, yes/no or
+    /// on/off, and any other value exits 78. Prefer the flag, in a drop-in for `ExecStart=`:
+    /// an agent older than Phase 7 refuses it, while it ignores `TCN_PQ_ONLY`.
+    #[arg(
+        long,
+        env = "TCN_PQ_ONLY",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pq_only: Option<String>,
     /// Name of this node, as in the relay policy.
     #[arg(long)]
     node: String,
@@ -378,9 +388,19 @@ fn request_reload(pid: u32, runtime_dir: Option<PathBuf>, wait: Duration) -> Res
     })
 }
 
-/// Loads the authorized clients and denylist, with the digests of the bytes parsed.
-type ClientsLoader =
-    Box<dyn Fn() -> Result<(zt_domain::AuthorizedClients, Digests), ConfigError> + Send>;
+/// The authorized clients and denylist, with the digests of the bytes parsed and the classical
+/// paths the agent still accepts with them (PQ-SUNSET).
+struct LoadedClients {
+    clients: zt_domain::AuthorizedClients,
+    digests: Digests,
+    report: Vec<String>,
+}
+
+/// Loads the authorized clients and denylist: at startup, in `check` and on every reload.
+type ClientsLoader = Box<dyn Fn() -> Result<LoadedClients, ConfigError> + Send>;
+
+/// Where `--pq-only` comes from, in its error messages.
+const PQ_ONLY_ORIGIN: &str = "--pq-only (TCN_PQ_ONLY)";
 
 /// Everything `run` needs, loaded and validated: what `check` checks.
 struct Prepared {
@@ -411,6 +431,14 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         reconnect_spread,
         max_streams,
     } = args;
+    // An invalid value is EX_CONFIG, never clap's usage error, which the unit would restart
+    // on forever (review 0014, A14-2).
+    let pq_only = pq_only
+        .as_deref()
+        .map(|value| sunset::parse_pq_only(PQ_ONLY_ORIGIN, value))
+        .transpose()
+        .map_err(|e| load_error(&e))?
+        .unwrap_or(false);
     let mut relays =
         config::relay_endpoints("--relay", &relay, &relay_key).map_err(config_error)?;
     let client_suites =
@@ -430,18 +458,22 @@ fn prepare(args: AgentArgs) -> Result<Prepared, Failure> {
         fingerprint: r.public_key.fingerprint(),
         role: "relay",
     }));
+    let pinned = relays.clone();
     let load = move || {
         let (clients, digests) =
-            config::load_authorized_clients_digested(&path, revocations.as_deref())?;
-        let origin = path.display().to_string();
-        config::reject_infrastructure_keys_as_authority(&origin, clients.cert_trust(), &forbidden)?;
-        if pq_only {
-            sunset::check_authorized_clients(&origin, &clients)?;
-        }
-        Ok((clients, digests))
+            config::load_agent_clients_checked(&path, revocations.as_deref(), &forbidden, pq_only)?;
+        let report = sunset::agent_report(&pinned, client_suites, &clients);
+        Ok(LoadedClients {
+            clients,
+            digests,
+            report,
+        })
     };
-    let (authorized, digests) = load().map_err(|e| load_error(&e))?;
-    let report = sunset::agent_report(&relays, client_suites, &authorized);
+    let LoadedClients {
+        clients: authorized,
+        digests,
+        report,
+    } = load().map_err(|e| load_error(&e))?;
     let (authorized_clients, updater) = Revocable::new(authorized);
     let node = NodeId::try_from(node.as_str()).map_err(config_error)?;
     let config = AgentConfig {
@@ -494,14 +526,22 @@ fn serve(
             config,
             updater,
             load,
+            pq_only,
             ..
         } = prepared;
         // A SIGHUP between the first read (in `prepare`) and `Hangups::listen` would be lost:
         // the files are read again now that it is collected.
-        let (authorized, digests) = load().map_err(|e| load_error(&e))?;
+        let LoadedClients {
+            clients: authorized,
+            digests,
+            report,
+        } = load().map_err(|e| load_error(&e))?;
         updater.replace(authorized);
         let generation = Generation::new();
         let first = lifecycle::configuration_loaded(&generation, &digests);
+        // The profile and what is still classical, in the journal and not only in `check`
+        // (review 0014, A14-4).
+        sunset::log_profile("agent", pq_only, &report);
         let metrics = AgentMetrics::new(config.relays.len());
         metrics.process().set_generation(first);
         let runtime_dir = reload::runtime_dir(runtime_dir);
@@ -537,7 +577,11 @@ fn serve(
             "authorized_clients_reload",
             reload::on_sighup(hangups, publisher, generation, move |generation| {
                 match load() {
-                    Ok((clients, digests)) => {
+                    Ok(LoadedClients {
+                        clients,
+                        digests,
+                        report,
+                    }) => {
                         let generation = generation.next();
                         updater.replace(clients);
                         tracing::info!(
@@ -547,6 +591,7 @@ fn serve(
                             files = %digests,
                             "configuration reloaded"
                         );
+                        sunset::log_profile("agent", pq_only, &report);
                         reload_metrics.process().reload_applied(generation);
                         Outcome::applied(generation, digests.to_string())
                     }

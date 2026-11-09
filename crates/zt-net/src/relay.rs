@@ -853,8 +853,11 @@ struct Connection {
     capacity: usize,
 }
 
+// `outer_suites_confirmed` names one field per suite: a new suite needs its own field there.
+const _: () = assert!(HandshakeSuite::ALL.len() == 3);
+
 /// Confirmed outer handshakes per role and suite in the current summary interval: the
-/// sunset signal of OPERATIONS §13, without identities. Only key confirmation counts, so a
+/// sunset signal of OPERATIONS §13 and §19, without identities. Only key confirmation counts, so a
 /// replayed message 1 cannot inflate it.
 #[derive(Default)]
 struct ConfirmedSuites {
@@ -876,17 +879,22 @@ impl ConfirmedSuites {
         }
         let n = |role, suite| counts.get(&(role, suite)).copied();
         let (agent, client) = (InitiatorRole::Agent, InitiatorRole::Client);
-        let (classical, hybrid) = (
+        // One field per suite, named after it (review 0014, A14-1): `IKhfs` has hybrid key
+        // exchange but classical authentication, so it is never counted as "hybrid".
+        let (ik, ikhfs, hybrid_ik) = (
             HandshakeSuite::NoiseIk25519,
             HandshakeSuite::NoiseIkhfs25519MlKem768,
+            HandshakeSuite::NoiseIkHybrid25519MlKem768,
         );
         tracing::info!(
             target: "zt_audit",
             event_kind = "outer_suites_confirmed",
-            agents_classical = n(agent, classical),
-            agents_hybrid = n(agent, hybrid),
-            clients_classical = n(client, classical),
-            clients_hybrid = n(client, hybrid),
+            agents_ik = n(agent, ik),
+            agents_ikhfs = n(agent, ikhfs),
+            agents_hybrid_ik = n(agent, hybrid_ik),
+            clients_ik = n(client, ik),
+            clients_ikhfs = n(client, ikhfs),
+            clients_hybrid_ik = n(client, hybrid_ik),
             "confirmed outer handshakes per role and suite"
         );
     }

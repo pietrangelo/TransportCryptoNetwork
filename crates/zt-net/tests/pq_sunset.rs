@@ -460,6 +460,7 @@ fn load_fleet(files: &FleetFiles, agent: &Identity) -> Result<Loaded, ConfigErro
 async fn start_fleet(loaded: Loaded, agent: Arc<Identity>) -> Lab {
     let mut relay = relay_config();
     relay.suites = loaded.suites;
+    relay.admission.summary_interval = std::time::Duration::from_secs(1);
     Lab::start_outer(
         agent,
         vec![(loaded.policy, relay)],
@@ -747,7 +748,8 @@ async fn a_reload_that_readmits_v1_identities_is_refused_under_the_profile() {
 /// pinned by its v2 key cannot come back over the classical suite (`identity_downgrade`, on
 /// the relay after step 2 and on the agent after step 3); after step 4 a v1 client gets in,
 /// and a certificate bound to a hybrid identity still passes only over the hybrid IK suite
-/// (`key_mismatch` over the classical one). There is no downgrade window.
+/// (`key_mismatch` over the classical one, counted as `unverified_certificate`). There is no
+/// downgrade window.
 #[tokio::test]
 async fn the_rollback_follows_the_documented_order_without_a_downgrade_window() {
     let log = Captured::default();
@@ -843,8 +845,15 @@ async fn the_rollback_follows_the_documented_order_without_a_downgrade_window() 
             .await
             .is_err()
     );
+    // Bob is not listed, so the relay counts his refused certificate (`key_mismatch`: it is
+    // bound to his hybrid identity and the handshake proved none) in its aggregate.
+    tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
     assert!(
-        reasons(&log).iter().any(|r| r == "key_mismatch"),
+        log.events("preauth_summary")
+            .iter()
+            .filter_map(|l| number(l, "unverified_certificate"))
+            .sum::<u64>()
+            >= 1,
         "step 4: {}",
         log.text()
     );

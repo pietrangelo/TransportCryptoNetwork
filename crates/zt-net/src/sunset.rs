@@ -281,3 +281,64 @@ pub fn write_report(
     }
     Ok(())
 }
+
+/// The profile in force and the classical paths a running process still accepts, in the
+/// audit log at startup and after every applied reload (review 0014, A14-4), so that the
+/// journal shows what `check` shows: `pq_only_profile` with `role`, `pq_only` and the number
+/// of `classical_paths`, then one `classical_paths_accepted` line per path of `report` (none
+/// under the profile, whose checks refuse every one of them).
+pub fn log_profile(role: &'static str, pq_only: bool, report: &[String]) {
+    if pq_only {
+        tracing::info!(
+            target: "zt_audit",
+            event_kind = "pq_only_profile",
+            role,
+            pq_only,
+            classical_paths = report.len(),
+            "pq-only profile in force (OPERATIONS §19)"
+        );
+    } else {
+        tracing::info!(
+            target: "zt_audit",
+            event_kind = "pq_only_profile",
+            role,
+            pq_only,
+            classical_paths = report.len(),
+            "pq-only profile not in force"
+        );
+    }
+    for path in report {
+        tracing::info!(
+            target: "zt_audit",
+            event_kind = "classical_paths_accepted",
+            role,
+            path = %path,
+            "classical path still accepted"
+        );
+    }
+}
+
+/// The value of the agent's `--pq-only` (or `TCN_PQ_ONLY`), as an operator writes it in a
+/// drop-in or in `agent.env`: `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, in any
+/// case (review 0014, A14-2).
+///
+/// # Errors
+/// [`ConfigError::PqOnly`] for any other value, the empty one included: the setting of a
+/// security profile is never guessed, and the agent exits 78 instead of starting without it.
+pub fn parse_pq_only(origin: &str, value: &str) -> Result<bool, ConfigError> {
+    const ON: [&str; 4] = ["true", "1", "yes", "on"];
+    const OFF: [&str; 4] = ["false", "0", "no", "off"];
+    if ON.iter().any(|v| v.eq_ignore_ascii_case(value)) {
+        Ok(true)
+    } else if OFF.iter().any(|v| v.eq_ignore_ascii_case(value)) {
+        Ok(false)
+    } else {
+        Err(refuse(
+            origin,
+            format!(
+                "invalid value {:?}: use true or false (also 1/0, yes/no, on/off)",
+                value.chars().take(32).collect::<String>()
+            ),
+        ))
+    }
+}

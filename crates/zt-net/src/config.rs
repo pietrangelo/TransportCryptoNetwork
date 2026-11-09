@@ -1175,6 +1175,56 @@ pub fn reject_infrastructure_keys_as_authority(
     Ok(())
 }
 
+/// The relay policy and denylist as `zt-relay` loads them at startup, in `check` and on every
+/// reload: a CA equal to a relay key (current or previous) is rejected (PROTOCOL §15.9) and,
+/// under `[handshake] pq_only`, the policy must pass [`crate::sunset::check_policy`]
+/// (PQ-SUNSET, OPERATIONS §19). One function for the three paths (review 0014, A14-3, A14-5).
+///
+/// # Errors
+/// See [`load_relay_policy_digested`], [`reject_infrastructure_keys_as_authority`] and
+/// [`crate::sunset::check_policy`].
+pub fn load_relay_policy_checked(
+    policy: &Path,
+    revocations: Option<&Path>,
+    keys: &Keyring,
+    pq_only: bool,
+) -> Result<(AccessPolicy, Digests), ConfigError> {
+    let (loaded, digests) = load_relay_policy_digested(policy, revocations)?;
+    let origin = policy.display().to_string();
+    reject_infrastructure_keys_as_authority(
+        &origin,
+        loaded.cert_trust(),
+        &own_keys(keys, "relay"),
+    )?;
+    if pq_only {
+        crate::sunset::check_policy(&origin, &loaded)?;
+    }
+    Ok((loaded, digests))
+}
+
+/// The agent's authorized clients and denylist as `zt-agent` loads them at startup, in `check`
+/// and on every reload: a CA equal to one of `forbidden` (the agent's keys and every
+/// `--relay-key`, PROTOCOL §15.9) is rejected and, under `--pq-only`, the clients must pass
+/// [`crate::sunset::check_authorized_clients`] (PQ-SUNSET, OPERATIONS §19).
+///
+/// # Errors
+/// See [`load_authorized_clients_digested`], [`reject_infrastructure_keys_as_authority`] and
+/// [`crate::sunset::check_authorized_clients`].
+pub fn load_agent_clients_checked(
+    path: &Path,
+    revocations: Option<&Path>,
+    forbidden: &[ForbiddenKey],
+    pq_only: bool,
+) -> Result<(AuthorizedClients, Digests), ConfigError> {
+    let (clients, digests) = load_authorized_clients_digested(path, revocations)?;
+    let origin = path.display().to_string();
+    reject_infrastructure_keys_as_authority(&origin, clients.cert_trust(), forbidden)?;
+    if pq_only {
+        crate::sunset::check_authorized_clients(&origin, &clients)?;
+    }
+    Ok((clients, digests))
+}
+
 /// Reads a denylist with the trust file rules.
 fn load_revocations(path: &Path, digests: &mut Digests) -> Result<Revocations, ConfigError> {
     let text = read_limited(path)?;
