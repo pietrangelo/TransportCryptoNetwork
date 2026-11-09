@@ -142,6 +142,12 @@ async fn soak_long() {
         std::fs::write(path, &csv).unwrap();
     }
     eprintln!("{} sessions, {} failures", r.sessions, r.failures);
-    assert!(r.sessions > 0);
+    // Restarts cost a few sessions each, never most of them.
+    assert!(
+        r.sessions > 0 && r.failures * 10 <= r.sessions,
+        "{} sessions, {} failures",
+        r.sessions,
+        r.failures
+    );
     check(&r.under_load, &r.baseline, &r.quiescent, Limits::default()).unwrap();
 }

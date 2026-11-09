@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod budget;
 pub mod channel;
 pub mod client;
 pub mod config;

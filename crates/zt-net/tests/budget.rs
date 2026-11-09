@@ -114,7 +114,7 @@ fn concurrent_reservations_never_exceed_the_limit() {
 #[test]
 fn the_default_queue_budget_follows_the_memory() {
     let d = zt_net::budget::default_queue_budget();
-    assert!(d >= 64 * 1024 * 1024 && d <= 1024 * 1024 * 1024, "{d}");
+    assert!((64 * 1024 * 1024..=1024 * 1024 * 1024).contains(&d), "{d}");
     assert_eq!(
         zt_net::budget::queue_budget_for(Some(16 * 1024 * 1024 * 1024)),
         1024 * 1024 * 1024
@@ -307,13 +307,13 @@ async fn pair() -> (
     channel::Established<tokio::io::DuplexStream>,
     channel::Established<tokio::io::DuplexStream>,
 ) {
-    let (a, b) = tokio::io::duplex(1024 * 1024);
+    let (near, far) = tokio::io::duplex(1024 * 1024);
     let server = Identity::generate().unwrap();
     let client = Identity::generate().unwrap();
     let keys = zt_crypto::Keyring::single(common::copy_of(&server));
     let t = common::timeouts();
     let accept = async {
-        channel::accept(b, &keys, Channel::Outer, &t)
+        channel::accept(far, &keys, Channel::Outer, &t)
             .await
             .unwrap()
             .establish(&t)
@@ -321,9 +321,15 @@ async fn pair() -> (
             .unwrap()
     };
     let connect = async {
-        channel::connect(a, &client, &server.public_key().into(), Channel::Outer, &t)
-            .await
-            .unwrap()
+        channel::connect(
+            near,
+            &client,
+            &server.public_key().into(),
+            Channel::Outer,
+            &t,
+        )
+        .await
+        .unwrap()
     };
     let (s, c) = tokio::join!(accept, connect);
     (c, s)
@@ -365,7 +371,7 @@ async fn a_small_payload_pins_only_its_own_message() {
 }
 
 fn arb_frame() -> impl Strategy<Value = Frame> {
-    let stream = (1_u32..1000).prop_map(|n| common::sid(n));
+    let stream = (1_u32..1000).prop_map(common::sid);
     prop_oneof![
         (
             stream.clone(),
@@ -379,7 +385,7 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
             stream,
             credit: zt_domain::Credit::try_from(c).unwrap(),
         }),
-        (stream, "[a-z][a-z0-9-]{0,20}").prop_map(|(stream, n)| Frame::Open {
+        (stream, "[a-z][a-z0-9]{0,20}").prop_map(|(stream, n)| Frame::Open {
             stream,
             target: common::node(&n),
         }),

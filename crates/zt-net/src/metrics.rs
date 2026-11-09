@@ -12,12 +12,13 @@
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use zt_domain::{AuthFailureReason, CloseReason, HandshakeSuite, RejectReason};
 
+use crate::budget::ByteBudget;
 use crate::lifecycle::Progress;
 
 /// The interval when the command line says nothing.
@@ -462,8 +463,8 @@ pub struct RelayMetrics {
     open_rejects: ByLabel,
     stream_closes: ByLabel,
     pub(crate) forwarded_bytes: Counter,
-    pub(crate) queue_bytes: Gauge,
-    pub(crate) queue_budget: Gauge,
+    /// The queue budget of the running relay, read when rendering.
+    queue: Budgeted,
     pub(crate) queue_shed: Counter,
     pub(crate) queue_overflow: Counter,
 }
@@ -492,8 +493,7 @@ impl RelayMetrics {
             open_rejects: ByLabel::new(REJECTS),
             stream_closes: ByLabel::new(CLOSES),
             forwarded_bytes: Counter::default(),
-            queue_bytes: Gauge::default(),
-            queue_budget: Gauge::default(),
+            queue: Budgeted::default(),
             queue_shed: Counter::default(),
             queue_overflow: Counter::default(),
         })
@@ -503,6 +503,11 @@ impl RelayMetrics {
     #[must_use]
     pub fn process(&self) -> &Process {
         &self.process
+    }
+
+    /// Reports `budget` as the relay's queue budget.
+    pub(crate) fn attach_queue(&self, budget: &Arc<ByteBudget>) {
+        self.queue.attach(budget);
     }
 
     pub(crate) fn preauth_failure(&self, reason: &str) {
@@ -627,12 +632,12 @@ impl RelayMetrics {
         out.gauge(
             "tcn_relay_queue_bytes",
             "Bytes queued towards peers and not yet written (global byte budget).",
-            self.queue_bytes.get(),
+            self.queue.used(),
         );
         out.gauge(
             "tcn_relay_queue_budget_bytes",
             "The global byte budget of the outbound queues.",
-            self.queue_budget.get(),
+            self.queue.limit(),
         );
         out.counter(
             "tcn_relay_queue_shed_total",
@@ -645,6 +650,35 @@ impl RelayMetrics {
             self.queue_overflow.get(),
         );
         out.0
+    }
+}
+
+/// The byte budget a running relay or agent reports (R-6): attached when it starts, replaced
+/// by the next run.
+#[derive(Debug, Default)]
+struct Budgeted(Mutex<Option<Arc<ByteBudget>>>);
+
+impl Budgeted {
+    fn attach(&self, budget: &Arc<ByteBudget>) {
+        if let Ok(mut b) = self.0.lock() {
+            *b = Some(Arc::clone(budget));
+        }
+    }
+
+    fn read(&self, f: impl FnOnce(&ByteBudget) -> usize) -> i64 {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|b| b.as_deref().map(f))
+            .map_or(0, |v| i64::try_from(v).unwrap_or(i64::MAX))
+    }
+
+    fn used(&self) -> i64 {
+        self.read(ByteBudget::used)
+    }
+
+    fn limit(&self) -> i64 {
+        self.read(ByteBudget::limit)
     }
 }
 
@@ -693,9 +727,10 @@ pub struct AgentMetrics {
     pub(crate) ssh_failures: Counter,
     pub(crate) to_ssh: Counter,
     pub(crate) from_ssh: Counter,
-    pub(crate) buffer_bytes: Gauge,
-    pub(crate) buffer_budget: Gauge,
+    /// The buffer budget of the running agent, read when rendering.
+    buffer: Budgeted,
     pub(crate) buffer_refusals: Counter,
+    pub(crate) window_grows: Counter,
 }
 
 impl AgentMetrics {
@@ -712,10 +747,15 @@ impl AgentMetrics {
             ssh_failures: Counter::default(),
             to_ssh: Counter::default(),
             from_ssh: Counter::default(),
-            buffer_bytes: Gauge::default(),
-            buffer_budget: Gauge::default(),
+            buffer: Budgeted::default(),
             buffer_refusals: Counter::default(),
+            window_grows: Counter::default(),
         })
+    }
+
+    /// Reports `budget` as the agent's buffer budget.
+    pub(crate) fn attach_buffer(&self, budget: &Arc<ByteBudget>) {
+        self.buffer.attach(budget);
     }
 
     /// Generation, reloads, drain, progress.
@@ -822,12 +862,17 @@ impl AgentMetrics {
         out.gauge(
             "tcn_agent_buffer_bytes",
             "Receive windows reserved from the global byte budget.",
-            self.buffer_bytes.get(),
+            self.buffer.used(),
         );
         out.gauge(
             "tcn_agent_buffer_budget_bytes",
             "The global byte budget of the stream receive buffers.",
-            self.buffer_budget.get(),
+            self.buffer.limit(),
+        );
+        out.counter(
+            "tcn_agent_window_grows_total",
+            "Receive windows grown by auto-tuning, within the byte budget.",
+            self.window_grows.get(),
         );
         out.counter(
             "tcn_agent_buffer_refusals_total",
@@ -1009,6 +1054,10 @@ pub(crate) struct Traffic<'a> {
     pub(crate) from_local: &'a Counter,
     /// Bytes written to the local side.
     pub(crate) to_local: &'a Counter,
+    /// Receive windows grown (R-6).
+    pub(crate) window_grows: Option<&'a Counter>,
+    /// Window growths the byte budget refused.
+    pub(crate) window_refusals: Option<&'a Counter>,
 }
 
 // ---------------------------------------------------------------------------------------------

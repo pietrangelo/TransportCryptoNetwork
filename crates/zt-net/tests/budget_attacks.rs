@@ -37,7 +37,7 @@ use zt_net::relay::{RelayConfig, RelayServer};
 const CHUNK: usize = 16 * 1024;
 
 /// A relay on the in-memory network, its key and its metrics.
-async fn duplex_relay(
+fn duplex_relay(
     agent: &Identity,
     clients: &[&Identity],
     queue_budget: usize,
@@ -103,10 +103,10 @@ async fn flooding_agent(mut ch: Established<DuplexStream>) {
                 return;
             }
             // Give the inbound side a chance between frames.
-            if let Ok(frame) = tokio::time::timeout(Duration::from_millis(0), ch.recv()).await {
-                if !on_agent_frame(&mut ch, &mut credit, frame).await {
-                    return;
-                }
+            if let Ok(frame) = tokio::time::timeout(Duration::from_millis(0), ch.recv()).await
+                && !on_agent_frame(&mut ch, &mut credit, frame).await
+            {
+                return;
             }
             continue;
         }
@@ -143,12 +143,12 @@ async fn on_agent_frame(
     }
 }
 
-/// Opens stream 1 to `web-01` and waits for its `OpenAck`.
-async fn open(ch: &mut Established<DuplexStream>) {
+/// Opens stream `id` to `web-01` and waits for its `OpenAck`.
+async fn open(ch: &mut Established<DuplexStream>, id: u32) {
     let t = common::timeouts();
     ch.send(
         &Frame::Open {
-            stream: common::sid(1),
+            stream: common::sid(id),
             target: common::node("web-01"),
         },
         &t,
@@ -185,13 +185,17 @@ fn sample_queue(m: Arc<RelayMetrics>, max: Arc<AtomicU64>, stop: Arc<AtomicBool>
 /// R6-E1: an authorized client that stops reading makes the relay queue the agent's data for
 /// it; past the global budget that connection, the largest backlog, is shed. Another client
 /// downloading at the same time is not affected, and the queue never runs far past the budget.
+///
+/// The budget is above one stream's window, as it always is in production: a healthy reader
+/// may hold a whole window in the relay's queue for a moment and must not be shed for it. The
+/// slow reader opens two streams to exceed it on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queue_budget_sheds_the_slowest_reader() {
     let agent = Identity::generate().unwrap();
     let slow = Identity::generate().unwrap();
     let good = Identity::generate().unwrap();
-    let budget = 192 * 1024;
-    let (net, relay, metrics) = duplex_relay(&agent, &[&slow, &good], budget).await;
+    let budget = INITIAL_WINDOW as usize + 64 * 1024;
+    let (net, relay, metrics) = duplex_relay(&agent, &[&slow, &good], budget);
     let agent_ch = connect(&net, 1024 * 1024, &agent, relay).await;
     tokio::spawn(flooding_agent(agent_ch));
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -202,13 +206,14 @@ async fn queue_budget_sheds_the_slowest_reader() {
     );
     sample_queue(Arc::clone(&metrics), Arc::clone(&max), Arc::clone(&stop));
 
-    // The slow reader: a pipe of 4 KiB that it never reads after the OpenAck.
+    // The slow reader: a pipe of 4 KiB that it never reads after the OpenAcks.
     let mut slow_ch = connect(&net, 4 * 1024, &slow, relay).await;
-    open(&mut slow_ch).await;
+    open(&mut slow_ch, 1).await;
+    open(&mut slow_ch, 2).await;
 
     // The good reader downloads 4 MiB, returning credit as it goes.
     let mut good_ch = connect(&net, 1024 * 1024, &good, relay).await;
-    open(&mut good_ch).await;
+    open(&mut good_ch, 1).await;
     let t = common::timeouts();
     let (mut received, mut unreturned) = (0_usize, 0_usize);
     let download = async {
@@ -269,7 +274,7 @@ async fn queue_budget_sheds_the_slowest_reader() {
 async fn relay_queue_never_exceeds_credit_while_writes_block() {
     let agent = Identity::generate().unwrap();
     let greedy = Identity::generate().unwrap();
-    let (net, relay, metrics) = duplex_relay(&agent, &[&greedy], 1 << 30).await;
+    let (net, relay, metrics) = duplex_relay(&agent, &[&greedy], 1 << 30);
     let agent_ch = connect(&net, 1024 * 1024, &agent, relay).await;
     tokio::spawn(flooding_agent(agent_ch));
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -280,7 +285,7 @@ async fn relay_queue_never_exceeds_credit_while_writes_block() {
     );
     sample_queue(Arc::clone(&metrics), Arc::clone(&max), Arc::clone(&stop));
     let mut ch = connect(&net, 4 * 1024, &greedy, relay).await;
-    open(&mut ch).await;
+    open(&mut ch, 1).await;
     let t = zt_net::Timeouts {
         write: Duration::from_millis(50),
         ..common::timeouts()

@@ -128,7 +128,8 @@ enum Command {
     },
 }
 
-/// Where and how often the metrics textfile is written (R-5, OPERATIONS §16).
+/// Where and how often the metrics textfile is written (R-5, OPERATIONS §17), and the byte
+/// budget (R-6, OPERATIONS §18).
 #[derive(Debug, clap::Args)]
 struct MetricsArgs {
     /// The metrics file, in the Prometheus text format for `node_exporter`'s textfile collector
@@ -139,6 +140,21 @@ struct MetricsArgs {
     /// How often the metrics file is rewritten, in seconds (1 to 3600).
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
     metrics_interval: u64,
+    /// The global byte budget of the frames queued towards peers, in MiB (16 to 65536; R-6,
+    /// OPERATIONS §18). Past it, the connection with the largest backlog is disconnected.
+    /// Default: a quarter of the memory (cgroup limit included), from 64 MiB to 1 GiB.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(16..=65536))]
+    queue_budget_mib: Option<u64>,
+}
+
+impl MetricsArgs {
+    /// The byte budget, from `--queue-budget-mib` or the default.
+    fn budget(&self) -> usize {
+        self.queue_budget_mib
+            .map_or_else(zt_net::budget::default_queue_budget, |mib| {
+                usize::try_from(mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+            })
+    }
 }
 
 /// How the process fails: a configuration error is `EX_CONFIG` (78), which the unit does not
@@ -444,6 +460,7 @@ fn serve(
         let metrics = RelayMetrics::new();
         let relay_config = RelayConfig {
             metrics: std::sync::Arc::clone(&metrics),
+            queue_budget: metrics_args.budget(),
             admission: settings.admission,
             suites: settings.suites,
             agent_idle: Some(settings.agent_idle),

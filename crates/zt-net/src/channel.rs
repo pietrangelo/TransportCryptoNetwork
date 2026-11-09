@@ -145,6 +145,7 @@ where
         framed,
         transport,
         decoder: FrameDecoder::new(),
+        scratch: BytesMut::new(),
     })
 }
 
@@ -292,6 +293,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
             framed,
             transport,
             decoder: FrameDecoder::new(),
+            scratch: BytesMut::new(),
         };
         if confirm_on_establish {
             established.confirmed();
@@ -305,6 +307,8 @@ pub struct Established<IO> {
     framed: Framed<IO, LengthDelimitedCodec>,
     transport: noise::Transport,
     decoder: FrameDecoder,
+    /// The plaintext of the frame being sent, reused from one frame to the next.
+    scratch: BytesMut,
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
@@ -336,8 +340,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
             Some(Err(err)) => return Err(NetError::Io(err)),
             None => return Ok(None),
         };
+        // The plaintext buffer, sized to the message, becomes the frame's buffer without a copy:
+        // a queued payload keeps only its own message alive (finding 0001-10).
         let plaintext = self.transport.decrypt(&message)?;
-        let mut buf = BytesMut::from(plaintext.as_slice());
+        let mut buf = BytesMut::from(Bytes::from(plaintext));
         let frame = self
             .decoder
             .decode(&mut buf)?
@@ -353,10 +359,30 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Established<IO> {
     /// # Errors
     /// I/O errors or timeout.
     pub async fn send(&mut self, frame: &Frame, timeouts: &Timeouts) -> Result<(), NetError> {
-        let mut plaintext = BytesMut::with_capacity(zt_proto::encoded_len(frame));
-        zt_proto::encode(frame, &mut plaintext);
-        let message = self.transport.encrypt(&plaintext)?;
-        timeout(timeouts.write, self.framed.send(Bytes::from(message)))
+        self.scratch.clear();
+        zt_proto::encode(frame, &mut self.scratch);
+        // Encrypted straight into the write buffer, after its length prefix (the codec's own
+        // format: two bytes, big endian): no ciphertext allocation, no copy (R6-E3).
+        let len = self.scratch.len().saturating_add(noise::TAG_LEN);
+        let prefix = u16::try_from(len).map_err(|_| NetError::Protocol("oversized frame"))?;
+        let out = self.framed.write_buffer_mut();
+        let start = out.len();
+        out.reserve(len.saturating_add(2));
+        out.extend_from_slice(&prefix.to_be_bytes());
+        out.resize(start.saturating_add(2).saturating_add(len), 0);
+        let written = out
+            .get_mut(start.saturating_add(2)..)
+            .ok_or(NetError::Protocol("write buffer"))
+            .and_then(|tail| Ok(self.transport.encrypt_into(&self.scratch, tail)?));
+        match written {
+            Ok(n) if n == len => {}
+            other => {
+                out.truncate(start);
+                other?;
+                return Err(NetError::Protocol("ciphertext length"));
+            }
+        }
+        timeout(timeouts.write, SinkExt::<Bytes>::flush(&mut self.framed))
             .await
             .map_err(|_| NetError::Timeout("write"))??;
         Ok(())

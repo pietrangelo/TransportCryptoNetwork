@@ -113,9 +113,11 @@ Items checked and **not** found to be gaps:
 - Per-relay quotas on the agent hold (0005b-1).
 - Pre-auth amplification: the relay sends nothing to an unauthenticated peer, so even a bigger
   PQ msg2 cannot be used for amplification. Keep this as an invariant.
-- Finding 0001-10 (small `Bytes` pinning large buffers): every message is copied into a buffer
-  of its exact size and `MIN_CHARGE` charges small frames, so it appears to be in practice
-  mitigated. The backlog should close it explicitly, with a test.
+- Finding 0001-10 (small `Bytes` pinning large buffers): every message is decrypted into a
+  buffer of its exact size, which becomes the frame's buffer without a copy (R-6), and
+  `MIN_CHARGE` charges small frames. **Closed** in R-6 by
+  `a_small_payload_pins_only_its_own_message` (`crates/zt-net/tests/budget.rs`): a 1-byte
+  payload keeps at most its own message alive.
 
 ---
 
@@ -392,6 +394,24 @@ A11-3). PROTOCOL §13 and OPERATIONS §5 have the operator view.
   crash-only restart.
 - **Smaller agent footprint:** a `worker_threads(2)` runtime for the agent; it handles few
   streams.
+
+**As implemented (R-6).**
+
+- Copies: `decrypt`'s buffer becomes the frame's buffer (`BytesMut::from(Bytes::from(vec))`),
+  and `Established::send` encodes into a reused scratch buffer and encrypts with
+  `Transport::encrypt_into` straight into the `Framed` write buffer, after the length prefix.
+  That is two allocations and one copy fewer on send, one allocation and one copy fewer on
+  receive. Measured with `tests/throughput.rs` (ignored, release, in-memory pipe): 16 KiB
+  frames 27–29 k/s → 29–30 k/s (about +5 %), 64-byte frames unchanged within noise. ChaCha20-Poly1305
+  dominates; no benchmark crate was added.
+- Window tuning: the receiver cannot see the sender's credit (grants in flight are invisible),
+  so the signal is the receiver's own backlog. The window doubles when a whole window was
+  delivered and the receiver waited on an empty queue since its last update; a lagging reader
+  keeps a backlog and never grows. No Ping round trip is needed. `CHUNK` stays at 16 KiB.
+- Byte budgets: as above for the relay, plus a budget of receive windows on the agent (AP-22)
+  with growth limited to three quarters of it. A shed connection's streams get `Close
+  PeerGone` from the core, not `Drained`.
+- The agent's runtime has two workers.
 
 ### 5.7 Testing: chaos, simulation, soak (G14)
 

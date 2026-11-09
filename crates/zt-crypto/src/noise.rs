@@ -901,20 +901,33 @@ impl Transport {
     /// # Errors
     /// [`CryptoError::MessageTooLarge`] over [`MAX_PLAINTEXT_LEN`].
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if plaintext.len() > MAX_PLAINTEXT_LEN {
+        let mut out = vec![0_u8; plaintext.len().saturating_add(TAG_LEN)];
+        let len = self.encrypt_into(plaintext, &mut out)?;
+        out.truncate(len);
+        Ok(out)
+    }
+
+    /// Encrypts a message into `out` (at least `plaintext.len() + TAG_LEN` bytes) and returns
+    /// the length of the ciphertext: the caller can write it straight into its output buffer,
+    /// without an intermediate allocation (resilience R-6).
+    ///
+    /// # Errors
+    /// [`CryptoError::MessageTooLarge`] over [`MAX_PLAINTEXT_LEN`] or if `out` is too short.
+    pub fn encrypt_into(&mut self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
+        if plaintext.len() > MAX_PLAINTEXT_LEN
+            || out.len() < plaintext.len().saturating_add(TAG_LEN)
+        {
             return Err(CryptoError::MessageTooLarge);
         }
-        let mut out = vec![0_u8; plaintext.len().saturating_add(TAG_LEN)];
         let len = self
             .state
-            .write_message(plaintext, &mut out)
+            .write_message(plaintext, out)
             .map_err(|_| CryptoError::Handshake)?;
-        out.truncate(len);
         self.sent = self.sent.wrapping_add(1);
         if self.sent.is_multiple_of(REKEY_INTERVAL) {
             self.state.rekey_outgoing();
         }
-        Ok(out)
+        Ok(len)
     }
 
     /// Decrypts a message into a **new** buffer, sized to the message.

@@ -22,16 +22,18 @@ fn the_tuner_starts_at_the_initial_window() {
     assert_eq!(t.update_threshold(), INITIAL_WINDOW / 4);
 }
 
-/// A sender with plenty of credit left is not window-limited: no growth.
+/// A receiver with a backlog (its local reader is the bottleneck) is not window-limited: no
+/// growth.
 #[test]
-fn no_growth_while_the_sender_has_credit() {
+fn no_growth_while_the_reader_lags() {
     let mut t = WindowTuner::new();
     t.on_delivered(INITIAL_WINDOW * 4);
     assert_eq!(t.wants_growth(INITIAL_WINDOW / 2), 0);
 }
 
-/// A sender that ran its window nearly dry while this side kept up is limited by the window:
-/// the window doubles, once per full window delivered, up to `MAX_WINDOW`.
+/// A receiver that kept up (it waited on an empty queue) while a full window was delivered is
+/// limited by the window, not by its reader: the window doubles, once per full window
+/// delivered, up to `MAX_WINDOW`.
 #[test]
 fn a_stalled_sender_doubles_the_window_up_to_the_maximum() {
     let mut t = WindowTuner::new();
@@ -79,9 +81,9 @@ proptest! {
         steps in proptest::collection::vec((0_u32..2 * MAX_WINDOW, 0_u32..MAX_WINDOW, any::<bool>()), 0..200)
     ) {
         let mut t = WindowTuner::new();
-        for (delivered, peer_credit, accept) in steps {
+        for (delivered, backlog, accept) in steps {
             t.on_delivered(delivered);
-            let g = t.wants_growth(peer_credit);
+            let g = t.wants_growth(backlog);
             prop_assert!(t.target().checked_add(g).is_some_and(|w| w <= MAX_WINDOW));
             if g > 0 {
                 if accept { t.grew(g) } else { t.refused() }

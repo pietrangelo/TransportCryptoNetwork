@@ -19,13 +19,14 @@ pub use zt_application::reconnect::ReconnectConfig;
 use zt_application::reconnect::{ReconnectPolicy, SessionEnd};
 use zt_crypto::noise::{self, Channel, Responded};
 use zt_crypto::{CryptoError, Keyring};
-use zt_domain::flow::Window;
+use zt_domain::flow::{INITIAL_WINDOW, Window};
 use zt_domain::{
     AcceptedSuites, AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection,
     ClientCredential, CloseReason, DomainEvent, Fingerprint, Frame, HandshakeChannel,
     HandshakeSuite, HybridFingerprint, NodeId, RejectReason, StreamId,
 };
 
+use crate::budget::ByteBudget;
 use crate::metrics::{AgentMetrics, Held, Traffic, auth_reason};
 use crate::net::{Dialer, TcpDialer};
 use crate::relay::{CertFields, audit, repeated_line};
@@ -78,6 +79,8 @@ struct Shared {
     handshaking: Arc<AtomicUsize>,
     /// What the agent counts (R-5).
     metrics: Arc<AgentMetrics>,
+    /// The receive windows of every stream, on every relay (R-6).
+    budget: Arc<ByteBudget>,
 }
 
 /// What the agent records and how it bounds its buffers (resilience R-5, R-6).
@@ -85,12 +88,17 @@ struct Shared {
 pub struct Observed {
     /// The agent's metrics, written by [`crate::metrics::export`] (the binary does it).
     pub metrics: Arc<AgentMetrics>,
+    /// The global byte budget of the streams' receive windows (R-6, AP-22): a stream whose
+    /// initial window does not fit is rejected with `ResourceExhausted`; windows grow only
+    /// within three quarters of it.
+    pub buffer_budget: usize,
 }
 
 impl Default for Observed {
     fn default() -> Self {
         Self {
             metrics: AgentMetrics::new(crate::MAX_RELAYS),
+            buffer_budget: crate::budget::default_buffer_budget(),
         }
     }
 }
@@ -293,7 +301,9 @@ pub async fn run_observed<D: Dialer>(
         draining: Arc::new(AtomicBool::new(false)),
         handshaking: Arc::new(AtomicUsize::new(0)),
         metrics: Arc::clone(&observed.metrics),
+        budget: ByteBudget::new(observed.buffer_budget),
     };
+    observed.metrics.attach_buffer(&shared.budget);
     let mut sessions = tokio::task::JoinSet::new();
     sessions.spawn(identity_summaries(
         Arc::clone(&shared.lines),
@@ -573,6 +583,14 @@ fn on_relay_frame<D: Dialer>(
                     reason: RejectReason::ResourceExhausted,
                 }));
             }
+            // The global byte budget (R-6): backpressure, never an out-of-memory.
+            let Some(window) = shared.budget.try_reserve(INITIAL_WINDOW as usize) else {
+                shared.metrics.buffer_refusals.inc();
+                return Ok(Some(Frame::Reject {
+                    stream,
+                    reason: RejectReason::ResourceExhausted,
+                }));
+            };
             let (tx, rx) = mpsc::channel(STREAM_QUEUE);
             streams.slots.insert(
                 stream,
@@ -582,7 +600,7 @@ fn on_relay_frame<D: Dialer>(
                 },
             );
             let task = StreamTask {
-                io: StreamIo::new(stream, rx, out_tx.clone()),
+                io: StreamIo::new(stream, rx, out_tx.clone(), window),
                 identity: Arc::clone(identity),
                 shared: shared.clone(),
                 authorized: config.authorized_clients.clone(),
@@ -1034,6 +1052,8 @@ async fn bridge<S>(
         result = pump(io, transport, ssh, Some(timeouts.write), Traffic {
             from_local: &metrics.from_ssh,
             to_local: &metrics.to_ssh,
+            window_grows: Some(&metrics.window_grows),
+            window_refusals: Some(&metrics.buffer_refusals),
         }) => match result {
             Ok(()) => "closed",
             Err(err) => {

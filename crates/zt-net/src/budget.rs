@@ -1,0 +1,200 @@
+//! Global byte budgets for buffered stream data (resilience R-6, review 0007 AP-22 and D-13):
+//! backpressure instead of an out-of-memory.
+//!
+//! - On the agent (and the client), every stream's receive window is a [`Reservation`]: a new
+//!   stream gets its initial window or is rejected with `ResourceExhausted`; a window grows only
+//!   while the budget has room outside its last quarter, kept for the initial windows of new
+//!   streams, so one bulk stream cannot starve the others.
+//! - On the relay, every frame queued towards a peer carries a [`Charge`]; past the budget the
+//!   relay sheds the connection with the largest backlog
+//!   ([`zt_application::efficiency::shed_victim`]).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const MIB: usize = 1024 * 1024;
+
+/// The smallest default queue budget of the relay.
+pub const MIN_QUEUE_BUDGET: usize = 64 * MIB;
+/// The largest default queue budget of the relay.
+pub const MAX_QUEUE_BUDGET: usize = 1024 * MIB;
+
+/// A byte budget shared by every stream or connection of a process.
+#[derive(Debug)]
+pub struct ByteBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl ByteBudget {
+    /// A budget of `limit` bytes, none used.
+    #[must_use]
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    /// The limit, in bytes.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Bytes reserved or charged now.
+    #[must_use]
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// More charged than the limit.
+    #[must_use]
+    pub fn exceeded(&self) -> bool {
+        self.used() > self.limit
+    }
+
+    /// Takes `n` bytes if the total stays within `ceiling`.
+    fn take(&self, n: usize, ceiling: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(n).filter(|&total| total <= ceiling)
+            })
+            .is_ok()
+    }
+
+    fn give_back(&self, n: usize) {
+        // Never below zero: every give-back matches an earlier take.
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(n))
+            });
+    }
+
+    /// Reserves `n` bytes, or `None` if they do not fit in the limit.
+    #[must_use]
+    pub fn try_reserve(self: &Arc<Self>, n: usize) -> Option<Reservation> {
+        self.take(n, self.limit).then(|| Reservation {
+            budget: Arc::clone(self),
+            bytes: n,
+        })
+    }
+
+    /// Charges `n` bytes whatever the limit (the relay's queued frames: the caller sheds when
+    /// [`Self::exceeded`]); released when the charge is dropped.
+    #[must_use]
+    pub fn charge(self: &Arc<Self>, n: usize) -> Charge {
+        self.used.fetch_add(n, Ordering::AcqRel);
+        Charge {
+            budget: Arc::clone(self),
+            bytes: n,
+        }
+    }
+}
+
+/// Bytes reserved from a [`ByteBudget`] (a receive window), released on drop.
+#[derive(Debug)]
+pub struct Reservation {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+
+impl Reservation {
+    /// Grows the reservation by `n` bytes if the budget stays within three quarters of its
+    /// limit (the last quarter is for the initial windows of new streams).
+    #[must_use]
+    pub fn try_grow(&mut self, n: usize) -> bool {
+        let limit = self.budget.limit;
+        let ceiling = limit.saturating_sub(limit / 4);
+        let grown = self.budget.take(n, ceiling);
+        if grown {
+            self.bytes = self.bytes.saturating_add(n);
+        }
+        grown
+    }
+
+    /// The bytes held.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget.give_back(self.bytes);
+    }
+}
+
+/// Bytes charged to a [`ByteBudget`] (a queued frame), released on drop.
+#[derive(Debug)]
+pub struct Charge {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+
+impl Charge {
+    /// The bytes charged.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.give_back(self.bytes);
+    }
+}
+
+/// The relay's queue budget for a machine with `memory` bytes (the smaller of the physical
+/// memory and the cgroup limit): a quarter of it, from 64 MiB to 1 GiB; 1 GiB if unknown.
+#[must_use]
+pub fn queue_budget_for(memory: Option<u64>) -> usize {
+    memory.map_or(MAX_QUEUE_BUDGET, |m| {
+        usize::try_from(m / 4)
+            .unwrap_or(usize::MAX)
+            .clamp(MIN_QUEUE_BUDGET, MAX_QUEUE_BUDGET)
+    })
+}
+
+/// The relay's default queue budget on this machine ([`queue_budget_for`]).
+#[must_use]
+pub fn default_queue_budget() -> usize {
+    queue_budget_for(memory())
+}
+
+/// The agent's default buffer budget: like the relay's queue budget, a quarter of the memory
+/// from 64 MiB to 1 GiB ([`queue_budget_for`]).
+#[must_use]
+pub fn default_buffer_budget() -> usize {
+    default_queue_budget()
+}
+
+/// A receive window outside any shared budget (the client's single stream): its own budget,
+/// large enough to grow to `MAX_WINDOW` within the three-quarter rule.
+#[must_use]
+pub fn standalone_window() -> Option<Reservation> {
+    let max = usize::try_from(zt_domain::flow::MAX_WINDOW).ok()?;
+    let initial = usize::try_from(zt_domain::flow::INITIAL_WINDOW).ok()?;
+    // limit - limit/4 >= MAX_WINDOW
+    ByteBudget::new(max.saturating_add(max / 3).saturating_add(4)).try_reserve(initial)
+}
+
+/// Physical memory, capped by the cgroup v2 limit if there is one.
+fn memory() -> Option<u64> {
+    let physical = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|kb| kb.saturating_mul(1024))
+    });
+    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    match (physical, cgroup) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (p, c) => p.or(c),
+    }
+}

@@ -174,7 +174,9 @@ where
     let (out_tx, out_rx) = mpsc::channel(1024);
     let relay_link = drive(ch, stream, to_stream, out_rx, t);
     let session = async {
-        let mut io = StreamIo::new(stream, from_driver, out_tx);
+        let window =
+            crate::budget::standalone_window().ok_or(NetError::Protocol("receive window"))?;
+        let mut io = StreamIo::new(stream, from_driver, out_tx, window);
         let (msg1, waiting) = noise::initiate_suite(
             identity,
             &config.node_key,
@@ -197,6 +199,8 @@ where
             Traffic {
                 from_local: &metrics.sent,
                 to_local: &metrics.received,
+                window_grows: None,
+                window_refusals: None,
             },
         )
         .await

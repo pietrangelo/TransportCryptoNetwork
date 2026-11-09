@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod efficiency;
 pub mod failover;
 pub mod flapping;
 pub mod identity_lines;

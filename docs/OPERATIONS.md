@@ -1363,9 +1363,65 @@ groups:
         for: 10m
       - alert: TcnQueueBudgetShedding     # slow readers disconnected by the byte budget (§18)
         expr: increase(tcn_relay_queue_shed_total[15m]) > 0
+      - alert: TcnAgentBufferExhausted    # streams rejected: the agent's byte budget is full (§18)
+        expr: increase(tcn_agent_buffer_refusals_total[15m]) > 0 and tcn_agent_buffer_bytes > 0.9 * tcn_agent_buffer_budget_bytes
       - alert: TcnKnownIdentityRefused    # revoked keys or certificates still trying
         expr: increase(tcn_relay_auth_failures_total{reason=~"key_revoked|certificate|identity_downgrade"}[15m]) > 0
       - alert: TcnDraining                # a drain that lasts more than the drain timeout
         expr: tcn_draining == 1
         for: 5m
+```
+
+## 18. Memory: byte budgets, window tuning, soak
+
+Buffered stream data is bounded by a **global byte budget** on the relay and on the agent: past
+it there is backpressure or a disconnection, never an out-of-memory (resilience R-6, review
+0007 AP-22 and D-13). `MemoryHigh=`/`MemoryMax=` in the unit stay the last resort.
+
+| Process | Option | Default | Past the budget |
+| :- | :- | :- | :- |
+| relay | `run --queue-budget-mib N` (16–65536) | a quarter of the memory (the cgroup limit included), from 64 MiB to 1 GiB | the connection with the **largest backlog** (the slowest reader) is disconnected at once, even in the middle of a write; ties go to the newest connection |
+| agent | `run --buffer-budget-mib N` (16–65536) | the same rule | a new stream whose initial window (256 KiB) does not fit is rejected with `Reject ResourceExhausted`; a window does not grow |
+
+**Relay.** Every frame queued towards a peer is counted until it is written. A shed connection
+is audited (`queue_budget_exceeded`, WARN, with the connection id, its backlog and the budget)
+and counted in `tcn_relay_queue_shed_total`. Its streams end as when the peer disconnects: the
+other side sees `Close PeerGone`, not `Drained` (resilience.md §5.6 said `Drained`; `PeerGone`
+is what the relay core already sends for a lost connection, and it is the truth). A healthy
+reader holds at most one window (1 MiB at most) per stream in the queue: keep the budget well
+above `streams per connection × 1 MiB`, which the default does on any real host. Reads and
+writes of a connection stay in one task, so a client that stops reading cannot make the relay
+queue more than its credit either (a regression test guards it).
+
+**Agent.** Each stream reserves its receive window from the budget when it opens and gives it
+back when it ends. A window **grows** (doubling, up to the protocol's `MAX_WINDOW`, 1 MiB) when
+the agent delivered a whole window to sshd while waiting for data, that is when the window and
+not sshd limits a transfer over a long or fat path; `tcn_agent_window_grows_total` counts it.
+Growth stops at three quarters of the budget: the last quarter is kept for the initial windows
+of new streams, so one bulk transfer cannot lock other clients out. A refused growth is counted
+in `tcn_agent_buffer_refusals_total` and the transfer simply goes on with its current window.
+The client tunes its own window the same way, within a budget of its own. No wire change: old
+peers keep working, and the relay and every peer still refuse a window beyond 1 MiB.
+
+**Sizing.** The budget is a ceiling on memory that *may* be buffered; it is only used while a
+reader is slower than its sender. Watch `tcn_relay_queue_bytes` against
+`tcn_relay_queue_budget_bytes` and `tcn_agent_buffer_bytes` against
+`tcn_agent_buffer_budget_bytes` (§17). Sheds or refusals on a host with free memory mean the
+budget is too small for its traffic; on a host short of memory they are the budget doing its job.
+
+**The agent's runtime** has two worker threads (it serves few streams); the relay uses one per
+core.
+
+**Soak.** A nightly workflow (`.github/workflows/soak.yml`, also started by hand) runs the relay,
+an agent and an echo server on localhost for 30 minutes: clients open sessions in a loop, the
+relay is restarted every minute and its policy reloaded every 10 seconds. File descriptors,
+resident memory and live tasks are sampled every 5 seconds; the run fails if any of them grows
+under load (least-squares trend after a warm-up quarter: more than 8 descriptors, 16 tasks or
+24 MiB) or has not come back after the load stops. The samples are kept as the `soak-samples`
+artifact (CSV). A 15-second version runs in every CI build, and a test injects a leak to prove
+the gate fails. To run it by hand:
+
+```sh
+TCN_SOAK_SECS=600 TCN_SOAK_REPORT=/tmp/soak.csv \
+  cargo test --release -p zt-net --test soak -- --ignored --nocapture soak_long
 ```

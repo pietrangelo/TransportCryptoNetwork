@@ -13,16 +13,18 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{timeout, timeout_at};
 use zt_application::admission::{
     Admission, AdmissionConfig, IdentityEvent, PreauthFailure, PreauthSummary, Refusal,
     RepeatedEvent, Ticket, is_known_identity,
 };
+use zt_application::efficiency::shed_victim;
 use zt_application::relay::{ConnId, Input, Now, Output, RelayCore, RelayLimits, SessionIds};
 use zt_crypto::Keyring;
 use zt_crypto::noise::Channel;
@@ -33,6 +35,7 @@ use zt_domain::{
     SuitePolicy,
 };
 
+use crate::budget::{ByteBudget, Charge};
 use crate::lifecycle::Progress;
 use crate::metrics::{RelayMetrics, RoleLabel, auth_reason};
 use crate::net::Acceptor;
@@ -57,6 +60,9 @@ pub struct RelayConfig {
     /// Where the relay counts what it does (R-5): written as a textfile by
     /// [`crate::metrics::export`], never served on a socket.
     pub metrics: Arc<RelayMetrics>,
+    /// The global byte budget of the frames queued towards peers (R-6, D-13): past it, the
+    /// connection with the largest backlog (the slowest reader) is disconnected.
+    pub queue_budget: usize,
 }
 
 impl Default for RelayConfig {
@@ -69,6 +75,7 @@ impl Default for RelayConfig {
             agent_idle: None,
             client_idle: None,
             metrics: RelayMetrics::new(),
+            queue_budget: crate::budget::default_queue_budget(),
         }
     }
 }
@@ -334,9 +341,136 @@ enum HubEvent {
         peer: Fingerprint,
         hybrid: Option<HybridFingerprint>,
         certificate: Option<Arc<CertClaims>>,
-        tx: mpsc::Sender<Frame>,
+        queue: PeerQueue,
     },
     Core(Input),
+}
+
+/// A frame queued towards a peer, charged to the global byte budget until written.
+struct Queued {
+    frame: Frame,
+    _charge: QueueCharge,
+}
+
+/// Bytes of a queued frame, counted in the global budget and in its connection's backlog.
+struct QueueCharge {
+    _global: Charge,
+    backlog: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for QueueCharge {
+    fn drop(&mut self) {
+        self.backlog.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The hub's side of a connection's outbound queue.
+struct PeerQueue {
+    tx: mpsc::Sender<Queued>,
+    /// Bytes queued and not yet written.
+    backlog: Arc<AtomicUsize>,
+    /// Wakes the connection task when the budget sheds it, even in the middle of a write.
+    shed: Arc<Notify>,
+}
+
+/// The connection task's side of its outbound queue.
+struct OwnQueue {
+    rx: mpsc::Receiver<Queued>,
+    shed: Arc<Notify>,
+}
+
+impl PeerQueue {
+    fn new(frames: usize) -> (Self, OwnQueue) {
+        let (tx, rx) = mpsc::channel(frames);
+        let shed = Arc::new(Notify::new());
+        (
+            Self {
+                tx,
+                backlog: Arc::new(AtomicUsize::new(0)),
+                shed: Arc::clone(&shed),
+            },
+            OwnQueue { rx, shed },
+        )
+    }
+
+    fn backlog(&self) -> usize {
+        self.backlog.load(Ordering::Acquire)
+    }
+}
+
+/// What a queued frame weighs in the budget: a `Data` payload (at least the minimum charge of
+/// the flow control); control frames are bounded by their count and weigh nothing.
+fn queued_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::Data { payload, .. } => {
+            usize::try_from(zt_domain::flow::charge(payload.len())).unwrap_or(usize::MAX)
+        }
+        _ => 0,
+    }
+}
+
+/// The relay's outbound queues against the global byte budget.
+struct Queues {
+    peers: HashMap<ConnId, PeerQueue>,
+    budget: Arc<ByteBudget>,
+    /// Shed connections whose queued frames are not released yet: not counted twice, so one
+    /// slow reader never costs another connection its place.
+    shedding: Vec<(ConnId, Arc<AtomicUsize>)>,
+}
+
+impl Queues {
+    fn new(budget: Arc<ByteBudget>) -> Self {
+        Self {
+            peers: HashMap::new(),
+            budget,
+            shedding: Vec::new(),
+        }
+    }
+
+    /// Queues `frame` for `conn`; `false` if the queue is full or gone.
+    fn send(&self, conn: ConnId, frame: Frame) -> Option<bool> {
+        let peer = self.peers.get(&conn)?;
+        let bytes = queued_bytes(&frame);
+        peer.backlog.fetch_add(bytes, Ordering::AcqRel);
+        let charge = QueueCharge {
+            _global: self.budget.charge(bytes),
+            backlog: Arc::clone(&peer.backlog),
+            bytes,
+        };
+        Some(
+            peer.tx
+                .try_send(Queued {
+                    frame,
+                    _charge: charge,
+                })
+                .is_ok(),
+        )
+    }
+
+    /// Past the budget, the connection with the largest backlog, detached and woken.
+    fn shed(&mut self) -> Option<(ConnId, usize)> {
+        if !self.budget.exceeded() {
+            return None;
+        }
+        self.shedding.retain(|(_, b)| b.load(Ordering::Acquire) > 0);
+        let releasing: usize = self
+            .shedding
+            .iter()
+            .map(|(_, b)| b.load(Ordering::Acquire))
+            .sum();
+        let total = self.budget.used().saturating_sub(releasing);
+        let victim = shed_victim(
+            total,
+            self.budget.limit(),
+            self.peers.iter().map(|(&id, p)| (id, p.backlog())),
+        )?;
+        let peer = self.peers.remove(&victim)?;
+        let backlog = peer.backlog();
+        peer.shed.notify_one();
+        self.shedding.push((victim, peer.backlog));
+        Some((victim, backlog))
+    }
 }
 
 /// Outbound queue of a connection: the most that the credit allows to be enqueued.
@@ -488,6 +622,7 @@ impl<A: Acceptor> RelayServer<A> {
             progress,
             drain_rx,
             Arc::clone(&metrics),
+            config.queue_budget,
         ));
         // One clone per live connection task: the drain waits for them to flush.
         let live = Arc::new(());
@@ -1053,7 +1188,8 @@ impl Connection {
     ) where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let (tx, mut rx) = mpsc::channel(self.capacity);
+        let (queue, own) = PeerQueue::new(self.capacity);
+        let OwnQueue { mut rx, shed } = own;
         let conn = self.conn;
         if self
             .hub
@@ -1062,7 +1198,7 @@ impl Connection {
                 peer: peer.fingerprint,
                 hybrid: peer.hybrid,
                 certificate,
-                tx,
+                queue,
             })
             .await
             .is_err()
@@ -1078,8 +1214,11 @@ impl Connection {
             return;
         }
         let mut deadline = crate::deadline(idle);
+        // Reads and writes stay in this one task (G11): while a write to a slow reader blocks,
+        // its `WindowUpdate`s are not read either, so its queue stays within the credit.
         loop {
             tokio::select! {
+                () = shed.notified() => break,
                 inbound = timeout_at(deadline, ch.recv()) => {
                     let frame = match inbound {
                         Ok(Ok(Some(frame))) => frame,
@@ -1099,13 +1238,21 @@ impl Connection {
                     }
                 }
                 outbound = rx.recv() => {
-                    let Some(frame) = outbound else { break };
-                    if ch.send(&frame, &self.timeouts).await.is_err() {
+                    let Some(queued) = outbound else { break };
+                    // Shed by the byte budget: stop at once, even in the middle of a write.
+                    let written = tokio::select! {
+                        r = ch.send(&queued.frame, &self.timeouts) => r.is_ok(),
+                        () = shed.notified() => false,
+                    };
+                    drop(queued);
+                    if !written {
                         break;
                     }
                 }
             }
         }
+        // The queued frames give their bytes back to the budget now.
+        drop(rx);
         let _ = self
             .hub
             .send(HubEvent::Core(Input::Disconnected { conn }))
@@ -1179,8 +1326,11 @@ async fn hub(
     progress: Progress,
     mut drain_rx: mpsc::Receiver<Duration>,
     metrics: Arc<RelayMetrics>,
+    queue_budget: usize,
 ) -> DrainOutcome {
-    let mut peers: HashMap<ConnId, mpsc::Sender<Frame>> = HashMap::new();
+    let budget = ByteBudget::new(queue_budget);
+    metrics.attach_queue(&budget);
+    let mut peers = Queues::new(budget);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     // A late tick is not caught up in a burst (A10-10): one tick per second of progress.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1213,13 +1363,13 @@ async fn hub(
             }
             event = events.recv() => match event {
                 None => return DrainOutcome::default(),
-                Some(HubEvent::Connected { conn, peer, hybrid, certificate, tx }) => {
-                    peers.insert(conn, tx);
+                Some(HubEvent::Connected { conn, peer, hybrid, certificate, queue }) => {
+                    peers.peers.insert(conn, queue);
                     Input::Connected { conn, peer, hybrid, certificate }
                 }
                 Some(HubEvent::Core(input)) => {
                     if let Input::Disconnected { conn } = &input {
-                        peers.remove(conn);
+                        peers.peers.remove(conn);
                     }
                     input
                 }
@@ -1240,7 +1390,7 @@ async fn hub(
 /// Hands `input` to the core and executes its outputs (and the disconnections they cause).
 fn execute(
     core: &mut RelayCore<RandomIds>,
-    peers: &mut HashMap<ConnId, mpsc::Sender<Frame>>,
+    peers: &mut Queues,
     input: Input,
     progress: &Progress,
     metrics: &RelayMetrics,
@@ -1254,20 +1404,34 @@ fn execute(
         for output in core.handle(input, now) {
             match output {
                 Output::Send { conn, frame } => {
-                    let Some(tx) = peers.get(&conn) else { continue };
                     count_sent(metrics, &frame);
-                    if tx.try_send(frame).is_err() {
-                        // Queue full or connection already closed: detach it.
-                        tracing::warn!(conn = conn.0, "outbound queue overflow");
-                        metrics.queue_overflow.inc();
-                        peers.remove(&conn);
-                        pending.push(Input::Disconnected { conn });
+                    match peers.send(conn, frame) {
+                        None | Some(true) => {}
+                        Some(false) => {
+                            // Queue full or connection already closed: detach it.
+                            tracing::warn!(conn = conn.0, "outbound queue overflow");
+                            metrics.queue_overflow.inc();
+                            peers.peers.remove(&conn);
+                            pending.push(Input::Disconnected { conn });
+                        }
+                    }
+                    if let Some((victim, backlog)) = peers.shed() {
+                        audit_line!(
+                            true,
+                            "queue_budget_exceeded",
+                            conn = victim.0,
+                            backlog,
+                            budget = peers.budget.limit(),
+                            "byte budget exceeded: slowest reader disconnected"
+                        );
+                        metrics.queue_shed.inc();
+                        pending.push(Input::Disconnected { conn: victim });
                     }
                 }
                 Output::Close { conn } => {
                     // Dropping the sender closes the connection after the frames already
                     // queued.
-                    peers.remove(&conn);
+                    peers.peers.remove(&conn);
                 }
                 Output::Audit(event) => audit(&event),
             }

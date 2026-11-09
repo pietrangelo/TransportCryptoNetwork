@@ -161,7 +161,8 @@ enum Command {
     },
 }
 
-/// Where and how often the metrics textfile is written (R-5, OPERATIONS §16).
+/// Where and how often the metrics textfile is written (R-5, OPERATIONS §17), and the byte
+/// budget (R-6, OPERATIONS §18).
 #[derive(Debug, clap::Args)]
 struct MetricsArgs {
     /// The metrics file, in the Prometheus text format for `node_exporter`'s textfile collector
@@ -173,6 +174,21 @@ struct MetricsArgs {
     /// How often the metrics file is rewritten, in seconds (1 to 3600).
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
     metrics_interval: u64,
+    /// The global byte budget of the streams' receive windows, in MiB (16 to 65536; R-6,
+    /// OPERATIONS §18). A stream whose initial window does not fit is rejected; windows grow
+    /// only within three quarters of it. Default: a quarter of the memory, from 64 MiB to 1 GiB.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(16..=65536))]
+    buffer_budget_mib: Option<u64>,
+}
+
+impl MetricsArgs {
+    /// The byte budget, from `--buffer-budget-mib` or the default.
+    fn budget(&self) -> usize {
+        self.buffer_budget_mib
+            .map_or_else(zt_net::budget::default_queue_budget, |mib| {
+                usize::try_from(mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+            })
+    }
 }
 
 /// `--max-streams` within the agent's limits (finding 0005b-4: beyond the maximum of the tokio
@@ -443,7 +459,11 @@ fn serve(
 ) -> Result<(), Failure> {
     // A watchdog too short for the heartbeat would kill a healthy agent (finding A10-3).
     lifecycle::check_watchdog().map_err(Failure::Config)?;
+    // Two workers: an agent serves few streams, and one worker per core of a large host only
+    // costs memory (R-6, resilience.md §5.6). Two, not one, so a blocked task cannot stall the
+    // watchdog's heartbeat.
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(runtime_error)?;
@@ -466,7 +486,8 @@ fn serve(
         let metrics = AgentMetrics::new(config.relays.len());
         metrics.process().set_generation(first);
         let runtime_dir = reload::runtime_dir(runtime_dir);
-        let metrics_file = metrics::default_path(metrics_args.metrics_file, runtime_dir.as_deref());
+        let metrics_file =
+            metrics::default_path(metrics_args.metrics_file.clone(), runtime_dir.as_deref());
         let publisher = Publisher::new(
             runtime_dir,
             Outcome::applied(first, digests.to_string()),
@@ -545,6 +566,7 @@ fn serve(
         systemd::notify_ready();
         let observed = agent::Observed {
             metrics: Arc::clone(&metrics),
+            buffer_budget: metrics_args.budget(),
         };
         let outcome = tokio::select! {
             () = agent::run_observed(keys, config, TcpDialer, terminate.wait(), drain_timeout, observed) => Ok(()),

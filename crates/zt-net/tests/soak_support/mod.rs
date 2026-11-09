@@ -12,7 +12,9 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::format_push_string
 )]
 
 use std::sync::Arc;
@@ -201,7 +203,7 @@ pub async fn run(plan: Plan) -> Run {
                 };
                 let id = Identity::from_secret_hex(&secret).unwrap();
                 let server =
-                    RelayServer::with_acceptor(l, id, policy_rx.clone(), common::relay_config())
+                    RelayServer::with_acceptor(l, id, policy_rx.clone(), soak_relay_config())
                         .unwrap();
                 let restart_every = plan.restart_every;
                 let stop2 = Arc::clone(&stop);
@@ -312,6 +314,18 @@ pub async fn run(plan: Plan) -> Run {
         sessions: sessions.load(Ordering::Relaxed),
         failures: failures.load(Ordering::Relaxed),
     }
+}
+
+/// The test relay, with admission generous enough for every client to come from one address at
+/// full speed for hours (the soak measures leaks, not the rate limit).
+fn soak_relay_config() -> zt_net::relay::RelayConfig {
+    let mut config = common::relay_config();
+    config.admission.source_burst = 65_536;
+    config.admission.wide_burst = 65_536;
+    // Confirmed handshakes refund their source token: one client identity, many sessions.
+    config.admission.identity_refund_burst = 65_536;
+    config.admission.identity_refund_refill = Duration::from_millis(1);
+    config
 }
 
 /// One session: connect, 4 KiB through the echo, close.
