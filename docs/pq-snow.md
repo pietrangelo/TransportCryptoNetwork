@@ -149,3 +149,56 @@ after its AEAD tag verifies, so an attacker gets at most one timing sample per k
 repeated-query oracle to amplify a leak; the constant-time claim rests on libcrux's verified
 portable and AVX2 code. The decision is revisited if the KEM is ever used with a static key
 (for example a post-quantum authenticated suite).
+
+**Revisited by PQ-AUTH** (§6): the hybrid IK suite decapsulates `ct1` with the responder's
+**static** key, before authentication, as often as anyone opens a connection. That is the
+repeated-query setting the decision above excluded. Mitigations in this release: libcrux's
+verified constant-time decapsulation (portable and AVX2), implicit rejection (FIPS 203: an
+invalid `ct1` yields a pseudo-random secret, and every failure is the same `handshake_failed`
+after Noise runs), and the relay's per-source admission budget (PROTOCOL §10.1), which bounds
+the sample rate. A dudect-style test of the static-key decapsulation is still **open** and
+listed for the next adversary review.
+
+## 6. PQ-AUTH: the hybrid IK suite without a new snow patch
+
+Decision (PQ-AUTH, D12): suite `0x02`,
+`Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s` (PROTOCOL §7.5.3), is **composed at the
+TCN layer** on the vendored snow, with patches 1–5 only. `vendor/snow` and
+`vendor/patches/snow` are unchanged, and `check-vendored-snow.sh` still verifies the same
+series.
+
+| Option | Verdict |
+| :- | :- |
+| (a) new snow tokens `skem` / `ekem` for static KEM (a "KEM-IK" pattern, as in PQNoise) | **rejected**: a new state-machine patch in the least-exercised code of the TCB, with no Noise spec revision to follow |
+| (b) TCN-layer composition: encapsulate outside snow, feed the secrets as Noise PSKs, bind the ciphertexts in the prologue | **chosen** |
+| (c) sign with ML-DSA node keys | **rejected**: node keys never sign (D12); signatures are 3.3 KB and the verifier is the riskiest PQ code |
+
+How (b) works: the initiator encapsulates to the responder's pinned static key before Noise
+(`ct1`, sent in clear in front of message 1) and uses `psk0 = SHA-256("TCN/3 skem-i\0" ‖ ct1 ‖
+ss1)`; the responder encapsulates to the initiator's static key, which message 1 carries
+encrypted (`ct2` in front of message 2), and both set `psk2 = SHA-256("TCN/3 skem-r\0" ‖ ct2 ‖
+ss2)` before the `psk` token at the end of message 2. The prologue `TCN/3 <channel>` ‖ `0x02` ‖
+`SHA-256(ek_r)` ‖ `ct1` binds the suite, the channel, the responder's KEM key and `ct1`. snow
+only parses the modifiers `psk0+psk2` of its existing grammar and runs its own PSK code; the
+protocol name carries them, so the transcript names the construction. Everything snow does not
+see (`ct1`, `ct2`, the PSK derivation, `ek_i` in the payload) is in `zt-crypto/src/noise.rs` and
+covered by `tests/pq_hybrid_ik.rs` and the `hybrid_ik` fuzz target.
+
+What it costs, on the machine of §5 (another day, release build, 2 000 rounds; median / p99
+in µs; compare rows of one run only):
+
+| Operation | classical, end to end | IKhfs, end to end | hybrid IK, end to end | hybrid IK, outer |
+| :- | -: | -: | -: | -: |
+| initiator: write message 1 | 196 / 261 | 229 / 580 | 290 / 515 | 438 / 582 |
+| responder: read message 1 | 152 / 292 | 151 / 440 | 278 / 383 | 299 / 437 |
+| responder: reject an invalid message 1 | 92 / 174 | 92 / 174 | 124 / 204 | 193 / 266 |
+| responder: read message 1 and write message 2 | 306 / 559 | 339 / 1 199 | 407 / 702 | 407 / 709 |
+| initiator: read message 2 | 110 / 229 | 148 / 302 | 170 / 329 | 171 / 323 |
+| full handshake, both sides | 665 / 1 199 | 720 / 1 269 | 871 / 1 515 | 899 / 1 825 |
+
+Deriving the static ML-KEM key when a key file is loaded: 59 / 96 µs. ML-KEM-768 in that run:
+keygen 20.9 / 42.9, encapsulate 22.5 / 44.3, decapsulate 22.5 / 55.5 µs. Against IKhfs the hybrid
+IK suite adds one encapsulation and one decapsulation per side and about 3.4 KB on the wire;
+the responder's unauthenticated cost grows by one decapsulation per key tried. The VM is noisy
+(the IKhfs p99 of this run is an outlier): the per-side p99 gate of pq.md §7 should be checked
+again on an idle machine before the suite becomes a default.

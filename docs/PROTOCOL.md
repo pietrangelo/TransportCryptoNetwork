@@ -114,9 +114,15 @@ X25519 form is used (Edwards → Montgomery map). The **fingerprint** is
 `SHA-256("TCN fingerprint v1\0" || x25519_public)`, displayed as `SHA256:<hex>`.
 Small-order public keys are rejected at load time.
 
+From PQ-AUTH every node also has a static ML-KEM-768 key **derived from the same seed** and a
+v2 public form, `tcn-pub-v2:<hex>` (Ed25519 ‖ ML-KEM encapsulation key), with the
+**fingerprint v2** `SHA256v2:<hex>` (§7.5.3). There is no new secret file. The v1 fingerprint
+stays the unit of roles, pins and revocation.
+
 ### 7.3 Handshake
 The suite pinned by the initiator (§7.5): `Noise_IK_25519_ChaChaPoly_BLAKE2s` (the classical
-suite, the default) or `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the hybrid suite), on
+suite, the default), `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the hybrid suite) or
+`Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the hybrid IK suite, §7.5.3), on
 either channel. Each channel and suite has its own prologue. The
 payload of
 message 2 MUST be empty (the initiator rejects a message 2 with a payload); the payload of
@@ -125,8 +131,8 @@ payload that is neither empty nor a valid certificate.
 
 | Channel | Initiator | Responder | Prologue |
 | :- | :- | :- | :- |
-| outer | agent or client | relay | classical: `TCN/1 outer`; hybrid: `TCN/2 outer` ‖ `0x01` |
-| end-to-end | client | agent (inside `Data` frames) | classical: `TCN/1 end-to-end`; hybrid: `TCN/2 end-to-end` ‖ `0x01` |
+| outer | agent or client | relay | classical: `TCN/1 outer`; hybrid: `TCN/2 outer` ‖ `0x01`; hybrid IK: `TCN/3 outer` ‖ `0x02` ‖ … (§7.5.3) |
+| end-to-end | client | agent (inside `Data` frames) | classical: `TCN/1 end-to-end`; hybrid: `TCN/2 end-to-end` ‖ `0x01`; hybrid IK: `TCN/3 end-to-end` ‖ `0x02` ‖ … |
 
 The initiator pins the responder's key. The responder learns the initiator's identity from the
 first message and, if it is not on its whitelist, **does not respond**: it closes without
@@ -134,7 +140,7 @@ sending the second message.
 
 On the end-to-end channel the client's first transport message MUST have the confirmation of
 its suite as its plaintext: `TCN/1 ready` for the classical suite, `TCN/2 ready` for the hybrid
-one. The confirmation of the other suite, or any other plaintext, closes the stream
+one, `TCN/3 ready` for the hybrid IK suite. The confirmation of the other suite, or any other plaintext, closes the stream
 (`ProtocolViolation`) without contacting sshd. IK message 1 can be replayed by anyone who observes it (the relay): only after this
 confirmation does the agent contact sshd and register the session.
 
@@ -156,6 +162,7 @@ configuration: exact, with no case folding, trimming or aliases.
 | :- | :- | -: | -: | :- |
 | `Noise_IK_25519_ChaChaPoly_BLAKE2s` | `0x00` | 96 + payload | 48 | supported, the default |
 | `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | supported on both channels (end to end since PQ-1, outer since Phase 3) |
+| `Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x02` | 3 568 + payload | 2 240 | supported on both channels (PQ-AUTH, §7.5.3); needs v2 keys |
 
 Message 1 of the classical suite is `e` (32) + encrypted `s` (32 + 16) + the payload tag (16).
 In IKhfs, `e1` (the 1 184-byte ML-KEM-768 encapsulation key) follows `es`, so it is encrypted
@@ -170,8 +177,8 @@ Rules:
   with the same error as an invalid message (no oracle). The classical suite is byte for byte
   the handshake of earlier releases: v1 peers interoperate in both directions.
 - **Domain separation.** The classical suite keeps the `TCN/1` prologues. From PQ-1 on, a new
-  suite has its own prologue (`TCN/2 <channel>` followed by its id), so that a message of one
-  suite is never valid as another.
+  suite has its own prologue (`TCN/2 <channel>` followed by its id; `TCN/3 <channel>` ‖ `0x02`
+  for the hybrid IK suite), so that a message of one suite is never valid as another.
 - **The initiator pins one suite** per relay and per node (`suite`, OPERATIONS §5). It never
   falls back to another: if the responder does not accept that suite, it does not answer.
 - **The responder accepts explicit sets, per role.** The relay has one set for agents and
@@ -301,6 +308,93 @@ decodes as a frame.
   post-quantum authentication and no post-quantum hiding of the static key or of the
   certificate in message 1 (both are encrypted under `es`, X25519 only).
 
+#### 7.5.3 The hybrid IK suite: post-quantum authentication (PQ-AUTH)
+
+Suite `0x02`, `Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s`, adds post-quantum
+**authentication** of both parties to IKhfs (decision D12). Node keys never sign: each side is
+authenticated by an encapsulation to its static ML-KEM-768 key **and** by its X25519 static key
+(DH), so an impersonator must break both.
+
+**Static keys (D12).** A node's ML-KEM-768 key is derived from its Ed25519 seed:
+`d ‖ z = SHAKE256("TCN ML-KEM-768 seed v1\0" ‖ seed, 64)`, then FIPS 203
+`ML-KEM.KeyGen_internal(d, z)`. Key files, permissions and rotation (§14) do not change; the
+decapsulation key is wiped on drop. Public form (D13): `tcn-pub-v2:` followed by exactly 2 432
+lowercase hex characters, Ed25519 (32) ‖ `ek` (1 184). A parser refuses another length,
+uppercase, spaces, a non-canonical or small-order Ed25519 key and an `ek` that fails the FIPS 203
+§7.2 modulus check. Fingerprint v2: `SHA-256("TCN fingerprint v2\0" ‖ x25519 ‖ ek)`, shown as
+`SHA256v2:<hex>`; the distinct prefix and domain keep it from ever being read as a v1 one.
+
+**Transcript.** Composed at the TCN layer on the vendored snow, with no new snow patch
+(docs/pq-snow.md §6):
+
+```text
+<- s, ek_r                                  (pinned: tcn-pub-v2)
+-> ct1 ‖ [psk0] e, es, e1, s, ss, {ek_i ‖ payload}
+<- ct2 ‖ e, ee, ekem1, se, [psk2], {}
+
+ct1, ss1 = Encaps(ek_r)   psk0 = SHA-256("TCN/3 skem-i\0" ‖ ct1 ‖ ss1)
+ct2, ss2 = Encaps(ek_i)   psk2 = SHA-256("TCN/3 skem-r\0" ‖ ct2 ‖ ss2)
+prologue = "TCN/3 <channel>" ‖ 0x02 ‖ SHA-256(ek_r) ‖ ct1
+```
+
+- `ct1` travels in clear in front of Noise message 1. The responder decapsulates it with its
+  static key (with the current key, then the previous one, §14) before Noise runs: this is
+  its only KEM operation before the authorization decision. `psk0` keys every encrypted field
+  of message 1, so the initiator's static key, `ek_i` and certificate are hidden from a future
+  quantum adversary, and only the holder of `dk_r` reads message 1.
+- `ek_i` is the first 1 184 bytes of the message 1 payload; the responder checks it (FIPS 203
+  §7.2) and computes the initiator's fingerprint v2 over the X25519 key Noise authenticated and
+  that `ek_i`. A failure of any kind is the same `handshake_failed`, no oracle.
+- `ct2` travels in clear in front of Noise message 2; `psk2` is mixed at the end of message 2,
+  so the transport keys depend on `ss2`. **The initiator's KEM authentication completes at key
+  confirmation (AP-12)**: before the first authentic transport frame (outer channel, §10.1) or
+  the confirmation `TCN/3 ready` (end to end, §7.3), the fingerprint v2 is only claimed. The
+  responder may use it to **refuse** before message 2 (a v2 pin that does not match, §15.4),
+  never to grant more than the X25519 key would.
+- The prologue binds the channel and suite (domain separation from `TCN/1` and `TCN/2`), the
+  responder's pinned `ek` and `ct1`: a `ct1` cut from another handshake, another channel or
+  another responder key fails Noise message 1.
+
+Sizes: message 1 = `ct1` (1 088) + IKhfs message 1 (1 296) + `ek_i` (1 184) = 3 568 + payload;
+message 2 = `ct2` (1 088) + IKhfs message 2 (1 152) = 2 240. With the longest certificate of
+any version (§15.14) message 1 is at most `3 568 + 7 670 = 11 238` bytes: within a Noise message,
+a `Data` frame (`const` assertions) and the relay's pre-authentication cap for the accepted
+union (§10.1).
+
+**Pins and accepted sets.** The initiator needs the responder's v2 key: a hybrid IK pin with a
+v1 key is a configuration error (`client.toml`, `--relay-key`, OPERATIONS §15), and the
+handshake API refuses it (`HybridKeyRequired`). A v2 key may be pinned with any suite. The
+responder accepts the suite only if it is in the role's set (§7.5); there is no fallback.
+
+**Policy entries (AP-6).** A `tcn-pub-v2:` key in the relay policy or in `clients.toml` is
+keyed by its v1 fingerprint, like a v1 key, and also **pins the hybrid identity**: that peer is
+then admitted only by a hybrid IK handshake that proves exactly that fingerprint v2. A classical
+or IKhfs handshake with the right X25519 key, or a hybrid IK one with another ML-KEM key, is
+refused before message 2 with `authentication_failed reason = identity_downgrade`. A v1 and a v2
+entry of the same key are one identity: listing both is a duplicate. A hybrid peer admitted by
+a v1 entry (whitelist or certificate v1, or a v2 certificate not bound to its hybrid identity)
+works, and after key confirmation the relay and the agent write `classical_identity_match`
+(WARN, `peer`, `peer_v2`): the configuration checked only its X25519 key.
+`session_established` and `e2e_session_started` carry `peer_v2` for a hybrid IK session.
+
+**Certificates.** A certificate v2 with `subject_kind = 0x02` names the subject's fingerprint
+v2 (§15.14): it is accepted only from a hybrid IK handshake that proved it, and is
+`key_mismatch` over any other suite.
+
+What it gives, and what it does not:
+
+- **Gives:** authentication of both parties against an adversary with a quantum computer
+  *during* the handshake, as long as ML-KEM-768 holds (and, if it fails, X25519 as before); the
+  confidentiality of IKhfs; post-quantum hiding of the initiator's identity and certificate.
+- **Does not hide** that a hybrid IK handshake took place (the sizes), nor which responder is
+  reached (its address names it).
+- **Does not change IK's properties:** message 1 is replayable (hence key confirmation), and
+  the responder has no KCI protection beyond what the KEM adds.
+- **Revocation and roles stay classical-keyed**: revoking a key (v1 or v2 form) revokes every
+  handshake of that X25519 key (§15.8).
+- The decapsulation with the static key is reachable before authentication by anyone who can
+  open a connection; it relies on libcrux's constant-time code (docs/pq-snow.md §5).
+
 ## 8. Lifecycle
 
 1. The agent connects, completes the handshake and sends `Register` within 10 s with the name
@@ -407,8 +501,8 @@ accept ─(per-source token, pre-auth slot)─▶ unconfirmed ─first authentic
    checked first, so they do not spend the source's tokens.
 2. **Message 1** must be complete within `msg1_deadline` (≥ 5 s), however slowly it trickles
    in. Its length prefix is checked on sight: over the largest legitimate message 1 of the
-   accepted suites (4 424 bytes for the classical suite, 5 624 with the hybrid one, §15.3,
-   §7.5.2), the connection is closed
+   accepted suites (7 766 bytes for the classical suite, 8 966 with the hybrid one, 11 238 with
+   the hybrid IK suite, §15.3, §7.5.2, §7.5.3), the connection is closed
    before any byte of the message is buffered. Until key confirmation (step 4) the limit is the
    largest legitimate first transport message: 87 bytes, the tag and a `Register` or `Open` with
    a 63-byte name. A longer prefix is refused on sight and counted as `oversized`. After key
@@ -954,10 +1048,13 @@ artefact to distribute and compare (`sha256sum`).
 | Entry | Effect |
 | :- | :- |
 | `serials` | that certificate is rejected (step 7) |
-| `keys` | that key is rejected with **any** credential: all its certificates, from any CA, and its whitelist entry (step 1). This is the revocation of a person or a machine |
+| `keys` | that key is rejected with **any** credential and **any** suite: all its certificates, from any CA, and its whitelist entry (step 1). This is the revocation of a person or a machine. An entry is a v1 key (64 hex), a v2 key (`tcn-pub-v2:`) or a v1 fingerprint (`SHA256:`) |
 
 The denylist also applies to open connections and sessions, like any reload (§12). A key is
-compared by fingerprint (X25519 form), so `P` and `−P` are the same entry.
+compared by fingerprint (X25519 form), so `P` and `−P` are the same entry. Every form of entry
+is reduced to that v1 fingerprint (AP-6): a key revoked by its v2 form cannot connect with a
+classical handshake, and the reverse. A fingerprint v2 (`SHA256v2:`) would match nothing, so it
+is a load error, whose message names the problem but never echoes the fingerprint.
 
 With a pinned CA, `--revocations` is **mandatory** (even with an empty file): relays and agents
 do not start, and a reload fails, if the configuration has `[[authorities]]` but no denylist.
@@ -1211,6 +1308,12 @@ is the longest certificate of any version, `MAX_ANY_CERT_LEN = 7 670`.
 | CA algorithm confusion (a v2 certificate checked with a v1 pin or the reverse; a reserved `sig_alg`) | the pin carries the algorithm; `ca_fp` covers `sig_alg` and both keys; `0x03`/`0x04` refused (§15.14) |
 | crafted ML-DSA signatures against the verifier (hint encoding, `use_hint`) | Ed25519 verified first; exact pin of `ml-dsa`; ACVP and Wycheproof vectors; differential tests against `libcrux-ml-dsa`; fuzz target `cert_v2_verify`; verify-after-sign in `zt-ca` |
 | a hybrid-bound certificate presented over a classical handshake | `subject_fp_v2` must equal the hybrid fingerprint the handshake authenticated (§15.14) |
+| quantum impersonation of a node during the handshake (X25519 broken) | hybrid IK suite: each side is also authenticated by an encapsulation to its static ML-KEM key (§7.5.3) |
+| downgrade of a v2-pinned peer to the classical or IKhfs suite, or to another ML-KEM key | the v2 entry pins the fingerprint v2: `identity_downgrade` before message 2; the initiator pins one suite and never falls back |
+| revoking a key by its v2 form and connecting with a v1 handshake (or the reverse); a `SHA256v2:` denylist entry that matches nothing | every denylist form is reduced to the X25519-level fingerprint; `SHA256v2:` is a load error (§15.8) |
+| tampered `ct1` or `ct2`, or `ct1` from another handshake, channel or responder key | implicit rejection gives another secret, so the PSK, and the AEAD tags fail; the prologue binds `SHA-256(ek_r)` and `ct1` |
+| replay of a hybrid IK message 1 | as for every suite: no key confirmation without `dk_i` (and the X25519 key), so no session (AP-12) |
+| malformed `tcn-pub-v2:` keys (length, case, weak or non-canonical Ed25519, `ek` over the modulus) | strict parser (§7.5.3); the same `handshake_failed` for an invalid `ek_i` in message 1 |
 
 ## 16. Out of scope
 

@@ -382,6 +382,7 @@ Security events have target `zt_audit` and a stable name in `fields.event_kind`:
 | `authentication_failed_repeated`, `handshake_suite_rejected_repeated`, `admission_refused_repeated` | WARN | (relay; agent: the first two) once per identity and interval: how many more times (`count`) the event was seen for `peer` after the line logged in full (see below) |
 | `outer_suites_confirmed` | INFO | (relay) every summary interval, if any outer handshake confirmed its key: `agents_classical`, `agents_hybrid`, `clients_classical`, `clients_hybrid` (absent when zero). No identities; replays never count. The sunset signal of §13 |
 | `relay_registered` | INFO | (agent) registered with a relay: `node`, `relay` (address), `suite` (the pinned outer suite) |
+| `classical_identity_match` | WARN | (relay and agent) after key confirmation: a peer that proved a hybrid identity (hybrid IK suite) was admitted by an entry that checked only its X25519 key (a v1 key, a certificate v1, or a v2 certificate not bound to its hybrid identity): `peer`, `peer_v2`. Replace the entry with its `tcn-pub-v2:` key (§16) |
 | `agent_flapping` | WARN | (relay) one node changed hands between agent connections 3 times within 60 s (two agents with the same key, or a reconnect loop): `node`, `peer`, `count`. Reported once per window; each registration still goes through |
 | `configuration_loaded` | INFO | (relay and agent) at startup: `generation` (1) and `files`, the `path=sha256:<hex>` of each trust and settings file, computed from the bytes parsed. `policy_reloaded` and `authorized_clients_reloaded` carry the next `generation` (one per `SIGHUP` that applied something; on the relay `relay_keys_reloaded` shares it) and the `files` they applied: the policy (or authorized clients) and the denylist, never `relay.toml`, which only a restart reads |
 | `relay_draining`, `relay_drained` | INFO | (relay) `SIGTERM` received: `timeout_secs`; drain over: `expired` (streams were still open at the deadline), `streams_closed` (closed with `Close Drained`) |
@@ -400,7 +401,8 @@ With certificates (§10), `session_established`, `e2e_session_started`, `access_
 `access_revoked` also have `credential` (`key` or `certificate`) and, for a certificate, `ca`
 (fingerprint of the CA), `serial`, `cert_name`, `not_after` and `cert_version` (`1`, or `2`
 for a post-quantum certificate, §10.8). `authentication_failed` has
-`reason = certificate` (or `key_revoked`) and `cert_check` with the check that failed (`malformed`,
+`reason = certificate` (or `key_revoked`, or `identity_downgrade`: a peer pinned by its
+`tcn-pub-v2:` key that did not prove that hybrid identity, §15) and `cert_check` with the check that failed (`malformed`,
 `key_mismatch`, `unknown_authority`, `bad_signature`, `serial_revoked`, `not_yet_valid`,
 `expired`, `lifetime_exceeds_authority`, `role_conflict`, `node_out_of_scope`; PROTOCOL §15.4).
 After signature verification (from `serial_revoked` onwards) it also reports `ca`, `serial`,
@@ -478,7 +480,9 @@ journalctl -u zt-relay -o cat | jq 'select(.target == "zt_audit") | .fields'
    and reload again. Check `access_revoked` in the audit log.
 
 A client with a certificate (§10) is not revoked by removing it from the files: its key is not there.
-The denylist is used instead (§10.5).
+The denylist is used instead (§10.5). Its `keys` take the v1 key, the `tcn-pub-v2:` key or the
+`SHA256:` fingerprint, all the same entry (§15); never a `SHA256v2:` fingerprint, which is
+refused at load time.
 
 ## 8. Multiple relays and key rotation
 
@@ -1082,3 +1086,110 @@ seconds. Long-lived sessions (an interactive shell, a long `scp`) are cut at the
 (the ones of its drop-ins too) before restarting. A missing or unreadable file exits 1 and is
 retried with the backoff. `systemctl reload` needs no pre-flight: the running service checks
 its own files and the reload fails if it rejects them.
+
+## 15. Hybrid identities (PQ-AUTH)
+
+Every key file already holds a hybrid identity: the static ML-KEM-768 key is derived from the
+same secret (PROTOCOL §7.5.3). There is no new file and nothing to back up. `keygen` (relay,
+agent, client) prints both forms:
+
+```text
+public_key     = "<64 hex>"
+fingerprint    = SHA256:<64 hex>
+public_key_v2  = "tcn-pub-v2:<2 432 hex>"
+fingerprint_v2 = SHA256v2:<64 hex>
+```
+
+For an existing key file, `zt-relay pubkey --key <file>` (and `zt-agent pubkey`, `zt-client
+pubkey`) prints the same four lines and leaves the file as it is: the v2 form is a function of
+the secret, so it is obtained where the key lives. Copy the v2 key from the output (about 2.4 KB
+of text), never retype it.
+
+Where the v2 key goes:
+
+| File or option | v2 key accepted | Effect |
+| :- | :- | :- |
+| relay `policy.toml`, `[[agents]]` and `[[clients]]` `public_key(s)` | yes | the entry is keyed by the v1 fingerprint, as before, and **pins** the hybrid identity: only a hybrid IK handshake that proves it is admitted (`identity_downgrade` otherwise) |
+| agent `clients.toml` `[[clients]]` | yes | the same, on the end-to-end channel |
+| `revoked.toml` `keys` | yes (also v1 keys and `SHA256:` fingerprints) | revokes the X25519-level identity, for every suite; `SHA256v2:` is a load error |
+| `client.toml` `relay_key`, `[[relays]] public_key`, `[[nodes]] public_key` | yes | required for the hybrid IK `suite`; accepted with any suite |
+| `zt-agent --relay-key` | yes | the same, with `--relay-suite` |
+| `zt-ca sign --subject` | yes, with a v2 CA | a certificate v2 bound to the hybrid identity (`subject_v2`, log column 8); a v1 CA refuses it |
+
+A v1 and a v2 entry of the same key in one file are the same identity: a duplicate, refused. An
+agent in rotation (§8) may list one v2 and one v1 key. Rules for the suite: a pin of
+`Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s` with a v1 key is a configuration
+error; there is no fallback to another suite.
+
+Audit: `session_established` and `e2e_session_started` carry `peer_v2` for a hybrid IK session;
+`classical_identity_match` (WARN) names hybrid peers still matched by v1 entries; denylist and
+roles are reported by the v1 fingerprint, as before.
+
+Cost (docs/pq-snow.md §5): about 3.5 KB more in message 1 and 1.1 KB more in message 2 than the
+classical suite, and on each side one more encapsulation and one more decapsulation than IKhfs.
+The responder decapsulates `ct1` before Noise runs: an invalid message 1 of hybrid IK length
+costs one decapsulation per key (two during a rotation).
+
+## 16. PQ-AUTH migration runbook
+
+The goal: post-quantum certificates (§10.8), then hybrid IK on every hop and end to end, with
+every peer pinned by its v2 key. Each phase can stop and roll back on its own. Act on
+confirmed signals only (`outer_suites_confirmed`, `session_established`,
+`e2e_session_started`, `classical_identity_match`), never on `handshake_suite_rejected` alone.
+
+**Phase 0, upgrade.** Upgrade every relay (rolling, §14), agent and client to the PQ-AUTH
+release without changing any file. Nothing changes on the wire. Check `zt-relay check` and
+`zt-agent check` with the unit's options.
+
+**Phase 1, CA v2.** Follow §10.8: create the v2 CA, pin both keys everywhere, sign only v2
+certificates, then drop the v1 key after `max_lifetime`. Watch `cert_version` in the audit.
+
+**Phase 2, collect the v2 identities.** Run `keygen` for new nodes, and for each existing node
+or client have its owner run `pubkey --key <its key file>` (§15). Keep them in your
+inventory next to the v1 keys; nothing is deployed yet. For certificate clients, re-issue the
+certificate with `--subject tcn-pub-v2:…` (a hybrid-bound certificate); it is accepted only over
+the hybrid IK suite, so distribute it to a client only together with its Phase 4 pin.
+
+**Phase 3, responders accept the suite.**
+
+1. Relays, one by one: add the hybrid IK suite to both role sets in `relay.toml` (keep the
+   others), rolling restart (§13 step 2). Check `handshake_suites_in_use`.
+2. Agents: add it to `--accept-client-suites`, restart with `--no-block` (§14).
+3. Publish the relays' and agents' v2 keys to the clients (`relay_key`, `[[nodes]]`).
+
+**Phase 4, initiators flip the suite** (as §13 steps 3–4 and §12):
+
+1. Agents: `--relay-key` with the relays' `tcn-pub-v2:` keys and
+   `--relay-suite Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s`, relay by relay.
+   Check `relay_registered` with that `suite`.
+2. Clients: the v2 keys and `suite` in `[[relays]]` and `[[nodes]]`; once every relay a client
+   uses accepts it, `require_outer_suite` with that name.
+3. Watch `outer_suites_confirmed` and `e2e_session_started suite=…` for the remaining classical
+   handshakes, and `classical_identity_match` for hybrid peers still matched by v1 entries.
+
+**Phase 5, pin the identities.** Replace v1 keys with `tcn-pub-v2:` keys in the relay policy and
+in `clients.toml`, per peer, **only after** that peer runs the hybrid IK suite on that hop
+(Phase 4): from then on that peer is refused over any other suite (`identity_downgrade`). Reload
+(no restart). `classical_identity_match` for that peer stops. The denylist needs no change: its
+entries keep matching every form.
+
+**Phase 6, sunset (optional).** When the counters show no classical or IKhfs handshake for a
+role, remove those suites from that role's set on the relays and from `--accept-client-suites`,
+as §13 step 5.
+
+**Rollback**, in reverse order, each step a reload or a rolling restart:
+
+1. Phase 6: put the classical suite back in the sets first.
+2. Phase 5: replace `tcn-pub-v2:` entries with the v1 keys and reload; peers can then use any
+   accepted suite again. A peer revoked in between stays revoked (the denylist is v1-keyed).
+3. Phase 4: remove the clients' and then the agents' hybrid IK pins (and `require_outer_suite`).
+   A hybrid-bound certificate stops working over the classical suite (`key_mismatch`): re-issue
+   it with the 64-hex subject, or keep the whitelist entry.
+4. Phase 3: only then remove the suite from the agents' and the relays' sets; removing it first
+   cuts off every peer that pins it.
+5. Phase 1: as §10.8 rollback.
+
+Mixed states are safe but weaker: during Phase 4 a client may fail over to a relay pinned to an
+older suite (§13); `require_outer_suite` closes that window. During Phase 5 a v1-pinned peer
+with a stolen X25519 key is still admitted over a classical handshake; that is the reason to
+complete Phase 5.
