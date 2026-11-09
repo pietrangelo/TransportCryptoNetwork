@@ -682,6 +682,16 @@ review recorded as `docs/adversary/00NN-pq-*.md`. Each phase updates PROTOCOL.md
 - Catalogue: verify that each removed path is now rejected (Parsing/State rows reused as
   negative tests).
 
+**As implemented (Phase 7, PQ-SUNSET; OPERATIONS §19).** The defaults do **not** change and no
+code path is removed: the suite ids replaced the numeric minimum of this section (AP-7), and a
+mixed fleet must keep working across upgrades. The sunset is the opt-in `pq_only` profile
+(`[handshake] pq_only` in `relay.toml`, `--pq-only` / `TCN_PQ_ONLY` on the agent, `pq_only` in
+`client.toml`), which refuses at every load a suite other than the hybrid IK suite (`IKhfs`
+included: its authentication is classical), a role missing from `require_hybrid_identity`, a v1
+CA key and, on the client, a certificate that is not v2 and hybrid-bound. `check` lists the
+classical paths a configuration still accepts. Removing the v1 code is left to a later major
+release, if ever.
+
 ---
 
 ## 8. Decisions for the user

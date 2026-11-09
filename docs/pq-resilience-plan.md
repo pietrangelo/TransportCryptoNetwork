@@ -1,11 +1,13 @@
 # Post-quantum and resilience roadmap (pre-implementation plan)
 
-Status: phases 1–6 implemented (PQ-0, R-1, PQ-1 end to end and on the outer hops, R-2, R-3,
-R-4 failover deadline and limited hedge, which closes backlog A5-4; PQ-AUTH; R-5 metrics
-textfile and `status`, R-6 byte budgets, window tuning, fewer copies and the nightly soak,
-which closes backlog 0001-10, and PQ-REL offline SLH-DSA + Ed25519 release signatures, with
-the findings of review 0013 fixed: per-identity shedding, pinned release keys); phase 7
-pending. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
+Status: **all seven phases done.** Phases 1–6: PQ-0, R-1, PQ-1 end to end and on the outer
+hops, R-2, R-3, R-4 failover deadline and limited hedge (closes backlog A5-4), PQ-AUTH, R-5
+metrics textfile and `status`, R-6 byte budgets, window tuning, fewer copies and the nightly
+soak (closes backlog 0001-10), and PQ-REL offline SLH-DSA + Ed25519 release signatures, with
+the findings of review 0013 fixed (per-identity shedding, pinned release keys). Phase 7,
+PQ-SUNSET: the opt-in `pq_only` profile of relay, agent and client, and `check` listing the
+classical paths still accepted (OPERATIONS §19); the built-in defaults stay classical, so
+mixed fleets keep working. Serial restarts are documented guidance (OPERATIONS §14), not enforced.
 
 This plan merges two independent design analyses and the adversary review of both:
 
@@ -98,15 +100,15 @@ The adversary rejected "all resilience first, then PQ" (AP-8): it delays the har
 and the PQ cost estimates behind it were inflated. The E2E upgrade needs no relay restart,
 because the relay is blind.
 
-| # | Phase | Scope | Wire change |
-| :-: | :- | :- | :-: |
-| 1 | **PQ-0 ∥ R-1** | Suite id type, accepted sets, KEM trait, test vectors, baselines on x86_64/aarch64 musl, vendored snow patch, SSH KEX guidance. In parallel: admission fixes (AP-1/AP-2) | no |
-| 2 | **PQ-1 E2E** | IKhfs on the client↔agent channel only. Upgrades clients and agents, not relays | E2E handshake only |
-| 3 | **PQ-1 outer ∥ R-2 + R-3** | IKhfs on both hops, rolled out with the new drain and rolling-restart tooling; simulator, reconnect, liveness, lifecycle | hop handshakes |
-| 4 | **R-4** | Failover deadline and limited hedge (closes A5-4; implemented) | no |
-| 5 | **PQ-AUTH** | Cert v2 composite, hybrid identities, hybrid IK, unified fingerprints | yes |
-| 6 | **R-5, R-6, PQ-REL** | Metrics, efficiency + soak, SLH-DSA release signing | no |
-| 7 | **PQ-SUNSET** | Remove classical-only suites from accepted sets, event-driven | config |
+| # | Phase | Scope | Wire change | Status |
+| :-: | :- | :- | :-: | :-: |
+| 1 | **PQ-0 ∥ R-1** | Suite id type, accepted sets, KEM trait, test vectors, baselines on x86_64/aarch64 musl, vendored snow patch, SSH KEX guidance. In parallel: admission fixes (AP-1/AP-2) | no | done |
+| 2 | **PQ-1 E2E** | IKhfs on the client↔agent channel only. Upgrades clients and agents, not relays | E2E handshake only | done |
+| 3 | **PQ-1 outer ∥ R-2 + R-3** | IKhfs on both hops, rolled out with the new drain and rolling-restart tooling; simulator, reconnect, liveness, lifecycle | hop handshakes | done |
+| 4 | **R-4** | Failover deadline and limited hedge (closes A5-4) | no | done |
+| 5 | **PQ-AUTH** | Cert v2 composite, hybrid identities, hybrid IK, unified fingerprints | yes | done |
+| 6 | **R-5, R-6, PQ-REL** | Metrics, efficiency + soak, SLH-DSA release signing | no | done |
+| 7 | **PQ-SUNSET** | Remove classical-only suites from accepted sets, event-driven: the opt-in `pq_only` profile and the `check` report (OPERATIONS §19); defaults unchanged | config | done |
 
 ## 5. Decisions for the user
 

@@ -56,12 +56,23 @@ pub fn check_suites(origin: &str, entry: &str, set: AcceptedSuites) -> Result<()
     }
 }
 
-/// `Ok` if `suite` is the hybrid IK suite.
+/// `Ok` if the pin `suite` is the hybrid IK suite.
 ///
 /// # Errors
 /// [`ConfigError::PqOnly`].
 pub fn check_suite(origin: &str, entry: &str, suite: HandshakeSuite) -> Result<(), ConfigError> {
-    check_suites(origin, entry, AcceptedSuites::only(suite))
+    if suite.requires_hybrid_identity() {
+        Ok(())
+    } else {
+        Err(refuse(
+            origin,
+            format!(
+                "{entry} is pinned to {}; only {} is allowed",
+                suite.protocol_name(),
+                PQ_ONLY_SUITE.protocol_name()
+            ),
+        ))
+    }
 }
 
 /// The pinned CA keys that sign certificates v1, as `authority name`.
