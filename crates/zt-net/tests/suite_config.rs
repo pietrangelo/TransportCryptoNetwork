@@ -1,5 +1,8 @@
-//! PQ-0 / R-1 specification: configuration of handshake suites and admission limits
-//! (`relay.toml`, the `suite` pins of `client.toml`, the agent's suite options).
+//! PQ-0 / R-1 / PQ-1 specification: configuration of handshake suites and admission limits
+//! (`relay.toml`, the `suite` pins of `client.toml`, the agent's suite options). From PQ-1 on
+//! the hybrid suite is accepted wherever it names the end-to-end channel (`[[nodes]] suite`,
+//! the agent's `--accept-client-suites`) and still refused for the outer channel (`relay.toml`,
+//! the relay pins of clients and agents).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -13,7 +16,9 @@ use std::time::Duration;
 
 use zt_application::admission::{AdmissionConfig, AdmissionConfigError};
 use zt_crypto::Identity;
-use zt_domain::{AcceptedSuites, HandshakeSuite, NodeId, SuiteError, SuitePolicy};
+use zt_domain::{
+    AcceptedSuites, HandshakeChannel, HandshakeSuite, NodeId, SuiteError, SuitePolicy,
+};
 use zt_net::config::{
     ConfigError, RelaySettings, parse_client_settings, parse_relay_settings, parse_suite,
     parse_suites,
@@ -140,24 +145,60 @@ fn invalid_admission_limits_are_refused_at_load() {
 
 #[test]
 fn suites_are_named_by_their_exact_noise_protocol_name() {
-    assert_eq!(
-        parse_suite("--x", CLASSIC).unwrap(),
-        HandshakeSuite::NoiseIk25519
-    );
-    assert_eq!(
-        parse_suites("--x", &[CLASSIC.to_owned()]).unwrap(),
-        AcceptedSuites::only(HandshakeSuite::NoiseIk25519)
-    );
-    for name in [
-        HFS,
-        "noise_ik_25519_chachapoly_blake2s",
-        " Noise_IK_25519_ChaChaPoly_BLAKE2s",
-        "1",
-        "",
-    ] {
-        assert!(parse_suite("--x", name).is_err(), "accepted {name:?}");
+    for channel in [HandshakeChannel::Outer, HandshakeChannel::EndToEnd] {
+        assert_eq!(
+            parse_suite("--x", CLASSIC, channel).unwrap(),
+            HandshakeSuite::NoiseIk25519
+        );
+        assert_eq!(
+            parse_suites("--x", &[CLASSIC.to_owned()], channel).unwrap(),
+            AcceptedSuites::only(HandshakeSuite::NoiseIk25519)
+        );
+        for name in [
+            "noise_ik_25519_chachapoly_blake2s",
+            " Noise_IK_25519_ChaChaPoly_BLAKE2s",
+            "Noise_IKhfs_25519+Kyber1024_ChaChaPoly_BLAKE2s",
+            "1",
+            "",
+        ] {
+            assert!(parse_suite("--x", name, channel).is_err(), "accepted {name:?}");
+        }
+        assert!(parse_suites("--x", &[], channel).is_err());
     }
-    assert!(parse_suites("--x", &[]).is_err());
+}
+
+/// PQ-1: the hybrid suite runs end to end, not on the outer channel (yet).
+#[test]
+fn the_hybrid_suite_is_accepted_end_to_end_and_refused_on_the_outer_channel() {
+    assert_eq!(
+        parse_suite("--x", HFS, HandshakeChannel::EndToEnd).unwrap(),
+        HandshakeSuite::NoiseIkhfs25519MlKem768
+    );
+    assert_eq!(
+        parse_suites(
+            "--x",
+            &[CLASSIC.to_owned(), HFS.to_owned()],
+            HandshakeChannel::EndToEnd
+        )
+        .unwrap(),
+        AcceptedSuites::new([
+            HandshakeSuite::NoiseIk25519,
+            HandshakeSuite::NoiseIkhfs25519MlKem768
+        ])
+        .unwrap()
+    );
+    match parse_suite("--x", HFS, HandshakeChannel::Outer) {
+        Err(ConfigError::Suite { source, .. }) => assert_eq!(source, SuiteError::Unsupported),
+        other => panic!("{other:?}"),
+    }
+    match parse_suites(
+        "--x",
+        &[CLASSIC.to_owned(), HFS.to_owned()],
+        HandshakeChannel::Outer,
+    ) {
+        Err(ConfigError::Suite { source, .. }) => assert_eq!(source, SuiteError::Unsupported),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -195,7 +236,8 @@ fn the_client_pins_a_suite_per_relay_and_per_node() {
 #[test]
 fn the_client_refuses_a_suite_it_cannot_run() {
     let (r1, n1) = (key(), key());
-    for (relay_suite, node_suite) in [(HFS, CLASSIC), (CLASSIC, HFS), ("bogus", CLASSIC)] {
+    // The hybrid suite towards a relay is the outer channel: not in this release.
+    for (relay_suite, node_suite) in [(HFS, CLASSIC), ("bogus", CLASSIC), (CLASSIC, "bogus")] {
         let text = format!(
             r#"
             relay = "r1.example.org:7443"
@@ -213,4 +255,51 @@ fn the_client_refuses_a_suite_it_cannot_run() {
             "{relay_suite} / {node_suite}"
         );
     }
+    let text = format!(
+        r#"
+        key = "client.key"
+        [[relays]]
+        address = "r1.example.org:7443"
+        public_key = "{r1}"
+        suite = "{HFS}"
+        [[nodes]]
+        node = "web-01"
+        public_key = "{n1}"
+        "#
+    );
+    assert!(parse_client_settings("client.toml", Path::new("/etc/tcn"), &text).is_err());
+}
+
+/// PQ-1: a client pins the hybrid suite per node. Nodes without `suite` stay classical (the
+/// default never changes, AP-7), so a fleet is flipped one node at a time.
+#[test]
+fn the_client_pins_the_hybrid_suite_per_node() {
+    let (r1, n1, n2) = (key(), key(), key());
+    let text = format!(
+        r#"
+        relay = "r1.example.org:7443"
+        relay_key = "{r1}"
+        key = "client.key"
+        [[nodes]]
+        node = "web-01"
+        public_key = "{n1}"
+        suite = "{HFS}"
+        [[nodes]]
+        node = "db-01"
+        public_key = "{n2}"
+        "#
+    );
+    let s = parse_client_settings("client.toml", Path::new("/etc/tcn"), &text).unwrap();
+    let web = NodeId::try_from("web-01").unwrap();
+    let db = NodeId::try_from("db-01").unwrap();
+    let c = s.client_config(&web, zt_net::Timeouts::default()).unwrap();
+    assert_eq!(c.node_suite, HandshakeSuite::NoiseIkhfs25519MlKem768);
+    // The relay pin is untouched: the outer channel stays classical.
+    assert!(
+        c.relays
+            .iter()
+            .all(|r| r.suite == HandshakeSuite::NoiseIk25519)
+    );
+    let c = s.client_config(&db, zt_net::Timeouts::default()).unwrap();
+    assert_eq!(c.node_suite, HandshakeSuite::NoiseIk25519);
 }

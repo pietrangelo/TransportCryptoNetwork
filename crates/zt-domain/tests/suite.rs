@@ -1,13 +1,15 @@
-//! PQ-0 specification: handshake suites, accepted sets per role, message sizes per suite
-//! (PROTOCOL §7.5, finding AP-7) and the corrected message 1 bound (side finding of the plan).
+//! PQ-0 and PQ-1 specification: handshake suites, accepted sets per role, message sizes per
+//! suite (PROTOCOL §7.5, finding AP-7), the corrected message 1 bound (side finding of the
+//! plan), and from PQ-1 on the channel each suite runs on: the hybrid suite on the end-to-end
+//! channel only (the outer channel follows in a later release).
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects, missing_docs)]
 
 use zt_domain::limits::{
     MAX_CERT_LEN, MAX_PAYLOAD_LEN, NOISE_MAX_MESSAGE_LEN, NOISE_MSG1_OVERHEAD,
 };
 use zt_domain::{
-    AcceptedSuites, DomainEvent, Fingerprint, HandshakeSuite, InitiatorRole, SuiteError,
-    SuitePolicy,
+    AcceptedSuites, DomainEvent, Fingerprint, HandshakeChannel, HandshakeSuite, InitiatorRole,
+    SuiteError, SuitePolicy,
 };
 
 const CLASSIC: HandshakeSuite = HandshakeSuite::NoiseIk25519;
@@ -18,17 +20,55 @@ fn the_classical_suite_is_todays_noise_ik() {
     assert_eq!(CLASSIC.protocol_name(), "Noise_IK_25519_ChaChaPoly_BLAKE2s");
     assert_eq!(CLASSIC.to_string(), "Noise_IK_25519_ChaChaPoly_BLAKE2s");
     assert_eq!(CLASSIC.id(), 0x00);
-    assert!(CLASSIC.is_supported());
+    assert!(CLASSIC.is_supported(HandshakeChannel::Outer));
+    assert!(CLASSIC.is_supported(HandshakeChannel::EndToEnd));
 }
 
+/// PQ-1: the hybrid suite runs on the end-to-end channel (client ↔ agent), which needs no
+/// relay upgrade. The outer channel keeps refusing it until the release that upgrades relays.
 #[test]
-fn the_hybrid_suite_is_reserved_but_not_supported_yet() {
+fn the_hybrid_suite_is_supported_end_to_end_only() {
     assert_eq!(
         HFS.protocol_name(),
         "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s"
     );
     assert_eq!(HFS.id(), 0x01);
-    assert!(!HFS.is_supported(), "PQ-1 enables it, not PQ-0");
+    assert!(HFS.is_supported(HandshakeChannel::EndToEnd));
+    assert!(!HFS.is_supported(HandshakeChannel::Outer));
+}
+
+/// The client's first end-to-end transport message names the suite generation (PROTOCOL
+/// §7.3): `TCN/1 ready` for the classical suite, `TCN/2 ready` for the hybrid one.
+#[test]
+fn each_suite_has_its_own_confirmation() {
+    assert_eq!(CLASSIC.confirmation(), b"TCN/1 ready");
+    assert_eq!(HFS.confirmation(), b"TCN/2 ready");
+}
+
+#[test]
+fn the_suites_a_channel_supports_form_a_set() {
+    assert_eq!(
+        AcceptedSuites::supported(HandshakeChannel::Outer),
+        AcceptedSuites::only(CLASSIC)
+    );
+    assert_eq!(
+        AcceptedSuites::supported(HandshakeChannel::EndToEnd),
+        AcceptedSuites::new([CLASSIC, HFS]).unwrap()
+    );
+}
+
+#[test]
+fn removing_suites_from_a_set_never_yields_an_empty_set() {
+    let both = AcceptedSuites::new([CLASSIC, HFS]).unwrap();
+    assert_eq!(
+        both.without(AcceptedSuites::only(CLASSIC)),
+        Some(AcceptedSuites::only(HFS))
+    );
+    assert_eq!(both.without(both), None);
+    assert_eq!(
+        AcceptedSuites::only(CLASSIC).without(AcceptedSuites::only(HFS)),
+        Some(AcceptedSuites::only(CLASSIC))
+    );
 }
 
 #[test]
@@ -83,7 +123,8 @@ fn an_accepted_set_is_explicit_and_non_empty() {
     assert!(!set.contains(HFS));
     assert_eq!(set.iter().collect::<Vec<_>>(), vec![CLASSIC]);
     assert_eq!(set, AcceptedSuites::only(CLASSIC));
-    assert!(set.all_supported());
+    assert!(set.all_supported(HandshakeChannel::Outer));
+    assert!(set.all_supported(HandshakeChannel::EndToEnd));
     assert_eq!(AcceptedSuites::new([]), Err(SuiteError::Empty));
     assert_eq!(
         AcceptedSuites::new([CLASSIC, CLASSIC]),
@@ -92,11 +133,12 @@ fn an_accepted_set_is_explicit_and_non_empty() {
 }
 
 #[test]
-fn a_set_with_a_reserved_suite_is_representable_but_not_supported() {
-    // The domain can describe it (PQ-1 tests use it); configuration refuses it in this build.
+fn a_set_with_the_hybrid_suite_is_supported_end_to_end_only() {
+    // The relay's configuration refuses it on the outer channel in this build.
     let set = AcceptedSuites::new([CLASSIC, HFS]).unwrap();
     assert!(set.contains(HFS));
-    assert!(!set.all_supported());
+    assert!(set.all_supported(HandshakeChannel::EndToEnd));
+    assert!(!set.all_supported(HandshakeChannel::Outer));
 }
 
 #[test]

@@ -26,7 +26,8 @@ ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
 # PQ-0 spike (docs/pq-snow.md): the HFS code path of stock snow, for tests only. Features of
 # dev-dependencies do not reach the release binaries.
 snow = { workspace = true, features = ["hfs"] }
-ml-kem.workspace = true
+# `zeroize`: the oracle satisfies the `ZeroizeOnDrop` bound of `Kem::DecapsulationKey`.
+ml-kem = { workspace = true, features = ["zeroize"] }
 
 [lints]
 workspace = true

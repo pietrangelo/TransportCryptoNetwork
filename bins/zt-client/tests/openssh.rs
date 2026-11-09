@@ -57,8 +57,17 @@ struct Lab {
 
 impl Lab {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// With `hybrid`, the agent accepts both suites and the client pins the hybrid one for
+    /// `web-01` (PQ-1); the relay is configured as always.
+    async fn start_with(hybrid: bool) -> Self {
         let fleet = Fleet::start().await;
         let client = fleet.client_dir(&fleet.ansible);
+        if hybrid {
+            client.pin_last_node_suite("Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s");
+        }
         let dir = client.dir.join("ssh");
         std::fs::create_dir_all(&dir).unwrap();
         let keygen = |name: &str| {
@@ -109,7 +118,20 @@ impl Lab {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        fleet.start_agent(addr).await;
+        if hybrid {
+            fleet
+                .start_agent_with(
+                    addr,
+                    zt_domain::AcceptedSuites::new([
+                        zt_domain::HandshakeSuite::NoiseIk25519,
+                        zt_domain::HandshakeSuite::NoiseIkhfs25519MlKem768,
+                    ])
+                    .unwrap(),
+                )
+                .await;
+        } else {
+            fleet.start_agent(addr).await;
+        }
 
         let host_pub = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
         std::fs::write(dir.join("known_hosts"), format!("web-01 {host_pub}")).unwrap();
@@ -175,6 +197,22 @@ async fn ssh_runs_a_command_through_tcn() {
     let out = run(lab.ssh().arg("echo tcn-ok")).await;
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "tcn-ok\n");
+}
+
+/// PQ-1: real OpenSSH over the hybrid end-to-end suite, through an unchanged relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_runs_a_command_over_the_hybrid_suite() {
+    let lab = Lab::start_with(true).await;
+    let out = run(lab.ssh().arg("echo tcn-pq-ok")).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "tcn-pq-ok\n");
+    let upload = lab.dir.join("pq-upload.bin");
+    random_file(&upload, 4 * 1024 * 1024);
+    let out = run(lab.ssh().arg("sha256sum").stdin(std::fs::File::open(&upload).unwrap())).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let remote = text(&out.stdout);
+    assert_eq!(remote.split_whitespace().next().unwrap(), sha256(&upload).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

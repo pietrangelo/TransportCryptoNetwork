@@ -250,3 +250,27 @@ fn secrets_are_redacted_in_debug() {
         assert!(!text.to_lowercase().contains("cdcd"), "{text}");
     }
 }
+
+// --- PQ-1: secret hygiene (review 0008, finding A8-12) -------------------------------------
+
+/// Every KEM secret wipes itself on drop: the trait requires it of every provider's
+/// decapsulation key, so the ephemeral key of a hybrid handshake (the secret IKhfs's forward
+/// secrecy depends on) cannot outlive the handshake in memory.
+#[test]
+fn kem_secrets_are_wiped_on_drop() {
+    fn wiped<T: zeroize::ZeroizeOnDrop>() {}
+    wiped::<<MlKem768 as Kem>::DecapsulationKey>();
+    wiped::<<Oracle as Kem>::DecapsulationKey>();
+    wiped::<KemSeed>();
+    wiped::<SharedSecret>();
+}
+
+/// A seed drawn by the provider's helper is never all zeros (it comes from the system CSPRNG)
+/// and two draws differ.
+#[test]
+fn random_seeds_come_from_the_system_csprng() {
+    let a = KemSeed::random().unwrap();
+    let b = KemSeed::random().unwrap();
+    assert_ne!(a.as_bytes(), &[0_u8; SEED_LEN]);
+    assert_ne!(a.as_bytes(), b.as_bytes());
+}

@@ -158,6 +158,15 @@ impl Fleet {
 
     /// Starts the `web-01` agent toward `ssh` and waits until it is registered.
     pub async fn start_agent(&self, ssh: SocketAddr) {
+        self.start_agent_with(
+            ssh,
+            zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        )
+        .await;
+    }
+
+    /// Like [`Fleet::start_agent`], with the suites the agent accepts from clients (PQ-1).
+    pub async fn start_agent_with(&self, ssh: SocketAddr, client_suites: zt_domain::AcceptedSuites) {
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
@@ -173,7 +182,7 @@ impl Fleet {
             ),
             timeouts: fast_timeouts(),
             max_streams: 16,
-            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            client_suites,
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(
@@ -257,6 +266,14 @@ impl ClientDir {
 
     pub fn config(&self) -> PathBuf {
         self.dir.join("client.toml")
+    }
+
+    /// Pins `suite` for the last `[[nodes]]` entry of `client.toml` (PQ-1).
+    pub fn pin_last_node_suite(&self, suite: &str) {
+        let path = self.config();
+        let mut toml = std::fs::read_to_string(&path).unwrap();
+        toml.push_str(&format!("suite = \"{suite}\"\n"));
+        std::fs::write(&path, toml).unwrap();
     }
 
     /// `zt-client --config <dir>/client.toml connect <node>` with piped stdio.

@@ -333,6 +333,23 @@ impl Lab {
         relays_config: Vec<(AccessPolicy, RelayConfig)>,
         clients: AuthorizedClients,
     ) -> Self {
+        Self::start_suites(
+            agent,
+            relays_config,
+            clients,
+            zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        )
+        .await
+    }
+
+    /// Like [`Lab::start_configured`], with the suites the agent accepts from clients on the
+    /// end-to-end channel (PQ-1). The relays are always configured as before.
+    pub async fn start_suites(
+        agent: Arc<Identity>,
+        relays_config: Vec<(AccessPolicy, RelayConfig)>,
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+    ) -> Self {
         let mut relays = Vec::new();
         for (p, c) in relays_config {
             relays.push(start_relay_with(p, c).await);
@@ -355,9 +372,7 @@ impl Lab {
                 authorized_clients: clients_rx,
                 timeouts: timeouts(),
                 max_streams: 16,
-                client_suites: zt_domain::AcceptedSuites::only(
-                    zt_domain::HandshakeSuite::NoiseIk25519,
-                ),
+                client_suites,
             },
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -370,6 +385,15 @@ impl Lab {
     }
 
     pub fn config(&self, certificate: Option<&Arc<[u8]>>) -> ClientConfig {
+        self.config_suite(certificate, zt_domain::HandshakeSuite::NoiseIk25519)
+    }
+
+    /// Like [`Lab::config`], with the end-to-end suite the client pins for the node.
+    pub fn config_suite(
+        &self,
+        certificate: Option<&Arc<[u8]>>,
+        node_suite: zt_domain::HandshakeSuite,
+    ) -> ClientConfig {
         ClientConfig {
             relays: self
                 .relays
@@ -382,7 +406,7 @@ impl Lab {
                 .collect(),
             node: node("web-01"),
             node_key: self.agent.public_key(),
-            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
+            node_suite,
             certificate: certificate.cloned(),
             timeouts: timeouts(),
         }
@@ -394,8 +418,17 @@ impl Lab {
         who: &Arc<Identity>,
         certificate: Option<&Arc<[u8]>>,
     ) -> Result<(DuplexStream, JoinHandle<Result<(), NetError>>), String> {
+        self.session_with(who, self.config(certificate)).await
+    }
+
+    /// Like [`Lab::session`], with an explicit client configuration.
+    pub async fn session_with(
+        &self,
+        who: &Arc<Identity>,
+        config: ClientConfig,
+    ) -> Result<(DuplexStream, JoinHandle<Result<(), NetError>>), String> {
         let (mut app, local) = tokio::io::duplex(64 * 1024);
-        let (who, config) = (Arc::clone(who), self.config(certificate));
+        let who = Arc::clone(who);
         let task = tokio::spawn(async move { client::connect(&who, &config, local).await });
         app.write_all(b"ping").await.map_err(|e| e.to_string())?;
         let mut buf = [0_u8; 4];
@@ -414,13 +447,19 @@ impl Lab {
         who: &Arc<Identity>,
         certificate: Option<&Arc<[u8]>>,
     ) -> Result<(), NetError> {
+        self.refused_with(who, &self.config(certificate)).await
+    }
+
+    /// Like [`Lab::refused`], with an explicit client configuration.
+    pub async fn refused_with(
+        &self,
+        who: &Arc<Identity>,
+        config: &ClientConfig,
+    ) -> Result<(), NetError> {
         let (_app, local) = tokio::io::duplex(1024);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            client::connect(who, &self.config(certificate), local),
-        )
-        .await
-        .expect("client hung")
+        tokio::time::timeout(Duration::from_secs(10), client::connect(who, config, local))
+            .await
+            .expect("client hung")
     }
 }
 
@@ -464,6 +503,18 @@ pub enum AgentAnswer {
 
 impl FakeRelay {
     pub async fn start(clients: AuthorizedClients) -> Self {
+        Self::start_suites(
+            clients,
+            zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        )
+        .await
+    }
+
+    /// Like [`FakeRelay::start`], with the suites the agent accepts from clients (PQ-1).
+    pub async fn start_suites(
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+    ) -> Self {
         let relay_id = Identity::generate().unwrap();
         let relay_keys = zt_crypto::Keyring::single(copy_of(&relay_id));
         let agent = Arc::new(Identity::generate().unwrap());
@@ -483,9 +534,7 @@ impl FakeRelay {
                 authorized_clients: Revocable::fixed(clients),
                 timeouts: timeouts(),
                 max_streams: 16,
-                client_suites: zt_domain::AcceptedSuites::only(
-                    zt_domain::HandshakeSuite::NoiseIk25519,
-                ),
+                client_suites,
             },
         ));
         let (tcp, _) = listener.accept().await.unwrap();
@@ -536,6 +585,63 @@ impl FakeRelay {
                 }
                 Some(_) => {}
                 None => return AgentAnswer::Silent,
+            }
+        }
+    }
+
+    /// `Open web-01` on stream `n`, then `msg1`: message 2 if the agent sends one.
+    pub async fn msg2(&mut self, n: u32, msg1: Vec<u8>) -> Result<Vec<u8>, AgentAnswer> {
+        self.open(n, msg1).await;
+        match self.next_on(n).await {
+            Ok(payload) => Ok(payload),
+            Err(answer) => Err(answer),
+        }
+    }
+
+    async fn open(&mut self, n: u32, msg1: Vec<u8>) {
+        self.ch
+            .send(
+                &Frame::Open {
+                    stream: sid(n),
+                    target: node("web-01"),
+                },
+                &timeouts(),
+            )
+            .await
+            .unwrap();
+        self.data(n, msg1).await;
+    }
+
+    /// A `Data` with `payload` on stream `n`.
+    pub async fn data(&mut self, n: u32, payload: Vec<u8>) {
+        self.ch
+            .send(
+                &Frame::Data {
+                    stream: sid(n),
+                    payload: FramePayload::try_from(payload).unwrap(),
+                },
+                &timeouts(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The next `Data` payload on stream `n`, or how the stream ended.
+    pub async fn next_on(&mut self, n: u32) -> Result<Vec<u8>, AgentAnswer> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Ok(frame) = tokio::time::timeout_at(deadline, self.ch.recv()).await else {
+                return Err(AgentAnswer::Silent);
+            };
+            match frame.unwrap() {
+                Some(Frame::Data { stream, payload }) if stream == sid(n) => {
+                    return Ok(payload.into_bytes().to_vec());
+                }
+                Some(Frame::Close { stream, reason }) if stream == sid(n) => {
+                    return Err(AgentAnswer::Closed(reason));
+                }
+                Some(_) => {}
+                None => return Err(AgentAnswer::Silent),
             }
         }
     }
