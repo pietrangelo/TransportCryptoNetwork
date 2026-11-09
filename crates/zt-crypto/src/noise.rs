@@ -186,6 +186,79 @@ pub fn respond_suites(
     Err(CryptoError::Handshake)
 }
 
+/// What a responder learns from a message 1 (finding A9-3 of review 0009).
+#[derive(Debug)]
+pub enum Responded {
+    /// The suite is accepted: the caller decides on the initiator, then accepts or drops.
+    /// Boxed: it holds the whole handshake state.
+    Pending(Box<AuthorizationPending>),
+    /// A valid message 1 of a suite this build supports on the channel but the caller does
+    /// not accept: who sent it, and with which suite. There is no `accept`: it can never
+    /// produce a message 2.
+    Unaccepted(Identified),
+}
+
+/// A valid message 1 of a suite outside the accepted set (see [`Responded::Unaccepted`]).
+#[derive(Debug)]
+pub struct Identified {
+    peer: Fingerprint,
+    payload: Vec<u8>,
+    suite: HandshakeSuite,
+}
+
+impl Identified {
+    /// The authenticated identity of the initiator. Message 1 can be replayed: this does not
+    /// prove that the initiator is live.
+    #[must_use]
+    pub const fn peer(&self) -> Fingerprint {
+        self.peer
+    }
+
+    /// The suite the initiator used.
+    #[must_use]
+    pub const fn suite(&self) -> HandshakeSuite {
+        self.suite
+    }
+
+    /// The payload of message 1, authenticated by Noise.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// Like [`respond_suites`], then, only if no accepted suite fits, the other suites this build
+/// supports on `channel`: a known initiator whose suite is not accepted is then
+/// [`Responded::Unaccepted`], so that the caller can name it. Those attempts are read-only:
+/// no KEM operation and no message 2.
+///
+/// The cost of an invalid message 1 is one trial per key for every suite this build supports
+/// on the channel whose length bounds fit, accepted or not.
+///
+/// # Errors
+/// [`CryptoError::Handshake`] if `msg1` is valid for no supported suite and key.
+pub fn respond_or_identify(
+    keys: &Keyring,
+    msg1: &[u8],
+    channel: Channel,
+    accepted: AcceptedSuites,
+) -> Result<Responded, CryptoError> {
+    let err = match respond_suites(keys, msg1, channel, accepted) {
+        Ok(pending) => return Ok(Responded::Pending(Box::new(pending))),
+        Err(err) => err,
+    };
+    let Some(others) = AcceptedSuites::supported(channel).without(accepted) else {
+        return Err(err);
+    };
+    let pending = respond_suites(keys, msg1, channel, others)?;
+    // The handshake state is dropped here: nothing can advance it any more.
+    Ok(Responded::Unaccepted(Identified {
+        peer: pending.peer,
+        payload: pending.payload,
+        suite: pending.suite,
+    }))
+}
+
 /// Responder: reads the first message and finds out who the initiator is. Always the
 /// classical suite.
 ///

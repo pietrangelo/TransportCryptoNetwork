@@ -187,6 +187,7 @@ impl Fleet {
             timeouts: fast_timeouts(),
             max_streams: 16,
             client_suites,
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(

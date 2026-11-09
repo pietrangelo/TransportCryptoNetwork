@@ -16,12 +16,16 @@
 //! vendored snow's HFS paths (`e1` read, then `ekem1` written by `accept`). The responder
 //! accepts both suites, as an upgraded agent does; the reported suite is the one sent; the
 //! outer channel never accepts a hybrid msg1.
+//!
+//! Review 0009 (A9-7): with bits 3 and 4 of the mode the responder accepts only the classical
+//! suite, as a default agent does, and runs `respond_or_identify`: a hybrid msg1 is never
+//! pending, only identified (with the true initiator), and the genuine one is identified.
 #![no_main]
 
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use zt_crypto::noise::{self, Channel, MAX_HANDSHAKE_PAYLOAD_LEN};
+use zt_crypto::noise::{self, Channel, MAX_HANDSHAKE_PAYLOAD_LEN, Responded};
 use zt_crypto::{Identity, Keyring};
 use zt_domain::{AcceptedSuites, HandshakeSuite};
 
@@ -101,6 +105,10 @@ fn hybrid(f: &Fixture, mode: u8, rest: &[u8]) {
         noise::respond_suites(&f.keys, &msg, Channel::Outer, AcceptedSuites::only(HFS)).is_err(),
         "the outer channel accepted a hybrid msg1"
     );
+    if mode & 16 != 0 {
+        fallback(f, &msg, msg == genuine, sent);
+        return;
+    }
     if let Ok(pending) = noise::respond_suites(&f.keys, &msg, Channel::EndToEnd, both()) {
         assert_eq!(
             pending.peer(),
@@ -116,6 +124,26 @@ fn hybrid(f: &Fixture, mode: u8, rest: &[u8]) {
         let _ = pending.accept();
     } else {
         assert!(msg != genuine, "the genuine hybrid msg1 was rejected");
+    }
+}
+
+/// The unaccepted-suite fallback of a classical-only agent (A9-3, A9-7).
+fn fallback(f: &Fixture, msg: &[u8], is_genuine: bool, sent: &[u8]) {
+    let classical = AcceptedSuites::only(HandshakeSuite::NoiseIk25519);
+    match noise::respond_or_identify(&f.keys, msg, Channel::EndToEnd, classical) {
+        Ok(Responded::Pending(_)) => panic!("a hybrid msg1 is pending at a classical-only agent"),
+        Ok(Responded::Unaccepted(found)) => {
+            assert_eq!(found.suite(), HFS);
+            assert_eq!(
+                found.peer(),
+                f.initiator.fingerprint(),
+                "a modified msg1 was identified as another initiator"
+            );
+            if is_genuine {
+                assert_eq!(found.payload(), sent, "the genuine payload changed");
+            }
+        }
+        Err(_) => assert!(!is_genuine, "the genuine hybrid msg1 was not identified"),
     }
 }
 

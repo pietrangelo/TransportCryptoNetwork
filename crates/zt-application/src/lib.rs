@@ -14,5 +14,6 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod identity_lines;
 pub mod ratelimit;
 pub mod relay;

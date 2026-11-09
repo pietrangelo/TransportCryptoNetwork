@@ -17,10 +17,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use zt_domain::{
-    AccessPolicy, AuthFailureReason, CertRejection, Fingerprint, HandshakeSuite, InitiatorRole,
-};
+use zt_domain::{AccessPolicy, AuthFailureReason, CertRejection, Fingerprint, InitiatorRole};
 
+use crate::identity_lines::IdentityLines;
+pub use crate::identity_lines::{IdentityEvent, MAX_LOGGED_IDENTITIES, RepeatedEvent};
 use crate::ratelimit::{HandshakeGate, KeyedRateLimiter, source_key, wide_source_key};
 
 /// The shortest accepted `msg1_deadline` (finding AP-20).
@@ -375,36 +375,6 @@ impl PreauthSummary {
 /// The most distinct sources or keys a summary counts.
 pub const MAX_DISTINCT: usize = 4_096;
 
-/// The most identities whose audit events are logged per interval (finding A8-2): at most
-/// two lines (the first event in full, then a `_repeated` count) for each, per interval.
-pub const MAX_LOGGED_IDENTITIES: usize = 256;
-
-/// An audit event about an identity the configuration knows (finding AP-3), logged in full
-/// once per identity and interval, then counted (finding A8-2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum IdentityEvent {
-    /// `authentication_failed` (for example a revoked key or an expired certificate, which a
-    /// replayed message 1 can produce at will).
-    AuthenticationFailed(AuthFailureReason),
-    /// `handshake_suite_rejected`: the suite is not accepted for the identity's role.
-    SuiteRejected(HandshakeSuite),
-    /// `admission_refused`: a confirmed identity refused at its concurrency limit or because
-    /// the established pool is full (finding A8-10).
-    AdmissionRefused(Refusal),
-}
-
-/// The events about one identity that were counted instead of logged in an interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RepeatedEvent {
-    /// The identity.
-    pub peer: Fingerprint,
-    /// The event.
-    pub event: IdentityEvent,
-    /// How many times it happened after the logged one.
-    pub count: u64,
-}
-
 /// The admission state of a relay. See the module documentation.
 #[derive(Debug)]
 pub struct Admission {
@@ -435,9 +405,8 @@ struct Interval {
     sources: HashSet<[u8; 9]>,
     keys: HashSet<Fingerprint>,
     saturated: bool,
-    /// Identity events of the interval: how many after the first, which was logged.
-    identities: HashMap<(Fingerprint, IdentityEvent), u64>,
-    suppressed_identities: u64,
+    /// Identity events of the interval (finding A8-2).
+    identities: IdentityLines,
 }
 
 impl Interval {
@@ -448,8 +417,7 @@ impl Interval {
             sources: HashSet::new(),
             keys: HashSet::new(),
             saturated: false,
-            identities: HashMap::new(),
-            suppressed_identities: 0,
+            identities: IdentityLines::default(),
         }
     }
 }
@@ -729,17 +697,7 @@ impl Admission {
     /// beyond [`MAX_LOGGED_IDENTITIES`] identities only in
     /// [`PreauthSummary::suppressed_identities`].
     pub fn note_identity_event(&mut self, peer: Fingerprint, event: IdentityEvent) -> bool {
-        let interval = &mut self.interval;
-        if let Some(count) = interval.identities.get_mut(&(peer, event)) {
-            *count = count.saturating_add(1);
-            return false;
-        }
-        if interval.identities.len() >= MAX_LOGGED_IDENTITIES {
-            interval.suppressed_identities = interval.suppressed_identities.saturating_add(1);
-            return false;
-        }
-        interval.identities.insert((peer, event), 0);
-        true
+        self.interval.identities.note(peer, event)
     }
 
     /// The summary of the interval that ended, if it had failures or repeated identity
@@ -753,18 +711,9 @@ impl Admission {
         if now < end {
             return None;
         }
-        let ended = core::mem::replace(&mut self.interval, Interval::new(now));
-        let repeated: Vec<RepeatedEvent> = ended
-            .identities
-            .iter()
-            .filter(|(_, count)| **count > 0)
-            .map(|((peer, event), count)| RepeatedEvent {
-                peer: *peer,
-                event: *event,
-                count: *count,
-            })
-            .collect();
-        if ended.counts.is_empty() && repeated.is_empty() && ended.suppressed_identities == 0 {
+        let mut ended = core::mem::replace(&mut self.interval, Interval::new(now));
+        let lines = ended.identities.take();
+        if ended.counts.is_empty() && lines.is_empty() {
             return None;
         }
         let saturated = ended.saturated
@@ -775,8 +724,8 @@ impl Admission {
             distinct_sources: ended.sources.len(),
             distinct_keys: ended.keys.len(),
             saturated,
-            repeated,
-            suppressed_identities: ended.suppressed_identities,
+            repeated: lines.repeated,
+            suppressed_identities: lines.suppressed_identities,
         })
     }
 }

@@ -187,8 +187,15 @@ pub(crate) fn audit(event: &DomainEvent) {
             );
         }
         // `DomainEvent` is `non_exhaustive`: a new event at least stays readable.
+        // Written before any proof that the peer is live (there is no message 2, so no
+        // confirmation): a replayed message 1 produces it too (finding A9-2).
         DomainEvent::HandshakeSuiteRejected { peer, suite } => {
-            emit!(%peer, suite = suite.protocol_name(), "handshake suite rejected");
+            emit!(
+                %peer,
+                suite = suite.protocol_name(),
+                confirmed = false,
+                "handshake suite rejected"
+            );
         }
         other => emit!(event = ?other, "audit event"),
     }
@@ -533,8 +540,8 @@ fn admission_limits_in_use(c: &AdmissionConfig) {
 }
 
 /// The `_repeated` line of an identity event (finding A8-2): who, what, and how many times
-/// after the line logged in full during the interval.
-fn repeated_line(r: &RepeatedEvent) {
+/// after the line logged in full during the interval. Also used by the agent (finding A9-2).
+pub(crate) fn repeated_line(r: &RepeatedEvent) {
     let peer = r.peer.to_string();
     match r.event {
         IdentityEvent::AuthenticationFailed(reason) => {
@@ -555,6 +562,7 @@ fn repeated_line(r: &RepeatedEvent) {
                 event_kind = "handshake_suite_rejected_repeated",
                 peer = %peer,
                 suite = suite.protocol_name(),
+                confirmed = false,
                 count = r.count,
                 "handshake suite rejected, repeated"
             );

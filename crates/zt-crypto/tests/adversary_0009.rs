@@ -39,9 +39,14 @@ fn a_suite_outside_the_accepted_set_is_identified_but_never_pending() {
         (CLASSIC, AcceptedSuites::only(HFS)),
         (HFS, AcceptedSuites::only(CLASSIC)),
     ] {
-        let (msg1, _) =
-            noise::initiate_suite(&alice, &agent.public_key(), Channel::EndToEnd, sent, b"cert")
-                .unwrap();
+        let (msg1, _) = noise::initiate_suite(
+            &alice,
+            &agent.public_key(),
+            Channel::EndToEnd,
+            sent,
+            b"cert",
+        )
+        .unwrap();
         match noise::respond_or_identify(&keys, &msg1, Channel::EndToEnd, accepted).unwrap() {
             Responded::Unaccepted(found) => {
                 assert_eq!(found.peer(), alice.fingerprint());
@@ -103,9 +108,14 @@ fn a_hybrid_message_1_with_the_largest_certificate_is_identified_by_a_classical_
     let (agent, keys) = agent();
     let alice = Identity::generate().unwrap();
     let payload = vec![0x54; MAX_CERT_LEN];
-    let (msg1, _) =
-        noise::initiate_suite(&alice, &agent.public_key(), Channel::EndToEnd, HFS, &payload)
-            .unwrap();
+    let (msg1, _) = noise::initiate_suite(
+        &alice,
+        &agent.public_key(),
+        Channel::EndToEnd,
+        HFS,
+        &payload,
+    )
+    .unwrap();
     assert!(msg1.len() > CLASSIC.max_msg1_len());
     match noise::respond_or_identify(
         &keys,

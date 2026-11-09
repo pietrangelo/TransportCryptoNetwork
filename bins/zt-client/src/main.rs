@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use zt_crypto::{Identity, PublicKey, cert_key};
-use zt_domain::{CertBody, CertScope, CloseReason, NodeId, RejectReason, UnixTime};
+use zt_domain::{CertBody, CertScope, CloseReason, HandshakeSuite, NodeId, RejectReason, UnixTime};
 use zt_net::config::{self, ClientSettings};
 use zt_net::{NetError, Timeouts, client};
 
@@ -304,12 +304,37 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
     // Reading stdin runs on a blocking thread that cannot be interrupted: if the session
     // has ended on the node side we do not wait for ssh to close stdin.
     runtime.shutdown_background();
-    result.map_err(|e| describe(&e, &node, not_after))
+    let suite = config.node_suite;
+    result.map_err(|e| describe(&e, &node, not_after, suite))
 }
 
 /// Message for the ssh user. It never contains bytes received from the network. `not_after`
-/// is the expiry of the certificate used, if any.
-fn describe(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> String {
+/// is the expiry of the certificate used, if any; `suite` is the suite pinned for the node.
+fn describe(
+    err: &NetError,
+    node: &NodeId,
+    not_after: Option<UnixTime>,
+    suite: HandshakeSuite,
+) -> String {
+    let text = describe_error(err, node, not_after);
+    // The agent does not say why it refused (no oracle), but the client knows its own pin: an
+    // agent that does not accept the suite closes with `Unauthorized`, one older than PQ-1
+    // sees an invalid handshake (finding A9-6).
+    let refused_by_agent = matches!(
+        err,
+        NetError::StreamClosed(CloseReason::Unauthorized | CloseReason::ProtocolViolation)
+    );
+    if refused_by_agent && suite != HandshakeSuite::NoiseIk25519 {
+        format!(
+            "{text}, or the agent does not accept the pinned suite {} (OPERATIONS §12)",
+            suite.protocol_name()
+        )
+    } else {
+        text
+    }
+}
+
+fn describe_error(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> String {
     let expired = not_after.is_some_and(|na| zt_net::unix_now() >= na);
     match err {
         NetError::StreamClosed(CloseReason::Unauthorized) if expired => {
@@ -351,8 +376,6 @@ fn describe(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> Strin
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-
-    use zt_domain::HandshakeSuite;
 
     use super::*;
 

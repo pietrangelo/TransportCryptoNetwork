@@ -18,20 +18,34 @@ included.
 published `Cargo.lock` is not committed (upstream's own `.gitignore` excludes it); the workspace
 and `fuzz/` lock files pin the dependencies.
 
-To review the patch against upstream:
+The patches are also stored as a series, applied in this order to the pristine release:
+
+| File (`vendor/patches/snow/`) | Patches below |
+| :- | :- |
+| `0001-ml-kem-768-kem-choice.patch` | 1 |
+| `0002-kem-sizes-short-keys-no-unwrap.patch` | 2, 3, 4 |
+| `0003-zeroize-kem-shared-secret.patch` | 5 (with the `zeroize` line of the published `Cargo.lock`) |
+
+CI (workflow `vendor`, `.github/scripts/check-vendored-snow.sh`, finding A9-1 of review 0009)
+downloads the release, checks its SHA-256, applies the series without fuzz and fails unless
+the result, without the published `Cargo.lock` and plus this file, equals `vendor/snow` byte
+for byte. It then runs the crate's own tests on the patched release
+(`--features "hfs pqclean_kyber1024"`, with the published `Cargo.lock` as patched). A change to
+`vendor/snow` therefore needs the matching change to the series and to this file. To run the
+same check locally:
 
 ```sh
-git diff f67c431 -- vendor/snow
-# or, from a fresh download:
-curl -sSfL https://static.crates.io/crates/snow/snow-0.10.0.crate -o snow.crate
-echo "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82  snow.crate" | sha256sum -c
-mkdir upstream && tar -xzf snow.crate -C upstream
-diff -ru upstream/snow-0.10.0 vendor/snow
+.github/scripts/check-vendored-snow.sh          # identity only
+.github/scripts/check-vendored-snow.sh --test   # and upstream's tests
 ```
 
-The diff touches only `Cargo.toml`, `src/params/mod.rs`, `src/resolvers/default.rs` and
-`src/handshakestate.rs`, plus this file. Each change carries a
-`TCN patch N` comment in the code.
+**Advisories.** A path crate has no registry source in `Cargo.lock`, so `cargo deny check
+advisories` on the workspace does **not** match the vendored copy against RustSec (licences,
+bans and sources are still checked). `vendor/upstream-advisories` is a package that only
+depends on `snow =0.10.0` from crates.io; the `vendor` workflow runs `cargo deny check
+advisories` on it on every pull request and daily, so an advisory against the release this
+copy was taken from fails CI. Whether such an advisory affects the patched copy is then decided
+by hand.
 
 ## Patches
 
@@ -58,7 +72,7 @@ All changes are behind the `hfs` feature: a build without it is upstream snow.
    fuzz targets `noise_responder` and `noise_initiator` exercise the paths around them.
 5. **The KEM shared secret is wiped.** `kem_output_buf` is a `zeroize::Zeroizing` buffer on
    both sides (finding A8-12). This adds the optional dependency `zeroize` 1.8, enabled by
-   `hfs`; it is already in TCN's dependency tree and under `cargo deny`.
+   `hfs`; it is already in TCN's dependency tree, from crates.io, and under `cargo deny`.
 
 Not changed: the handshake state machine, the token order (`e1` after the first DH token,
 `ekem1` after `ee`), the constants, and the cipher, hash and DH code. snow's internal HKDF and

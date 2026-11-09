@@ -87,7 +87,10 @@ async fn replayed_suite_rejections_on_the_agent_are_rate_limited_per_identity() 
         .chain(log.events("handshake_suite_rejected_repeated").iter())
     {
         assert!(line.contains("\"confirmed\":false"), "{line}");
-        assert_eq!(field(line, "suite").as_deref(), Some(CLASSIC.protocol_name()));
+        assert_eq!(
+            field(line, "suite").as_deref(),
+            Some(CLASSIC.protocol_name())
+        );
     }
     assert_eq!(relay.sshd_connections(), 0);
 }
@@ -101,12 +104,10 @@ async fn replayed_authentication_failures_on_the_agent_are_rate_limited_per_iden
     let alice = Arc::new(Identity::generate().unwrap());
     let mut revoked = CertTrust::new();
     revoked.set_revocations(Revocations::new([], [alice.fingerprint()]).unwrap());
-    let mut relay = FakeRelay::start_logging(
-        agent_clients(&[alice.fingerprint()], revoked),
-        AcceptedSuites::only(CLASSIC),
-        INTERVAL,
-    )
-    .await;
+    let mut clients = agent_clients(&[alice.fingerprint()], CertTrust::new());
+    clients.set_cert_trust(revoked).unwrap();
+    let mut relay =
+        FakeRelay::start_logging(clients, AcceptedSuites::only(CLASSIC), INTERVAL).await;
     let (recorded, _) = noise::initiate_suite(
         &alice,
         &relay.agent.public_key(),
@@ -122,8 +123,11 @@ async fn replayed_authentication_failures_on_the_agent_are_rate_limited_per_iden
         );
     }
     tokio::time::sleep(INTERVAL * 5 / 2).await;
-    let (full, repeated) =
-        full_and_repeated(&log, "authentication_failed", &alice.fingerprint().to_string());
+    let (full, repeated) = full_and_repeated(
+        &log,
+        "authentication_failed",
+        &alice.fingerprint().to_string(),
+    );
     assert!((1..=2).contains(&full), "{full} full lines\n{}", log.text());
     assert_eq!(full as u64 + repeated, 30);
     let line = &log.events("authentication_failed_repeated")[0];
@@ -145,9 +149,14 @@ async fn made_up_keys_cannot_grow_the_agents_line_table() {
     // Message 1s are cheap to make; one stream at a time keeps the agent's quota free.
     for i in 1..=300 {
         let mallory = Identity::generate().unwrap();
-        let (msg1, _) =
-            noise::initiate_suite(&mallory, &relay.agent.public_key(), Channel::EndToEnd, CLASSIC, &[])
-                .unwrap();
+        let (msg1, _) = noise::initiate_suite(
+            &mallory,
+            &relay.agent.public_key(),
+            Channel::EndToEnd,
+            CLASSIC,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             relay.offer(i, msg1).await,
             AgentAnswer::Closed(CloseReason::Unauthorized)
@@ -179,7 +188,12 @@ impl snow::types::Kem for InvalidKeyKem {
     fn pubkey(&self) -> &[u8] {
         &[0xff; 1_184]
     }
-    fn encapsulate(&self, _: &[u8], _: &mut [u8], _: &mut [u8]) -> Result<(usize, usize), snow::Error> {
+    fn encapsulate(
+        &self,
+        _: &[u8],
+        _: &mut [u8],
+        _: &mut [u8],
+    ) -> Result<(usize, usize), snow::Error> {
         Err(snow::Error::Kem)
     }
     fn decapsulate(&self, _: &[u8], _: &mut [u8]) -> Result<usize, snow::Error> {
@@ -253,7 +267,10 @@ async fn an_invalid_e1_from_a_known_client_is_audited() {
         .filter(|l| field(l, "peer") == Some(alice.fingerprint().to_string()))
         .collect();
     assert_eq!(failed.len(), 1, "{}", log.text());
-    assert_eq!(field(&failed[0], "reason").as_deref(), Some("handshake_failed"));
+    assert_eq!(
+        field(&failed[0], "reason").as_deref(),
+        Some("HandshakeFailed")
+    );
     assert_eq!(relay.sshd_connections(), 0);
 }
 
@@ -299,10 +316,20 @@ async fn a_large_certificate_hybrid_msg1_to_a_classical_agent_is_a_suite_rejecti
         AgentAnswer::Closed(CloseReason::Unauthorized)
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(log.events("authentication_failed").is_empty(), "{}", log.text());
+    assert!(
+        log.events("authentication_failed").is_empty(),
+        "{}",
+        log.text()
+    );
     let rejected = log.events("handshake_suite_rejected");
     assert_eq!(rejected.len(), 1, "{}", log.text());
-    assert_eq!(field(&rejected[0], "peer"), Some(alice.fingerprint().to_string()));
-    assert_eq!(field(&rejected[0], "suite").as_deref(), Some(HFS.protocol_name()));
+    assert_eq!(
+        field(&rejected[0], "peer"),
+        Some(alice.fingerprint().to_string())
+    );
+    assert_eq!(
+        field(&rejected[0], "suite").as_deref(),
+        Some(HFS.protocol_name())
+    );
     assert_eq!(relay.sshd_connections(), 0);
 }

@@ -5,14 +5,15 @@
 //! open SSH sessions to the nodes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout, timeout_at};
-use zt_crypto::Keyring;
-use zt_crypto::noise::{self, Channel};
+use zt_application::identity_lines::{IdentityEvent, IdentityLines};
+use zt_crypto::noise::{self, Channel, Responded};
+use zt_crypto::{CryptoError, Keyring};
 use zt_domain::flow::Window;
 use zt_domain::{
     AcceptedSuites, AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection,
@@ -20,7 +21,7 @@ use zt_domain::{
     HandshakeSuite, NodeId, RejectReason, StreamId,
 };
 
-use crate::relay::{CertFields, audit};
+use crate::relay::{CertFields, audit, repeated_line};
 use crate::stream::{STREAM_QUEUE, StreamIo, pump};
 use crate::{NetError, Timeouts, channel};
 
@@ -41,6 +42,72 @@ pub struct AgentConfig {
     pub max_streams: usize,
     /// Handshake suites accepted from clients on the end-to-end channel (PROTOCOL §7.5).
     pub client_suites: zt_domain::AcceptedSuites,
+    /// The interval of the per-identity audit lines (finding A9-2): an event about a client is
+    /// logged in full once per client and interval, the repeats are counted in one
+    /// `<event>_repeated` line. Normally [`IDENTITY_LOG_INTERVAL`]; at least one second.
+    pub identity_log_interval: Duration,
+}
+
+/// The default [`AgentConfig::identity_log_interval`], the relay's `summary_interval`.
+pub const IDENTITY_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// What the agent's stream tasks share, across all relays.
+#[derive(Clone)]
+struct Shared {
+    /// Sessions to sshd for the whole agent.
+    sessions: Arc<Semaphore>,
+    /// The per-identity audit lines of the current interval (finding A9-2).
+    lines: Arc<Mutex<IdentityLines>>,
+}
+
+impl Shared {
+    /// Logs `event`; an event about a named client only if it is the first of its kind for
+    /// that client in the interval (finding A9-2: a compromised relay replays a recorded
+    /// message 1 at will). The others are counted for the `_repeated` line.
+    fn audit(&self, event: &DomainEvent) {
+        let key = match event {
+            DomainEvent::AuthenticationFailed {
+                peer: Some(peer),
+                reason,
+                ..
+            } => Some((*peer, IdentityEvent::AuthenticationFailed(*reason))),
+            DomainEvent::HandshakeSuiteRejected { peer, suite } => {
+                Some((*peer, IdentityEvent::SuiteRejected(*suite)))
+            }
+            _ => None,
+        };
+        let full = key.is_none_or(|(peer, ev)| {
+            self.lines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .note(peer, ev)
+        });
+        if full {
+            audit(event);
+        }
+    }
+}
+
+/// Every `interval`: the `_repeated` lines of the interval that ended, and how many events
+/// were not even counted per identity (beyond the table's bound).
+async fn identity_summaries(lines: Arc<Mutex<IdentityLines>>, interval: Duration) {
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let ended = lines.lock().unwrap_or_else(PoisonError::into_inner).take();
+        for repeated in &ended.repeated {
+            repeated_line(repeated);
+        }
+        if ended.suppressed_identities > 0 {
+            tracing::warn!(
+                target: "zt_audit",
+                event_kind = "identity_events_suppressed",
+                count = ended.suppressed_identities,
+                "audit events about further identities only counted"
+            );
+        }
+    }
 }
 
 /// The suites in use, once at startup (finding AP-7): those accepted from clients end to end
@@ -92,6 +159,10 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
         );
         return;
     }
+    if config.identity_log_interval < Duration::from_secs(1) {
+        tracing::error!("the agent's identity log interval must be at least one second");
+        return;
+    }
     // The CLI validates these too (PROTOCOL §7.5): a library user cannot run a suite on a
     // channel that does not support it.
     if !config
@@ -106,14 +177,21 @@ pub async fn run(keys: Arc<Keyring>, config: AgentConfig) {
         return;
     }
     handshake_suites_in_use(&config);
-    let slots = Arc::new(Semaphore::new(config.max_streams));
+    let shared = Shared {
+        sessions: Arc::new(Semaphore::new(config.max_streams)),
+        lines: Arc::new(Mutex::new(IdentityLines::default())),
+    };
     let mut sessions = tokio::task::JoinSet::new();
+    sessions.spawn(identity_summaries(
+        Arc::clone(&shared.lines),
+        config.identity_log_interval,
+    ));
     for relay in config.relays.clone() {
         sessions.spawn(run_one(
             Arc::clone(&keys),
             relay,
             config.clone(),
-            Arc::clone(&slots),
+            shared.clone(),
         ));
     }
     // The loops never terminate; if one panicked the others would keep going.
@@ -124,13 +202,13 @@ async fn run_one(
     identity: Arc<Keyring>,
     relay: crate::RelayEndpoint,
     config: AgentConfig,
-    slots: Arc<Semaphore>,
+    shared: Shared,
 ) {
     const MAX_DELAY: Duration = Duration::from_secs(60);
     let mut delay = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        match run_session(&identity, &relay, &config, &slots).await {
+        match run_session(&identity, &relay, &config, &shared).await {
             Ok(()) => tracing::info!(relay = %relay.address, "relay closed the connection"),
             Err(err) => tracing::warn!(relay = %relay.address, error = %err, "relay session ended"),
         }
@@ -156,7 +234,7 @@ async fn run_session(
     identity: &Arc<Keyring>,
     relay: &crate::RelayEndpoint,
     config: &AgentConfig,
-    slots: &Arc<Semaphore>,
+    shared: &Shared,
 ) -> Result<(), NetError> {
     let t = &config.timeouts;
     let tcp = timeout(t.handshake, TcpStream::connect(&relay.address))
@@ -194,7 +272,7 @@ async fn run_session(
             inbound = timeout_at(deadline, ch.recv()) => {
                 let frame = inbound.map_err(|_| NetError::Timeout("relay idle"))??.ok_or(NetError::Closed)?;
                 deadline = crate::deadline(t.idle);
-                if let Some(reply) = on_relay_frame(frame, identity, config, slots, &mut streams, &out_tx, &done_tx)? {
+                if let Some(reply) = on_relay_frame(frame, identity, config, shared, &mut streams, &out_tx, &done_tx)? {
                     ch.send(&reply, t).await?;
                 }
             }
@@ -254,7 +332,7 @@ fn on_relay_frame(
     frame: Frame,
     identity: &Arc<Keyring>,
     config: &AgentConfig,
-    slots: &Arc<Semaphore>,
+    shared: &Shared,
     streams: &mut Streams,
     out_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<StreamId>,
@@ -289,7 +367,7 @@ fn on_relay_frame(
             let task = StreamTask {
                 io: StreamIo::new(stream, rx, out_tx.clone()),
                 identity: Arc::clone(identity),
-                sessions: Arc::clone(slots),
+                shared: shared.clone(),
                 authorized: config.authorized_clients.clone(),
                 node: config.node.clone(),
                 ssh_target: config.ssh_target.clone(),
@@ -358,8 +436,8 @@ fn on_relay_frame(
 struct StreamTask {
     io: StreamIo,
     identity: Arc<Keyring>,
-    /// Sessions to sshd for the whole agent (all relays).
-    sessions: Arc<Semaphore>,
+    /// Sessions to sshd and audit lines, for the whole agent (all relays).
+    shared: Shared,
     authorized: crate::Revocable<AuthorizedClients>,
     /// This agent's node: it must be within the effective scope of a certificate.
     node: NodeId,
@@ -403,20 +481,9 @@ async fn read_msg1(
     identity: &Keyring,
     timeouts: &Timeouts,
     client_suites: AcceptedSuites,
-) -> Option<noise::AuthorizationPending> {
-    let pending = match io.recv_message(timeouts).await {
-        // A message 1 longer than the one with the largest certificate is not even parsed
-        // (PROTOCOL §15.3): it is a rejected certificate, not a handshake to attempt.
-        Ok(msg1) if msg1.len() > client_suites.max_msg1_len() => {
-            audit(&DomainEvent::AuthenticationFailed {
-                peer: None,
-                reason: AuthFailureReason::Certificate(CertRejection::Malformed),
-                certificate: None,
-            });
-            io.close(CloseReason::Unauthorized).await;
-            return None;
-        }
-        Ok(msg1) => respond(identity, &msg1, client_suites),
+) -> Option<Responded> {
+    let msg1 = match io.recv_message(timeouts).await {
+        Ok(msg1) => msg1,
         // The client has already closed: replying with another `Close` is pointless
         // (finding 0002-1).
         Err(NetError::StreamClosed(_)) => return None,
@@ -426,16 +493,38 @@ async fn read_msg1(
             return None;
         }
     };
-    let Ok(pending) = pending else {
+    // A message 1 longer than the one with the largest certificate is not even parsed
+    // (PROTOCOL §15.3): it is a rejected certificate, not a handshake to attempt. The bound is
+    // that of every suite this build runs end to end, not only the accepted ones, so that a
+    // known client with a large certificate and an unaccepted suite is still named (finding
+    // A9-5); the per-suite bounds apply inside `respond_or_identify`.
+    let supported = AcceptedSuites::supported(HandshakeChannel::EndToEnd);
+    let responded = if msg1.len() > supported.max_msg1_len() {
+        Err(CryptoError::Handshake)
+    } else {
+        noise::respond_or_identify(identity, &msg1, Channel::EndToEnd, client_suites)
+    };
+    let Ok(responded) = responded else {
+        // Longer than any accepted message 1: reported as before, a malformed certificate.
+        let reason = if msg1.len() > client_suites.max_msg1_len() {
+            AuthFailureReason::Certificate(CertRejection::Malformed)
+        } else {
+            AuthFailureReason::HandshakeFailed
+        };
         audit(&DomainEvent::AuthenticationFailed {
             peer: None,
-            reason: AuthFailureReason::HandshakeFailed,
+            reason,
             certificate: None,
         });
-        io.close(CloseReason::ProtocolViolation).await;
+        let close = if matches!(reason, AuthFailureReason::HandshakeFailed) {
+            CloseReason::ProtocolViolation
+        } else {
+            CloseReason::Unauthorized
+        };
+        io.close(close).await;
         return None;
     };
-    Some(pending)
+    Some(responded)
 }
 
 impl StreamTask {
@@ -443,45 +532,60 @@ impl StreamTask {
         let Self {
             mut io,
             identity,
-            sessions,
+            shared,
             authorized,
             node,
             ssh_target,
             timeouts,
             client_suites,
         } = self;
-        let Some(pending) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
+        let Some(responded) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
             return;
         };
-        let client = pending.peer();
-        let suite = pending.suite();
+        let (client, suite, payload) = match &responded {
+            Responded::Pending(pending) => (pending.peer(), pending.suite(), pending.payload()),
+            Responded::Unaccepted(found) => (found.peer(), found.suite(), found.payload()),
+        };
         // Before message 2: a rejected client does not complete the handshake and does not
         // reach sshd (like an unknown client, PROTOCOL §8 item 3).
-        let credential =
-            match admit_client(&authorized.current(), &client, pending.payload(), &node) {
-                Ok(credential) => credential,
-                Err((reason, certificate)) => {
-                    audit(&DomainEvent::AuthenticationFailed {
-                        peer: Some(client),
-                        reason,
-                        certificate,
-                    });
-                    io.close(CloseReason::Unauthorized).await;
-                    return;
-                }
-            };
+        let credential = match admit_client(&authorized.current(), &client, payload, &node) {
+            Ok(credential) => credential,
+            Err((reason, certificate)) => {
+                shared.audit(&DomainEvent::AuthenticationFailed {
+                    peer: Some(client),
+                    reason,
+                    certificate,
+                });
+                io.close(CloseReason::Unauthorized).await;
+                return;
+            }
+        };
         // A known client whose suite this agent does not accept (review 0008, A8-11): no
         // message 2, and the suite is named so that the operator sees a client pinned ahead
-        // of (or behind) the agent's configuration.
-        if !client_suites.contains(suite) {
-            audit(&DomainEvent::HandshakeSuiteRejected {
-                peer: client,
-                suite,
-            });
-            io.close(CloseReason::Unauthorized).await;
-            return;
-        }
+        // of (or behind) the agent's configuration. `Unaccepted` has no `accept` (finding
+        // A9-3), and the line is rate-limited and says it is unconfirmed (finding A9-2).
+        let pending = match responded {
+            Responded::Pending(pending) => pending,
+            Responded::Unaccepted(_) => {
+                shared.audit(&DomainEvent::HandshakeSuiteRejected {
+                    peer: client,
+                    suite,
+                });
+                io.close(CloseReason::Unauthorized).await;
+                return;
+            }
+        };
         let Ok((msg2, mut transport)) = pending.accept() else {
+            // An invalid `e1` (FIPS 203 §7.2) from the key holder of an authorized client, or
+            // a failure of this host's random number generator (finding A9-4).
+            if getrandom::u64().is_err() {
+                tracing::error!("the system random number generator failed");
+            }
+            shared.audit(&DomainEvent::AuthenticationFailed {
+                peer: Some(client),
+                reason: AuthFailureReason::HandshakeFailed,
+                certificate: None,
+            });
             io.close(CloseReason::ProtocolViolation).await;
             return;
         };
@@ -497,7 +601,7 @@ impl StreamTask {
                     .decrypt(&confirm)
                     .is_ok_and(|p| p == suite.confirmation()) => {}
             Ok(_) => {
-                audit(&DomainEvent::AuthenticationFailed {
+                shared.audit(&DomainEvent::AuthenticationFailed {
                     peer: Some(client),
                     reason: AuthFailureReason::HandshakeFailed,
                     certificate: None,
@@ -513,7 +617,7 @@ impl StreamTask {
         }
         // Only now, with a real client, is one of the `max_streams` global slots taken; it
         // stays taken until the end of this function.
-        let Ok(_session) = sessions.try_acquire_owned() else {
+        let Ok(_session) = Arc::clone(&shared.sessions).try_acquire_owned() else {
             tracing::warn!(peer = %client, "too many sessions on this agent");
             io.close(CloseReason::Drained).await;
             return;
@@ -542,23 +646,6 @@ struct Session {
     credential: ClientCredential,
     node: NodeId,
     suite: HandshakeSuite,
-}
-
-/// The end-to-end handshake: the accepted suites first; if none fits, the other suites this
-/// build runs end to end, only to name a known client whose suite is not accepted (the caller
-/// refuses it before message 2). Those are read-only attempts: no KEM operation and no
-/// message 2 happen before `accept`, which a rejected suite never reaches.
-fn respond(
-    keys: &Keyring,
-    msg1: &[u8],
-    accepted: AcceptedSuites,
-) -> Result<noise::AuthorizationPending, zt_crypto::CryptoError> {
-    noise::respond_suites(keys, msg1, Channel::EndToEnd, accepted).or_else(|err| {
-        match AcceptedSuites::supported(HandshakeChannel::EndToEnd).without(accepted) {
-            Some(others) => noise::respond_suites(keys, msg1, Channel::EndToEnd, others),
-            None => Err(err),
-        }
-    })
 }
 
 /// The maximum interval at which the system clock is re-read for a certificate's expiry

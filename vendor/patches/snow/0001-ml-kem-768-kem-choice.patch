@@ -1,0 +1,31 @@
+--- a/src/params/mod.rs
++++ b/src/params/mod.rs
+@@ -128,6 +128,9 @@
+ pub enum KemChoice {
+     /// The 1024-bit Kyber variant.
+     Kyber1024,
++    /// ML-KEM-768 (FIPS 203). TCN patch 1 (see PATCHES.md): snow provides no implementation,
++    /// the application's resolver must.
++    MlKem768,
+ }
+ 
+ #[cfg(feature = "hfs")]
+@@ -138,6 +141,7 @@
+         use self::KemChoice::*;
+         match s {
+             "Kyber1024" => Ok(Kyber1024),
++            "MLKEM768" => Ok(MlKem768),
+             _ => Err(PatternProblem::UnsupportedKemType.into()),
+         }
+     }
+--- a/src/resolvers/default.rs
++++ b/src/resolvers/default.rs
+@@ -119,6 +119,8 @@
+     fn resolve_kem(&self, choice: &KemChoice) -> Option<Box<dyn Kem>> {
+         match *choice {
+             KemChoice::Kyber1024 => Some(Box::new(Kyber1024::default())),
++            // TCN patch 1: no built-in ML-KEM-768, the application's resolver provides it.
++            KemChoice::MlKem768 => None,
+         }
+     }
+ }

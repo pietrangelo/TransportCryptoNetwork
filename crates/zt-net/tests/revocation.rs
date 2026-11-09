@@ -125,6 +125,7 @@ impl Lab {
             timeouts: fast(),
             max_streams: 16,
             client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(

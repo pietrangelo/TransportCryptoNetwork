@@ -83,3 +83,10 @@ path = "fuzz_targets/admission.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "kem_inputs"
+path = "fuzz_targets/kem_inputs.rs"
+test = false
+doc = false
+bench = false

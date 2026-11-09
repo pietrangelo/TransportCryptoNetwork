@@ -236,6 +236,7 @@ fn run(command: Command) -> Result<(), String> {
                     timeouts: Timeouts::default(),
                     max_streams,
                     client_suites,
+                    identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
                 };
                 let events = ReloadEvents {
                     reloaded: "authorized_clients_reloaded",

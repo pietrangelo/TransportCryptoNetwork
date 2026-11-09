@@ -182,6 +182,7 @@ async fn start_agent_with(
         timeouts: timeouts(),
         max_streams,
         client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
     };
     tokio::spawn(agent::run(Arc::new(keys), config));
 }
@@ -874,6 +875,7 @@ async fn an_out_of_range_max_streams_is_refused_without_panic() {
             timeouts: timeouts(),
             max_streams: max,
             client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
         };
         let keys: Keyring = Identity::generate().unwrap().into();
         tokio::time::timeout(Duration::from_secs(2), agent::run(Arc::new(keys), config))

@@ -373,6 +373,7 @@ impl Lab {
                 timeouts: timeouts(),
                 max_streams: 16,
                 client_suites,
+                identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
             },
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;

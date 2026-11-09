@@ -27,9 +27,7 @@ fn suite_rejections_of_one_identity_are_logged_once_then_counted() {
     let mut lines = IdentityLines::default();
     let rejected = IdentityEvent::SuiteRejected(HandshakeSuite::NoiseIk25519);
     let failed = IdentityEvent::AuthenticationFailed(AuthFailureReason::HandshakeFailed);
-    let full = (0..40)
-        .filter(|_| lines.note(key(1), rejected))
-        .count();
+    let full = (0..40).filter(|_| lines.note(key(1), rejected)).count();
     assert_eq!(full, 1);
     // Another event of the same identity, and the same event of another, are logged too.
     assert!(lines.note(key(1), failed));
@@ -37,7 +35,11 @@ fn suite_rejections_of_one_identity_are_logged_once_then_counted() {
     let ended = lines.take();
     assert_eq!(ended.repeated.len(), 1);
     assert_eq!(
-        (ended.repeated[0].peer, ended.repeated[0].event, ended.repeated[0].count),
+        (
+            ended.repeated[0].peer,
+            ended.repeated[0].event,
+            ended.repeated[0].count
+        ),
         (key(1), rejected, 39)
     );
     assert_eq!(ended.suppressed_identities, 0);
