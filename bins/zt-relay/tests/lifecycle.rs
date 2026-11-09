@@ -92,7 +92,19 @@ fn command(dir: &Dir, sub: &str) -> Command {
     cmd
 }
 
+/// Every running relay holds a read guard; a test that counts listening sockets takes the
+/// write guard, so that no other test's relay listens meanwhile.
+static RELAYS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn relay_slot() -> std::sync::RwLockReadGuard<'static, ()> {
+    RELAYS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Running {
+    /// Released after the child is killed (`Drop` runs before the fields are dropped).
+    _slot: Option<std::sync::RwLockReadGuard<'static, ()>>,
     child: Child,
     lines: mpsc::Receiver<serde_json::Value>,
     /// Lines read while waiting for another one.
@@ -109,6 +121,19 @@ impl Drop for Running {
 
 impl Running {
     fn start(dir: &Dir, extra: &[&str]) -> Self {
+        Self::start_holding(dir, extra, Some(relay_slot()))
+    }
+
+    /// For a caller that already holds [`RELAYS`].
+    fn start_unlocked(dir: &Dir, extra: &[&str]) -> Self {
+        Self::start_holding(dir, extra, None)
+    }
+
+    fn start_holding(
+        dir: &Dir,
+        extra: &[&str],
+        slot: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    ) -> Self {
         let mut child = command(dir, "run")
             .args(extra)
             .stdout(Stdio::null())
@@ -129,6 +154,7 @@ impl Running {
             }
         });
         let mut r = Self {
+            _slot: slot,
             child,
             lines,
             seen: std::cell::RefCell::default(),
@@ -239,6 +265,7 @@ fn sigterm_drains_and_exits_cleanly() {
 #[test]
 fn an_early_sigterm_is_clean() {
     let dir = setup("early");
+    let _slot = relay_slot();
     for delay in [0, 5, 20, 50] {
         let child = command(&dir, "run")
             .stdout(Stdio::null())
@@ -714,25 +741,62 @@ fn wait_metric(path: &Path, prefix: &str) -> String {
     }
 }
 
-/// TCP sockets of `pid` in the `LISTEN` state (AP-21: no new listening socket).
-fn listening_sockets(pid: u32) -> usize {
-    let inodes: std::collections::HashSet<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap()
-        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-        .filter_map(|t| {
-            let t = t.to_string_lossy().into_owned();
-            Some(t.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
-        })
-        .collect();
+/// TCP sockets in the `LISTEN` state, by inode, from `/proc/net/tcp*` (world-readable).
+fn listeners() -> Vec<(String, u32)> {
     ["/proc/net/tcp", "/proc/net/tcp6"]
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
         .flat_map(|t| t.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
-        .filter(|l| {
+        .filter_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            f.len() > 9 && f[3] == "0A" && inodes.contains(f[9])
+            (f.len() > 9 && f.get(3) == Some(&"0A"))
+                .then(|| Some(((*f.get(9)?).to_owned(), f.get(7)?.parse().ok()?)))
+                .flatten()
         })
-        .count()
+        .collect()
+}
+
+/// The socket inodes `pid` holds, or `None` if its descriptors cannot be read.
+fn socket_inodes(pid: &str) -> Option<std::collections::HashSet<String>> {
+    Some(
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .ok()?
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter_map(|t| {
+                let t = t.to_string_lossy().into_owned();
+                Some(t.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+            })
+            .collect(),
+    )
+}
+
+/// Listening sockets of this user that the test process itself does not hold.
+fn foreign_listeners() -> std::collections::HashSet<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let uid = std::fs::metadata("/proc/self").unwrap().uid();
+    let own = socket_inodes("self").unwrap_or_default();
+    listeners()
+        .into_iter()
+        .filter(|(inode, owner)| *owner == uid && !own.contains(inode))
+        .map(|(inode, _)| inode)
+        .collect()
+}
+
+/// TCP sockets of `pid` in the `LISTEN` state.
+///
+/// As root the child's descriptors are read directly. As another user they cannot be: the
+/// binary makes itself non-dumpable (`PR_SET_DUMPABLE` 0, so keys never reach a core file),
+/// which also makes `/proc/<pid>/fd` root-only. Then every listening socket of this user that
+/// is neither the test's own nor in `baseline` (taken before the child started) is counted:
+/// the caller makes sure the child is the only process of this user that may listen meanwhile.
+fn listening_sockets(pid: u32, baseline: &std::collections::HashSet<String>) -> usize {
+    match socket_inodes(&pid.to_string()) {
+        Some(inodes) => listeners()
+            .iter()
+            .filter(|(inode, _)| inodes.contains(inode))
+            .count(),
+        None => foreign_listeners().difference(baseline).count(),
+    }
 }
 
 fn status(path: &Path) -> std::process::Output {
@@ -751,7 +815,12 @@ fn the_relay_writes_its_metrics_and_status_reads_them() {
     std::fs::create_dir_all(dir.0.join("textfile")).unwrap();
     let path = dir.0.join("textfile/zt-relay.prom");
     let p = path.display().to_string();
-    let relay = Running::start(&dir, &["--metrics-file", &p, "--metrics-interval", "1"]);
+    // No other test's relay runs meanwhile, so the count is this relay's alone.
+    let _alone = RELAYS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let baseline = foreign_listeners();
+    let relay = Running::start_unlocked(&dir, &["--metrics-file", &p, "--metrics-interval", "1"]);
     let text = wait_metric(&path, "tcn_config_generation 1");
     assert!(
         text.contains("tcn_build_info{role=\"relay\",version=\""),
@@ -765,7 +834,7 @@ fn the_relay_writes_its_metrics_and_status_reads_them() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("role: relay"), "{stdout}");
     assert!(stdout.contains("tcn_config_generation 2"), "{stdout}");
-    assert_eq!(listening_sockets(relay.child.id()), 1);
+    assert_eq!(listening_sockets(relay.child.id(), &baseline), 1);
 }
 
 /// Without `--metrics-file`, the metrics go to the runtime directory (0700, readable by root

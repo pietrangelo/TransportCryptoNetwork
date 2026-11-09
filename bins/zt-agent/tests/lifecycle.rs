@@ -228,25 +228,62 @@ fn a_missing_key_is_restarted_not_ex_config() {
 // R-5: the metrics textfile and `status` (resilience.md §5.5, review 0007 AP-21)
 // ---------------------------------------------------------------------------------------------
 
-/// TCP sockets of `pid` in the `LISTEN` state.
-fn listening_sockets(pid: u32) -> usize {
-    let inodes: std::collections::HashSet<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap()
-        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-        .filter_map(|t| {
-            let t = t.to_string_lossy().into_owned();
-            Some(t.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
-        })
-        .collect();
+/// TCP sockets in the `LISTEN` state, by inode, from `/proc/net/tcp*` (world-readable).
+fn listeners() -> Vec<(String, u32)> {
     ["/proc/net/tcp", "/proc/net/tcp6"]
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
         .flat_map(|t| t.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
-        .filter(|l| {
+        .filter_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            f.len() > 9 && f.get(3) == Some(&"0A") && f.get(9).is_some_and(|i| inodes.contains(*i))
+            (f.len() > 9 && f.get(3) == Some(&"0A"))
+                .then(|| Some(((*f.get(9)?).to_owned(), f.get(7)?.parse().ok()?)))
+                .flatten()
         })
-        .count()
+        .collect()
+}
+
+/// The socket inodes `pid` holds, or `None` if its descriptors cannot be read.
+fn socket_inodes(pid: &str) -> Option<std::collections::HashSet<String>> {
+    Some(
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .ok()?
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter_map(|t| {
+                let t = t.to_string_lossy().into_owned();
+                Some(t.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+            })
+            .collect(),
+    )
+}
+
+/// Listening sockets of this user that the test process itself does not hold.
+fn foreign_listeners() -> std::collections::HashSet<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let uid = std::fs::metadata("/proc/self").unwrap().uid();
+    let own = socket_inodes("self").unwrap_or_default();
+    listeners()
+        .into_iter()
+        .filter(|(inode, owner)| *owner == uid && !own.contains(inode))
+        .map(|(inode, _)| inode)
+        .collect()
+}
+
+/// TCP sockets of `pid` in the `LISTEN` state.
+///
+/// As root the child's descriptors are read directly. As another user they cannot be: the
+/// binary makes itself non-dumpable (`PR_SET_DUMPABLE` 0, so keys never reach a core file),
+/// which also makes `/proc/<pid>/fd` root-only. Then every listening socket of this user that
+/// is neither the test's own nor in `baseline` (taken before the child started) is counted:
+/// the caller makes sure the child is the only process of this user that may listen meanwhile.
+fn listening_sockets(pid: u32, baseline: &std::collections::HashSet<String>) -> usize {
+    match socket_inodes(&pid.to_string()) {
+        Some(inodes) => listeners()
+            .iter()
+            .filter(|(inode, _)| inodes.contains(inode))
+            .count(),
+        None => foreign_listeners().difference(baseline).count(),
+    }
 }
 
 /// R5-M5 and AP-21: the agent writes its metrics textfile, `status` reads it, and the agent
@@ -256,6 +293,8 @@ fn the_agent_writes_its_metrics_and_never_listens() {
     let dir = setup("metrics");
     let path = dir.0.join("run/agent.prom");
     let p = path.display().to_string();
+    // Agents never listen: the other tests' agents cannot add to the count.
+    let baseline = foreign_listeners();
     let agent = Running::start(&dir, &["--metrics-file", &p, "--metrics-interval", "1"]);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let text = loop {
@@ -276,7 +315,7 @@ fn the_agent_writes_its_metrics_and_never_listens() {
         .unwrap();
     assert!(out.status.success(), "{}", text_of(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("role: agent"));
-    assert_eq!(listening_sockets(agent.child.id()), 0);
+    assert_eq!(listening_sockets(agent.child.id(), &baseline), 0);
 }
 
 fn text_of(out: &std::process::Output) -> String {

@@ -54,22 +54,35 @@ impl ByteBudget {
         self.used() > self.limit
     }
 
+    /// Applies `f` to the bytes used, atomically; `false` if `f` refuses. A plain
+    /// compare-exchange loop: `fetch_update` is deprecated on nightly (renamed `try_update`),
+    /// which stable does not have yet.
+    fn update(&self, f: impl Fn(usize) -> Option<usize>) -> bool {
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = f(current) else {
+                return false;
+            };
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Takes `n` bytes if the total stays within `ceiling`.
     fn take(&self, n: usize, ceiling: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(n).filter(|&total| total <= ceiling)
-            })
-            .is_ok()
+        self.update(|used| used.checked_add(n).filter(|&total| total <= ceiling))
     }
 
     fn give_back(&self, n: usize) {
         // Never below zero: every give-back matches an earlier take.
-        let _ = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(n))
-            });
+        self.update(|used| Some(used.saturating_sub(n)));
     }
 
     /// Reserves `n` bytes, or `None` if they do not fit in the limit.
