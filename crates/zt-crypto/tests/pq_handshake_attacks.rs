@@ -216,7 +216,7 @@ fn pair() -> Pair {
 }
 
 fn start(p: &Pair) -> (Vec<u8>, AwaitingResponse) {
-    noise::initiate_suite(&p.client, &p.agent_pk, Channel::EndToEnd, HFS, &[]).unwrap()
+    noise::initiate_suite(&p.client, p.agent_pk, Channel::EndToEnd, HFS, &[]).unwrap()
 }
 
 // --- downgrade and binding ------------------------------------------------------------------
@@ -227,7 +227,7 @@ fn start(p: &Pair) -> (Vec<u8>, AwaitingResponse) {
 fn a_message_1_of_one_suite_is_never_valid_as_the_other() {
     let p = pair();
     let (classical, _) =
-        noise::initiate_suite(&p.client, &p.agent_pk, Channel::EndToEnd, CLASSIC, &[]).unwrap();
+        noise::initiate_suite(&p.client, p.agent_pk, Channel::EndToEnd, CLASSIC, &[]).unwrap();
     let (hybrid, _) = start(&p);
     assert_eq!(
         noise::respond_suites(
@@ -441,7 +441,7 @@ fn an_oversized_message_1_is_refused() {
     let p = pair();
     let payload = vec![0x5a; MAX_ANY_CERT_LEN + 1];
     assert_eq!(
-        noise::initiate_suite(&p.client, &p.agent_pk, Channel::EndToEnd, HFS, &payload).err(),
+        noise::initiate_suite(&p.client, p.agent_pk, Channel::EndToEnd, HFS, &payload).err(),
         Some(CryptoError::MessageTooLarge)
     );
     let msg1 = raw_msg1(

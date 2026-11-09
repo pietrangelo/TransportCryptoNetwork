@@ -81,6 +81,7 @@ fn duplicate_agents_are_reported() {
             Input::Connected {
                 conn,
                 peer: agent,
+                hybrid: None,
                 certificate: None,
             },
             now,

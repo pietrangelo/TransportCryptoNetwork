@@ -213,7 +213,7 @@ impl Fleet {
             .iter()
             .map(|(name, id)| RelayEndpoint {
                 address: format!("{name}:{PORT}"),
-                public_key: id.public_key(),
+                public_key: id.public_key().into(),
                 suite: HandshakeSuite::NoiseIk25519,
             })
             .collect()
@@ -328,7 +328,7 @@ impl Fleet {
         ClientConfig {
             relays: self.endpoints(),
             node: node("web-01"),
-            node_key: self.agent.public_key(),
+            node_key: self.agent.public_key().into(),
             node_suite: HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: Timeouts::default(),

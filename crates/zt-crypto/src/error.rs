@@ -28,6 +28,10 @@ pub enum CryptoError {
     /// The handshake suite is not supported by this build (PROTOCOL §7.5).
     #[error("handshake suite not supported")]
     UnsupportedSuite,
+    /// The hybrid IK suite needs the peer's v2 public key (PQ-AUTH): a v1 pin has no ML-KEM
+    /// key to encapsulate to.
+    #[error("the hybrid IK suite needs the peer's v2 public key")]
+    HybridKeyRequired,
     /// A certificate just signed does not verify with the fleet's verifier (finding AP-5):
     /// it is not issued.
     #[error("the new certificate failed verification after signing")]

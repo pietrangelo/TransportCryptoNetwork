@@ -13,16 +13,35 @@
 //! ciphertext, then `MixKey` of the shared secret). The responder encapsulates in `accept`,
 //! after the authorization decision; the initiator decapsulates in `complete`.
 //!
+//! The hybrid IK suite (PQ-AUTH, suite 0x02, PROTOCOL §7.5.3) composes `IKhfs` with two
+//! encapsulations to the parties' **static** ML-KEM-768 keys, fed to Noise as pre-shared keys:
+//!
+//! ```text
+//! -> ct1 ‖ [psk0] e, es, e1, s, ss, {ek_i ‖ payload}   psk0 = SHA-256("TCN/3 skem-i\0" ‖ ct1 ‖ ss1)
+//! <- ct2 ‖ e, ee, ekem1, se, [psk2], {}                psk2 = SHA-256("TCN/3 skem-r\0" ‖ ct2 ‖ ss2)
+//! ```
+//!
+//! `ct1` is encapsulated to the responder's pinned key (only its holder reads message 1, and
+//! the initiator's identity and certificate are protected by ML-KEM from the first byte);
+//! `ct2` to the initiator's key, which message 1 carries and the fingerprint v2 binds (only
+//! its holder derives the transport keys). The prologue `"TCN/3 <channel>" ‖ 0x02 ‖
+//! SHA-256(ek_r) ‖ ct1` binds the channel, the suite, the responder's key and `ct1`. Node keys
+//! never sign: authentication is by KEM in both directions, plus DH.
+//!
 //! IK: the initiator knows and **pins** the static key of the responder; the responder learns
 //! the initiator's key from the first message. If the decision is negative the responder
 //! simply does not reply: the initiator learns nothing, not even whether its key exists.
 
+use sha2::{Digest, Sha256};
 use snow::{Builder, HandshakeState, TransportState};
+use zeroize::Zeroizing;
 pub use zt_domain::HandshakeChannel as Channel;
-use zt_domain::{AcceptedSuites, Fingerprint, HandshakeSuite};
+use zt_domain::{AcceptedSuites, Fingerprint, HandshakeSuite, HybridFingerprint};
 
 use crate::error::CryptoError;
-use crate::identity::{Identity, PublicKey, fingerprint_of_x25519};
+use crate::hybrid::{EK_LEN, PeerKey, hybrid_fingerprint_of};
+use crate::identity::{Identity, fingerprint_of_x25519};
+use crate::kem::{ENCAPSULATION_RANDOMNESS_LEN, Kem, MlKem768};
 use crate::keyring::Keyring;
 
 /// Maximum length of a Noise message.
@@ -47,8 +66,55 @@ const fn prologue(channel: Channel, suite: HandshakeSuite) -> Option<&'static [u
         (HandshakeSuite::NoiseIkhfs25519MlKem768, Channel::EndToEnd) => {
             Some(b"TCN/2 end-to-end\x01")
         }
+        // Followed by SHA-256(ek_r) ‖ ct1 (see [`hybrid_prologue`]).
+        (HandshakeSuite::NoiseIkHybrid25519MlKem768, Channel::Outer) => Some(b"TCN/3 outer\x02"),
+        (HandshakeSuite::NoiseIkHybrid25519MlKem768, Channel::EndToEnd) => {
+            Some(b"TCN/3 end-to-end\x02")
+        }
         _ => None,
     }
+}
+
+/// Length of an ML-KEM-768 ciphertext (`ct1`, `ct2`).
+const CT_LEN: usize = 1_088;
+
+/// Domain separation of `psk0`, from the encapsulation to the responder's static key.
+const PSK_INITIATOR: &[u8] = b"TCN/3 skem-i\0";
+/// Domain separation of `psk2`, from the encapsulation to the initiator's static key.
+const PSK_RESPONDER: &[u8] = b"TCN/3 skem-r\0";
+
+/// The full prologue of the hybrid IK suite: `"TCN/3 <channel>" ‖ 0x02 ‖ SHA-256(ek_r) ‖ ct1`.
+fn hybrid_prologue(
+    channel: Channel,
+    responder_ek: &[u8],
+    ct1: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let base = prologue(channel, HandshakeSuite::NoiseIkHybrid25519MlKem768)
+        .ok_or(CryptoError::UnsupportedSuite)?;
+    let mut out = Vec::with_capacity(base.len().saturating_add(32).saturating_add(ct1.len()));
+    out.extend_from_slice(base);
+    out.extend_from_slice(&Sha256::digest(responder_ek));
+    out.extend_from_slice(ct1);
+    Ok(out)
+}
+
+/// A Noise pre-shared key from a static encapsulation: `SHA-256(label ‖ ct ‖ ss)`.
+fn kem_psk(label: &[u8], ct: &[u8], ss: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(
+        Sha256::new()
+            .chain_update(label)
+            .chain_update(ct)
+            .chain_update(ss)
+            .finalize()
+            .into(),
+    )
+}
+
+/// Encapsulation with fresh randomness from the system.
+fn encapsulate(ek: &[u8]) -> Result<(Vec<u8>, crate::kem::SharedSecret), CryptoError> {
+    let mut m = Zeroizing::new([0_u8; ENCAPSULATION_RANDOMNESS_LEN]);
+    getrandom::fill(m.as_mut()).map_err(|_| CryptoError::Random)?;
+    MlKem768::encapsulate(ek, &m).map_err(|_| CryptoError::Handshake)
 }
 
 // The `TCN/2` prologues end with the id of their suite.
@@ -69,6 +135,16 @@ fn builder(
     channel: Channel,
     suite: HandshakeSuite,
 ) -> Result<(Builder<'static>, zeroize::Zeroizing<[u8; 32]>), CryptoError> {
+    let prologue = prologue(channel, suite).ok_or(CryptoError::UnsupportedSuite)?;
+    builder_with(local, channel, suite, prologue)
+}
+
+fn builder_with<'a>(
+    local: &Identity,
+    channel: Channel,
+    suite: HandshakeSuite,
+    prologue: &'a [u8],
+) -> Result<(Builder<'a>, zeroize::Zeroizing<[u8; 32]>), CryptoError> {
     if !suite.is_supported(channel) {
         return Err(CryptoError::UnsupportedSuite);
     }
@@ -76,7 +152,6 @@ fn builder(
         .protocol_name()
         .parse()
         .map_err(|_| CryptoError::UnsupportedSuite)?;
-    let prologue = prologue(channel, suite).ok_or(CryptoError::UnsupportedSuite)?;
     let secret = local.x25519_secret();
     // snow's primitives, and TCN's KEM provider for the hybrid suite.
     let builder = Builder::with_resolver(params, Box::new(crate::resolver::Resolver))
@@ -94,7 +169,7 @@ pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = zt_domain::limits::MAX_ANY_CERT_LEN
 /// [`CryptoError::Handshake`] if the Noise state cannot be built.
 pub fn initiate(
     local: &Identity,
-    remote: &PublicKey,
+    remote: impl Into<PeerKey>,
     channel: Channel,
 ) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
     initiate_with_payload(local, remote, channel, &[])
@@ -108,7 +183,7 @@ pub fn initiate(
 /// [`CryptoError::Handshake`] if the Noise state cannot be built.
 pub fn initiate_with_payload(
     local: &Identity,
-    remote: &PublicKey,
+    remote: impl Into<PeerKey>,
     channel: Channel,
     payload: &[u8],
 ) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
@@ -127,20 +202,25 @@ pub fn initiate_with_payload(
 ///
 /// # Errors
 /// [`CryptoError::UnsupportedSuite`] if this build cannot run `suite` on `channel`,
+/// [`CryptoError::HybridKeyRequired`] for the hybrid IK suite with a v1 pin,
 /// [`CryptoError::MessageTooLarge`] over [`MAX_HANDSHAKE_PAYLOAD_LEN`],
 /// [`CryptoError::Handshake`] if the Noise state cannot be built.
 pub fn initiate_suite(
     local: &Identity,
-    remote: &PublicKey,
+    remote: impl Into<PeerKey>,
     channel: Channel,
     suite: HandshakeSuite,
     payload: &[u8],
 ) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    let remote = remote.into();
+    if suite.requires_hybrid_identity() {
+        return initiate_hybrid(local, &remote, channel, suite, payload);
+    }
     let (builder, secret) = builder(local, channel, suite)?;
     if payload.len() > MAX_HANDSHAKE_PAYLOAD_LEN {
         return Err(CryptoError::MessageTooLarge);
     }
-    let remote_static = remote.x25519();
+    let remote_static = remote.public_key().x25519();
     let mut state = builder
         .local_private_key(secret.as_ref())
         .and_then(|b| b.remote_public_key(&remote_static))
@@ -153,6 +233,51 @@ pub fn initiate_suite(
             state,
             responder: remote.fingerprint(),
             suite,
+            static_dk: None,
+        },
+    ))
+}
+
+/// The initiator of the hybrid IK suite: `ct1 ‖ IKhfs+psk0 message 1`, with the initiator's
+/// static encapsulation key in front of `payload`.
+fn initiate_hybrid(
+    local: &Identity,
+    remote: &PeerKey,
+    channel: Channel,
+    suite: HandshakeSuite,
+    payload: &[u8],
+) -> Result<(Vec<u8>, AwaitingResponse), CryptoError> {
+    let responder = remote.hybrid().ok_or(CryptoError::HybridKeyRequired)?;
+    if !suite.is_supported(channel) {
+        return Err(CryptoError::UnsupportedSuite);
+    }
+    if payload.len() > MAX_HANDSHAKE_PAYLOAD_LEN {
+        return Err(CryptoError::MessageTooLarge);
+    }
+    let (ct1, ss1) = encapsulate(responder.encapsulation_key())?;
+    let psk0 = kem_psk(PSK_INITIATOR, &ct1, ss1.as_bytes());
+    let prologue = hybrid_prologue(channel, responder.encapsulation_key(), &ct1)?;
+    let (builder, secret) = builder_with(local, channel, suite, &prologue)?;
+    let remote_static = responder.classical().x25519();
+    let mut state = builder
+        .psk(0, &psk0)
+        .and_then(|b| b.local_private_key(secret.as_ref()))
+        .and_then(|b| b.remote_public_key(&remote_static))
+        .and_then(Builder::build_initiator)
+        .map_err(|_| CryptoError::Handshake)?;
+    let own = local.static_kem();
+    let mut full = Vec::with_capacity(EK_LEN.saturating_add(payload.len()));
+    full.extend_from_slice(&own.ek);
+    full.extend_from_slice(payload);
+    let mut msg1 = ct1;
+    msg1.extend_from_slice(&write(&mut state, &full)?);
+    Ok((
+        msg1,
+        AwaitingResponse {
+            state,
+            responder: responder.fingerprint(),
+            suite,
+            static_dk: Some(Box::new(local.static_decapsulation_key())),
         },
     ))
 }
@@ -202,6 +327,7 @@ pub enum Responded {
 #[derive(Debug)]
 pub struct Identified {
     peer: Fingerprint,
+    hybrid: Option<HybridFingerprint>,
     payload: Vec<u8>,
     suite: HandshakeSuite,
 }
@@ -218,6 +344,13 @@ impl Identified {
     #[must_use]
     pub const fn suite(&self) -> HandshakeSuite {
         self.suite
+    }
+
+    /// The fingerprint v2 the initiator claimed (hybrid IK suite only). Unconfirmed: there
+    /// is no message 2, so nothing proved the ML-KEM half.
+    #[must_use]
+    pub const fn hybrid_peer(&self) -> Option<HybridFingerprint> {
+        self.hybrid
     }
 
     /// The payload of message 1, authenticated by Noise.
@@ -254,6 +387,7 @@ pub fn respond_or_identify(
     // The handshake state is dropped here: nothing can advance it any more.
     Ok(Responded::Unaccepted(Identified {
         peer: pending.peer,
+        hybrid: pending.hybrid_peer(),
         payload: pending.payload,
         suite: pending.suite,
     }))
@@ -281,6 +415,9 @@ fn respond_one(
     if msg1.len() > MAX_MESSAGE_LEN {
         return Err(CryptoError::Handshake);
     }
+    if suite.requires_hybrid_identity() {
+        return respond_hybrid(local, msg1, channel, suite);
+    }
     let (builder, secret) = builder(local, channel, suite).map_err(|_| CryptoError::Handshake)?;
     let mut state = builder
         .local_private_key(secret.as_ref())
@@ -303,6 +440,58 @@ fn respond_one(
         state,
         peer,
         payload: buffer,
+        suite,
+        hybrid: None,
+    })
+}
+
+/// The responder of the hybrid IK suite: decapsulates `ct1` with the static key (the only
+/// KEM operation before the authorization decision), reads message 1, checks the initiator's
+/// encapsulation key (FIPS 203 §7.2) and binds it into the fingerprint v2.
+fn respond_hybrid(
+    local: &Identity,
+    msg1: &[u8],
+    channel: Channel,
+    suite: HandshakeSuite,
+) -> Result<AuthorizationPending, CryptoError> {
+    let (Some(ct1), Some(rest)) = (msg1.get(..CT_LEN), msg1.get(CT_LEN..)) else {
+        return Err(CryptoError::Handshake);
+    };
+    let own = local.static_kem();
+    let ss1 = MlKem768::decapsulate(&own.dk, ct1).map_err(|_| CryptoError::Handshake)?;
+    let psk0 = kem_psk(PSK_INITIATOR, ct1, ss1.as_bytes());
+    let prologue = hybrid_prologue(channel, &own.ek, ct1)?;
+    let (builder, secret) =
+        builder_with(local, channel, suite, &prologue).map_err(|_| CryptoError::Handshake)?;
+    let mut state = builder
+        .psk(0, &psk0)
+        .and_then(|b| b.local_private_key(secret.as_ref()))
+        .and_then(Builder::build_responder)
+        .map_err(|_| CryptoError::Handshake)?;
+    let mut buffer = Zeroizing::new(vec![0_u8; rest.len()]);
+    let len = state
+        .read_message(rest, &mut buffer)
+        .map_err(|_| CryptoError::Handshake)?;
+    let plain = buffer.get(..len).ok_or(CryptoError::Handshake)?;
+    let (Some(initiator_ek), Some(payload)) = (plain.get(..EK_LEN), plain.get(EK_LEN..)) else {
+        return Err(CryptoError::Handshake);
+    };
+    // The same error for every reason (no oracle): a bad key, an oversized payload.
+    if payload.len() > MAX_HANDSHAKE_PAYLOAD_LEN
+        || !MlKem768::is_valid_encapsulation_key(initiator_ek)
+    {
+        return Err(CryptoError::Handshake);
+    }
+    let raw = state.get_remote_static().ok_or(CryptoError::Handshake)?;
+    let x25519: [u8; 32] = raw.try_into().map_err(|_| CryptoError::Handshake)?;
+    Ok(AuthorizationPending {
+        peer: fingerprint_of_x25519(&x25519),
+        hybrid: Some(HybridPeer {
+            fingerprint: hybrid_fingerprint_of(&x25519, initiator_ek),
+            encapsulation_key: initiator_ek.to_vec(),
+        }),
+        payload: payload.to_vec(),
+        state,
         suite,
     })
 }
@@ -332,6 +521,8 @@ pub struct AwaitingResponse {
     state: HandshakeState,
     responder: Fingerprint,
     suite: HandshakeSuite,
+    /// The initiator's static decapsulation key, for `ct2` (hybrid IK suite only).
+    static_dk: Option<Box<<MlKem768 as Kem>::DecapsulationKey>>,
 }
 
 impl AwaitingResponse {
@@ -349,6 +540,21 @@ impl AwaitingResponse {
         if msg2.len() > MAX_MESSAGE_LEN {
             return Err(CryptoError::Handshake);
         }
+        let msg2 = match &self.static_dk {
+            None => msg2,
+            Some(dk) => {
+                // `ct2 ‖ message 2`: `psk2` comes from the initiator's own static key.
+                let (Some(ct2), Some(rest)) = (msg2.get(..CT_LEN), msg2.get(CT_LEN..)) else {
+                    return Err(CryptoError::Handshake);
+                };
+                let ss2 = MlKem768::decapsulate(dk, ct2).map_err(|_| CryptoError::Handshake)?;
+                let psk2 = kem_psk(PSK_RESPONDER, ct2, ss2.as_bytes());
+                self.state
+                    .set_psk(2, psk2.as_ref())
+                    .map_err(|_| CryptoError::Handshake)?;
+                rest
+            }
+        };
         let mut payload = vec![0_u8; msg2.len()];
         let len = self
             .state
@@ -372,6 +578,17 @@ pub struct AuthorizationPending {
     peer: Fingerprint,
     payload: Vec<u8>,
     suite: HandshakeSuite,
+    /// The initiator's hybrid identity (hybrid IK suite only).
+    hybrid: Option<HybridPeer>,
+}
+
+/// What message 1 of the hybrid IK suite says about the initiator.
+#[derive(Debug)]
+struct HybridPeer {
+    fingerprint: HybridFingerprint,
+    /// Its static encapsulation key, already checked (FIPS 203 §7.2): `accept` encapsulates
+    /// `ct2` to it.
+    encapsulation_key: Vec<u8>,
 }
 
 impl AuthorizationPending {
@@ -385,6 +602,15 @@ impl AuthorizationPending {
     #[must_use]
     pub fn peer(&self) -> Fingerprint {
         self.peer
+    }
+
+    /// The initiator's fingerprint v2, with the hybrid IK suite: X25519 proved by Noise, the
+    /// ML-KEM half proved only at key confirmation (finding AP-12): the decision taken on it
+    /// before message 2 is classical-strength, and a peer that cannot decapsulate `ct2` never
+    /// produces an authentic transport message.
+    #[must_use]
+    pub fn hybrid_peer(&self) -> Option<HybridFingerprint> {
+        self.hybrid.as_ref().map(|h| h.fingerprint)
     }
 
     /// The payload of message 1, authenticated by Noise (empty if the initiator did not send
@@ -402,7 +628,19 @@ impl AuthorizationPending {
     /// [`CryptoError::Handshake`] if the Noise state cannot advance, or if `e1` is not a valid
     /// ML-KEM-768 encapsulation key.
     pub fn accept(mut self) -> Result<(Vec<u8>, Transport), CryptoError> {
-        let msg2 = write(&mut self.state, &[])?;
+        let msg2 = match &self.hybrid {
+            None => write(&mut self.state, &[])?,
+            Some(hybrid) => {
+                let (ct2, ss2) = encapsulate(&hybrid.encapsulation_key)?;
+                let psk2 = kem_psk(PSK_RESPONDER, &ct2, ss2.as_bytes());
+                self.state
+                    .set_psk(2, psk2.as_ref())
+                    .map_err(|_| CryptoError::Handshake)?;
+                let mut msg2 = ct2;
+                msg2.extend_from_slice(&write(&mut self.state, &[])?);
+                msg2
+            }
+        };
         let transport = Transport::from_handshake(self.state, self.peer)?;
         Ok((msg2, transport))
     }

@@ -46,15 +46,17 @@ fn each_suite_has_its_own_confirmation() {
     assert_eq!(HFS.confirmation(), b"TCN/2 ready");
 }
 
+/// Since PQ-AUTH the hybrid IK suite (0x02) runs on both channels too.
 #[test]
 fn the_suites_a_channel_supports_form_a_set() {
+    let hybrid = HandshakeSuite::NoiseIkHybrid25519MlKem768;
     assert_eq!(
         AcceptedSuites::supported(HandshakeChannel::Outer),
-        AcceptedSuites::new([CLASSIC, HFS]).unwrap()
+        AcceptedSuites::new([CLASSIC, HFS, hybrid]).unwrap()
     );
     assert_eq!(
         AcceptedSuites::supported(HandshakeChannel::EndToEnd),
-        AcceptedSuites::new([CLASSIC, HFS]).unwrap()
+        AcceptedSuites::new([CLASSIC, HFS, hybrid]).unwrap()
     );
 }
 

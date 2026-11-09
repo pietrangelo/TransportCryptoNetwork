@@ -13,8 +13,7 @@
 )]
 
 use sha2::{Digest, Sha256};
-use sha3::Shake256;
-use sha3::digest::{ExtendableOutput, Update, XofReader};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
 use zt_crypto::kem::{Kem, KemSeed, MlKem768};
 use zt_crypto::{CryptoError, HybridPublicKey, Identity, PeerKey, PublicKey};
 use zt_domain::{FingerprintText, HybridFingerprint};
@@ -24,7 +23,7 @@ fn seeded(b: u8) -> ([u8; 32], Identity) {
     (seed, Identity::from_secret_hex(&hex::encode(seed)).unwrap())
 }
 
-/// D12: `d ‖ z = SHAKE256("TCN ML-KEM-768 seed v1\0" ‖ seed, 64)`, then FIPS 203 KeyGen.
+/// D12: `d ‖ z = SHAKE256("TCN ML-KEM-768 seed v1\0" ‖ seed, 64)`, then FIPS 203 `KeyGen`.
 fn derived_ek(seed: &[u8; 32]) -> Vec<u8> {
     let mut xof = Shake256::default();
     xof.update(b"TCN ML-KEM-768 seed v1\0");
@@ -144,12 +143,18 @@ fn malformed_v2_public_keys_are_refused() {
         bad_ek,
         weak_ed,
     ] {
-        assert!(bad.parse::<HybridPublicKey>().is_err(), "{}", &bad[..bad.len().min(40)]);
+        assert!(
+            bad.parse::<HybridPublicKey>().is_err(),
+            "{}",
+            &bad[..bad.len().min(40)]
+        );
     }
     // The v1 parser does not take a v2 text either.
     assert!(text.parse::<PublicKey>().is_err());
     // Errors never carry the key.
-    let err = text[..text.len() - 2].parse::<HybridPublicKey>().unwrap_err();
+    let err = text[..text.len() - 2]
+        .parse::<HybridPublicKey>()
+        .unwrap_err();
     assert!(matches!(err, CryptoError::InvalidKey));
 }
 

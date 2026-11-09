@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, timeout_at};
 pub use zt_application::failover::FailoverConfig;
 use zt_application::failover::{Action, Event, FailoverPlan, Failure, GiveUp, MAX_IN_FLIGHT, Step};
+use zt_crypto::Identity;
 use zt_crypto::noise::{self, Channel};
-use zt_crypto::{Identity, PublicKey};
 use zt_domain::flow::Window;
 use zt_domain::{CloseReason, Frame, NodeId, RejectReason, StreamId};
 
@@ -28,8 +28,9 @@ pub struct ClientConfig {
     pub relays: Vec<crate::RelayEndpoint>,
     /// Destination node.
     pub node: NodeId,
-    /// Public key of the node's agent, pinned for the end-to-end channel.
-    pub node_key: PublicKey,
+    /// Public key of the node's agent, pinned for the end-to-end channel: v1, or v2 (needed by
+    /// the hybrid IK suite, PQ-AUTH).
+    pub node_key: zt_crypto::PeerKey,
     /// Handshake suite pinned for the end-to-end channel with the node (PROTOCOL §7.5).
     pub node_suite: zt_domain::HandshakeSuite,
     /// Client certificate (PROTOCOL §15), sent in message 1 of both channels.

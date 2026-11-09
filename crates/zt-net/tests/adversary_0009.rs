@@ -64,7 +64,7 @@ async fn replayed_suite_rejections_on_the_agent_are_rate_limited_per_identity() 
     .await;
     let (recorded, _) = noise::initiate_suite(
         &alice,
-        &relay.agent.public_key(),
+        relay.agent.public_key(),
         Channel::EndToEnd,
         CLASSIC,
         &[],
@@ -110,7 +110,7 @@ async fn replayed_authentication_failures_on_the_agent_are_rate_limited_per_iden
         FakeRelay::start_logging(clients, AcceptedSuites::only(CLASSIC), INTERVAL).await;
     let (recorded, _) = noise::initiate_suite(
         &alice,
-        &relay.agent.public_key(),
+        relay.agent.public_key(),
         Channel::EndToEnd,
         CLASSIC,
         &[],
@@ -151,7 +151,7 @@ async fn made_up_keys_cannot_grow_the_agents_line_table() {
         let mallory = Identity::generate().unwrap();
         let (msg1, _) = noise::initiate_suite(
             &mallory,
-            &relay.agent.public_key(),
+            relay.agent.public_key(),
             Channel::EndToEnd,
             CLASSIC,
             &[],
@@ -305,7 +305,7 @@ async fn a_large_certificate_hybrid_msg1_to_a_classical_agent_is_a_suite_rejecti
     .await;
     let (msg1, _) = noise::initiate_suite(
         &alice,
-        &relay.agent.public_key(),
+        relay.agent.public_key(),
         Channel::EndToEnd,
         HFS,
         &cert,

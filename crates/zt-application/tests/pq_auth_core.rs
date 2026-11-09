@@ -2,7 +2,12 @@
 //! connection carries the hybrid identity its handshake proved (the core sees it only after
 //! key confirmation), v2 pins are rechecked on every policy update, a hybrid peer admitted
 //! through a v1 entry is reported, and sessions name the hybrid identity.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -61,7 +66,11 @@ struct Harness {
 impl Harness {
     fn new(pin_alice: bool) -> Self {
         Self {
-            core: RelayCore::new(Arc::new(policy(pin_alice)), RelayLimits::default(), Counter(0)),
+            core: RelayCore::new(
+                Arc::new(policy(pin_alice)),
+                RelayLimits::default(),
+                Counter(0),
+            ),
         }
     }
     fn input(&mut self, input: Input) -> Vec<Output> {

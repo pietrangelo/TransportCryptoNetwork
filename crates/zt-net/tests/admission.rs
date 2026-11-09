@@ -77,7 +77,7 @@ async fn a_client_that_sends_no_frame_is_closed_at_the_first_frame_deadline() {
     .await;
     let relay = &lab.relays[0];
     let tcp = TcpStream::connect(relay.addr).await.unwrap();
-    let mut ch = channel::connect(tcp, &client, &relay.key, Channel::Outer, &timeouts())
+    let mut ch = channel::connect(tcp, &client, &relay.key.into(), Channel::Outer, &timeouts())
         .await
         .expect("handshake completes");
     let started = tokio::time::Instant::now();

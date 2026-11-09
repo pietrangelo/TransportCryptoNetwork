@@ -7,7 +7,7 @@ use zt_crypto::{CryptoError, Identity, Keyring};
 
 fn handshake_with(pinned: &Identity, keys: &Keyring, ch: Channel) -> Result<(), CryptoError> {
     let initiator = Identity::generate().unwrap();
-    let (msg1, waiting) = noise::initiate(&initiator, &pinned.public_key(), ch)?;
+    let (msg1, waiting) = noise::initiate(&initiator, pinned.public_key(), ch)?;
     let pending = noise::respond_any(keys, &msg1, ch)?;
     assert_eq!(pending.peer(), initiator.fingerprint());
     let (msg2, mut resp) = pending.accept()?;
@@ -91,6 +91,6 @@ fn a_message_for_the_previous_key_on_the_other_channel_is_refused() {
     // The domain separation of channels also holds for the previous key.
     let (_, old, keys) = rotating();
     let initiator = Identity::generate().unwrap();
-    let (msg1, _) = noise::initiate(&initiator, &old.public_key(), Channel::Outer).unwrap();
+    let (msg1, _) = noise::initiate(&initiator, old.public_key(), Channel::Outer).unwrap();
     assert!(noise::respond_any(&keys, &msg1, Channel::EndToEnd).is_err());
 }

@@ -281,11 +281,10 @@ fn warn(message: &str) {
 
 fn keygen(out: &Path) -> Result<(), String> {
     let identity = config::create_identity(out).map_err(|e| e.to_string())?;
-    writeln!(
+    write!(
         std::io::stdout(),
-        "public_key  = \"{}\"\nfingerprint = {}",
-        identity.public_key(),
-        identity.fingerprint()
+        "{}",
+        config::public_identity_text(&identity)
     )
     .map_err(|e| e.to_string())
 }

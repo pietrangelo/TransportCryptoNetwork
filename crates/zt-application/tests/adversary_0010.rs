@@ -181,6 +181,7 @@ fn a_draining_core_rejects_new_streams_and_keeps_the_open_ones() {
             Input::Connected {
                 conn,
                 peer,
+                hybrid: None,
                 certificate: None,
             },
             now,

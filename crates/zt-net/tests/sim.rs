@@ -137,7 +137,7 @@ fn agent_host(
             let config = zt_net::agent::AgentConfig {
                 relays: vec![RelayEndpoint {
                     address: format!("relay:{RELAY_PORT}"),
-                    public_key: relay_key,
+                    public_key: relay_key.into(),
                     suite: HandshakeSuite::NoiseIk25519,
                 }],
                 node: node(&name),
@@ -288,11 +288,11 @@ fn half_open_agent_link_is_detected() {
         let config = ClientConfig {
             relays: vec![RelayEndpoint {
                 address: format!("relay:{RELAY_PORT}"),
-                public_key: relay_key,
+                public_key: relay_key.into(),
                 suite: HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
-            node_key: agent_key,
+            node_key: agent_key.into(),
             node_suite: HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: timeouts(),

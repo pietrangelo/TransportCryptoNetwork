@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use zt_crypto::Keyring;
-use zt_crypto::PublicKey;
+use zt_crypto::PeerKey;
 use zt_domain::{HandshakeChannel, NodeId};
 use zt_net::Timeouts;
 use zt_net::agent::{self, AgentConfig};
@@ -47,9 +47,10 @@ struct AgentArgs {
     /// of them (at most 8).
     #[arg(long, required = true, value_delimiter = ',')]
     relay: Vec<String>,
-    /// Public key of each relay (64 hex characters), in the same order as `--relay`.
+    /// Public key of each relay (64 hex characters, or its `tcn-pub-v2:` key, required by
+    /// the hybrid IK suite), in the same order as `--relay`.
     #[arg(long, required = true, value_delimiter = ',')]
-    relay_key: Vec<PublicKey>,
+    relay_key: Vec<PeerKey>,
     /// Handshake suite pinned for the relays (its exact Noise protocol name, PROTOCOL
     /// §7.5): one for all of them, or one per `--relay` in the same order. Without it, the
     /// classical suite; there is never a fallback to another suite. Pin the hybrid suite
@@ -226,6 +227,15 @@ fn pin_suites(
         }
         _ => return Err("--relay-suite: give one suite, or one per --relay".into()),
     }
+    for relay in relays.iter() {
+        config::hybrid_key_for(
+            "--relay-key",
+            &relay.address,
+            relay.suite,
+            &relay.public_key,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if accept_client_suites.is_empty() {
         return Ok(zt_domain::AcceptedSuites::only(
             zt_domain::HandshakeSuite::NoiseIk25519,
@@ -243,11 +253,10 @@ fn run(command: Command) -> Result<(), Failure> {
     match command {
         Command::Keygen { out } => {
             let identity = config::create_identity(&out).map_err(config_error)?;
-            writeln!(
+            write!(
                 std::io::stdout(),
-                "public_key  = \"{}\"\nfingerprint = {}",
-                identity.public_key(),
-                identity.fingerprint()
+                "{}",
+                config::public_identity_text(&identity)
             )
             .map_err(runtime_error)
         }

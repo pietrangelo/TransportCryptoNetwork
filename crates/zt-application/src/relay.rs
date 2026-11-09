@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use zt_domain::flow::Window;
 use zt_domain::{
     AccessPolicy, Admission, AuthFailureReason, CertClaims, CertRef, ClientCredential, CloseReason,
-    DomainEvent, Fingerprint, Frame, NodeId, RejectReason, SessionId, StreamId, UnixTime,
+    DomainEvent, Fingerprint, Frame, HybridFingerprint, NodeId, RejectReason, SessionId, StreamId,
+    UnixTime,
 };
 
 use crate::flapping::{FlapConfig, FlapDetector};
@@ -45,6 +46,9 @@ pub enum Input {
         conn: ConnId,
         /// The peer's identity.
         peer: Fingerprint,
+        /// The peer's hybrid identity, with the hybrid IK suite (PQ-AUTH, PROTOCOL §7.5.3):
+        /// proved in full, since the core sees a connection only after key confirmation.
+        hybrid: Option<HybridFingerprint>,
         /// The certificate presented in message 1, already verified (steps 3–6 of
         /// PROTOCOL §15.4); `None` without a certificate.
         certificate: Option<Arc<CertClaims>>,
@@ -154,6 +158,17 @@ enum Role {
 }
 
 /// The audit reference of a credential: `None` for the whitelist.
+/// `true` if the credential is a certificate v2 bound to this very hybrid identity: then the
+/// configuration (the CA) did check more than the X25519 key.
+fn bound_to_hybrid(role: &Role, peer_v2: &HybridFingerprint) -> bool {
+    matches!(
+        role,
+        Role::Client {
+            credential: ClientCredential::Certificate(claims)
+        } if claims.subject_hybrid() == Some(peer_v2)
+    )
+}
+
 fn cert_ref(credential: &ClientCredential) -> Option<CertRef> {
     match credential {
         ClientCredential::Key => None,
@@ -203,6 +218,8 @@ impl RecentlyClosed {
 #[derive(Debug)]
 struct Conn {
     peer: Fingerprint,
+    /// The hybrid identity the handshake proved (PQ-AUTH), rechecked against v2 pins.
+    hybrid: Option<HybridFingerprint>,
     role: Role,
     streams: BTreeSet<StreamId>,
     pings: TokenBucket,
@@ -239,6 +256,8 @@ struct Route {
     state: StreamState,
     session: SessionId,
     client: Fingerprint,
+    /// The client's hybrid identity, for audit.
+    client_v2: Option<HybridFingerprint>,
     target: NodeId,
     /// The client's certificate, for audit (`None` for the whitelist).
     certificate: Option<CertRef>,
@@ -303,8 +322,9 @@ impl<S: SessionIds> RelayCore<S> {
             Input::Connected {
                 conn,
                 peer,
+                hybrid,
                 certificate,
-            } => self.on_connected(conn, peer, certificate.as_ref(), now, &mut out),
+            } => self.on_connected(conn, peer, hybrid, certificate.as_ref(), now, &mut out),
             Input::Received { conn, frame } => {
                 if self.conns.contains_key(&conn)
                     && let Err(rule) = self.on_frame(conn, frame, now, &mut out)
@@ -367,6 +387,7 @@ impl<S: SessionIds> RelayCore<S> {
         &mut self,
         conn: ConnId,
         peer: Fingerprint,
+        hybrid: Option<HybridFingerprint>,
         certificate: Option<&Arc<CertClaims>>,
         now: Now,
         out: &mut Vec<Output>,
@@ -374,9 +395,13 @@ impl<S: SessionIds> RelayCore<S> {
         if self.conns.contains_key(&conn) {
             return;
         }
-        // Steps 1, 5 and 7–11 of PROTOCOL §15.4 rechecked with the policy and clock at the
-        // moment the connection reaches the core: a reload in the meantime is not lost.
-        let role = match self.policy.admit(&peer, certificate, now.unix) {
+        // Steps 1, 5 and 7–11 of PROTOCOL §15.4 and the v2 pin rechecked with the policy and
+        // clock at the moment the connection reaches the core: a reload in the meantime is
+        // not lost.
+        let admitted = self
+            .policy
+            .admit_hybrid(&peer, hybrid.as_ref(), certificate, now.unix);
+        let role = match admitted {
             Err(reason) => {
                 out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                     peer: Some(peer),
@@ -395,6 +420,16 @@ impl<S: SessionIds> RelayCore<S> {
             },
             Ok(Admission::Client { credential }) => Role::Client { credential },
         };
+        // A hybrid identity matched only through its X25519 key (pq.md §4.6).
+        if let Some(peer_v2) = hybrid
+            && self.policy.hybrid_identity(&peer).is_none()
+            && !bound_to_hybrid(&role, &peer_v2)
+        {
+            out.push(Output::Audit(DomainEvent::ClassicalIdentityMatch {
+                peer,
+                peer_v2,
+            }));
+        }
         let now = now.instant;
         let pings = TokenBucket::new(self.limits.ping_burst, self.limits.ping_refill, now);
         let opens = TokenBucket::new(self.limits.open_burst, self.limits.open_refill, now);
@@ -402,6 +437,7 @@ impl<S: SessionIds> RelayCore<S> {
             conn,
             Conn {
                 peer,
+                hybrid,
                 role,
                 streams: BTreeSet::new(),
                 pings,
@@ -664,6 +700,7 @@ impl<S: SessionIds> RelayCore<S> {
     ) -> Result<(), Violation> {
         let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
         let client = c.peer;
+        let client_v2 = c.hybrid;
         if c.streams.contains(&stream) {
             return Err("stream id reuse");
         }
@@ -723,6 +760,7 @@ impl<S: SessionIds> RelayCore<S> {
             state: StreamState::Opening,
             session,
             client,
+            client_v2,
             target: target.clone(),
             certificate: certificate.clone(),
             send: Window::initial(),
@@ -764,6 +802,7 @@ impl<S: SessionIds> RelayCore<S> {
             client: route.client,
             target: route.target.clone(),
             certificate: route.certificate.clone(),
+            client_v2: route.client_v2,
         };
         if let Some(back) = self.routes.get_mut(&(peer, peer_stream)) {
             back.state = StreamState::Open;
@@ -836,12 +875,13 @@ impl<S: SessionIds> RelayCore<S> {
                 continue;
             };
             let peer = c.peer;
+            let hybrid = c.hybrid;
             // Is the saved credential still valid with the new policy? (denylist, CA still
-            // pinned per key, maximum lifetime, role.)
+            // pinned per key, maximum lifetime, role, v2 pin.)
             let (keeps, credential) = match &c.role {
                 Role::Agent { node, .. } => (
                     matches!(
-                        self.policy.admit(&peer, None, now),
+                        self.policy.admit_hybrid(&peer, hybrid.as_ref(), None, now),
                         Ok(Admission::Agent { node: current }) if current == node
                     ),
                     None,
@@ -849,7 +889,7 @@ impl<S: SessionIds> RelayCore<S> {
                 Role::Client { credential } => match credential {
                     ClientCredential::Key => (
                         matches!(
-                            self.policy.admit(&peer, None, now),
+                            self.policy.admit_hybrid(&peer, hybrid.as_ref(), None, now),
                             Ok(Admission::Client {
                                 credential: ClientCredential::Key
                             })
@@ -861,7 +901,10 @@ impl<S: SessionIds> RelayCore<S> {
                     // to the `Key` credential and its permissions, even if they are narrower than
                     // the certificate's.
                     ClientCredential::Certificate(claims) => {
-                        match self.policy.admit(&peer, Some(claims), now) {
+                        match self
+                            .policy
+                            .admit_hybrid(&peer, hybrid.as_ref(), Some(claims), now)
+                        {
                             Ok(Admission::Client { credential }) => (true, Some(credential)),
                             _ => (false, Some(credential.clone())),
                         }

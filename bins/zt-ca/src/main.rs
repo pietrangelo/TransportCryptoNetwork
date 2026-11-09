@@ -16,8 +16,8 @@ use std::process::ExitCode;
 
 use clap::{ArgGroup, Parser, Subcommand};
 use zt_crypto::{
-    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, PublicKey, cert_key,
-    encode_certificate_text, sign_certificate, sign_certificate_v2, trusted_ca_key,
+    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, HybridPublicKey, PublicKey,
+    cert_key, encode_certificate_text, sign_certificate, sign_certificate_v2, trusted_ca_key,
     trusted_composite_ca_key,
 };
 use zt_domain::limits::{MAX_CERT_LIFETIME_SECS, MAX_CERT_NODES};
@@ -57,7 +57,9 @@ enum Command {
         /// Issuance log (TSV, append-only, 0600). Mandatory.
         #[arg(long)]
         log: PathBuf,
-        /// Public key of the client (64 hex characters).
+        /// Public key of the client: 64 hex characters, or its `tcn-pub-v2:` key, which a v2
+        /// CA binds to the hybrid identity (the certificate then passes only the hybrid IK
+        /// suite, PROTOCOL §15.14).
         #[arg(long)]
         subject: String,
         /// Name of the client, for audit logs (`[a-z0-9-]`, 1..=63).
@@ -173,11 +175,25 @@ struct SignArgs<'a> {
     out: &'a Path,
 }
 
+/// `--subject`: a v1 key, or a `tcn-pub-v2:` key and its fingerprint v2 (PROTOCOL §15.14).
+fn parse_subject(text: &str) -> Result<(PublicKey, Option<zt_domain::HybridFingerprint>), String> {
+    if text.starts_with(HybridPublicKey::PREFIX) {
+        let hybrid = text
+            .parse::<HybridPublicKey>()
+            .map_err(|_| "--subject: not a valid tcn-pub-v2 public key")?;
+        return Ok((*hybrid.classical(), Some(hybrid.hybrid_fingerprint())));
+    }
+    let key = parse_public_key(text).ok_or(
+        "--subject: not a valid public key (64 lowercase hexadecimal characters, or \
+         tcn-pub-v2:<hex>)",
+    )?;
+    Ok((key, None))
+}
+
 fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     // All argument checks before touching a file.
     let lifetime = parse_validity(args.validity)?;
-    let subject = parse_public_key(args.subject)
-        .ok_or("--subject: not a valid Ed25519 public key (64 lowercase hexadecimal characters)")?;
+    let (subject, subject_v2) = parse_subject(args.subject)?;
     let name =
         NodeId::try_from(args.name).map_err(|_| "--name: must be [a-z0-9-], 1..=63 characters")?;
     let scope = parse_scope(args.nodes, args.all_nodes)?;
@@ -197,6 +213,13 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     }
     let serial = random_serial()?;
     let (cert, scope, version) = match &ca {
+        AnyCaKey::V1(_) if subject_v2.is_some() => {
+            return Err(
+                "--subject: a v1 CA cannot bind a tcn-pub-v2 key; sign it with a v2 \
+                        CA, or give the 64-hex key for a classical certificate"
+                    .into(),
+            );
+        }
         AnyCaKey::V1(ca) => {
             let subject_key = cert_key(&subject);
             let ca_key = cert_key(&ca.public_key());
@@ -223,7 +246,13 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
             }
             let body = CertBodyV2::new(
                 public.ca_fp(),
-                CertSubject::Classical(subject.fingerprint()),
+                match subject_v2 {
+                    Some(hybrid) => CertSubject::Hybrid {
+                        classical: subject.fingerprint(),
+                        hybrid,
+                    },
+                    None => CertSubject::Classical(subject.fingerprint()),
+                },
                 serial,
                 not_before,
                 not_after,
@@ -248,8 +277,9 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     let subject_fp = subject.fingerprint();
     // Columns: serial, subject (X25519-level fingerprint, the revocation unit, AP-6), name,
     // validity, scope, certificate version, hybrid fingerprint of the subject (`-` if none).
+    let hybrid_column = subject_v2.map_or_else(|| "-".to_owned(), |h| h.to_string());
     let line = format!(
-        "{serial}\t{subject_fp}\t{name}\t{}\t{}\t{}\t{version}\t-\n",
+        "{serial}\t{subject_fp}\t{name}\t{}\t{}\t{}\t{version}\t{hybrid_column}\n",
         not_before.as_secs(),
         not_after.as_secs(),
         scope_column(&scope),
@@ -262,6 +292,9 @@ fn sign(args: &SignArgs<'_>) -> Result<(), String> {
     let mut out = String::new();
     let _ = writeln!(out, "serial      = {serial}");
     let _ = writeln!(out, "subject     = {subject_fp}");
+    if let Some(hybrid) = subject_v2 {
+        let _ = writeln!(out, "subject_v2  = {hybrid}");
+    }
     let _ = writeln!(out, "not_before  = {}", zt_net::utc_text(not_before));
     let _ = writeln!(out, "not_after   = {}", zt_net::utc_text(not_after));
     emit(&out)

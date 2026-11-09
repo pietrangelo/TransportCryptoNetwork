@@ -68,10 +68,10 @@ fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
     report(
         "initiator: write msg1",
         time(|| {
-            let _ = noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
+            let _ = noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
         }),
     );
-    let (msg1, _) = noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
+    let (msg1, _) = noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
     report(
         "responder: read msg1 (unauthenticated cost)",
         time(|| {
@@ -98,7 +98,7 @@ fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
         time_with(
             || {
                 let (msg1, waiting) =
-                    noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
+                    noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
                 let pending = noise::respond_suites(&keys, &msg1, channel, accepted).unwrap();
                 let (msg2, _) = pending.accept().unwrap();
                 (waiting, msg2)
@@ -112,7 +112,7 @@ fn handshake_baseline(suite: HandshakeSuite, channel: Channel) {
         "full handshake, both sides",
         time(|| {
             let (msg1, waiting) =
-                noise::initiate_suite(&client, &responder_pk, channel, suite, &cert).unwrap();
+                noise::initiate_suite(&client, responder_pk, channel, suite, &cert).unwrap();
             let pending = noise::respond_suites(&keys, &msg1, channel, accepted).unwrap();
             let (msg2, _) = pending.accept().unwrap();
             let _ = waiting.complete(&msg2).unwrap();
@@ -159,7 +159,7 @@ fn hybrid_handshake_cpu_baseline() {
     .unwrap();
     let (mut msg1, _) = noise::initiate_suite(
         &client,
-        &agent_pk,
+        agent_pk,
         Channel::EndToEnd,
         HandshakeSuite::NoiseIkhfs25519MlKem768,
         &[0x5a; 400],

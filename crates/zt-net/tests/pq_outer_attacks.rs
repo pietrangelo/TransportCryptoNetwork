@@ -62,7 +62,7 @@ async fn an_agent_with_a_client_only_suite_gets_no_message_2() {
         }),
     )
     .await;
-    let (msg1, _) = noise::initiate_suite(&agent, &relay.key, Channel::Outer, HFS, &[]).unwrap();
+    let (msg1, _) = noise::initiate_suite(&agent, relay.key, Channel::Outer, HFS, &[]).unwrap();
     for _ in 0..5 {
         assert_eq!(probe_relay(relay.addr, &msg1).await, None);
     }
@@ -102,7 +102,7 @@ async fn a_client_with_an_agent_only_suite_gets_no_message_2() {
         }),
     )
     .await;
-    let (msg1, _) = noise::initiate_suite(&alice, &relay.key, Channel::Outer, HFS, &[]).unwrap();
+    let (msg1, _) = noise::initiate_suite(&alice, relay.key, Channel::Outer, HFS, &[]).unwrap();
     for _ in 0..3 {
         assert_eq!(probe_relay(relay.addr, &msg1).await, None);
     }
@@ -118,7 +118,7 @@ async fn a_client_with_an_agent_only_suite_gets_no_message_2() {
         2
     );
     // And the agent's own suite still works for the agent.
-    let (msg1, _) = noise::initiate_suite(&agent, &relay.key, Channel::Outer, HFS, &[]).unwrap();
+    let (msg1, _) = noise::initiate_suite(&agent, relay.key, Channel::Outer, HFS, &[]).unwrap();
     assert_eq!(
         probe_relay(relay.addr, &msg1).await.map(|m| m.len()),
         Some(HFS.msg2_len())
@@ -167,12 +167,12 @@ async fn a_hybrid_pinned_client_never_falls_back() {
             .iter()
             .map(|a| zt_net::RelayEndpoint {
                 address: a.to_string(),
-                public_key: relay_key,
+                public_key: relay_key.into(),
                 suite: HFS,
             })
             .collect(),
         node: common::node("web-01"),
-        node_key: agent.public_key(),
+        node_key: agent.public_key().into(),
         node_suite: CLASSIC,
         certificate: None,
         timeouts: common::timeouts(),
@@ -208,7 +208,7 @@ async fn a_hybrid_pinned_agent_never_falls_back() {
         zt_net::agent::AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: addr.to_string(),
-                public_key: Identity::generate().unwrap().public_key(),
+                public_key: Identity::generate().unwrap().public_key().into(),
                 suite: HFS,
             }],
             node: common::node("web-01"),
@@ -255,7 +255,7 @@ async fn the_preauth_cap_admits_the_largest_hybrid_message_1_and_nothing_more() 
     .await;
     let payload = vec![0x5a; zt_domain::limits::MAX_ANY_CERT_LEN];
     let (largest, _) =
-        noise::initiate_suite(&alice, &relay.key, Channel::Outer, HFS, &payload).unwrap();
+        noise::initiate_suite(&alice, relay.key, Channel::Outer, HFS, &payload).unwrap();
     assert_eq!(largest.len(), HFS.max_msg1_len());
     assert_eq!(probe_relay(relay.addr, &largest).await, None);
     let mut over = largest.clone();
@@ -289,7 +289,7 @@ fn hybrid_message_1s_are_bound_to_their_channel() {
         (Channel::EndToEnd, Channel::Outer),
     ] {
         let (msg1, _) =
-            noise::initiate_suite(&alice, &responder.public_key(), sent, HFS, &[]).unwrap();
+            noise::initiate_suite(&alice, responder.public_key(), sent, HFS, &[]).unwrap();
         assert_eq!(
             noise::respond_suites(&keys, &msg1, sent, both)
                 .unwrap()
@@ -299,14 +299,9 @@ fn hybrid_message_1s_are_bound_to_their_channel() {
         assert!(noise::respond_suites(&keys, &msg1, other, both).is_err());
         assert!(noise::respond_or_identify(&keys, &msg1, other, both).is_err());
     }
-    let (classic, _) = noise::initiate_suite(
-        &alice,
-        &responder.public_key(),
-        Channel::Outer,
-        CLASSIC,
-        &[],
-    )
-    .unwrap();
+    let (classic, _) =
+        noise::initiate_suite(&alice, responder.public_key(), Channel::Outer, CLASSIC, &[])
+            .unwrap();
     assert!(
         noise::respond_suites(&keys, &classic, Channel::Outer, AcceptedSuites::only(HFS)).is_err()
     );

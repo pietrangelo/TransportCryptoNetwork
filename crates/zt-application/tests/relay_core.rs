@@ -99,6 +99,7 @@ impl Harness {
         self.input(Input::Connected {
             conn: ConnId(conn),
             peer: fp(peer),
+            hybrid: None,
             certificate: None,
         })
     }
@@ -239,6 +240,7 @@ fn full_session_lifecycle_is_routed_and_audited() {
                 client,
                 target,
                 certificate: None,
+                client_v2: None,
             },
         ] => {
             assert_eq!(client, &fp(ANSIBLE));

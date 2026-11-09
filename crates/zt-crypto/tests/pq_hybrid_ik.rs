@@ -24,8 +24,7 @@
 )]
 
 use sha2::{Digest, Sha256};
-use sha3::Shake256;
-use sha3::digest::{ExtendableOutput, Update, XofReader};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
 use snow::params::{CipherChoice, DHChoice, HashChoice, KemChoice};
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::types::{Cipher, Dh, Hash, Random};
@@ -74,7 +73,12 @@ impl snow::types::Kem for EphemeralKem {
     fn pubkey(&self) -> &[u8] {
         &self.ek
     }
-    fn encapsulate(&self, pk: &[u8], ss: &mut [u8], ct: &mut [u8]) -> Result<(usize, usize), snow::Error> {
+    fn encapsulate(
+        &self,
+        pk: &[u8],
+        ss: &mut [u8],
+        ct: &mut [u8],
+    ) -> Result<(usize, usize), snow::Error> {
         let (c, s) = MlKem768::encapsulate(pk, &rnd()).map_err(|_| snow::Error::Kem)?;
         ss[..32].copy_from_slice(s.as_bytes());
         ct[..c.len()].copy_from_slice(&c);
@@ -224,7 +228,9 @@ fn hand_complete(
         Some(dk) => *MlKem768::decapsulate(dk, ct2).unwrap().as_bytes(),
         None => rnd(),
     };
-    state.set_psk(2, &psk(b"TCN/3 skem-r\0", ct2, &ss2)).unwrap();
+    state
+        .set_psk(2, &psk(b"TCN/3 skem-r\0", ct2, &ss2))
+        .unwrap();
     let mut buf = vec![0_u8; 65_535];
     let n = state.read_message(rest, &mut buf).map_err(|_| ())?;
     if n != 0 {
@@ -234,7 +240,11 @@ fn hand_complete(
 }
 
 /// The hand-built responder: reads a message 1 from `zt-crypto` and answers it.
-fn hand_respond(responder: &Node, channel: Channel, msg1: &[u8]) -> (Vec<u8>, Vec<u8>, snow::TransportState) {
+fn hand_respond(
+    responder: &Node,
+    channel: Channel,
+    msg1: &[u8],
+) -> (Vec<u8>, Vec<u8>, snow::TransportState) {
     let (ct1, rest) = msg1.split_at(CT);
     let ss1 = MlKem768::decapsulate(&responder.dk, ct1).unwrap();
     let mut state = Builder::with_resolver(NAME.parse().unwrap(), Box::new(TestResolver))
@@ -250,11 +260,17 @@ fn hand_respond(responder: &Node, channel: Channel, msg1: &[u8]) -> (Vec<u8>, Ve
     let n = state.read_message(rest, &mut buf).unwrap();
     let payload = buf[..n].to_vec();
     let (ct2, ss2) = MlKem768::encapsulate(&payload[..EK], &rnd()).unwrap();
-    state.set_psk(2, &psk(b"TCN/3 skem-r\0", &ct2, ss2.as_bytes())).unwrap();
+    state
+        .set_psk(2, &psk(b"TCN/3 skem-r\0", &ct2, ss2.as_bytes()))
+        .unwrap();
     let n = state.write_message(&[], &mut buf).unwrap();
     let mut msg2 = ct2;
     msg2.extend_from_slice(&buf[..n]);
-    (msg2, payload[EK..].to_vec(), state.into_transport_mode().unwrap())
+    (
+        msg2,
+        payload[EK..].to_vec(),
+        state.into_transport_mode().unwrap(),
+    )
 }
 
 fn keys(n: &Node) -> Keyring {
@@ -323,7 +339,7 @@ fn an_independent_implementation_interoperates_in_both_roles() {
     // zt-crypto initiator → hand-built responder.
     let (msg1, waiting) = noise::initiate_suite(
         &client.id,
-        &agent.id.hybrid_public_key(),
+        agent.id.hybrid_public_key(),
         Channel::Outer,
         HYBRID,
         b"c2",
@@ -347,7 +363,7 @@ fn the_previous_key_still_answers() {
     .unwrap();
     let (msg1, _) = noise::initiate_suite(
         &client.id,
-        &old.id.hybrid_public_key(),
+        old.id.hybrid_public_key(),
         Channel::Outer,
         HYBRID,
         &[],
@@ -357,19 +373,26 @@ fn the_previous_key_still_answers() {
 }
 
 /// Spec: the hybrid suite needs the responder's v2 key; a v2 key also pins the classical and
-/// IKhfs suites (only its X25519 part is used there).
+/// `IKhfs` suites (only its X25519 part is used there).
 #[test]
 fn the_hybrid_suite_needs_a_v2_pin() {
     let (client, agent) = (node(0x16), node(0x28));
     assert_eq!(
-        noise::initiate_suite(&client.id, &agent.id.public_key(), Channel::Outer, HYBRID, &[])
-            .err(),
+        noise::initiate_suite(
+            &client.id,
+            agent.id.public_key(),
+            Channel::Outer,
+            HYBRID,
+            &[]
+        )
+        .err(),
         Some(CryptoError::HybridKeyRequired)
     );
     let v2 = PeerKey::from(agent.id.hybrid_public_key());
     for suite in [CLASSIC, HFS] {
         let (msg1, _) = noise::initiate_suite(&client.id, &v2, Channel::Outer, suite, &[]).unwrap();
-        let pending = noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(suite)).unwrap();
+        let pending =
+            noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(suite)).unwrap();
         assert_eq!(pending.hybrid_peer(), None);
     }
 }
@@ -383,7 +406,7 @@ fn a_tampered_ct1_is_refused() {
     let (client, agent) = (node(0x17), node(0x29));
     let (msg1, _) = noise::initiate_suite(
         &client.id,
-        &agent.id.hybrid_public_key(),
+        agent.id.hybrid_public_key(),
         Channel::Outer,
         HYBRID,
         &[],
@@ -407,18 +430,23 @@ fn a_tampered_ct2_is_refused() {
     for pos in [0, CT / 2, CT - 1, CT, HYBRID.msg2_len() - 1] {
         let (msg1, waiting) = noise::initiate_suite(
             &client.id,
-            &agent.id.hybrid_public_key(),
+            agent.id.hybrid_public_key(),
             Channel::Outer,
             HYBRID,
             &[],
         )
         .unwrap();
-        let (mut msg2, _) = noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID))
-            .unwrap()
-            .accept()
-            .unwrap();
+        let (mut msg2, _) =
+            noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID))
+                .unwrap()
+                .accept()
+                .unwrap();
         msg2[pos] ^= 0x80;
-        assert_eq!(waiting.complete(&msg2).err(), Some(CryptoError::Handshake), "{pos}");
+        assert_eq!(
+            waiting.complete(&msg2).err(),
+            Some(CryptoError::Handshake),
+            "{pos}"
+        );
     }
 }
 
@@ -443,7 +471,7 @@ fn a_message_1_for_another_responder_kem_key_is_refused() {
     let other = Keyring::single(Identity::generate().unwrap());
     let (msg1, _) = noise::initiate_suite(
         &client.id,
-        &agent.id.hybrid_public_key(),
+        agent.id.hybrid_public_key(),
         Channel::Outer,
         HYBRID,
         &[],
@@ -472,10 +500,13 @@ fn a_crqc_impostor_fails_at_key_confirmation() {
         noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).unwrap();
     assert_eq!(pending.peer(), victim.id.fingerprint());
     assert_ne!(pending.hybrid_peer(), Some(victim.id.hybrid_fingerprint()));
-    assert_eq!(pending.hybrid_peer(), Some(zt_crypto::hybrid_fingerprint_of(
-        &victim.id.public_key().x25519(),
-        &attacker.ek
-    )));
+    assert_eq!(
+        pending.hybrid_peer(),
+        Some(zt_crypto::hybrid_fingerprint_of(
+            &victim.id.public_key().x25519(),
+            &attacker.ek
+        ))
+    );
     // Victim's X25519 and the victim's ek: message 2, then nothing.
     let (msg1, state) = hand_msg1(
         &victim.x25519,
@@ -514,7 +545,14 @@ fn an_invalid_initiator_kem_key_is_refused() {
     );
     assert!(noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).is_err());
     // A payload shorter than an encapsulation key is refused too.
-    let (msg1, _) = hand_msg1(&client.x25519, &client.ek[..100], &agent, Channel::Outer, &[], Twist::default());
+    let (msg1, _) = hand_msg1(
+        &client.x25519,
+        &client.ek[..100],
+        &agent,
+        Channel::Outer,
+        &[],
+        Twist::default(),
+    );
     assert!(noise::respond_suites(&keys(&agent), &msg1, Channel::Outer, only(HYBRID)).is_err());
 }
 
@@ -525,7 +563,7 @@ fn a_replayed_message_1_shares_no_key() {
     let (client, agent) = (node(0x1d), node(0x2e));
     let (msg1, waiting) = noise::initiate_suite(
         &client.id,
-        &agent.id.hybrid_public_key(),
+        agent.id.hybrid_public_key(),
         Channel::EndToEnd,
         HYBRID,
         &[],
@@ -538,10 +576,11 @@ fn a_replayed_message_1_shares_no_key() {
         .unwrap();
     let mut initiator = waiting.complete(&msg2).unwrap();
     let confirmation = initiator.encrypt(HYBRID.confirmation()).unwrap();
-    let (msg2b, mut replayed) = noise::respond_suites(&ring, &msg1, Channel::EndToEnd, only(HYBRID))
-        .unwrap()
-        .accept()
-        .unwrap();
+    let (msg2b, mut replayed) =
+        noise::respond_suites(&ring, &msg1, Channel::EndToEnd, only(HYBRID))
+            .unwrap()
+            .accept()
+            .unwrap();
     assert_ne!(msg2, msg2b);
     assert!(replayed.decrypt(&confirmation).is_err());
 }
@@ -557,7 +596,8 @@ fn no_suite_is_read_as_another() {
     let classic_and_hfs = AcceptedSuites::new([CLASSIC, HFS]).unwrap();
     assert!(noise::respond_suites(&ring, &hybrid, Channel::Outer, classic_and_hfs).is_err());
     for suite in [CLASSIC, HFS] {
-        let (other, _) = noise::initiate_suite(&client.id, &v2, Channel::Outer, suite, &[]).unwrap();
+        let (other, _) =
+            noise::initiate_suite(&client.id, &v2, Channel::Outer, suite, &[]).unwrap();
         assert!(noise::respond_suites(&ring, &other, Channel::Outer, only(HYBRID)).is_err());
     }
     match noise::respond_or_identify(&ring, &hybrid, Channel::Outer, classic_and_hfs).unwrap() {
@@ -570,15 +610,17 @@ fn no_suite_is_read_as_another() {
     }
 }
 
+/// Builds a prologue from `ct1` and the responder's encapsulation key.
+type Prologue = fn(&[u8], &[u8]) -> Vec<u8>;
 /// Attack (cross-channel prologue confusion): a message 1 of one channel is refused on the
-/// other, and so is one written with the IKhfs prologue or without `SHA-256(ek_r)`.
+/// other, and so is one written with the `IKhfs` prologue or without `SHA-256(ek_r)`.
 #[test]
 fn the_prologue_binds_channel_suite_and_responder_kem_key() {
     let (client, agent) = (node(0x21), node(0x30));
     let ring = keys(&agent);
     let (outer, _) = noise::initiate_suite(
         &client.id,
-        &agent.id.hybrid_public_key(),
+        agent.id.hybrid_public_key(),
         Channel::Outer,
         HYBRID,
         &[],
@@ -587,7 +629,7 @@ fn the_prologue_binds_channel_suite_and_responder_kem_key() {
     assert!(noise::respond_suites(&ring, &outer, Channel::EndToEnd, only(HYBRID)).is_err());
     assert!(noise::respond_suites(&ring, &outer, Channel::Outer, only(HYBRID)).is_ok());
     // Hand-built with altered prologues.
-    let variants: [fn(&[u8], &[u8]) -> Vec<u8>; 3] = [
+    let variants: [Prologue; 3] = [
         |ct1, _ek| [b"TCN/2 outer\x01".as_slice(), ct1].concat(),
         |ct1, _ek| [b"TCN/3 outer\x02".as_slice(), ct1].concat(),
         |ct1, ek| [b"TCN/3 outer\x01".as_slice(), &Sha256::digest(ek), ct1].concat(),
@@ -619,9 +661,13 @@ fn truncated_and_oversized_messages_are_refused() {
     let (client, agent) = (node(0x23), node(0x31));
     let ring = keys(&agent);
     let v2 = agent.id.hybrid_public_key();
-    let (msg1, waiting) = noise::initiate_suite(&client.id, &v2, Channel::Outer, HYBRID, &[]).unwrap();
+    let (msg1, waiting) =
+        noise::initiate_suite(&client.id, &v2, Channel::Outer, HYBRID, &[]).unwrap();
     for len in [0, 1, CT - 1, CT, CT + 32, msg1.len() - 1] {
-        assert!(noise::respond_suites(&ring, &msg1[..len], Channel::Outer, only(HYBRID)).is_err(), "{len}");
+        assert!(
+            noise::respond_suites(&ring, &msg1[..len], Channel::Outer, only(HYBRID)).is_err(),
+            "{len}"
+        );
     }
     let mut longer = msg1.clone();
     longer.push(0);

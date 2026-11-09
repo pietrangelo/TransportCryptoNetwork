@@ -29,7 +29,8 @@ use zt_crypto::noise::Channel;
 use zt_domain::flow::{MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE};
 use zt_domain::{
     AccessPolicy, AuthFailureReason, CertClaims, CertRef, DomainEvent, Fingerprint, Frame,
-    HandshakeSuite, InitiatorRole, PeerRole, RejectReason, SessionId, SuitePolicy,
+    HandshakeSuite, HybridFingerprint, InitiatorRole, PeerRole, RejectReason, SessionId,
+    SuitePolicy,
 };
 
 use crate::lifecycle::Progress;
@@ -131,13 +132,16 @@ pub(crate) fn audit(event: &DomainEvent) {
         DomainEvent::SessionEstablished {
             session,
             client,
+            client_v2,
             target,
             certificate,
         } => {
             let c = CertFields::of(certificate.as_ref());
+            let peer_v2 = client_v2.as_ref().map(ToString::to_string);
             emit!(
                     session = %session_hex(session),
                     peer = %client,
+                    peer_v2 = peer_v2.as_deref(),
                     node = %target,
                     credential = c.credential,
                     ca = c.ca.as_deref(),
@@ -219,6 +223,11 @@ pub(crate) fn audit(event: &DomainEvent) {
                 "handshake suite rejected"
             );
         }
+        // A hybrid peer admitted by a v1 entry (pq.md §4.6): the configuration checked only
+        // its X25519 key. Written after key confirmation.
+        DomainEvent::ClassicalIdentityMatch { peer, peer_v2 } => {
+            emit!(%peer, %peer_v2, "hybrid identity matched by a classical entry");
+        }
         DomainEvent::AgentFlapping {
             node,
             fingerprint,
@@ -271,6 +280,7 @@ impl CertFields {
 fn failure_fields(reason: AuthFailureReason) -> (String, Option<&'static str>) {
     match reason {
         AuthFailureReason::KeyRevoked => ("key_revoked".into(), None),
+        AuthFailureReason::IdentityDowngrade => ("identity_downgrade".into(), None),
         AuthFailureReason::Certificate(check) => ("certificate".into(), Some(check.as_str())),
         other => (format!("{other:?}"), None),
     }
@@ -317,6 +327,7 @@ enum HubEvent {
     Connected {
         conn: ConnId,
         peer: Fingerprint,
+        hybrid: Option<HybridFingerprint>,
         certificate: Option<Arc<CertClaims>>,
         tx: mpsc::Sender<Frame>,
     },
@@ -856,7 +867,7 @@ impl Connection {
         admitted: &Admitted,
     ) -> Option<(
         channel::Established<IO>,
-        Fingerprint,
+        Peer,
         Option<Arc<CertClaims>>,
         Frame,
         InitiatorRole,
@@ -887,10 +898,13 @@ impl Connection {
             }
         };
         let peer = pending.peer();
+        // Claimed in message 1, proved at key confirmation (finding AP-12): before message 2
+        // it can only refuse, never grant more than the X25519 key.
+        let hybrid = pending.hybrid_peer();
         let policy = self.policy.current();
         // PROTOCOL §15.4, before message 2: a rejection is equivalent to an unknown key, which
         // does not even receive the second handshake message.
-        let certificate = match admit(&policy, &peer, pending.payload()) {
+        let certificate = match admit(&policy, &peer, hybrid.as_ref(), pending.payload()) {
             Ok(certificate) => certificate,
             Err((reason, certificate)) => {
                 if is_known_identity(&policy, &peer, reason) {
@@ -954,7 +968,16 @@ impl Connection {
         ch.confirmed();
         self.confirmed.note(role, suite);
         tracing::debug!(%addr, %peer, conn = self.conn.0, ?suite, "peer connected");
-        Some((ch, peer, certificate, first, role))
+        Some((
+            ch,
+            Peer {
+                fingerprint: peer,
+                hybrid,
+            },
+            certificate,
+            first,
+            role,
+        ))
     }
 
     /// A confirmed identity refused at admission (finding A8-10): one rate-limited audit line
@@ -991,7 +1014,7 @@ impl Connection {
     async fn run<IO>(
         self,
         mut ch: channel::Established<IO>,
-        peer: Fingerprint,
+        peer: Peer,
         certificate: Option<Arc<CertClaims>>,
         first: Frame,
         idle: Duration,
@@ -1004,7 +1027,8 @@ impl Connection {
             .hub
             .send(HubEvent::Connected {
                 conn,
-                peer,
+                peer: peer.fingerprint,
+                hybrid: peer.hybrid,
                 certificate,
                 tx,
             })
@@ -1057,6 +1081,14 @@ impl Connection {
     }
 }
 
+/// The identities a confirmed initiator proved: its X25519-level fingerprint and, with the
+/// hybrid IK suite, its fingerprint v2.
+#[derive(Clone, Copy)]
+struct Peer {
+    fingerprint: Fingerprint,
+    hybrid: Option<HybridFingerprint>,
+}
+
 /// The rejection from [`admit`]: the reason and, after signature verification, the certificate
 /// (PROTOCOL §15.11).
 type AdmitRefusal = (AuthFailureReason, Option<CertRef>);
@@ -1067,6 +1099,7 @@ type AdmitRefusal = (AuthFailureReason, Option<CertRef>);
 fn admit(
     policy: &AccessPolicy,
     peer: &Fingerprint,
+    hybrid: Option<&HybridFingerprint>,
     payload: &[u8],
 ) -> Result<Option<Arc<CertClaims>>, AdmitRefusal> {
     let trust = policy.cert_trust();
@@ -1079,14 +1112,15 @@ fn admit(
     let certificate = if payload.is_empty() {
         None
     } else {
-        let claims = zt_crypto::verify_certificate(payload, peer, trust)
+        let claims = zt_crypto::verify_certificate_hybrid(payload, peer, hybrid, trust)
             .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
         Some(Arc::new(claims))
     };
     // Steps 5 and 7–11 and the precedence of the whitelist.
     policy
-        .admit(
+        .admit_hybrid(
             peer,
+            hybrid,
             certificate.as_ref(),
             crate::lifecycle::certificate_now(),
         )
@@ -1146,9 +1180,9 @@ async fn hub(
             }
             event = events.recv() => match event {
                 None => return DrainOutcome::default(),
-                Some(HubEvent::Connected { conn, peer, certificate, tx }) => {
+                Some(HubEvent::Connected { conn, peer, hybrid, certificate, tx }) => {
                     peers.insert(conn, tx);
-                    Input::Connected { conn, peer, certificate }
+                    Input::Connected { conn, peer, hybrid, certificate }
                 }
                 Some(HubEvent::Core(input)) => {
                     if let Input::Disconnected { conn } = &input {

@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::{
-    Ca, Captured, Lab, agent_clients, assert_alive, field, node, relay_config, relay_policy,
-    scope, trust,
+    Ca, Captured, Lab, agent_clients, assert_alive, field, node, relay_config, relay_policy, scope,
+    trust,
 };
 use zt_crypto::Identity;
 use zt_domain::trust::CertTrust;
@@ -103,8 +103,14 @@ fn the_denylist_takes_keys_and_v1_fingerprints_only() {
     let err = parse_revocations("revoked.toml", &format!("keys = [\"{v2}\"]\n")).unwrap_err();
     let shown = err.to_string();
     assert!(!shown.contains(&v2[9..40]), "{shown}");
-    assert!(shown.contains("v2") || shown.contains("SHA256v2"), "{shown}");
-    assert!(matches!(err, ConfigError::Key { .. } | ConfigError::Domain { .. }));
+    assert!(
+        shown.contains("v2") || shown.contains("SHA256v2"),
+        "{shown}"
+    );
+    assert!(matches!(
+        err,
+        ConfigError::Key { .. } | ConfigError::Domain { .. }
+    ));
 }
 
 /// Spec and attack (Downgrade): `client.toml` pins the hybrid suite only with v2 keys; a v2
@@ -134,7 +140,10 @@ fn the_hybrid_suite_is_pinned_only_with_v2_keys() {
             agent.public_key()
         ),
     ] {
-        assert!(parse_client_settings("client.toml", base, &bad).is_err(), "{bad}");
+        assert!(
+            parse_client_settings("client.toml", base, &bad).is_err(),
+            "{bad}"
+        );
     }
     let classical_with_v2 = format!(
         "key = \"client.key\"\nrelay = \"r1.example:7000\"\nrelay_key = \"{}\"\n",
@@ -161,7 +170,11 @@ async fn a_hybrid_client_reaches_its_node_over_hybrid_hops() {
     let _guard = log.install();
     let alice = id();
     let agent = id();
-    let mut policy = relay_policy(&agent.fingerprint(), &[alice.fingerprint()], CertTrust::new());
+    let mut policy = relay_policy(
+        &agent.fingerprint(),
+        &[alice.fingerprint()],
+        CertTrust::new(),
+    );
     hybrid_pins(&mut policy, &[&alice, &agent]);
     let mut clients = agent_clients(&[alice.fingerprint()], CertTrust::new());
     clients
@@ -198,7 +211,11 @@ async fn a_hybrid_client_reaches_its_node_over_hybrid_hops() {
         field(&started[0], "peer_v2"),
         Some(alice.hybrid_fingerprint().to_string())
     );
-    assert!(log.events("classical_identity_match").is_empty(), "{}", log.text());
+    assert!(
+        log.events("classical_identity_match").is_empty(),
+        "{}",
+        log.text()
+    );
 }
 
 /// Attack (AP-6): `a_key_revoked_by_its_v2_identity_cannot_connect_with_a_v1_handshake`. The
@@ -238,14 +255,18 @@ async fn a_key_revoked_by_its_v2_identity_cannot_connect_with_a_v1_handshake() {
 }
 
 /// Attack (Downgrade): a client pinned in v2 by the relay and the agent cannot connect with a
-/// classical (or IKhfs) handshake, even with the right X25519 key: `identity_downgrade`.
+/// classical (or `IKhfs`) handshake, even with the right X25519 key: `identity_downgrade`.
 #[tokio::test]
 async fn a_v2_pinned_client_is_refused_over_a_classical_handshake() {
     let log = Captured::default();
     let _guard = log.install();
     let alice = id();
     let agent = id();
-    let mut policy = relay_policy(&agent.fingerprint(), &[alice.fingerprint()], CertTrust::new());
+    let mut policy = relay_policy(
+        &agent.fingerprint(),
+        &[alice.fingerprint()],
+        CertTrust::new(),
+    );
     hybrid_pins(&mut policy, &[&alice]);
     let mut config = relay_config();
     config.suites = zt_domain::SuitePolicy {
@@ -301,7 +322,11 @@ async fn a_hybrid_peer_matched_by_a_v1_entry_is_reported() {
     let _guard = log.install();
     let alice = id();
     let agent = id();
-    let policy = relay_policy(&agent.fingerprint(), &[alice.fingerprint()], CertTrust::new());
+    let policy = relay_policy(
+        &agent.fingerprint(),
+        &[alice.fingerprint()],
+        CertTrust::new(),
+    );
     let mut config = relay_config();
     config.suites = zt_domain::SuitePolicy {
         agents: AcceptedSuites::only(CLASSIC),

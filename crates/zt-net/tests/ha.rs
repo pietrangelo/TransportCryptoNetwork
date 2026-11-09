@@ -153,7 +153,7 @@ async fn relay(keys: Keyring, policy: AccessPolicy) -> SocketAddr {
 fn endpoint(addr: SocketAddr, key: &PublicKey) -> RelayEndpoint {
     RelayEndpoint {
         address: addr.to_string(),
-        public_key: *key,
+        public_key: (*key).into(),
         suite: zt_domain::HandshakeSuite::NoiseIk25519,
     }
 }
@@ -192,7 +192,7 @@ fn client_config(relays: Vec<RelayEndpoint>, node_key: &PublicKey) -> ClientConf
     ClientConfig {
         relays,
         node: node("web-01"),
-        node_key: *node_key,
+        node_key: (*node_key).into(),
         node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),

@@ -67,7 +67,11 @@ async fn lab(alice: &Arc<Identity>, suites: SuitePolicy, agent_suite: HandshakeS
 fn the_hybrid_suite_runs_on_both_channels() {
     assert!(HFS.is_supported(HandshakeChannel::Outer));
     assert!(HFS.is_supported(HandshakeChannel::EndToEnd));
-    assert_eq!(AcceptedSuites::supported(HandshakeChannel::Outer), both());
+    // PQ-AUTH adds the hybrid IK suite (PROTOCOL §7.5.3) on both channels.
+    assert_eq!(
+        AcceptedSuites::supported(HandshakeChannel::Outer),
+        AcceptedSuites::new([CLASSIC, HFS, HandshakeSuite::NoiseIkHybrid25519MlKem768]).unwrap()
+    );
 }
 
 /// The full upgrade (pq.md §6.3, last row): every hop and the end-to-end channel hybrid.

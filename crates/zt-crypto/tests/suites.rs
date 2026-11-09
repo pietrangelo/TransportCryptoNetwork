@@ -21,7 +21,7 @@ fn a_pinned_classical_handshake_completes_and_reports_its_suite() {
     let keys = Keyring::single(Identity::from_secret_hex(&relay.to_secret_hex()).unwrap());
     let (msg1, waiting) = noise::initiate_suite(
         &client,
-        &relay.public_key(),
+        relay.public_key(),
         Channel::Outer,
         CLASSIC,
         b"cert",
@@ -46,7 +46,7 @@ fn the_classical_suite_has_the_sizes_its_constants_say() {
     let payload = vec![0x42; 300];
     let (msg1, waiting) = noise::initiate_suite(
         &client,
-        &relay.public_key(),
+        relay.public_key(),
         Channel::EndToEnd,
         CLASSIC,
         &payload,
@@ -71,14 +71,14 @@ fn the_new_api_is_wire_compatible_with_the_v1_one() {
     let keys = Keyring::single(Identity::from_secret_hex(&relay.to_secret_hex()).unwrap());
     // New initiator, v1 responder.
     let (msg1, waiting) =
-        noise::initiate_suite(&client, &relay.public_key(), Channel::Outer, CLASSIC, &[]).unwrap();
+        noise::initiate_suite(&client, relay.public_key(), Channel::Outer, CLASSIC, &[]).unwrap();
     let (msg2, _) = noise::respond_any(&keys, &msg1, Channel::Outer)
         .unwrap()
         .accept()
         .unwrap();
     waiting.complete(&msg2).unwrap();
     // v1 initiator, new responder.
-    let (msg1, waiting) = noise::initiate(&client, &relay.public_key(), Channel::Outer).unwrap();
+    let (msg1, waiting) = noise::initiate(&client, relay.public_key(), Channel::Outer).unwrap();
     let pending =
         noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(CLASSIC)).unwrap();
     assert_eq!(pending.suite(), CLASSIC);
@@ -96,7 +96,7 @@ fn the_previous_key_is_still_tried_for_every_accepted_suite() {
     )
     .unwrap();
     let (msg1, _) =
-        noise::initiate_suite(&client, &old.public_key(), Channel::Outer, CLASSIC, &[]).unwrap();
+        noise::initiate_suite(&client, old.public_key(), Channel::Outer, CLASSIC, &[]).unwrap();
     let pending =
         noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(CLASSIC)).unwrap();
     assert_eq!(pending.peer(), client.fingerprint());
@@ -109,7 +109,7 @@ fn an_initiator_pins_the_hybrid_suite_on_either_channel() {
     let (client, relay) = ids();
     for channel in [Channel::Outer, Channel::EndToEnd] {
         let (msg1, waiting) =
-            noise::initiate_suite(&client, &relay.public_key(), channel, HFS, &[]).unwrap();
+            noise::initiate_suite(&client, relay.public_key(), channel, HFS, &[]).unwrap();
         assert_eq!(msg1.len(), HFS.msg1_overhead());
         assert_eq!(waiting.suite(), HFS);
     }

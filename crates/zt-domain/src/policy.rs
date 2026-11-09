@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::cert::{CertClaims, CertRejection, UnixTime};
-use crate::crypto::Fingerprint;
+use crate::crypto::{Fingerprint, HybridFingerprint};
 use crate::error::DomainError;
 use crate::events::AuthFailureReason;
 use crate::ids::NodeId;
@@ -89,6 +89,46 @@ pub struct AccessPolicy {
     nodes: BTreeSet<NodeId>,
     clients: HashMap<Fingerprint, ClientGrant>,
     cert_trust: CertTrust,
+    /// v2 pins (PQ-AUTH): the hybrid identity a key must prove, keyed by its X25519-level
+    /// fingerprint (the one identity and revocation unit, finding AP-6).
+    hybrid: HybridPins,
+}
+
+/// v2 pins: X25519-level fingerprint → the fingerprint v2 its handshake must prove.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HybridPins(HashMap<Fingerprint, HybridFingerprint>);
+
+impl HybridPins {
+    /// Pins `hybrid` for `peer`. A key has one v2 identity, and a v2 identity one key.
+    pub(crate) fn pin(
+        &mut self,
+        peer: Fingerprint,
+        hybrid: HybridFingerprint,
+    ) -> Result<(), DomainError> {
+        if self.0.contains_key(&peer) || self.0.values().any(|h| *h == hybrid) {
+            return Err(DomainError::DuplicatePeer(peer));
+        }
+        self.0.insert(peer, hybrid);
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, peer: &Fingerprint) -> Option<&HybridFingerprint> {
+        self.0.get(peer)
+    }
+
+    /// `Ok` if `peer` has no v2 pin, or the handshake proved exactly the pinned identity.
+    /// Fingerprint v2 comparison is constant-time.
+    pub(crate) fn check(
+        &self,
+        peer: &Fingerprint,
+        proved: Option<&HybridFingerprint>,
+    ) -> Result<(), AuthFailureReason> {
+        match (self.0.get(peer), proved) {
+            (None, _) => Ok(()),
+            (Some(pinned), Some(proved)) if pinned == proved => Ok(()),
+            (Some(_), _) => Err(AuthFailureReason::IdentityDowngrade),
+        }
+    }
 }
 
 impl AccessPolicy {
@@ -166,6 +206,29 @@ impl AccessPolicy {
         Ok(())
     }
 
+    /// Pins the v2 identity of a key that already has a role (PQ-AUTH, PROTOCOL §7.5.3): from
+    /// then on the key is admitted only through a hybrid IK handshake that proved `hybrid`.
+    ///
+    /// # Errors
+    /// [`DomainError::UnknownPeer`] if the key has no role, [`DomainError::DuplicatePeer`] if
+    /// it is already pinned or `hybrid` is another key's.
+    pub fn pin_hybrid(
+        &mut self,
+        peer: Fingerprint,
+        hybrid: HybridFingerprint,
+    ) -> Result<(), DomainError> {
+        if self.role(&peer).is_none() {
+            return Err(DomainError::UnknownPeer(peer));
+        }
+        self.hybrid.pin(peer, hybrid)
+    }
+
+    /// The v2 identity pinned for `peer`, if any.
+    #[must_use]
+    pub fn hybrid_identity(&self, peer: &Fingerprint) -> Option<&HybridFingerprint> {
+        self.hybrid.get(peer)
+    }
+
     /// The role of a key, or `None` if unknown.
     #[must_use]
     pub fn role(&self, peer: &Fingerprint) -> Option<PeerRole<'_>> {
@@ -209,7 +272,7 @@ impl AccessPolicy {
         &self.cert_trust
     }
 
-    /// Steps 1, 2, 5, 7–11 of PROTOCOL §15.4 and the table in §15.5.
+    /// [`Self::admit_hybrid`] for a handshake that proved no hybrid identity.
     ///
     /// # Errors
     /// The rejection reason, for the audit.
@@ -219,10 +282,28 @@ impl AccessPolicy {
         cert: Option<&Arc<CertClaims>>,
         now: UnixTime,
     ) -> Result<Admission<'_>, AuthFailureReason> {
-        // Step 1: the denylist applies to any credential and any role.
+        self.admit_hybrid(peer, None, cert, now)
+    }
+
+    /// Steps 1, 2, 5, 7–11 of PROTOCOL §15.4 and the table in §15.5, for a handshake that
+    /// proved the X25519-level identity `peer` and, with the hybrid IK suite, the hybrid
+    /// identity `hybrid` (PQ-AUTH). A key pinned in v2 needs exactly that hybrid identity.
+    ///
+    /// # Errors
+    /// The rejection reason, for the audit.
+    pub fn admit_hybrid(
+        &self,
+        peer: &Fingerprint,
+        hybrid: Option<&HybridFingerprint>,
+        cert: Option<&Arc<CertClaims>>,
+        now: UnixTime,
+    ) -> Result<Admission<'_>, AuthFailureReason> {
+        // Step 1: the denylist applies to any credential, any role and any handshake.
         if self.cert_trust.is_key_revoked(peer) {
             return Err(AuthFailureReason::KeyRevoked);
         }
+        // The v2 pin, before any certificate: no downgrade to a classical handshake.
+        self.hybrid.check(peer, hybrid)?;
         // Steps 5 and 7–10: a presented certificate is always verified (fail closed), even
         // for a whitelisted key.
         if let Some(claims) = cert {

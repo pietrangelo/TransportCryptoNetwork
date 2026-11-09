@@ -86,7 +86,7 @@ async fn agent_on(
     let config = zt_net::agent::AgentConfig {
         relays: vec![RelayEndpoint {
             address: relay.addr.to_string(),
-            public_key: relay.key,
+            public_key: relay.key.into(),
             suite: HandshakeSuite::NoiseIk25519,
         }],
         node: common::node("web-01"),
@@ -111,11 +111,11 @@ fn client_config(relay: &Drained, agent: &Identity) -> client::ClientConfig {
     client::ClientConfig {
         relays: vec![RelayEndpoint {
             address: relay.addr.to_string(),
-            public_key: relay.key,
+            public_key: relay.key.into(),
             suite: HandshakeSuite::NoiseIk25519,
         }],
         node: common::node("web-01"),
-        node_key: agent.public_key(),
+        node_key: agent.public_key().into(),
         node_suite: HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: common::timeouts(),

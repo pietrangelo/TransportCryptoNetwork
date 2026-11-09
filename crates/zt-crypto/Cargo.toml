@@ -13,6 +13,7 @@ thiserror.workspace = true
 snow.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
+shake.workspace = true
 zeroize.workspace = true
 hex.workspace = true
 getrandom.workspace = true

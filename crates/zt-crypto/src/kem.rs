@@ -201,6 +201,17 @@ impl core::fmt::Debug for MlKem768DecapsulationKey {
     }
 }
 
+impl MlKem768 {
+    /// `true` if `encapsulation_key` has the length of ML-KEM-768 and passes the FIPS 203
+    /// §7.2 input check (type and modulus): the check of a static key at load time
+    /// (PQ-AUTH), before it is ever used.
+    #[must_use]
+    pub fn is_valid_encapsulation_key(encapsulation_key: &[u8]) -> bool {
+        MlKem768PublicKey::try_from(encapsulation_key)
+            .is_ok_and(|ek| mlkem768::validate_public_key(&ek))
+    }
+}
+
 impl Kem for MlKem768 {
     const ALGORITHM: &'static str = "ML-KEM-768";
     const ENCAPSULATION_KEY_LEN: usize = MlKem768PublicKey::len();

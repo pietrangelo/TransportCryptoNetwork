@@ -514,7 +514,7 @@ async fn stalled_first_relay(connect_timeout: u32) -> (std::process::Output, Dur
     let config = zt_net::agent::AgentConfig {
         relays: vec![zt_net::RelayEndpoint {
             address: via.to_string(),
-            public_key: relay_b_id.public_key(),
+            public_key: relay_b_id.public_key().into(),
             suite: zt_domain::HandshakeSuite::NoiseIk25519,
         }],
         node: common::node("web-01"),

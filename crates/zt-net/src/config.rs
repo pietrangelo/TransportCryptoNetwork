@@ -13,14 +13,16 @@ use std::sync::Arc;
 use serde::Deserialize;
 use thiserror::Error;
 use zt_crypto::{
-    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, CryptoError, Identity, Keyring,
-    PublicKey, decode_certificate_text, trusted_ca_key, trusted_composite_ca_key,
+    CaSigningKey, CompositeCaPublicKey, CompositeCaSigningKey, CryptoError, HybridPublicKey,
+    Identity, Keyring, PeerKey, PublicKey, decode_certificate_text, trusted_ca_key,
+    trusted_composite_ca_key,
 };
 use zt_domain::limits::DEFAULT_AUTHORITY_LIFETIME_SECS;
 use zt_domain::trust::{CertTrust, Revocations, TrustedCaKey};
 use zt_domain::{
     AccessPolicy, AllowedNodes, AnyCertBody, AuthorizedClients, CertFormatError, CertSerial,
-    ClientGrant, DomainError, NodeId, decode_any_certificate,
+    ClientGrant, DomainError, Fingerprint, FingerprintText, HybridFingerprint, NodeId,
+    decode_any_certificate,
 };
 
 /// Maximum size of a configuration file.
@@ -340,6 +342,19 @@ pub fn load_keyring(current: &Path, previous: Option<&Path>) -> Result<Keyring, 
     }
 }
 
+/// The public lines `keygen` prints (PROTOCOL §7.5.3, OPERATIONS §16): the v1 key and
+/// fingerprint, then the v2 key (`tcn-pub-v2:`) and fingerprint v2 derived from the same seed.
+#[must_use]
+pub fn public_identity_text(identity: &Identity) -> String {
+    format!(
+        "public_key     = \"{}\"\nfingerprint    = {}\npublic_key_v2  = \"{}\"\nfingerprint_v2 = {}\n",
+        identity.public_key(),
+        identity.fingerprint(),
+        identity.hybrid_public_key(),
+        identity.hybrid_fingerprint()
+    )
+}
+
 /// Generates a new identity and writes it to a new file with `0600` permissions.
 /// Never overwrites an existing file.
 ///
@@ -537,7 +552,8 @@ impl Ctx<'_> {
             message: redact_hex(err.message()),
         }
     }
-    fn key(&self, entry: &str, text: &str) -> Result<PublicKey, ConfigError> {
+    /// A peer key: v1 (64 hex characters) or v2 (`tcn-pub-v2:`, PROTOCOL §7.5.3).
+    fn key(&self, entry: &str, text: &str) -> Result<PeerKey, ConfigError> {
         text.parse().map_err(|source| ConfigError::Key {
             path: self.0.into(),
             entry: entry.into(),
@@ -627,11 +643,16 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
         };
         let keys = texts
             .into_iter()
-            .map(|t| ctx.key(&entry.node, t).map(|k| k.fingerprint()))
+            .map(|t| ctx.key(&entry.node, t))
             .collect::<Result<Vec<_>, _>>()?;
+        let fingerprints: Vec<_> = keys.iter().map(PeerKey::fingerprint).collect();
         policy
-            .add_agent_keys(node, &keys)
+            .add_agent_keys(node, &fingerprints)
             .map_err(|e| ctx.domain(&entry.node, e))?;
+        for key in &keys {
+            pin_hybrid(key, |fp, v2| policy.pin_hybrid(fp, v2))
+                .map_err(|e| ctx.domain(&entry.node, e))?;
+        }
     }
     for entry in &file.clients {
         let name = ctx.node(&entry.name, &entry.name)?;
@@ -639,6 +660,8 @@ pub fn parse_policy(origin: &str, text: &str) -> Result<AccessPolicy, ConfigErro
         let allowed = ctx.allowed(&entry.name, &entry.allow)?;
         policy
             .add_client(key.fingerprint(), ClientGrant { name, allowed })
+            .map_err(|e| ctx.domain(&entry.name, e))?;
+        pin_hybrid(&key, |fp, v2| policy.pin_hybrid(fp, v2))
             .map_err(|e| ctx.domain(&entry.name, e))?;
     }
     // The CAs last: `set_cert_trust` rejects a CA key equal to that of a peer.
@@ -689,12 +712,17 @@ pub fn parse_authorized_clients(
     let mut clients = AuthorizedClients::new();
     for entry in &file.clients {
         let key = ctx.key(&entry.name, &entry.public_key)?;
-        // A repeated key is not an error (it was a set before Phase 6).
+        // A repeated key is not an error (it was a set before Phase 6), but its v2 identity
+        // is pinned once: a v1 and a v2 entry of one key, or two v2 entries, are refused.
         if !clients.contains_key(&key.fingerprint()) {
             clients
                 .add_client(key.fingerprint())
                 .map_err(|e| ctx.domain(&entry.name, e))?;
+        } else if key.hybrid().is_some() || clients.hybrid_identity(&key.fingerprint()).is_some() {
+            return Err(ctx.domain(&entry.name, DomainError::DuplicatePeer(key.fingerprint())));
         }
+        pin_hybrid(&key, |fp, v2| clients.pin_hybrid(fp, v2))
+            .map_err(|e| ctx.domain(&entry.name, e))?;
     }
     let trust = parse_authorities(&ctx, &file.authorities)?;
     clients
@@ -720,12 +748,44 @@ pub fn parse_revocations(origin: &str, text: &str) -> Result<Revocations, Config
         .keys
         .iter()
         .enumerate()
-        .map(|(i, text)| {
-            ctx.canonical_key(&format!("keys[{i}]"), text)
-                .map(|k| k.fingerprint())
-        })
+        .map(|(i, text)| revoked_key(&ctx, &format!("keys[{i}]"), text))
         .collect::<Result<Vec<_>, _>>()?;
     Revocations::new(serials, keys).map_err(|e| ctx.domain("revocations", e))
+}
+
+/// Pins the v2 identity of `key` if it is a v2 key (PROTOCOL §7.5.3): the entry stays keyed
+/// by the X25519-level fingerprint (finding AP-6), and the pin forbids the classical
+/// handshakes to that key.
+fn pin_hybrid(
+    key: &PeerKey,
+    pin: impl FnOnce(Fingerprint, HybridFingerprint) -> Result<(), DomainError>,
+) -> Result<(), DomainError> {
+    match key.hybrid() {
+        Some(hybrid) => pin(hybrid.fingerprint(), hybrid.hybrid_fingerprint()),
+        None => Ok(()),
+    }
+}
+
+/// A `keys` entry of the denylist, reduced to the X25519-level fingerprint, the unit of
+/// revocation (PROTOCOL §15.8, finding AP-6): a v1 key (canonical), a v2 key or a `SHA256:`
+/// fingerprint. A `SHA256v2:` fingerprint would match nothing and is refused, unechoed.
+fn revoked_key(ctx: &Ctx<'_>, entry: &str, text: &str) -> Result<Fingerprint, ConfigError> {
+    if text.starts_with(HybridPublicKey::PREFIX) {
+        return ctx.key(entry, text).map(|k| k.fingerprint());
+    }
+    if text.starts_with(HybridFingerprint::PREFIX) {
+        return Err(ctx.domain(entry, DomainError::HybridFingerprintNotRevocable));
+    }
+    if text.starts_with("SHA256:") {
+        return match FingerprintText::parse(text) {
+            Ok(FingerprintText::V1(fingerprint)) => Ok(fingerprint),
+            Ok(FingerprintText::V2(_)) => {
+                Err(ctx.domain(entry, DomainError::HybridFingerprintNotRevocable))
+            }
+            Err(e) => Err(ctx.domain(entry, e)),
+        };
+    }
+    ctx.canonical_key(entry, text).map(|k| k.fingerprint())
 }
 
 /// 32 hexadecimal characters → 16 bytes.
@@ -880,7 +940,7 @@ pub fn load_ca_key(path: &Path) -> Result<CaSigningKey, ConfigError> {
 pub fn parse_known_nodes(
     origin: &str,
     text: &str,
-) -> Result<HashMap<NodeId, PublicKey>, ConfigError> {
+) -> Result<HashMap<NodeId, PeerKey>, ConfigError> {
     let ctx = Ctx(origin);
     let file: NodesFile = toml::from_str(text).map_err(|e| ctx.syntax(&e))?;
     let mut nodes = HashMap::new();
@@ -1047,7 +1107,7 @@ pub fn load_authorized_clients_digested(
 ///
 /// # Errors
 /// See [`parse_known_nodes`].
-pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PublicKey>, ConfigError> {
+pub fn load_known_nodes(path: &Path) -> Result<HashMap<NodeId, PeerKey>, ConfigError> {
     parse_known_nodes(&path.display().to_string(), &read_limited(path)?)
 }
 
@@ -1066,7 +1126,7 @@ pub struct ClientSettings {
     pub key: std::path::PathBuf,
     /// Reachable nodes, each with the pinned key of its agent. A missing node is not
     /// reachable: there is no trust-on-first-use.
-    pub nodes: HashMap<NodeId, PublicKey>,
+    pub nodes: HashMap<NodeId, PeerKey>,
     /// The client certificate file, if configured (PROTOCOL §15).
     pub certificate: Option<std::path::PathBuf>,
     /// The end-to-end handshake suite pinned per node (PROTOCOL §7.5).
@@ -1094,7 +1154,7 @@ impl ClientSettings {
         Ok(crate::client::ClientConfig {
             relays: self.relays.clone(),
             node: node.clone(),
-            node_key: *node_key,
+            node_key: node_key.clone(),
             node_suite: self
                 .node_suites
                 .get(node)
@@ -1120,7 +1180,7 @@ impl ClientSettings {
 pub fn relay_endpoints(
     origin: &str,
     addresses: &[String],
-    keys: &[PublicKey],
+    keys: &[PeerKey],
 ) -> Result<Vec<crate::RelayEndpoint>, ConfigError> {
     let fail = |message: &str| ConfigError::Syntax {
         path: origin.into(),
@@ -1145,7 +1205,7 @@ pub fn relay_endpoints(
         }
         out.push(crate::RelayEndpoint {
             address: address.clone(),
-            public_key: *key,
+            public_key: key.clone(),
             suite: zt_domain::HandshakeSuite::NoiseIk25519,
         });
     }
@@ -1228,6 +1288,7 @@ pub fn parse_client_settings(
         if let Some(text) = text {
             relay.suite = parse_suite(origin, text, zt_domain::HandshakeChannel::Outer)?;
         }
+        hybrid_key_for(origin, &relay.address, relay.suite, &relay.public_key)?;
     }
     let require_outer_suite = file
         .require_outer_suite
@@ -1274,6 +1335,7 @@ pub fn parse_client_settings(
         if let Some(text) = &entry.suite {
             // The node pin is the end-to-end channel (PROTOCOL §7.5).
             let suite = parse_suite(origin, text, zt_domain::HandshakeChannel::EndToEnd)?;
+            hybrid_key_for(origin, &entry.node, suite, &key)?;
             node_suites.insert(node.clone(), suite);
         }
         if nodes.insert(node.clone(), key).is_some() {
@@ -1289,6 +1351,29 @@ pub fn parse_client_settings(
         require_outer_suite,
         connect_deadline,
     })
+}
+
+/// The hybrid IK suite authenticates the responder's static ML-KEM key: its pin must be a v2
+/// key (PROTOCOL §7.5.3). A v2 key is accepted with every suite.
+///
+/// # Errors
+/// [`ConfigError::Syntax`] for the hybrid IK suite with a v1 key.
+pub fn hybrid_key_for(
+    origin: &str,
+    entry: &str,
+    suite: zt_domain::HandshakeSuite,
+    key: &PeerKey,
+) -> Result<(), ConfigError> {
+    if suite.requires_hybrid_identity() && key.hybrid().is_none() {
+        return Err(ConfigError::Syntax {
+            path: origin.into(),
+            message: format!(
+                "{entry}: suite {} needs a tcn-pub-v2 public key",
+                suite.protocol_name()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// `connect_deadline_secs`: 1 to 300 s, the plan's default without it.

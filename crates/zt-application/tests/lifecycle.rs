@@ -127,6 +127,7 @@ fn shutdown_closes_every_stream_with_drained() {
         Input::Connected {
             conn: a,
             peer: agent,
+            hybrid: None,
             certificate: None,
         },
         now,
@@ -142,6 +143,7 @@ fn shutdown_closes_every_stream_with_drained() {
         Input::Connected {
             conn: c,
             peer: client,
+            hybrid: None,
             certificate: None,
         },
         now,

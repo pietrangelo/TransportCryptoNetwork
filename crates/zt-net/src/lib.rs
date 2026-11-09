@@ -32,8 +32,6 @@ pub use revocable::{Revocable, Updater};
 
 use std::time::Duration;
 
-use zt_crypto::PublicKey;
-
 /// Maximum number of relays in an agent's or a client's list (PROTOCOL §13).
 pub const MAX_RELAYS: usize = 8;
 
@@ -42,8 +40,8 @@ pub const MAX_RELAYS: usize = 8;
 pub struct RelayEndpoint {
     /// Address (`host:port`).
     pub address: String,
-    /// Public key of the relay, pinned.
-    pub public_key: PublicKey,
+    /// Public key of the relay, pinned: v1, or v2 (needed by the hybrid IK suite, PQ-AUTH).
+    pub public_key: zt_crypto::PeerKey,
     /// Handshake suite pinned for this relay (PROTOCOL §7.5): no fallback to another one.
     pub suite: zt_domain::HandshakeSuite,
 }

@@ -38,7 +38,7 @@ fn both() -> AcceptedSuites {
 fn a_pinned_hybrid_handshake_completes_end_to_end() {
     let (client, keys, pk) = setup();
     let (msg1, waiting) =
-        noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, b"certificate").unwrap();
+        noise::initiate_suite(&client, pk, Channel::EndToEnd, HFS, b"certificate").unwrap();
     assert_eq!(waiting.suite(), HFS);
     let pending =
         noise::respond_suites(&keys, &msg1, Channel::EndToEnd, AcceptedSuites::only(HFS)).unwrap();
@@ -63,7 +63,7 @@ fn the_hybrid_suite_has_the_sizes_its_constants_say() {
     let (client, keys, pk) = setup();
     for payload in [Vec::new(), vec![0x42; 300], vec![0x5a; MAX_ANY_CERT_LEN]] {
         let (msg1, waiting) =
-            noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, &payload).unwrap();
+            noise::initiate_suite(&client, pk, Channel::EndToEnd, HFS, &payload).unwrap();
         assert_eq!(msg1.len(), 1_296 + payload.len());
         assert_eq!(msg1.len(), HFS.msg1_overhead() + payload.len());
         let pending =
@@ -82,7 +82,7 @@ fn a_responder_that_accepts_both_suites_finds_each_one() {
     let (client, keys, pk) = setup();
     for suite in [CLASSIC, HFS] {
         let (msg1, waiting) =
-            noise::initiate_suite(&client, &pk, Channel::EndToEnd, suite, &[]).unwrap();
+            noise::initiate_suite(&client, pk, Channel::EndToEnd, suite, &[]).unwrap();
         let pending = noise::respond_suites(&keys, &msg1, Channel::EndToEnd, both()).unwrap();
         assert_eq!(pending.suite(), suite);
         let (msg2, _) = pending.accept().unwrap();
@@ -98,7 +98,7 @@ fn the_previous_key_is_tried_for_the_hybrid_suite() {
     let old_pk = old.public_key();
     let keys = Keyring::rotating(Identity::generate().unwrap(), old).unwrap();
     let (msg1, waiting) =
-        noise::initiate_suite(&client, &old_pk, Channel::EndToEnd, HFS, &[]).unwrap();
+        noise::initiate_suite(&client, old_pk, Channel::EndToEnd, HFS, &[]).unwrap();
     let pending = noise::respond_suites(&keys, &msg1, Channel::EndToEnd, both()).unwrap();
     assert_eq!(pending.suite(), HFS);
     let (msg2, _) = pending.accept().unwrap();
@@ -110,7 +110,7 @@ fn the_previous_key_is_tried_for_the_hybrid_suite() {
 #[test]
 fn the_hybrid_suite_runs_on_the_outer_channel_with_its_own_prologue() {
     let (client, keys, pk) = setup();
-    let (msg1, waiting) = noise::initiate_suite(&client, &pk, Channel::Outer, HFS, &[]).unwrap();
+    let (msg1, waiting) = noise::initiate_suite(&client, pk, Channel::Outer, HFS, &[]).unwrap();
     assert_eq!(msg1.len(), HFS.msg1_overhead());
     let pending =
         noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(HFS)).unwrap();
@@ -120,7 +120,7 @@ fn the_hybrid_suite_runs_on_the_outer_channel_with_its_own_prologue() {
     let mut initiator = waiting.complete(&msg2).unwrap();
     let sealed = initiator.encrypt(b"first frame").unwrap();
     assert_eq!(responder.decrypt(&sealed).unwrap(), b"first frame");
-    let (e2e, _) = noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, &[]).unwrap();
+    let (e2e, _) = noise::initiate_suite(&client, pk, Channel::EndToEnd, HFS, &[]).unwrap();
     assert_eq!(
         noise::respond_suites(&keys, &e2e, Channel::Outer, AcceptedSuites::only(HFS)).err(),
         Some(CryptoError::Handshake)
@@ -134,7 +134,7 @@ fn every_hybrid_handshake_is_fresh() {
     let (client, keys, pk) = setup();
     let run = || {
         let (msg1, waiting) =
-            noise::initiate_suite(&client, &pk, Channel::EndToEnd, HFS, &[]).unwrap();
+            noise::initiate_suite(&client, pk, Channel::EndToEnd, HFS, &[]).unwrap();
         let pending =
             noise::respond_suites(&keys, &msg1, Channel::EndToEnd, AcceptedSuites::only(HFS))
                 .unwrap();

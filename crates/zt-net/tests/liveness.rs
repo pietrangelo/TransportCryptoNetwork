@@ -126,7 +126,7 @@ async fn unanswered_pings_end_the_session() {
         agent_config(
             RelayEndpoint {
                 address: addr.to_string(),
-                public_key: relay.public_key(),
+                public_key: relay.public_key().into(),
                 suite: HandshakeSuite::NoiseIk25519,
             },
             timeouts,
@@ -179,10 +179,15 @@ async fn duplicate_agents_are_reported_by_the_relay() {
     let relay = start_relay_with(policy, common::relay_config()).await;
     for _ in 0..4 {
         let tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
-        let mut ch =
-            zt_net::channel::connect(tcp, &agent, &relay.key, Channel::Outer, &common::timeouts())
-                .await
-                .unwrap();
+        let mut ch = zt_net::channel::connect(
+            tcp,
+            &agent,
+            &relay.key.into(),
+            Channel::Outer,
+            &common::timeouts(),
+        )
+        .await
+        .unwrap();
         ch.send(
             &zt_domain::Frame::Register {
                 node: common::node("web-01"),

@@ -69,7 +69,11 @@ fn the_hybrid_ik_suite_has_its_id_name_and_sizes() {
     // The sets: the hybrid suite is never implied by another.
     let all = AcceptedSuites::new([CLASSIC, HFS, HYBRID]).unwrap();
     assert_eq!(all.max_msg1_len(), HYBRID.max_msg1_len());
-    assert!(!AcceptedSuites::new([CLASSIC, HFS]).unwrap().contains(HYBRID));
+    assert!(
+        !AcceptedSuites::new([CLASSIC, HFS])
+            .unwrap()
+            .contains(HYBRID)
+    );
 }
 
 // --- fingerprints (AP-6) ------------------------------------------------------------------

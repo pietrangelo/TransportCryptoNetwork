@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 use zt_domain::Fingerprint;
 
 use crate::error::CryptoError;
+use crate::hybrid::{HybridPublicKey, StaticKem};
+use crate::kem::{Kem, MlKem768};
 
 /// Domain separation for fingerprints: a TCN hash never coincides with a hash of other
 /// protocols over the same key.
@@ -32,6 +34,8 @@ pub fn fingerprint_of_x25519(x25519: &[u8; 32]) -> Fingerprint {
 /// and its `Debug` is redacted.
 pub struct Identity {
     key: SigningKey,
+    /// The static ML-KEM-768 key pair derived from the seed (PQ-AUTH, D12).
+    kem: StaticKem,
 }
 
 impl Identity {
@@ -42,9 +46,7 @@ impl Identity {
     pub fn generate() -> Result<Self, CryptoError> {
         let mut seed = Zeroizing::new([0_u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(|_| CryptoError::Random)?;
-        Ok(Self {
-            key: SigningKey::from_bytes(&seed),
-        })
+        Ok(Self::from_seed(&seed))
     }
 
     /// Loads an identity from its hex form (64 characters).
@@ -54,9 +56,38 @@ impl Identity {
     pub fn from_secret_hex(text: &str) -> Result<Self, CryptoError> {
         let mut seed = Zeroizing::new([0_u8; 32]);
         hex::decode_to_slice(text.trim(), seed.as_mut()).map_err(|_| CryptoError::InvalidKey)?;
-        Ok(Self {
-            key: SigningKey::from_bytes(&seed),
-        })
+        Ok(Self::from_seed(&seed))
+    }
+
+    fn from_seed(seed: &[u8; 32]) -> Self {
+        Self {
+            key: SigningKey::from_bytes(seed),
+            kem: StaticKem::derive(seed),
+        }
+    }
+
+    /// The v2 public key (PQ-AUTH): Ed25519 and the derived ML-KEM-768 encapsulation key.
+    #[must_use]
+    pub fn hybrid_public_key(&self) -> HybridPublicKey {
+        HybridPublicKey::new(self.public_key(), std::sync::Arc::clone(&self.kem.ek))
+    }
+
+    /// The fingerprint v2 of the identity.
+    #[must_use]
+    pub fn hybrid_fingerprint(&self) -> zt_domain::HybridFingerprint {
+        self.hybrid_public_key().hybrid_fingerprint()
+    }
+
+    /// The static ML-KEM key pair, for the hybrid IK responder.
+    pub(crate) const fn static_kem(&self) -> &StaticKem {
+        &self.kem
+    }
+
+    /// A fresh copy of the static decapsulation key, owned by a handshake in flight (the
+    /// initiator decapsulates `ct2` after this borrow has ended). Re-derived from the seed:
+    /// the key type has no `Clone`.
+    pub(crate) fn static_decapsulation_key(&self) -> <MlKem768 as Kem>::DecapsulationKey {
+        StaticKem::derive(self.key.as_bytes()).dk
     }
 
     /// `true` if `bytes` are the secret seed of this identity (comparison without early

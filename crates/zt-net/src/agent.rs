@@ -23,7 +23,7 @@ use zt_domain::flow::Window;
 use zt_domain::{
     AcceptedSuites, AuthFailureReason, AuthorizedClients, CertClaims, CertRef, CertRejection,
     ClientCredential, CloseReason, DomainEvent, Fingerprint, Frame, HandshakeChannel,
-    HandshakeSuite, NodeId, RejectReason, StreamId,
+    HandshakeSuite, HybridFingerprint, NodeId, RejectReason, StreamId,
 };
 
 use crate::net::{Dialer, TcpDialer};
@@ -610,6 +610,7 @@ struct StreamTask<D> {
 fn admit_client(
     clients: &AuthorizedClients,
     client: &Fingerprint,
+    hybrid: Option<&HybridFingerprint>,
     payload: &[u8],
     node: &NodeId,
 ) -> Result<ClientCredential, (AuthFailureReason, Option<CertRef>)> {
@@ -622,14 +623,15 @@ fn admit_client(
     let certificate: Option<Arc<CertClaims>> = if payload.is_empty() {
         None
     } else {
-        let claims = zt_crypto::verify_certificate(payload, client, trust)
+        let claims = zt_crypto::verify_certificate_hybrid(payload, client, hybrid, trust)
             .map_err(|check| (AuthFailureReason::Certificate(check), None))?;
         Some(Arc::new(claims))
     };
     // After the signature, the rejection carries the certificate (finding 0006-3).
     clients
-        .admit(
+        .admit_hybrid(
             client,
+            hybrid,
             certificate.as_ref(),
             node,
             crate::lifecycle::certificate_now(),
@@ -708,13 +710,30 @@ impl<D: Dialer> StreamTask<D> {
         let Some(responded) = read_msg1(&mut io, &identity, &timeouts, client_suites).await else {
             return;
         };
-        let (client, suite, payload) = match &responded {
-            Responded::Pending(pending) => (pending.peer(), pending.suite(), pending.payload()),
-            Responded::Unaccepted(found) => (found.peer(), found.suite(), found.payload()),
+        let (client, hybrid, suite, payload) = match &responded {
+            Responded::Pending(pending) => (
+                pending.peer(),
+                pending.hybrid_peer(),
+                pending.suite(),
+                pending.payload(),
+            ),
+            Responded::Unaccepted(found) => (
+                found.peer(),
+                found.hybrid_peer(),
+                found.suite(),
+                found.payload(),
+            ),
         };
         // Before message 2: a rejected client does not complete the handshake and does not
-        // reach sshd (like an unknown client, PROTOCOL §8 item 3).
-        let credential = match admit_client(&authorized.current(), &client, payload, &node) {
+        // reach sshd (like an unknown client, PROTOCOL §8 item 3). The v2 identity is only
+        // claimed until key confirmation (finding AP-12): here it can only refuse.
+        let credential = match admit_client(
+            &authorized.current(),
+            &client,
+            hybrid.as_ref(),
+            payload,
+            &node,
+        ) {
             Ok(credential) => credential,
             Err((reason, certificate)) => {
                 shared.audit(&DomainEvent::AuthenticationFailed {
@@ -781,6 +800,20 @@ impl<D: Dialer> StreamTask<D> {
                 return;
             }
         }
+        // Key confirmed: the client proved its static ML-KEM key too. A hybrid identity that
+        // only a v1 entry admitted is reported (pq.md §4.6).
+        if let Some(peer_v2) = hybrid
+            && authorized.current().hybrid_identity(&client).is_none()
+            && !matches!(
+                &credential,
+                ClientCredential::Certificate(claims) if claims.subject_hybrid() == Some(&peer_v2)
+            )
+        {
+            audit(&DomainEvent::ClassicalIdentityMatch {
+                peer: client,
+                peer_v2,
+            });
+        }
         // A drain that started during the handshake: no new session (finding A10-5).
         if shared.draining.load(Ordering::SeqCst) {
             io.close(CloseReason::Drained).await;
@@ -802,6 +835,7 @@ impl<D: Dialer> StreamTask<D> {
         };
         let session = Session {
             client,
+            hybrid,
             credential,
             node,
             suite,
@@ -814,6 +848,8 @@ impl<D: Dialer> StreamTask<D> {
 /// which handshake suite it used.
 struct Session {
     client: Fingerprint,
+    /// The fingerprint v2 the client proved, with the hybrid IK suite.
+    hybrid: Option<HybridFingerprint>,
     credential: ClientCredential,
     node: NodeId,
     suite: HandshakeSuite,
@@ -835,7 +871,13 @@ async fn until_cut(session: &Session, authorized: &mut crate::Revocable<Authoriz
     loop {
         let now = crate::lifecycle::certificate_now();
         let clients = authorized.current();
-        if !clients.still_admits(&session.client, &session.credential, &session.node, now) {
+        if !clients.still_admits_hybrid(
+            &session.client,
+            session.hybrid.as_ref(),
+            &session.credential,
+            &session.node,
+            now,
+        ) {
             return match &session.credential {
                 ClientCredential::Certificate(claims) if now >= claims.not_after() => Cut::Expired,
                 _ => Cut::Revoked,
@@ -873,10 +915,12 @@ async fn bridge<S>(
         ClientCredential::Certificate(claims) => Some(claims.reference()),
     };
     let c = CertFields::of(certificate.as_ref());
+    let peer_v2 = session.hybrid.as_ref().map(ToString::to_string);
     tracing::info!(
         target: "zt_audit",
         event_kind = "e2e_session_started",
         peer = %client,
+        peer_v2 = peer_v2.as_deref(),
         %stream,
         suite = session.suite.protocol_name(),
         credential = c.credential,

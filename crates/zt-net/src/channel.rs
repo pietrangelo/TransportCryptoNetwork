@@ -13,8 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec, LengthDelimitedCodecError};
 use zt_crypto::noise::{self, Channel, MAX_MESSAGE_LEN};
-use zt_crypto::{Identity, Keyring, PublicKey};
-use zt_domain::{AcceptedSuites, Fingerprint, Frame, HandshakeSuite};
+use zt_crypto::{Identity, Keyring, PeerKey};
+use zt_domain::{AcceptedSuites, Fingerprint, Frame, HandshakeSuite, HybridFingerprint};
 use zt_proto::FrameDecoder;
 
 use crate::{NetError, Timeouts};
@@ -68,7 +68,7 @@ where
 pub async fn connect<IO>(
     io: IO,
     local: &Identity,
-    remote: &PublicKey,
+    remote: &PeerKey,
     channel: Channel,
     timeouts: &Timeouts,
 ) -> Result<Established<IO>, NetError>
@@ -94,7 +94,7 @@ where
 pub async fn connect_with_payload<IO>(
     io: IO,
     local: &Identity,
-    remote: &PublicKey,
+    remote: &PeerKey,
     channel: Channel,
     payload: &[u8],
     timeouts: &Timeouts,
@@ -122,7 +122,7 @@ where
 pub async fn connect_suite<IO>(
     io: IO,
     local: &Identity,
-    remote: &PublicKey,
+    remote: &PeerKey,
     channel: Channel,
     suite: HandshakeSuite,
     payload: &[u8],
@@ -251,6 +251,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Pending<IO> {
     #[must_use]
     pub fn suite(&self) -> HandshakeSuite {
         self.handshake.suite()
+    }
+
+    /// The peer's fingerprint v2 with the hybrid IK suite (PROTOCOL §7.5.3): its static
+    /// ML-KEM key is proved only at key confirmation (finding AP-12).
+    #[must_use]
+    pub fn hybrid_peer(&self) -> Option<HybridFingerprint> {
+        self.handshake.hybrid_peer()
     }
 
     /// The payload of message 1 (empty without a certificate).

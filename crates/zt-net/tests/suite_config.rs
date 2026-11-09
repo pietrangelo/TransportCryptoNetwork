@@ -216,7 +216,11 @@ fn the_hybrid_suite_is_accepted_on_both_channels() {
             HandshakeChannel::Outer,
         )
         .unwrap(),
-        AcceptedSuites::supported(HandshakeChannel::Outer)
+        AcceptedSuites::new([
+            HandshakeSuite::NoiseIk25519,
+            HandshakeSuite::NoiseIkhfs25519MlKem768
+        ])
+        .unwrap()
     );
 }
 

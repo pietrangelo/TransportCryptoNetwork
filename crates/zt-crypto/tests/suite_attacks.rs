@@ -26,7 +26,7 @@ fn setup() -> (Identity, Keyring, zt_crypto::PublicKey) {
 #[test]
 fn a_suite_outside_the_accepted_set_is_not_tried() {
     let (client, keys, pk) = setup();
-    let (msg1, _) = noise::initiate_suite(&client, &pk, Channel::Outer, CLASSIC, &[]).unwrap();
+    let (msg1, _) = noise::initiate_suite(&client, pk, Channel::Outer, CLASSIC, &[]).unwrap();
     assert_eq!(
         noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(HFS)).err(),
         Some(CryptoError::Handshake)
@@ -37,7 +37,7 @@ fn a_suite_outside_the_accepted_set_is_not_tried() {
 #[test]
 fn an_outer_message_1_is_not_valid_end_to_end() {
     let (client, keys, pk) = setup();
-    let (msg1, _) = noise::initiate_suite(&client, &pk, Channel::Outer, CLASSIC, &[]).unwrap();
+    let (msg1, _) = noise::initiate_suite(&client, pk, Channel::Outer, CLASSIC, &[]).unwrap();
     assert!(
         noise::respond_suites(
             &keys,
@@ -54,7 +54,7 @@ fn an_outer_message_1_is_not_valid_end_to_end() {
 #[test]
 fn message_1_lengths_outside_the_suite_bounds_are_refused() {
     let (client, keys, pk) = setup();
-    let (msg1, _) = noise::initiate_suite(&client, &pk, Channel::Outer, CLASSIC, &[]).unwrap();
+    let (msg1, _) = noise::initiate_suite(&client, pk, Channel::Outer, CLASSIC, &[]).unwrap();
     let accepted = AcceptedSuites::only(CLASSIC);
     let mut too_long = msg1.clone();
     too_long.resize(CLASSIC.max_msg1_len() + 1, 0);
@@ -80,7 +80,7 @@ fn message_1_lengths_outside_the_suite_bounds_are_refused() {
 fn a_message_1_at_the_largest_legitimate_size_is_accepted() {
     let (client, keys, pk) = setup();
     let payload = vec![0x5a; zt_domain::limits::MAX_ANY_CERT_LEN];
-    let (msg1, _) = noise::initiate_suite(&client, &pk, Channel::Outer, CLASSIC, &payload).unwrap();
+    let (msg1, _) = noise::initiate_suite(&client, pk, Channel::Outer, CLASSIC, &payload).unwrap();
     assert_eq!(msg1.len(), CLASSIC.max_msg1_len());
     let pending =
         noise::respond_suites(&keys, &msg1, Channel::Outer, AcceptedSuites::only(CLASSIC)).unwrap();

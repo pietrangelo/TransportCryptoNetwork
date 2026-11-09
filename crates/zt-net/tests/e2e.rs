@@ -127,7 +127,7 @@ impl Fleet {
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
-                public_key: self.relay_id.public_key(),
+                public_key: self.relay_id.public_key().into(),
                 suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
@@ -167,11 +167,11 @@ impl Fleet {
         ClientConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
-                public_key: self.relay_id.public_key(),
+                public_key: self.relay_id.public_key().into(),
                 suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node(target),
-            node_key: self.agent_id.public_key(),
+            node_key: self.agent_id.public_key().into(),
             node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: fast_timeouts(),
@@ -294,7 +294,7 @@ async fn unknown_client_key_gets_no_answer() {
 async fn client_detects_a_relay_impostor() {
     let fleet = Fleet::start(test_relay_config()).await;
     let mut config = fleet.client_config("web-01");
-    config.relays[0].public_key = fleet.stranger.public_key();
+    config.relays[0].public_key = fleet.stranger.public_key().into();
     let (_app, local) = tokio::io::duplex(1024);
     let err = client::connect(&fleet.ansible, &config, local)
         .await

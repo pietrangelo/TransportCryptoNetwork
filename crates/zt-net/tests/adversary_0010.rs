@@ -70,7 +70,7 @@ async fn outer(
     zt_net::channel::connect_suite(
         tcp,
         who,
-        relay,
+        &relay.into(),
         Channel::Outer,
         IK,
         &[],
@@ -103,7 +103,7 @@ fn agent_config(
     zt_net::agent::AgentConfig {
         relays: vec![RelayEndpoint {
             address: addr.to_string(),
-            public_key: relay,
+            public_key: relay.into(),
             suite: IK,
         }],
         node: common::node("web-01"),
@@ -268,7 +268,7 @@ async fn a_draining_agent_counts_and_refuses_streams_in_mid_handshake() {
     );
 
     let (msg1, waiting) =
-        noise::initiate_suite(&alice, &agent_key, Channel::EndToEnd, IK, &[]).unwrap();
+        noise::initiate_suite(&alice, agent_key, Channel::EndToEnd, IK, &[]).unwrap();
     ch.send(
         &Frame::Data {
             stream: s1,

@@ -14,7 +14,7 @@ fn pair(
     responder: &Identity,
     ch: Channel,
 ) -> (noise::Transport, noise::Transport) {
-    let (msg1, waiting) = noise::initiate(initiator, &responder.public_key(), ch).unwrap();
+    let (msg1, waiting) = noise::initiate(initiator, responder.public_key(), ch).unwrap();
     let pending = noise::respond(responder, &msg1, ch).unwrap();
     assert_eq!(
         pending.peer(),
@@ -76,11 +76,11 @@ fn initiator_rejects_an_impostor_responder() {
     let client = Identity::generate().unwrap();
     let relay = Identity::generate().unwrap();
     let mitm = Identity::generate().unwrap();
-    let (msg1, waiting) = noise::initiate(&client, &relay.public_key(), Channel::Outer).unwrap();
+    let (msg1, waiting) = noise::initiate(&client, relay.public_key(), Channel::Outer).unwrap();
     // The MITM cannot even read msg1: it is encrypted to the relay's static key.
     assert!(noise::respond(&mitm, &msg1, Channel::Outer).is_err());
     // Nor can it forge a response that the client accepts.
-    let (fake1, _) = noise::initiate(&mitm, &mitm.public_key(), Channel::Outer).unwrap();
+    let (fake1, _) = noise::initiate(&mitm, mitm.public_key(), Channel::Outer).unwrap();
     let (fake2, _) = noise::respond(&mitm, &fake1, Channel::Outer)
         .unwrap()
         .accept()
@@ -93,7 +93,7 @@ fn channels_are_domain_separated() {
     // A msg1 of the end-to-end channel is not valid on the outer channel (different prologue).
     let a = Identity::generate().unwrap();
     let b = Identity::generate().unwrap();
-    let (msg1, _) = noise::initiate(&a, &b.public_key(), Channel::EndToEnd).unwrap();
+    let (msg1, _) = noise::initiate(&a, b.public_key(), Channel::EndToEnd).unwrap();
     assert!(noise::respond(&b, &msg1, Channel::Outer).is_err());
 }
 
@@ -101,7 +101,7 @@ fn channels_are_domain_separated() {
 fn tampered_handshake_and_transport_messages_are_rejected() {
     let a = Identity::generate().unwrap();
     let b = Identity::generate().unwrap();
-    let (mut msg1, _) = noise::initiate(&a, &b.public_key(), Channel::Outer).unwrap();
+    let (mut msg1, _) = noise::initiate(&a, b.public_key(), Channel::Outer).unwrap();
     let last = msg1.len() - 1;
     msg1[last] ^= 1;
     assert!(noise::respond(&b, &msg1, Channel::Outer).is_err());
@@ -221,7 +221,7 @@ fn msg1_payload_reaches_the_responder_intact() {
                 .map(|i: usize| u8::try_from(i % 251).unwrap())
                 .collect();
             let (msg1, waiting) =
-                noise::initiate_with_payload(&client, &relay.public_key(), ch, &payload).unwrap();
+                noise::initiate_with_payload(&client, relay.public_key(), ch, &payload).unwrap();
             let pending = noise::respond(&relay, &msg1, ch).unwrap();
             assert_eq!(pending.peer(), client.fingerprint());
             assert_eq!(pending.payload(), payload.as_slice(), "{ch:?} {len}");
@@ -237,8 +237,7 @@ fn msg1_payload_reaches_the_responder_intact() {
     let old_pin = old.public_key();
     let keys = Keyring::rotating(new, old).unwrap();
     for ch in [Channel::Outer, Channel::EndToEnd] {
-        let (msg1, _) =
-            noise::initiate_with_payload(&client, &old_pin, ch, b"certificate").unwrap();
+        let (msg1, _) = noise::initiate_with_payload(&client, old_pin, ch, b"certificate").unwrap();
         let pending = noise::respond_any(&keys, &msg1, ch).unwrap();
         assert_eq!(pending.payload(), b"certificate");
     }
@@ -249,13 +248,12 @@ fn initiate_without_payload_is_unchanged() {
     let relay = Identity::generate().unwrap();
     let client = Identity::generate().unwrap();
     for ch in [Channel::Outer, Channel::EndToEnd] {
-        let (msg1, _) = noise::initiate(&client, &relay.public_key(), ch).unwrap();
+        let (msg1, _) = noise::initiate(&client, relay.public_key(), ch).unwrap();
         // e (32) + encrypted s (48) + tag of the empty payload (16).
         assert_eq!(msg1.len(), 96);
         let pending = noise::respond(&relay, &msg1, ch).unwrap();
         assert!(pending.payload().is_empty());
-        let (msg1, _) =
-            noise::initiate_with_payload(&client, &relay.public_key(), ch, &[]).unwrap();
+        let (msg1, _) = noise::initiate_with_payload(&client, relay.public_key(), ch, &[]).unwrap();
         assert_eq!(msg1.len(), 96);
         assert!(
             noise::respond(&relay, &msg1, ch)
@@ -276,9 +274,9 @@ fn an_oversized_msg1_payload_is_refused_on_both_sides() {
     assert_eq!(MAX_HANDSHAKE_PAYLOAD_LEN, 7_670);
     for ch in [Channel::Outer, Channel::EndToEnd] {
         // Initiator: the maximum passes, one more does not.
-        assert!(noise::initiate_with_payload(&client, &relay.public_key(), ch, &max).is_ok());
+        assert!(noise::initiate_with_payload(&client, relay.public_key(), ch, &max).is_ok());
         assert!(matches!(
-            noise::initiate_with_payload(&client, &relay.public_key(), ch, &over),
+            noise::initiate_with_payload(&client, relay.public_key(), ch, &over),
             Err(CryptoError::MessageTooLarge)
         ));
         // Responder, with an initiator that does not respect the limit.
@@ -322,10 +320,10 @@ fn a_non_empty_msg2_payload_is_refused_by_the_initiator() {
     };
     for ch in [Channel::Outer, Channel::EndToEnd] {
         // Control: the same responder with an empty payload is accepted.
-        let (msg1, waiting) = noise::initiate(&client, &relay.public_key(), ch).unwrap();
+        let (msg1, waiting) = noise::initiate(&client, relay.public_key(), ch).unwrap();
         assert!(waiting.complete(&reply(&msg1, ch, &[])).is_ok());
         for payload in [&b"x"[..], &[0; 64][..], &[0xff; 4_328][..]] {
-            let (msg1, waiting) = noise::initiate(&client, &relay.public_key(), ch).unwrap();
+            let (msg1, waiting) = noise::initiate(&client, relay.public_key(), ch).unwrap();
             assert!(
                 matches!(
                     waiting.complete(&reply(&msg1, ch, payload)),

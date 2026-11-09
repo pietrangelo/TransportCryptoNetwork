@@ -128,6 +128,7 @@ impl H {
         self.input(Input::Connected {
             conn: ConnId(conn),
             peer: fp(peer),
+            hybrid: None,
             certificate: None,
         })
     }

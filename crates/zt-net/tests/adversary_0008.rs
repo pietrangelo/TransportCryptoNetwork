@@ -251,7 +251,7 @@ async fn a_confirmed_identity_over_its_limit_is_named_and_answered() {
     let (mut app, _task) = lab.session(&client, None).await.unwrap();
     for _ in 0..3 {
         let tcp = TcpStream::connect(relay.addr).await.unwrap();
-        let mut ch = channel::connect(tcp, &client, &relay.key, Channel::Outer, &timeouts())
+        let mut ch = channel::connect(tcp, &client, &relay.key.into(), Channel::Outer, &timeouts())
             .await
             .unwrap();
         let stream = StreamId::try_from(7).unwrap();

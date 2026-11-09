@@ -275,6 +275,7 @@ fuzz_target!(|data: &[u8]| {
                 Input::Connected {
                     conn: ConnId(conn),
                     peer,
+                    hybrid: None,
                     certificate,
                 }
             }

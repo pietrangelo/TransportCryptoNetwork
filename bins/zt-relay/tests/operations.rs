@@ -149,11 +149,11 @@ impl Relay {
         ClientConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.addr.clone(),
-                public_key: self.key.public_key(),
+                public_key: self.key.public_key().into(),
                 suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: NodeId::try_from("web-01").unwrap(),
-            node_key: Identity::generate().unwrap().public_key(),
+            node_key: Identity::generate().unwrap().public_key().into(),
             node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: Timeouts {
@@ -404,7 +404,7 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
 
     let reaches = |relay: &Relay, pin: &Identity| {
         let mut config = relay.config();
-        config.relays[0].public_key = pin.public_key();
+        config.relays[0].public_key = pin.public_key().into();
         let who = Identity::from_secret_hex(&client.to_secret_hex()).unwrap();
         async move {
             let (_app, local) = tokio::io::duplex(1024);
@@ -699,7 +699,7 @@ async fn sighup_reloads_revocations_and_cuts_a_revoked_certificate() {
     let mut live = zt_net::channel::connect_with_payload(
         tcp,
         &alice,
-        &relay.key.public_key(),
+        &relay.key.public_key().into(),
         zt_crypto::noise::Channel::Outer,
         &cert,
         &relay.config().timeouts,
@@ -917,7 +917,7 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
     // The relay still replies with the previous key and admits a certificate from the new CA.
     let (other_cert, _) = issue(&other, &alice);
     let mut config = relay.config();
-    config.relays[0].public_key = fresh.public_key();
+    config.relays[0].public_key = fresh.public_key().into();
     config.certificate = Some(std::sync::Arc::from(other_cert.as_slice()));
     let (_app, local) = tokio::io::duplex(1024);
     let r = tokio::time::timeout(

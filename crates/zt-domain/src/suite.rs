@@ -41,6 +41,11 @@ pub enum HandshakeSuite {
     /// `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` with the `TCN/2` prologues: hybrid
     /// forward secrecy (X25519 and ML-KEM-768), on both channels.
     NoiseIkhfs25519MlKem768,
+    /// The hybrid IK of PQ-AUTH (PROTOCOL §7.5.3): `Noise_IKhfs+psk0+psk2_25519+MLKEM768_…`
+    /// with the `TCN/3` prologues, composed with an ML-KEM-768 encapsulation to each party's
+    /// **static** key (`psk0` to the responder's, `psk2` to the initiator's). Authentication by
+    /// KEM in both directions plus DH; needs the peer's v2 public key.
+    NoiseIkHybrid25519MlKem768,
 }
 
 /// Why a suite name, id or set was refused.
@@ -63,7 +68,11 @@ pub enum SuiteError {
 
 impl HandshakeSuite {
     /// Every suite this version of the protocol knows, supported or not.
-    pub const ALL: [Self; 2] = [Self::NoiseIk25519, Self::NoiseIkhfs25519MlKem768];
+    pub const ALL: [Self; 3] = [
+        Self::NoiseIk25519,
+        Self::NoiseIkhfs25519MlKem768,
+        Self::NoiseIkHybrid25519MlKem768,
+    ];
 
     /// The suite id. It never travels in the clear: it is mixed into the prologue of the
     /// suites that have one (the classical suite keeps the `TCN/1` prologue).
@@ -72,6 +81,7 @@ impl HandshakeSuite {
         match self {
             Self::NoiseIk25519 => 0x00,
             Self::NoiseIkhfs25519MlKem768 => 0x01,
+            Self::NoiseIkHybrid25519MlKem768 => 0x02,
         }
     }
 
@@ -81,6 +91,9 @@ impl HandshakeSuite {
         match self {
             Self::NoiseIk25519 => "Noise_IK_25519_ChaChaPoly_BLAKE2s",
             Self::NoiseIkhfs25519MlKem768 => "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s",
+            Self::NoiseIkHybrid25519MlKem768 => {
+                "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s"
+            }
         }
     }
 
@@ -90,8 +103,21 @@ impl HandshakeSuite {
         // Every suite runs on both channels since PQ-1 on the outer channel (Phase 3). The
         // match stays, so that a future suite has to decide per channel.
         match (self, channel) {
-            (Self::NoiseIk25519 | Self::NoiseIkhfs25519MlKem768, _) => true,
+            (
+                Self::NoiseIk25519
+                | Self::NoiseIkhfs25519MlKem768
+                | Self::NoiseIkHybrid25519MlKem768,
+                _,
+            ) => true,
         }
+    }
+
+    /// `true` if the suite authenticates the static ML-KEM keys (PQ-AUTH): the initiator must
+    /// pin the responder's v2 public key, and the responder learns the initiator's
+    /// fingerprint v2.
+    #[must_use]
+    pub const fn requires_hybrid_identity(self) -> bool {
+        matches!(self, Self::NoiseIkHybrid25519MlKem768)
     }
 
     /// The plaintext of the client's first end-to-end transport message (PROTOCOL §7.3): it
@@ -101,6 +127,7 @@ impl HandshakeSuite {
         match self {
             Self::NoiseIk25519 => b"TCN/1 ready",
             Self::NoiseIkhfs25519MlKem768 => b"TCN/2 ready",
+            Self::NoiseIkHybrid25519MlKem768 => b"TCN/3 ready",
         }
     }
 
@@ -110,13 +137,21 @@ impl HandshakeSuite {
         match self {
             // e + encrypted s + payload tag.
             Self::NoiseIk25519 => NOISE_MSG1_OVERHEAD,
-            // e + encrypted e1 + encrypted s + payload tag. In IK the HFS modifier puts `e1`
-            // after `es` (HFS §5), so it is encrypted: the spike test checks it against snow.
-            Self::NoiseIkhfs25519MlKem768 => {
-                DH_LEN + MLKEM768_EK_LEN + NOISE_TAG_LEN + DH_LEN + NOISE_TAG_LEN + NOISE_TAG_LEN
+            Self::NoiseIkhfs25519MlKem768 => Self::HFS_MSG1_OVERHEAD,
+            // ct1 in front, the IKhfs message 1, and the initiator's static encapsulation key
+            // at the start of the payload.
+            Self::NoiseIkHybrid25519MlKem768 => {
+                MLKEM768_CT_LEN + Self::HFS_MSG1_OVERHEAD + MLKEM768_EK_LEN
             }
         }
     }
+
+    /// e + encrypted e1 + encrypted s + payload tag. In IK the HFS modifier puts `e1` after
+    /// `es` (HFS §5), so it is encrypted: the spike test checks it against snow.
+    const HFS_MSG1_OVERHEAD: usize =
+        DH_LEN + MLKEM768_EK_LEN + NOISE_TAG_LEN + DH_LEN + NOISE_TAG_LEN + NOISE_TAG_LEN;
+    /// e + encrypted ekem1 + empty payload tag.
+    const HFS_MSG2_LEN: usize = DH_LEN + MLKEM768_CT_LEN + NOISE_TAG_LEN + NOISE_TAG_LEN;
 
     /// The longest legitimate message 1: the one carrying the largest certificate
     /// (PROTOCOL §15.3).
@@ -131,10 +166,9 @@ impl HandshakeSuite {
         match self {
             // e + empty payload tag.
             Self::NoiseIk25519 => DH_LEN + NOISE_TAG_LEN,
-            // e + encrypted ekem1 + empty payload tag.
-            Self::NoiseIkhfs25519MlKem768 => {
-                DH_LEN + MLKEM768_CT_LEN + NOISE_TAG_LEN + NOISE_TAG_LEN
-            }
+            Self::NoiseIkhfs25519MlKem768 => Self::HFS_MSG2_LEN,
+            // ct2 in front of the IKhfs message 2.
+            Self::NoiseIkHybrid25519MlKem768 => MLKEM768_CT_LEN + Self::HFS_MSG2_LEN,
         }
     }
 

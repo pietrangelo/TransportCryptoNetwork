@@ -309,11 +309,10 @@ fn run(command: Command) -> Result<(), Failure> {
     match command {
         Command::Keygen { out } => {
             let identity = config::create_identity(&out).map_err(config_error)?;
-            writeln!(
+            write!(
                 std::io::stdout(),
-                "public_key  = \"{}\"\nfingerprint = {}",
-                identity.public_key(),
-                identity.fingerprint()
+                "{}",
+                config::public_identity_text(&identity)
             )
             .map_err(runtime_error)
         }

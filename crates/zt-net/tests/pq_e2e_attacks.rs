@@ -118,7 +118,7 @@ async fn an_unknown_client_with_a_rejected_suite_is_not_named_as_a_suite_rejecti
     .await;
     let (msg1, _) = noise::initiate_suite(
         &mallory,
-        &relay.agent.public_key(),
+        relay.agent.public_key(),
         Channel::EndToEnd,
         HFS,
         &[],
@@ -157,7 +157,7 @@ async fn a_replayed_hybrid_message_1_never_reaches_sshd() {
         FakeRelay::start_suites([alice.fingerprint()].into_iter().collect(), both()).await;
     let (msg1, _) = noise::initiate_suite(
         &alice,
-        &relay.agent.public_key(),
+        relay.agent.public_key(),
         Channel::EndToEnd,
         HFS,
         &[],
@@ -187,7 +187,7 @@ async fn the_confirmation_must_match_the_suite() {
     ] {
         stream += 1;
         let (msg1, waiting) =
-            noise::initiate_suite(&alice, &agent_key, Channel::EndToEnd, suite, &[]).unwrap();
+            noise::initiate_suite(&alice, agent_key, Channel::EndToEnd, suite, &[]).unwrap();
         let msg2 = relay.msg2(stream, msg1).await.unwrap();
         let mut t = waiting.complete(&msg2).unwrap();
         relay.data(stream, t.encrypt(confirm).unwrap()).await;
@@ -201,7 +201,7 @@ async fn the_confirmation_must_match_the_suite() {
     for suite in [HFS, CLASSIC] {
         stream += 1;
         let (msg1, waiting) =
-            noise::initiate_suite(&alice, &agent_key, Channel::EndToEnd, suite, &[]).unwrap();
+            noise::initiate_suite(&alice, agent_key, Channel::EndToEnd, suite, &[]).unwrap();
         let msg2 = relay.msg2(stream, msg1).await.unwrap();
         let mut t = waiting.complete(&msg2).unwrap();
         relay
@@ -229,7 +229,7 @@ async fn an_oversized_message_1_is_refused_before_parsing() {
             FakeRelay::start_suites([alice.fingerprint()].into_iter().collect(), accepted).await;
         let (mut msg1, _) = noise::initiate_suite(
             &alice,
-            &relay.agent.public_key(),
+            relay.agent.public_key(),
             Channel::EndToEnd,
             HFS,
             &vec![0x5a; zt_domain::limits::MAX_ANY_CERT_LEN],
@@ -260,7 +260,7 @@ async fn a_truncated_hybrid_message_1_is_an_invalid_handshake() {
         FakeRelay::start_suites([alice.fingerprint()].into_iter().collect(), both()).await;
     let (msg1, _) = noise::initiate_suite(
         &alice,
-        &relay.agent.public_key(),
+        relay.agent.public_key(),
         Channel::EndToEnd,
         HFS,
         &[],

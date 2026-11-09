@@ -116,7 +116,7 @@ impl Lab {
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay.to_string(),
-                public_key: relay_id.public_key(),
+                public_key: relay_id.public_key().into(),
                 suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
@@ -150,11 +150,11 @@ impl Lab {
         ClientConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
-                public_key: self.relay_id.public_key(),
+                public_key: self.relay_id.public_key().into(),
                 suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
-            node_key: self.agent_id.public_key(),
+            node_key: self.agent_id.public_key().into(),
             node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: fast(),
