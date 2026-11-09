@@ -931,3 +931,112 @@ fn check_enforces_the_pq_only_profile_and_reports_classical_paths() {
     assert!(!stdout.contains("classical"), "{stdout}");
     assert!(stdout.contains("pq-only"), "{stdout}");
 }
+
+/// Review 0014, A14-3 (mutant M1: `Reloader { pq_only: false }`): under `[handshake] pq_only`
+/// the running relay checks every reloaded policy against the profile. The policy an operator
+/// might write for §19.3 step 4 while the profile is still on (a v1 agent key, no
+/// `require_hybrid_identity`) is rejected: `reload` exits 78 naming `pq_only`, the relay logs
+/// `policy_reload_failed`, keeps the policy in force and runs on.
+#[test]
+fn a_pq_only_relay_rejects_a_reload_that_readmits_v1_identities() {
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let dir = setup("pq-reload");
+    let agent = Identity::generate().unwrap();
+    write(
+        &dir.0,
+        "relay.toml",
+        &format!(
+            "[handshake]\npq_only = true\nagent_suites = [\"{HYBRID}\"]\nclient_suites = [\"{HYBRID}\"]\n"
+        ),
+    );
+    write(
+        &dir.0,
+        "policy.toml",
+        &format!(
+            "require_hybrid_identity = [\"agents\", \"clients\"]\n\n[[agents]]\nnode = \"web-01\"\npublic_key = \"{}\"\n",
+            agent.hybrid_public_key()
+        ),
+    );
+    let config = dir.0.join("relay.toml").display().to_string();
+    let mut relay = Running::start(&dir, &["--config", &config]);
+    relay.event("configuration_loaded");
+    write(
+        &dir.0,
+        "policy.toml",
+        &format!(
+            "[[agents]]\nnode = \"web-01\"\npublic_key = \"{}\"\n",
+            agent.public_key()
+        ),
+    );
+    let out = reload(&dir, &relay);
+    assert_eq!(out.status.code(), Some(EX_CONFIG), "{}", text(&out));
+    assert!(text(&out).contains("pq_only"), "{}", text(&out));
+    let failed = relay.event("policy_reload_failed");
+    assert!(
+        failed["fields"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pq_only")),
+        "{failed}"
+    );
+    assert!(relay.child.try_wait().unwrap().is_none(), "the relay died");
+    assert!(std::net::TcpStream::connect(&relay.addr).is_ok());
+}
+
+/// Review 0014, A14-4: the running relay says whether the profile is in force, and which
+/// classical paths its configuration still accepts, at startup and after every applied
+/// reload (`pq_only_profile`, then one `classical_paths_accepted` per path). Under the
+/// profile it logs `pq_only=true` and no classical path.
+#[test]
+fn the_relay_logs_its_profile_and_classical_paths_at_startup_and_on_reload() {
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let dir = setup("pq-log");
+    let relay = Running::start(&dir, &[]);
+    let profile = relay.event("pq_only_profile");
+    assert_eq!(profile["fields"]["pq_only"], false, "{profile}");
+    assert_eq!(profile["fields"]["role"], "relay", "{profile}");
+    let path = relay.event("classical_paths_accepted");
+    assert!(
+        path["fields"]["path"]
+            .as_str()
+            .is_some_and(|p| p.contains("agent suites")),
+        "{path}"
+    );
+    new_agent_policy(&dir);
+    let out = reload(&dir, &relay);
+    assert!(out.status.success(), "{}", text(&out));
+    relay.event("policy_reloaded");
+    let profile = relay.event("pq_only_profile");
+    assert_eq!(profile["fields"]["pq_only"], false, "{profile}");
+    relay.event("classical_paths_accepted");
+    drop(relay);
+
+    let agent = Identity::generate().unwrap();
+    write(
+        &dir.0,
+        "relay.toml",
+        &format!(
+            "[handshake]\npq_only = true\nagent_suites = [\"{HYBRID}\"]\nclient_suites = [\"{HYBRID}\"]\n"
+        ),
+    );
+    write(
+        &dir.0,
+        "policy.toml",
+        &format!(
+            "require_hybrid_identity = [\"agents\", \"clients\"]\n\n[[agents]]\nnode = \"web-01\"\npublic_key = \"{}\"\n",
+            agent.hybrid_public_key()
+        ),
+    );
+    let config = dir.0.join("relay.toml").display().to_string();
+    let relay = Running::start(&dir, &["--config", &config]);
+    let profile = relay.event("pq_only_profile");
+    assert_eq!(profile["fields"]["pq_only"], true, "{profile}");
+    relay.event("configuration_loaded");
+    assert!(
+        relay
+            .seen
+            .borrow()
+            .iter()
+            .all(|v| v["fields"]["event_kind"] != "classical_paths_accepted"),
+        "a classical path under the profile"
+    );
+}

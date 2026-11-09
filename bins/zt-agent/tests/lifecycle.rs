@@ -385,3 +385,178 @@ fn check_enforces_the_pq_only_profile() {
     assert!(!stdout.contains("classical"), "{stdout}");
     assert!(stdout.contains("pq-only"), "{stdout}");
 }
+
+/// Review 0014, A14-2: `--pq-only` and `TCN_PQ_ONLY` take the boolean spellings an operator
+/// writes in `agent.env` or a drop-in (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, any
+/// case), and every other value, the empty one included, is a configuration error (78, which
+/// the unit does not restart on) naming the setting, never a usage error (2, a restart loop).
+/// With the classical defaults, an enabled profile is a `pq_only` refusal (78) and a disabled
+/// one passes `check`.
+#[test]
+fn the_pq_only_setting_is_parsed_leniently_and_an_invalid_value_is_ex_config() {
+    let dir = setup("pq-value");
+    let on = |out: &std::process::Output, how: &str| {
+        assert_eq!(out.status.code(), Some(EX_CONFIG), "{how}: {}", text(out));
+        assert!(
+            text(out).contains("pq_only: ") && text(out).contains("--relay-suite"),
+            "{how}: {}",
+            text(out)
+        );
+    };
+    let off = |out: &std::process::Output, how: &str| {
+        assert!(out.status.success(), "{how}: {}", text(out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("classical still accepted"),
+            "{how}: {}",
+            text(out)
+        );
+    };
+    let invalid = |out: &std::process::Output, how: &str| {
+        assert_eq!(out.status.code(), Some(EX_CONFIG), "{how}: {}", text(out));
+        assert!(text(out).contains("invalid"), "{how}: {}", text(out));
+        assert!(text(out).contains("TCN_PQ_ONLY"), "{how}: {}", text(out));
+    };
+    for value in ["true", "1", "yes", "on", "True", "YES", "On"] {
+        let out = command(&dir, "check")
+            .env("TCN_PQ_ONLY", value)
+            .output()
+            .unwrap();
+        on(&out, &format!("TCN_PQ_ONLY={value}"));
+        let out = command(&dir, "check")
+            .arg(format!("--pq-only={value}"))
+            .output()
+            .unwrap();
+        on(&out, &format!("--pq-only={value}"));
+    }
+    for value in ["false", "0", "no", "off", "False", "OFF"] {
+        let out = command(&dir, "check")
+            .env("TCN_PQ_ONLY", value)
+            .output()
+            .unwrap();
+        off(&out, &format!("TCN_PQ_ONLY={value}"));
+        let out = command(&dir, "check")
+            .arg(format!("--pq-only={value}"))
+            .output()
+            .unwrap();
+        off(&out, &format!("--pq-only={value}"));
+    }
+    for value in ["", " ", "maybe", "2", "enable", "true,false"] {
+        for sub in ["check", "run"] {
+            let out = command(&dir, sub)
+                .env("TCN_PQ_ONLY", value)
+                .output()
+                .unwrap();
+            invalid(&out, &format!("{sub} TCN_PQ_ONLY={value:?}"));
+        }
+        let out = command(&dir, "check")
+            .arg(format!("--pq-only={value}"))
+            .output()
+            .unwrap();
+        invalid(&out, &format!("--pq-only={value:?}"));
+    }
+    // The bare flag turns it on, and the flag wins over the environment.
+    let out = command(&dir, "check")
+        .arg("--pq-only")
+        .env("TCN_PQ_ONLY", "false")
+        .output()
+        .unwrap();
+    on(&out, "--pq-only over TCN_PQ_ONLY=false");
+}
+
+/// Review 0014, A14-4: the running agent says whether the profile is in force, and which
+/// classical paths its configuration still accepts, at startup and after every applied
+/// reload (`pq_only_profile`, then one `classical_paths_accepted` per path).
+#[test]
+fn the_agent_logs_its_profile_and_classical_paths_at_startup_and_on_reload() {
+    let dir = setup("pq-log");
+    let agent = Running::start(&dir, &[]);
+    let line = agent.wait_for("pq_only_profile");
+    assert!(line.contains("\"pq_only\":false"), "{line}");
+    assert!(line.contains("\"role\":\"agent\""), "{line}");
+    let line = agent.wait_for("classical_paths_accepted");
+    assert!(line.contains("\"path\":"), "{line}");
+    let out = agent.reload(&dir);
+    assert!(out.status.success(), "{}", text(&out));
+    agent.wait_for("authorized_clients_reloaded");
+    let line = agent.wait_for("pq_only_profile");
+    assert!(line.contains("\"pq_only\":false"), "{line}");
+    agent.wait_for("classical_paths_accepted");
+}
+
+/// Review 0014, A14-4: under the profile the running agent logs `pq_only=true` and no
+/// classical path.
+#[test]
+fn a_pq_only_agent_logs_the_profile_and_no_classical_path() {
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let dir = setup("pq-run");
+    std::fs::write(
+        dir.0.join("clients.toml"),
+        "require_hybrid_identity = [\"clients\"]\n",
+    )
+    .unwrap();
+    let mut child = Command::new(BIN)
+        .args([
+            "--log-format",
+            "json",
+            "run",
+            "--pq-only",
+            "--node",
+            "web-01",
+        ])
+        .args(["--relay", "127.0.0.1:9", "--relay-key"])
+        .arg(
+            Identity::generate()
+                .unwrap()
+                .hybrid_public_key()
+                .to_string(),
+        )
+        .args(["--relay-suite", HYBRID, "--accept-client-suites", HYBRID])
+        .arg("--key")
+        .arg(dir.0.join("agent.key"))
+        .arg("--authorized-clients")
+        .arg(dir.0.join("clients.toml"))
+        .env("RUNTIME_DIRECTORY", dir.0.join("run"))
+        .env_remove("TCN_ACCEPT_CLIENT_SUITES")
+        .env_remove("TCN_PQ_ONLY")
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("WATCHDOG_USEC")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let agent = Running { child, lines };
+    let mut before = Vec::new();
+    let profile = loop {
+        let line = agent
+            .lines
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no pq_only_profile");
+        if line.contains("\"event_kind\":\"pq_only_profile\"") {
+            break line;
+        }
+        before.push(line);
+    };
+    assert!(profile.contains("\"pq_only\":true"), "{profile}");
+    // The classical paths come right after the profile line: wait for the next audit line.
+    let next = agent.wait_for("handshake_suites_in_use");
+    before.push(next);
+    while let Ok(line) = agent.lines.recv_timeout(Duration::from_millis(500)) {
+        before.push(line);
+    }
+    assert!(
+        before
+            .iter()
+            .all(|l| !l.contains("classical_paths_accepted")),
+        "{before:?}"
+    );
+}

@@ -145,10 +145,22 @@ async fn the_relay_reports_confirmed_handshakes_per_role_and_suite() {
     let lines = log.events("outer_suites_confirmed");
     assert!(!lines.is_empty(), "{}", log.text());
     let sum = |key: &str| lines.iter().filter_map(|l| number(l, key)).sum::<u64>();
-    assert_eq!(sum("agents_hybrid"), 1, "{lines:?}");
-    assert_eq!(sum("clients_classical"), 1, "{lines:?}");
-    assert_eq!(sum("agents_classical"), 0, "{lines:?}");
-    assert_eq!(sum("clients_hybrid"), 0, "{lines:?}");
+    // Each suite under its own name (review 0014, A14-1): `IKhfs` is `*_ikhfs`, never
+    // "hybrid", which reads as hybrid authentication.
+    assert_eq!(sum("agents_ikhfs"), 1, "{lines:?}");
+    assert_eq!(sum("clients_ik"), 1, "{lines:?}");
+    for key in [
+        "agents_ik",
+        "agents_hybrid_ik",
+        "clients_ikhfs",
+        "clients_hybrid_ik",
+        "agents_hybrid",
+        "clients_hybrid",
+        "agents_classical",
+        "clients_classical",
+    ] {
+        assert_eq!(sum(key), 0, "{key}: {lines:?}");
+    }
     for line in &lines {
         assert!(field(line, "peer").is_none(), "{line}");
     }

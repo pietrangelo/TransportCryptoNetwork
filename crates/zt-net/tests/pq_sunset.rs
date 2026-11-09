@@ -3,7 +3,8 @@
 //! `pq_only` profile (`[handshake] pq_only` in `relay.toml`, `--pq-only` on the agent,
 //! `pq_only` in `client.toml`) refuses at load time any setting that would still accept a
 //! classical suite, a v1 identity or a v1 certificate, and the end-state fleet of OPERATIONS
-//! §19 refuses each of them on every channel: both outer hops and end to end.
+//! §19, loaded from its files through the loading code of the binaries, refuses each of them on
+//! every channel: both outer hops and end to end. The rollback follows the order of §19.3.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -14,16 +15,16 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{Ca, Captured, Lab, assert_alive, field, relay_config, scope};
-use zt_crypto::Identity;
-use zt_domain::{AcceptedSuites, AccessPolicy, AuthorizedClients, HandshakeSuite};
+use common::{Ca, Captured, Lab, assert_alive, copy_of, field, number, relay_config, scope};
+use zt_crypto::{Identity, Keyring};
+use zt_domain::{AcceptedSuites, AccessPolicy, AuthorizedClients, HandshakeSuite, SuitePolicy};
 use zt_net::config::{
-    ConfigError, RelaySettings, parse_authorized_clients, parse_certificate_file,
-    parse_client_settings, parse_policy, parse_relay_settings, parse_revocations,
+    self, ConfigError, RelaySettings, parse_authorized_clients, parse_certificate_file,
+    parse_client_settings, parse_policy, parse_relay_settings,
 };
 use zt_net::sunset;
 
@@ -307,58 +308,287 @@ fn a_pq_only_client_pins_only_the_hybrid_ik_suite() {
     pq_only_error(&sunset::check_certificate("alice.cert", &file(&v1)).unwrap_err());
 }
 
-// --- the end-state fleet on the network ---------------------------------------------------
+// --- the fleet, loaded through the loading code of the binaries -------------------------
 
-/// The fleet of OPERATIONS §19, every file parsed from its end-state text and checked by the
-/// profile: one relay, the `web-01` agent pinned to the hybrid IK suite, the agent's
-/// `clients.toml`.
-async fn pq_only_fleet(
-    agent: Arc<Identity>,
-    alice: &Identity,
-    ca: &Ca,
-    agent_suite: HandshakeSuite,
-) -> Lab {
-    let settings = parse_relay_settings("relay.toml", &relay_toml()).unwrap();
-    let mut policy = parse_policy("policy.toml", &policy_toml(&agent, alice, ca)).unwrap();
-    sunset::check_policy("policy.toml", &policy).unwrap();
-    with_empty_denylist_policy(&mut policy);
-    let mut clients = parse_authorized_clients("clients.toml", &clients_toml(alice, ca)).unwrap();
-    sunset::check_authorized_clients("clients.toml", &clients).unwrap();
-    with_empty_denylist_clients(&mut clients);
+/// A directory of configuration files as an operator writes them (0644 in a 0755 directory),
+/// removed on drop.
+struct Files(PathBuf);
+
+impl Drop for Files {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+static NEXT_FILES: AtomicUsize = AtomicUsize::new(0);
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+impl Files {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "zt-pq-sunset-{}-{}",
+            std::process::id(),
+            NEXT_FILES.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        set_mode(&dir, 0o755);
+        Self(dir)
+    }
+
+    fn put(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, text).unwrap();
+        set_mode(&path, 0o644);
+        path
+    }
+}
+
+/// What the operator writes for one relay and the `web-01` agent: `relay.toml`, the relay
+/// policy, the agent's `clients.toml` and the agent's options.
+#[derive(Clone)]
+struct FleetFiles {
+    relay_toml: String,
+    policy: String,
+    clients: String,
+    /// `--pq-only` of the agent.
+    agent_pq_only: bool,
+    /// `--relay-suite` of the agent.
+    agent_relay_suite: HandshakeSuite,
+    /// `--accept-client-suites` of the agent.
+    agent_client_suites: AcceptedSuites,
+}
+
+impl FleetFiles {
+    /// The end state of OPERATIONS §19.1.
+    fn end_state(agent: &Identity, alice: &Identity, ca: &Ca) -> Self {
+        Self {
+            relay_toml: relay_toml(),
+            policy: policy_toml(agent, alice, ca),
+            clients: clients_toml(alice, ca),
+            agent_pq_only: true,
+            agent_relay_suite: HYBRID,
+            agent_client_suites: AcceptedSuites::only(HYBRID),
+        }
+    }
+
+    /// The same files and options without the profile, on the relay and on the agent.
+    fn without_profile(&self) -> Self {
+        Self {
+            relay_toml: self.relay_toml.replace("pq_only = true", "pq_only = false"),
+            agent_pq_only: false,
+            ..self.clone()
+        }
+    }
+}
+
+fn edited(base: &FleetFiles, edit: impl FnOnce(&mut FleetFiles)) -> FleetFiles {
+    let mut files = base.clone();
+    edit(&mut files);
+    files
+}
+
+/// The fleet's configuration as `zt-relay` and `zt-agent` load it, at startup, in `check` and
+/// on every reload: the profile is applied by the loading code under test, never by the test
+/// (review 0014, A14-5).
+struct Loaded {
+    suites: SuitePolicy,
+    policy: AccessPolicy,
+    clients: AuthorizedClients,
+    client_suites: AcceptedSuites,
+    relay_suite: HandshakeSuite,
+}
+
+/// The relay's policy and the agent's `clients.toml` through their loading code, with the
+/// relay's `pq_only` and the agent's `--pq-only`.
+fn load_trust(
+    files: &FleetFiles,
+    agent: &Identity,
+    relay_pq_only: bool,
+) -> (
+    Result<AccessPolicy, ConfigError>,
+    Result<AuthorizedClients, ConfigError>,
+) {
+    let dir = Files::new();
+    let revoked = dir.put("revoked.toml", "");
+    let relay_keys = Keyring::single(Identity::generate().unwrap());
+    let policy = config::load_relay_policy_checked(
+        &dir.put("policy.toml", &files.policy),
+        Some(&revoked),
+        &relay_keys,
+        relay_pq_only,
+    )
+    .map(|(policy, _)| policy);
+    let agent_keys = Keyring::single(copy_of(agent));
+    let clients = config::load_agent_clients_checked(
+        &dir.put("clients.toml", &files.clients),
+        Some(&revoked),
+        &config::own_keys(&agent_keys, "agent"),
+        files.agent_pq_only,
+    )
+    .map(|(clients, _)| clients);
+    (policy, clients)
+}
+
+fn load_fleet(files: &FleetFiles, agent: &Identity) -> Result<Loaded, ConfigError> {
+    let dir = Files::new();
+    let (settings, _) =
+        config::load_relay_settings_digested(&dir.put("relay.toml", &files.relay_toml))?;
+    let relay = Identity::generate().unwrap();
+    let relays = [zt_net::RelayEndpoint {
+        address: "r1.example:7000".into(),
+        public_key: common::pin_of(&relay, files.agent_relay_suite),
+        suite: files.agent_relay_suite,
+    }];
+    if files.agent_pq_only {
+        sunset::check_agent_suites(&relays, files.agent_client_suites)?;
+    }
+    let (policy, clients) = load_trust(files, agent, settings.pq_only);
+    Ok(Loaded {
+        suites: settings.suites,
+        policy: policy?,
+        clients: clients?,
+        client_suites: files.agent_client_suites,
+        relay_suite: files.agent_relay_suite,
+    })
+}
+
+async fn start_fleet(loaded: Loaded, agent: Arc<Identity>) -> Lab {
     let mut relay = relay_config();
-    relay.suites = settings.suites;
+    relay.suites = loaded.suites;
     Lab::start_outer(
         agent,
-        vec![(policy, relay)],
-        clients,
-        AcceptedSuites::only(HYBRID),
-        agent_suite,
+        vec![(loaded.policy, relay)],
+        loaded.clients,
+        loaded.client_suites,
+        loaded.relay_suite,
     )
     .await
 }
 
-fn empty_denylist() -> zt_domain::trust::Revocations {
-    parse_revocations("revoked.toml", "").unwrap()
+/// The end-state fleet of OPERATIONS §19.1, loaded from its files.
+async fn end_state_fleet(agent: Arc<Identity>, alice: &Identity, ca: &Ca) -> Lab {
+    let loaded = load_fleet(&FleetFiles::end_state(&agent, alice, ca), &agent).unwrap();
+    start_fleet(loaded, agent).await
 }
 
-fn with_empty_denylist_policy(policy: &mut AccessPolicy) {
-    let mut trust = policy.cert_trust().clone();
-    trust.set_revocations(empty_denylist());
-    policy.set_cert_trust(trust).unwrap();
+/// `SIGHUP` on the relay and on the agent: the files go through the same loading code, and a
+/// refused file leaves the configuration in force (the relay's `Reloader`, the agent's `load`).
+fn reload_fleet(
+    lab: &Lab,
+    files: &FleetFiles,
+    agent: &Identity,
+) -> (Result<(), ConfigError>, Result<(), ConfigError>) {
+    // `relay.toml` is read at startup only: the reload keeps its `pq_only`.
+    let relay_pq_only = parse_relay_settings("relay.toml", &files.relay_toml)
+        .unwrap()
+        .pq_only;
+    let (policy, clients) = load_trust(files, agent, relay_pq_only);
+    (
+        policy.map(|p| lab.relays[0].policy.replace(p)),
+        clients.map(|c| lab.clients.replace(c)),
+    )
 }
 
-fn with_empty_denylist_clients(clients: &mut AuthorizedClients) {
-    let mut trust = clients.cert_trust().clone();
-    trust.set_revocations(empty_denylist());
-    clients.set_cert_trust(trust).unwrap();
+fn reasons(log: &Captured) -> Vec<String> {
+    log.events("authentication_failed")
+        .iter()
+        .filter_map(|l| field(l, "reason"))
+        .collect()
+}
+
+/// Attack (review 0014, A14-5 and mutants M2/M3): the profile itself, through the loading code
+/// of both binaries. Each file below keeps one classical path next to the end state; the
+/// profile refuses every one of them, and the same files load without it, so what keeps them
+/// out is the profile and not the parser. `IKhfs` (classical authentication) is refused like
+/// the classical suite, and a v1 CA key like a v1 identity, also inside a rotation pair.
+#[test]
+fn the_profile_refuses_every_file_that_keeps_a_classical_path() {
+    let (agent, alice, ca, old) = (id(), id(), Ca::new_v2(), Ca::new());
+    let end = FleetFiles::end_state(&agent, &alice, &ca);
+    load_fleet(&end, &agent).unwrap();
+    let v2 = ca.v2.as_ref().unwrap().public_key().to_string();
+    let v2_ca = format!("public_key = \"{v2}\"");
+    let v1_ca = format!("public_key = \"{}\"", old.key.public_key());
+    let rotation = format!("public_keys = [\"{v2}\", \"{}\"]", old.key.public_key());
+    let hybrid_set = format!("[\"{HYBRID_NAME}\"]");
+    let cases = [
+        (
+            "relay: IKhfs for agents",
+            edited(&end, |f| {
+                f.relay_toml = f.relay_toml.replacen(
+                    &hybrid_set,
+                    &format!("[\"{HYBRID_NAME}\", \"{IKHFS_NAME}\"]"),
+                    1,
+                );
+            }),
+        ),
+        (
+            "relay: the classical suite for clients",
+            edited(&end, |f| {
+                f.relay_toml = f.relay_toml.replace(
+                    &format!("client_suites = {hybrid_set}"),
+                    &format!("client_suites = [\"{HYBRID_NAME}\", \"{CLASSIC_NAME}\"]"),
+                );
+            }),
+        ),
+        (
+            "relay: v1 clients",
+            edited(&end, |f| {
+                f.policy = f.policy.replace(
+                    "require_hybrid_identity = [\"agents\", \"clients\"]",
+                    "require_hybrid_identity = [\"agents\"]",
+                );
+            }),
+        ),
+        (
+            "relay: a v1 CA key in a rotation pair",
+            edited(&end, |f| f.policy = f.policy.replace(&v2_ca, &rotation)),
+        ),
+        (
+            "agent: a v1 CA key",
+            edited(&end, |f| f.clients = f.clients.replace(&v2_ca, &v1_ca)),
+        ),
+        (
+            "agent: v1 clients",
+            edited(&end, |f| {
+                f.clients = f
+                    .clients
+                    .replace("require_hybrid_identity = [\"clients\"]\n", "");
+            }),
+        ),
+        (
+            "agent: IKhfs end to end",
+            edited(&end, |f| {
+                f.agent_client_suites = AcceptedSuites::new([HYBRID, IKHFS]).unwrap();
+            }),
+        ),
+        (
+            "agent: IKhfs towards the relay",
+            edited(&end, |f| f.agent_relay_suite = IKHFS),
+        ),
+    ];
+    for (name, files) in &cases {
+        match load_fleet(files, &agent) {
+            Ok(_) => panic!("{name}: loaded under the profile"),
+            Err(err) => pq_only_error(&err),
+        }
+        if let Err(err) = load_fleet(&files.without_profile(), &agent) {
+            panic!("{name}: refused without the profile: {err}");
+        }
+    }
 }
 
 /// Spec: the end-state fleet works: a whitelisted client and a client with a hybrid-bound
 /// certificate v2 reach their node over the hybrid IK suite on both hops and end to end.
 #[tokio::test]
-async fn a_pq_only_fleet_admits_hybrid_clients() {
+async fn the_end_state_fleet_admits_hybrid_clients() {
     let (agent, alice, bob, ca) = (id(), id(), id(), Ca::new_v2());
-    let lab = pq_only_fleet(agent, &alice, &ca, HYBRID).await;
+    let lab = end_state_fleet(agent, &alice, &ca).await;
     let (mut app, _t) = lab
         .session_with(&alice, lab.config_outer(None, HYBRID, HYBRID))
         .await
@@ -374,11 +604,11 @@ async fn a_pq_only_fleet_admits_hybrid_clients() {
 }
 
 /// Attack (Downgrade, client → relay): the classical suite and `IKhfs` on the outer hop are
-/// refused by the pq-only relay, whatever the end-to-end suite.
+/// refused by the end-state relay, whatever the end-to-end suite.
 #[tokio::test]
-async fn a_pq_only_fleet_refuses_classical_suites_on_the_client_hop() {
+async fn the_end_state_fleet_refuses_classical_suites_on_the_client_hop() {
     let (agent, alice, ca) = (id(), id(), Ca::new_v2());
-    let lab = pq_only_fleet(agent, &alice, &ca, HYBRID).await;
+    let lab = end_state_fleet(agent, &alice, &ca).await;
     for outer in [CLASSIC, IKHFS] {
         for e2e in [HYBRID, CLASSIC] {
             assert!(
@@ -393,13 +623,13 @@ async fn a_pq_only_fleet_refuses_classical_suites_on_the_client_hop() {
 }
 
 /// Attack (Downgrade, end to end): over a hybrid outer hop, the classical suite and `IKhfs`
-/// end to end are refused by the pq-only agent.
+/// end to end are refused by the end-state agent.
 #[tokio::test]
-async fn a_pq_only_fleet_refuses_classical_suites_end_to_end() {
+async fn the_end_state_fleet_refuses_classical_suites_end_to_end() {
     let log = Captured::default();
     let _guard = log.install();
     let (agent, alice, ca) = (id(), id(), Ca::new_v2());
-    let lab = pq_only_fleet(agent, &alice, &ca, HYBRID).await;
+    let lab = end_state_fleet(agent, &alice, &ca).await;
     for e2e in [CLASSIC, IKHFS] {
         assert!(
             lab.refused_with(&alice, &lab.config_outer(None, HYBRID, e2e))
@@ -417,13 +647,17 @@ async fn a_pq_only_fleet_refuses_classical_suites_end_to_end() {
     );
 }
 
-/// Attack (Downgrade, agent → relay): an agent pinning the classical suite or `IKhfs` never
-/// registers with the pq-only relay, so its node stays unreachable.
+/// Attack (Downgrade, agent → relay; A14-2): an agent outside the profile (an agent older than
+/// Phase 7 ignores it) that pins the classical suite or `IKhfs` never registers with the
+/// pq-only relay, so its node stays unreachable.
 #[tokio::test]
-async fn a_pq_only_relay_refuses_classical_agents() {
+async fn a_pq_only_relay_refuses_agents_outside_the_profile() {
     for agent_suite in [CLASSIC, IKHFS] {
         let (agent, alice, ca) = (id(), id(), Ca::new_v2());
-        let lab = pq_only_fleet(agent, &alice, &ca, agent_suite).await;
+        let mut files = FleetFiles::end_state(&agent, &alice, &ca);
+        files.agent_pq_only = false;
+        files.agent_relay_suite = agent_suite;
+        let lab = start_fleet(load_fleet(&files, &agent).unwrap(), agent).await;
         assert!(
             lab.refused_with(&alice, &lab.config_outer(None, HYBRID, HYBRID))
                 .await
@@ -439,11 +673,11 @@ async fn a_pq_only_relay_refuses_classical_agents() {
 /// CAs) and a certificate v2 bound only to the classical identity are all refused, on the
 /// relay and on the agent.
 #[tokio::test]
-async fn a_pq_only_fleet_refuses_v1_identities_and_v1_certificates() {
+async fn the_end_state_fleet_refuses_v1_identities_and_v1_certificates() {
     let log = Captured::default();
     let _guard = log.install();
     let (agent, alice, mallory, ca, old) = (id(), id(), id(), Ca::new_v2(), Ca::new());
-    let lab = pq_only_fleet(agent, &alice, &ca, HYBRID).await;
+    let lab = end_state_fleet(agent, &alice, &ca).await;
     let (v1, _) = old.issue(&mallory.public_key(), scope(&["web-01"]));
     let (classical_v2, _) = ca.issue(&mallory.public_key(), scope(&["web-01"]));
     for cert in [None, Some(&v1), Some(&classical_v2)] {
@@ -454,11 +688,7 @@ async fn a_pq_only_fleet_refuses_v1_identities_and_v1_certificates() {
         );
     }
     assert_eq!(lab.sshd.load(Ordering::SeqCst), 0);
-    let reasons: Vec<String> = log
-        .events("authentication_failed")
-        .iter()
-        .filter_map(|l| field(l, "reason"))
-        .collect();
+    let reasons = reasons(&log);
     assert!(
         reasons.iter().any(|r| r == "identity_downgrade"),
         "{reasons:?}"
@@ -468,50 +698,207 @@ async fn a_pq_only_fleet_refuses_v1_identities_and_v1_certificates() {
     // counts in its aggregate (no per-event line).
 }
 
-/// Spec (rollback, OPERATIONS §19): turning the profile off and adding the classical suite
-/// back is a configuration change only, and the classical client gets in again.
+/// Attack (review 0014, A14-3 and A14-5, on the network): under the profile, a reload that
+/// re-admits a v1 identity (no `require_hybrid_identity`, mallory pinned by her X25519 key)
+/// is refused by the loading code of both binaries, the end-state configuration stays in
+/// force and mallory stays out. The same reload outside the profile is applied and lets her
+/// in: the outcome on the wire depends on the profile.
 #[tokio::test]
-async fn the_rollback_is_a_configuration_change() {
-    let (agent, alice) = (id(), id());
-    let rolled_back = parse_relay_settings(
-        "relay.toml",
-        &format!(
+async fn a_reload_that_readmits_v1_identities_is_refused_under_the_profile() {
+    for pq_only in [true, false] {
+        let (agent, alice, mallory, ca) = (id(), id(), id(), Ca::new_v2());
+        let end = FleetFiles::end_state(&agent, &alice, &ca);
+        let files = if pq_only { end } else { end.without_profile() };
+        let lab = start_fleet(load_fleet(&files, &agent).unwrap(), Arc::clone(&agent)).await;
+        let readmit = edited(&files, |f| {
+            f.policy = format!(
+                "{}\n[[clients]]\nname = \"mallory\"\npublic_key = \"{}\"\nallow = [\"*\"]\n",
+                f.policy
+                    .replace("require_hybrid_identity = [\"agents\", \"clients\"]\n", ""),
+                mallory.public_key()
+            );
+            f.clients = format!(
+                "{}\n[[clients]]\nname = \"mallory\"\npublic_key = \"{}\"\n",
+                f.clients
+                    .replace("require_hybrid_identity = [\"clients\"]\n", ""),
+                mallory.public_key()
+            );
+        });
+        let (relay, agent_reload) = reload_fleet(&lab, &readmit, &agent);
+        let session = lab
+            .session_with(&mallory, lab.config_outer(None, HYBRID, HYBRID))
+            .await;
+        if pq_only {
+            pq_only_error(&relay.unwrap_err());
+            pq_only_error(&agent_reload.unwrap_err());
+            assert!(session.is_err(), "mallory got in under the profile");
+            assert_eq!(lab.sshd.load(Ordering::SeqCst), 0);
+        } else {
+            relay.unwrap();
+            agent_reload.unwrap();
+            let (mut app, _t) = session.unwrap();
+            assert_alive(&mut app).await;
+        }
+    }
+}
+
+/// Spec (rollback, OPERATIONS §19.3), step by step in the documented order: clients, relays,
+/// agents, and only then the §16 rollback. While `require_hybrid_identity` stays, a client
+/// pinned by its v2 key cannot come back over the classical suite (`identity_downgrade`, on
+/// the relay after step 2 and on the agent after step 3); after step 4 a v1 client gets in,
+/// and a certificate bound to a hybrid identity still passes only over the hybrid IK suite
+/// (`key_mismatch` over the classical one). There is no downgrade window.
+#[tokio::test]
+async fn the_rollback_follows_the_documented_order_without_a_downgrade_window() {
+    let log = Captured::default();
+    let _guard = log.install();
+    let (agent, alice, bob, ca) = (id(), id(), id(), Ca::new_v2());
+    let end = FleetFiles::end_state(&agent, &alice, &ca);
+    let (bob_cert, _) = ca.issue_hybrid(&bob.hybrid_public_key(), scope(&["web-01"]));
+
+    // Step 1, clients: `pq_only` removed from `client.toml`, nothing changes on the wire.
+    let client = client_toml(&id(), &agent).replace("pq_only = true\n", "");
+    let client = parse_client_settings("client.toml", Path::new("/etc/tcn"), &client).unwrap();
+    assert!(!client.pq_only);
+
+    // Step 2, relays: the profile off and the classical suite back in both sets. The policy
+    // still requires hybrid identities.
+    let step2 = edited(&end, |f| {
+        f.relay_toml = format!(
             "[handshake]\npq_only = false\nagent_suites = [\"{HYBRID_NAME}\", \"{CLASSIC_NAME}\"]\nclient_suites = [\"{HYBRID_NAME}\", \"{CLASSIC_NAME}\"]\n"
-        ),
-    )
-    .unwrap();
-    assert!(!rolled_back.pq_only);
-    let policy = parse_policy(
-        "policy.toml",
-        &format!(
-            "[[agents]]\nnode = \"web-01\"\npublic_key = \"{}\"\n\n\
-             [[clients]]\nname = \"alice\"\npublic_key = \"{}\"\nallow = [\"*\"]\n",
-            agent.public_key(),
-            alice.public_key(),
-        ),
-    )
-    .unwrap();
-    let clients = parse_authorized_clients(
-        "clients.toml",
-        &format!(
-            "[[clients]]\nname = \"alice\"\npublic_key = \"{}\"\n",
-            alice.public_key()
-        ),
-    )
-    .unwrap();
-    let mut relay = relay_config();
-    relay.suites = rolled_back.suites;
-    let lab = Lab::start_outer(
-        agent,
-        vec![(policy, relay)],
-        clients,
-        AcceptedSuites::new([HYBRID, CLASSIC]).unwrap(),
-        CLASSIC,
-    )
-    .await;
+        );
+    });
+    let lab = start_fleet(load_fleet(&step2, &agent).unwrap(), Arc::clone(&agent)).await;
+    log.clear();
+    assert!(
+        lab.refused_with(&alice, &lab.config_outer(None, CLASSIC, HYBRID))
+            .await
+            .is_err()
+    );
+    assert_eq!(lab.sshd.load(Ordering::SeqCst), 0);
+    assert!(
+        reasons(&log).iter().any(|r| r == "identity_downgrade"),
+        "step 2: {}",
+        log.text()
+    );
+    let (mut app, _t) = lab
+        .session_with(&alice, lab.config_outer(None, HYBRID, HYBRID))
+        .await
+        .unwrap();
+    assert_alive(&mut app).await;
+    drop((app, lab));
+
+    // Step 3, agents: `--pq-only` removed and the classical suite accepted end to end.
+    // `clients.toml` still requires hybrid clients.
+    let step3 = edited(&step2, |f| {
+        f.agent_pq_only = false;
+        f.agent_client_suites = AcceptedSuites::new([HYBRID, CLASSIC]).unwrap();
+    });
+    let lab = start_fleet(load_fleet(&step3, &agent).unwrap(), Arc::clone(&agent)).await;
+    log.clear();
+    assert!(
+        lab.refused_with(&alice, &lab.config_outer(None, HYBRID, CLASSIC))
+            .await
+            .is_err()
+    );
+    assert_eq!(lab.sshd.load(Ordering::SeqCst), 0);
+    assert!(
+        reasons(&log).iter().any(|r| r == "identity_downgrade"),
+        "step 3: {}",
+        log.text()
+    );
+    // The relay admitted the hybrid hop; the refusal was the agent's.
+    assert!(
+        !log.events("session_established").is_empty(),
+        "{}",
+        log.text()
+    );
+    drop(lab);
+
+    // Step 4, the §16 rollback: `require_hybrid_identity` removed, alice back to her v1 key.
+    // The composite CA stays pinned.
+    let step4 = edited(&step3, |f| {
+        let v1 = |text: &str| {
+            text.replace(
+                &alice.hybrid_public_key().to_string(),
+                &alice.public_key().to_string(),
+            )
+        };
+        f.policy = v1(&f
+            .policy
+            .replace("require_hybrid_identity = [\"agents\", \"clients\"]\n", ""));
+        f.clients = v1(&f
+            .clients
+            .replace("require_hybrid_identity = [\"clients\"]\n", ""));
+    });
+    let lab = start_fleet(load_fleet(&step4, &agent).unwrap(), Arc::clone(&agent)).await;
+    log.clear();
     let (mut app, _t) = lab
         .session_with(&alice, lab.config_outer(None, CLASSIC, CLASSIC))
         .await
         .unwrap();
     assert_alive(&mut app).await;
+    assert!(
+        lab.refused_with(&bob, &lab.config_outer(Some(&bob_cert), CLASSIC, CLASSIC))
+            .await
+            .is_err()
+    );
+    assert!(
+        reasons(&log).iter().any(|r| r == "key_mismatch"),
+        "step 4: {}",
+        log.text()
+    );
+    let (mut app, _t) = lab
+        .session_with(&bob, lab.config_outer(Some(&bob_cert), HYBRID, HYBRID))
+        .await
+        .unwrap();
+    assert_alive(&mut app).await;
+    assert_eq!(lab.sshd.load(Ordering::SeqCst), 2);
+}
+
+// --- the sunset signal ----------------------------------------------------------------------
+
+/// Spec (review 0014, A14-1): `outer_suites_confirmed` counts each suite under its own name.
+/// In the end-state fleet every confirmed handshake is hybrid IK, and it is counted as such
+/// (`agents_hybrid_ik`, `clients_hybrid_ik`); no field calls `IKhfs` "hybrid" any more.
+#[tokio::test]
+async fn the_sunset_audit_counts_hybrid_ik_handshakes() {
+    let log = Captured::default();
+    let _guard = log.install();
+    let (agent, alice, ca) = (id(), id(), Ca::new_v2());
+    let loaded = load_fleet(&FleetFiles::end_state(&agent, &alice, &ca), &agent).unwrap();
+    let mut relay = relay_config();
+    relay.suites = loaded.suites;
+    relay.admission.summary_interval = std::time::Duration::from_secs(1);
+    let lab = Lab::start_outer(
+        agent,
+        vec![(loaded.policy, relay)],
+        loaded.clients,
+        loaded.client_suites,
+        loaded.relay_suite,
+    )
+    .await;
+    let (mut app, _t) = lab
+        .session_with(&alice, lab.config_outer(None, HYBRID, HYBRID))
+        .await
+        .unwrap();
+    assert_alive(&mut app).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+    let lines = log.events("outer_suites_confirmed");
+    assert!(!lines.is_empty(), "{}", log.text());
+    let sum = |key: &str| lines.iter().filter_map(|l| number(l, key)).sum::<u64>();
+    assert_eq!(sum("agents_hybrid_ik"), 1, "{lines:?}");
+    assert_eq!(sum("clients_hybrid_ik"), 1, "{lines:?}");
+    for key in [
+        "agents_ik",
+        "agents_ikhfs",
+        "clients_ik",
+        "clients_ikhfs",
+        "agents_hybrid",
+        "clients_hybrid",
+        "agents_classical",
+        "clients_classical",
+    ] {
+        assert_eq!(sum(key), 0, "{key}: {lines:?}");
+    }
 }
