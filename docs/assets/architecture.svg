@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 830" width="1200" height="830" role="img" aria-labelledby="t d">
+  <title id="t">TCN architecture</title>
+  <desc id="d">zt-client on the admin workstation and zt-agent on each target server both open outbound
+    Noise connections to one or more zt-relay instances. The relay authenticates and routes but
+    only sees opaque Data frames: an end-to-end Noise channel between client and agent carries the
+    SSH session to 127.0.0.1:22. Target servers have no listening ports. An offline CA issues
+    short-lived client certificates; metrics go to a textfile; releases carry SLH-DSA and Ed25519
+    signatures.</desc>
+  <style>
+    svg {
+      --bg: #ffffff; --bg2: #f6f8fb; --ink: #0f172a; --muted: #475569; --line: #cbd5e1;
+      --cli: #2563eb; --cli-bg: #eff6ff; --cli-bd: #93c5fd;
+      --rel: #7c3aed; --rel-bg: #f5f3ff; --rel-bd: #c4b5fd;
+      --agt: #059669; --agt-bg: #ecfdf5; --agt-bd: #6ee7b7;
+      --ca: #b45309; --ca-bg: #fffbeb; --ca-bd: #fcd34d;
+      --ops: #0369a1; --ops-bg: #f0f9ff; --ops-bd: #7dd3fc;
+      --obs: #0f766e; --obs-bg: #f0fdfa; --obs-bd: #5eead4;
+      --relz: #be123c; --relz-bg: #fff1f2; --relz-bd: #fda4af;
+      --hop: #dbeafe; --hop-bd: #60a5fa; --e2e: #d1fae5; --e2e-bd: #10b981;
+      --ssh: #ede9fe; --ssh-bd: #8b5cf6; --deny: #dc2626;
+    }
+    @media (prefers-color-scheme: dark) {
+      svg {
+        --bg: #0d1117; --bg2: #161b22; --ink: #e6edf3; --muted: #9da7b3; --line: #30363d;
+        --cli: #60a5fa; --cli-bg: #0f1d33; --cli-bd: #1e40af;
+        --rel: #a78bfa; --rel-bg: #1a1430; --rel-bd: #5b21b6;
+        --agt: #34d399; --agt-bg: #0b231b; --agt-bd: #047857;
+        --ca: #fbbf24; --ca-bg: #261c07; --ca-bd: #92400e;
+        --ops: #38bdf8; --ops-bg: #08202e; --ops-bd: #075985;
+        --obs: #2dd4bf; --obs-bg: #062320; --obs-bd: #0f766e;
+        --relz: #fb7185; --relz-bg: #2a0e16; --relz-bd: #9f1239;
+        --hop: #13284a; --hop-bd: #3b82f6; --e2e: #0c3326; --e2e-bd: #10b981;
+        --ssh: #2a1d4d; --ssh-bd: #8b5cf6; --deny: #f87171;
+      }
+    }
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); font-size: 12.5px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 11.5px; }
+    .h1 { font-size: 24px; font-weight: 700; }
+    .sub { font-size: 13.5px; fill: var(--muted); }
+    .zone { font-size: 11px; font-weight: 700; letter-spacing: 1.2px; fill: var(--muted); }
+    .title { font-size: 17px; font-weight: 700; }
+    .tag { font-size: 11.5px; font-weight: 600; }
+    .small { font-size: 11px; fill: var(--muted); }
+    .bg { fill: var(--bg); stroke: var(--line); }
+    .cli { fill: var(--cli-bg); stroke: var(--cli-bd); stroke-width: 1.5; }
+    .rel { fill: var(--rel-bg); stroke: var(--rel-bd); stroke-width: 1.5; }
+    .agt { fill: var(--agt-bg); stroke: var(--agt-bd); stroke-width: 1.5; }
+    .ca { fill: var(--ca-bg); stroke: var(--ca-bd); stroke-width: 1.5; }
+    .ops { fill: var(--ops-bg); stroke: var(--ops-bd); stroke-width: 1.5; }
+    .obs { fill: var(--obs-bg); stroke: var(--obs-bd); stroke-width: 1.5; }
+    .relz { fill: var(--relz-bg); stroke: var(--relz-bd); stroke-width: 1.5; }
+    .inner { fill: var(--bg); stroke: var(--line); }
+    .c-cli { fill: var(--cli); } .c-rel { fill: var(--rel); } .c-agt { fill: var(--agt); }
+    .c-ca { fill: var(--ca); } .c-ops { fill: var(--ops); } .c-obs { fill: var(--obs); }
+    .c-relz { fill: var(--relz); } .c-deny { fill: var(--deny); } .c-muted { fill: var(--muted); }
+    .a-cli { stroke: var(--cli); stroke-width: 2.5; fill: none; }
+    .a-agt { stroke: var(--agt); stroke-width: 2.5; fill: none; }
+    .a-dash { stroke: var(--muted); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+    .a-ssh { stroke: var(--ssh-bd); stroke-width: 2; fill: none; }
+    .hop { fill: var(--hop); stroke: var(--hop-bd); stroke-width: 1.5; }
+    .e2e { fill: var(--e2e); stroke: var(--e2e-bd); stroke-width: 1.5; }
+    .ssh { fill: var(--ssh); stroke: var(--ssh-bd); stroke-width: 1.5; }
+    .deny { fill: none; stroke: var(--deny); stroke-width: 2; }
+    .sep { stroke: var(--line); stroke-width: 1; }
+  </style>
+  <defs>
+    <marker id="ah-cli" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="c-cli"/></marker>
+    <marker id="ah-agt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="c-agt"/></marker>
+    <marker id="ah-mut" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="c-muted"/></marker>
+    <marker id="ah-ssh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--ssh-bd)"/></marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="1199" height="829" rx="18"/>
+
+  <!-- Header -->
+  <text class="h1" x="30" y="46">TCN · Transport Crypto Network</text>
+  <text class="sub" x="30" y="70">Zero Trust access for SSH and Ansible: no VPN, no listening ports on the target servers.</text>
+  <g transform="translate(760 30)">
+    <rect x="0" y="0" width="16" height="10" rx="3" class="hop"/><text class="small" x="22" y="9">outer hop</text>
+    <rect x="96" y="0" width="16" height="10" rx="3" class="e2e"/><text class="small" x="118" y="9">end to end</text>
+    <rect x="200" y="0" width="16" height="10" rx="3" class="ssh"/><text class="small" x="222" y="9">SSH</text>
+    <path d="M0,30 H28" class="a-cli" marker-end="url(#ah-cli)"/><text class="small" x="36" y="34">outbound TCP</text>
+    <path d="M140,30 H168" class="a-dash" marker-end="url(#ah-mut)"/><text class="small" x="176" y="34">failover / offline flow</text>
+  </g>
+
+  <!-- Zone labels -->
+  <text class="zone" x="30" y="106">ADMIN WORKSTATION · ANSIBLE</text>
+  <text class="zone" x="440" y="106">PUBLIC RELAYS · HA, UP TO 8</text>
+  <text class="zone" x="870" y="106">TARGET SERVERS · FLEET</text>
+
+  <!-- Client panel -->
+  <rect class="cli" x="30" y="125" width="310" height="320" rx="14"/>
+  <rect class="inner" x="46" y="140" width="130" height="34" rx="8"/>
+  <text class="mono" x="58" y="162">ssh web-01.tcn</text>
+  <rect class="inner" x="188" y="140" width="136" height="34" rx="8"/>
+  <text class="mono" x="198" y="162">ansible-playbook</text>
+  <path d="M111,175 V206" class="a-dash" marker-end="url(#ah-mut)"/>
+  <path d="M256,175 V206" class="a-dash" marker-end="url(#ah-mut)"/>
+  <text class="small" x="130" y="196">ProxyCommand · stdio</text>
+  <rect class="inner" x="46" y="210" width="278" height="218" rx="10"/>
+  <circle cx="66" cy="231" r="6" class="c-cli"/>
+  <text class="title" x="80" y="237">zt-client</text>
+  <text x="62" y="264">• one seed: Ed25519 / X25519 + ML-KEM-768</text>
+  <text x="62" y="286">• short-lived certificate v2 from the CA</text>
+  <text x="62" y="308">• up to 8 relays, each key pinned</text>
+  <text x="62" y="330">• pins one suite, never falls back</text>
+  <text x="62" y="352">• tries the next relay only before</text>
+  <text x="74" y="370">OpenAck, overall deadline 8 s</text>
+  <text x="62" y="392">• initiator of the end-to-end channel</text>
+  <text class="mono c-muted" x="62" y="416">~/.config/tcn/client.toml</text>
+
+  <!-- Relay stack -->
+  <rect class="rel" x="468" y="117" width="296" height="300" rx="14" opacity="0.55"/>
+  <text class="tag c-rel" x="752" y="130" text-anchor="end">relay #8</text>
+  <rect class="rel" x="454" y="134" width="296" height="300" rx="14" opacity="0.8"/>
+  <text class="tag c-rel" x="738" y="147" text-anchor="end">relay #2</text>
+  <rect class="rel" x="440" y="151" width="296" height="294" rx="14"/>
+  <circle cx="462" cy="177" r="6" class="c-rel"/>
+  <text class="title" x="476" y="183">zt-relay #1</text>
+  <text class="mono c-muted" x="476" y="202">:7443 · its only listening port</text>
+  <text x="456" y="228">• authenticates both hops (mutual)</text>
+  <text x="456" y="250">• policy whitelist: client → nodes</text>
+  <text x="456" y="272">• admission: pre-auth pool, key</text>
+  <text x="468" y="290">confirmation, per-identity cap</text>
+  <text x="456" y="312">• routes streams by NodeId</text>
+  <text x="456" y="334">• blind: Data payload stays opaque</text>
+  <text x="456" y="356">• SIGHUP reload · SIGTERM drain</text>
+  <rect class="inner" x="456" y="370" width="264" height="60" rx="8"/>
+  <text class="tag c-rel" x="468" y="388">session map</text>
+  <text class="mono" x="468" y="406">alice → web-01  stream 7</text>
+  <text class="mono" x="468" y="422">ci-bot → db-01  stream 3</text>
+
+  <!-- Agent stack -->
+  <rect class="agt" x="898" y="117" width="272" height="300" rx="14" opacity="0.55"/>
+  <text class="tag c-agt" x="1158" y="130" text-anchor="end">db-01</text>
+  <rect class="agt" x="884" y="134" width="272" height="300" rx="14" opacity="0.8"/>
+  <text class="tag c-agt" x="1144" y="147" text-anchor="end">app-03</text>
+  <rect class="agt" x="870" y="151" width="272" height="294" rx="14"/>
+  <circle cx="892" cy="177" r="6" class="c-agt"/>
+  <text class="title" x="906" y="183">zt-agent</text>
+  <text class="tag c-agt" x="1000" y="183">web-01</text>
+  <text class="mono c-muted" x="906" y="202">0 listening ports</text>
+  <text x="886" y="228">• outbound only, to every relay</text>
+  <text x="886" y="250">• jittered reconnect, liveness</text>
+  <text x="886" y="272">• verifies client certificate v2</text>
+  <text x="886" y="294">• clients.toml whitelist</text>
+  <text x="886" y="316">• end-to-end responder</text>
+  <text x="886" y="338">• hot revocation, drain</text>
+  <path d="M1006,348 V370" class="a-ssh" marker-end="url(#ah-ssh)"/>
+  <rect class="inner" x="886" y="374" width="240" height="56" rx="8"/>
+  <text class="tag" x="900" y="396" style="fill: var(--ssh-bd)">sshd</text>
+  <text class="mono" x="900" y="416">127.0.0.1:22 (loopback)</text>
+
+  <!-- Inbound deny badge -->
+  <g transform="translate(870 352)">
+    <circle cx="0" cy="0" r="15" style="fill: var(--bg)" class="deny"/>
+    <path d="M-6,-6 L6,6 M6,-6 L-6,6" class="deny"/>
+  </g>
+  <text class="tag c-deny" x="798" y="348">inbound</text>
+  <text class="tag c-deny" x="798" y="363">deny all</text>
+
+  <!-- Connections -->
+  <path d="M342,232 H436" class="a-cli" marker-end="url(#ah-cli)"/>
+  <text class="tag c-cli" x="357" y="222">outbound</text>
+  <text class="small" x="353" y="250">Noise hop</text>
+  <path d="M342,262 C392,262 404,146 450,144" class="a-dash" marker-end="url(#ah-mut)"/>
+  <text class="small" x="352" y="146">failover</text>
+  <path d="M868,232 H740" class="a-agt" marker-end="url(#ah-agt)"/>
+  <text class="tag c-agt" x="776" y="222">outbound</text>
+  <text class="small" x="778" y="250">Noise hop</text>
+  <path d="M868,262 C830,262 800,160 768,150" class="a-dash" marker-end="url(#ah-mut)"/>
+  <text class="small" x="772" y="276">to each relay</text>
+
+  <!-- Encryption layers -->
+  <text class="zone" x="30" y="478">ENCRYPTION LAYERS · WHO CAN READ WHAT</text>
+  <rect x="30" y="510" width="84" height="44" rx="22" class="cli"/>
+  <text class="tag c-cli" x="45" y="537">zt-client</text>
+  <rect x="1086" y="510" width="84" height="44" rx="22" class="agt"/>
+  <text class="tag c-agt" x="1100" y="537">zt-agent</text>
+  <rect x="122" y="488" width="452" height="88" rx="16" class="hop"/>
+  <rect x="626" y="488" width="452" height="88" rx="16" class="hop"/>
+  <text class="tag c-cli" x="138" y="505">Hop 1 · client ↔ relay</text>
+  <text class="tag c-cli" x="642" y="505">Hop 2 · relay ↔ agent</text>
+  <text class="small" x="410" y="505">framing + routing</text>
+  <text class="small" x="914" y="505">framing + routing</text>
+  <rect x="570" y="482" width="60" height="100" rx="10" class="rel"/>
+  <text class="tag c-rel" x="584" y="598">relay</text>
+  <rect x="136" y="514" width="928" height="54" rx="12" class="e2e"/>
+  <text class="tag c-agt" x="150" y="531">End-to-end Noise · client ↔ agent, inside Data frames</text>
+  <text class="small" x="740" y="531">opaque to the relay</text>
+  <rect x="150" y="539" width="900" height="22" rx="8" class="ssh"/>
+  <text class="mono" x="162" y="554">SSH session · OpenSSH key exchange (mlkem768x25519 on OpenSSH ≥ 10)</text>
+
+  <!-- Suites strip -->
+  <rect x="30" y="610" width="1140" height="34" rx="10" style="fill: var(--bg2); stroke: var(--line)"/>
+  <text class="tag" x="46" y="632">Handshake suites, pinned per peer:</text>
+  <text class="mono" x="268" y="632">0x00 Noise_IK X25519</text>
+  <text class="mono" x="440" y="632">0x01 IKhfs X25519+ML-KEM-768</text>
+  <text class="mono" x="672" y="632">0x02 hybrid IK, PQ authentication</text>
+  <text class="small" x="934" y="632">opt-in pq_only profile: 0x02 only</text>
+
+  <!-- Bottom cards -->
+  <rect class="ca" x="30" y="660" width="270" height="146" rx="12"/>
+  <circle cx="50" cy="684" r="6" class="c-ca"/>
+  <text class="title" x="64" y="690">zt-ca · offline CA</text>
+  <text x="46" y="716">• composite ML-DSA-65 + Ed25519</text>
+  <text x="46" y="738">• short-lived client certificates v2</text>
+  <text x="46" y="760">• pinned on every relay and agent</text>
+  <text x="46" y="782">• expiry closes live sessions</text>
+
+  <rect class="ops" x="320" y="660" width="270" height="146" rx="12"/>
+  <circle cx="340" cy="684" r="6" class="c-ops"/>
+  <text class="title" x="354" y="690">Policy and keys</text>
+  <text x="336" y="716">• policy.toml on each relay</text>
+  <text x="336" y="738">• distributed with Ansible</text>
+  <text x="336" y="760">• rotation: current + previous key</text>
+  <text x="336" y="782">• revocation and denylist on reload</text>
+
+  <rect class="obs" x="610" y="660" width="270" height="146" rx="12"/>
+  <circle cx="630" cy="684" r="6" class="c-obs"/>
+  <text class="title" x="644" y="690">Observability</text>
+  <text x="626" y="716">• metrics textfile → node_exporter</text>
+  <text x="626" y="738">• no metrics port, no /healthz</text>
+  <text x="626" y="760">• zt_audit JSON security events</text>
+  <text x="626" y="782">• no secrets or payload in logs</text>
+
+  <rect class="relz" x="900" y="660" width="270" height="146" rx="12"/>
+  <circle cx="920" cy="684" r="6" class="c-relz"/>
+  <text class="title" x="934" y="690">Signed releases</text>
+  <text x="916" y="716">• static musl binaries, SLSA</text>
+  <text x="916" y="738">• SLH-DSA-SHA2-128s + Ed25519</text>
+  <text x="928" y="756">over SHA256SUMS, both required</text>
+  <text x="916" y="782">• keys pinned, signed offline</text>
+</svg>
