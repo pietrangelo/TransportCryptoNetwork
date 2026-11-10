@@ -13,24 +13,27 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod budget;
 pub mod channel;
 pub mod client;
 pub mod config;
 mod error;
 pub mod keys;
+pub mod lifecycle;
 pub mod logging;
+pub mod metrics;
+pub mod net;
 pub mod relay;
 pub mod reload;
 mod revocable;
 mod stream;
+pub mod sunset;
 pub mod systemd;
 
 pub use error::NetError;
 pub use revocable::{Revocable, Updater};
 
 use std::time::Duration;
-
-use zt_crypto::PublicKey;
 
 /// Maximum number of relays in an agent's or a client's list (PROTOCOL §13).
 pub const MAX_RELAYS: usize = 8;
@@ -40,8 +43,10 @@ pub const MAX_RELAYS: usize = 8;
 pub struct RelayEndpoint {
     /// Address (`host:port`).
     pub address: String,
-    /// Public key of the relay, pinned.
-    pub public_key: PublicKey,
+    /// Public key of the relay, pinned: v1, or v2 (needed by the hybrid IK suite, PQ-AUTH).
+    pub public_key: zt_crypto::PeerKey,
+    /// Handshake suite pinned for this relay (PROTOCOL §7.5): no fallback to another one.
+    pub suite: zt_domain::HandshakeSuite,
 }
 
 /// Timeouts of all network operations.
@@ -69,7 +74,7 @@ impl Default for Timeouts {
             write: Duration::from_secs(30),
             open: Duration::from_secs(15),
             ssh_connect: Duration::from_secs(5),
-            keepalive: Duration::from_secs(30),
+            keepalive: Duration::from_secs(10),
         }
     }
 }
@@ -130,6 +135,15 @@ fn civil(secs: u64) -> Option<String> {
     Some(format!(
         "{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z"
     ))
+}
+
+/// Locks `mutex`, also when it is poisoned: the guarded tables (admission, per-identity
+/// lines) stay consistent across a panic (each operation is a few map updates), and refusing
+/// every connection would be worse.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Deadline `after` from now. An absurd duration that would overflow the clock expires

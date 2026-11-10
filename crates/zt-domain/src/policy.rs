@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::cert::{CertClaims, CertRejection, UnixTime};
-use crate::crypto::Fingerprint;
+use crate::crypto::{Fingerprint, HybridFingerprint};
 use crate::error::DomainError;
 use crate::events::AuthFailureReason;
 use crate::ids::NodeId;
@@ -76,6 +76,66 @@ pub enum Admission<'a> {
     },
 }
 
+/// The roles whose peers must prove a **pinned or certificate-bound** hybrid identity
+/// (`require_hybrid_identity`, PQ-AUTH, finding A12-1 of review 0012): an explicit set, like
+/// the accepted suites (AP-7). For a required role a peer is admitted only through the hybrid
+/// IK suite with exactly the fingerprint v2 of its v2 pin or of its hybrid-bound certificate;
+/// anything else is `identity_downgrade`, never a warning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HybridRequirement {
+    agents: bool,
+    clients: bool,
+}
+
+impl HybridRequirement {
+    /// No role is required to be hybrid (the default: the migration of OPERATIONS §16).
+    pub const NONE: Self = Self {
+        agents: false,
+        clients: false,
+    };
+
+    /// The requirement for agents and for clients.
+    #[must_use]
+    pub const fn new(agents: bool, clients: bool) -> Self {
+        Self { agents, clients }
+    }
+
+    /// `true` if agents must prove a pinned hybrid identity.
+    #[must_use]
+    pub const fn agents(self) -> bool {
+        self.agents
+    }
+
+    /// `true` if clients must prove a pinned or certificate-bound hybrid identity.
+    #[must_use]
+    pub const fn clients(self) -> bool {
+        self.clients
+    }
+}
+
+/// `Ok` if the admitted credential is bound to the hybrid identity the handshake proved: a v2
+/// pin (already checked equal to `hybrid` by [`HybridPins::check`]) or a certificate whose
+/// `subject_v2` is `hybrid`. Used only for the roles that require it.
+pub(crate) fn require_bound(
+    pins: &HybridPins,
+    peer: &Fingerprint,
+    hybrid: Option<&HybridFingerprint>,
+    credential: Option<&ClientCredential>,
+) -> Result<(), AuthFailureReason> {
+    let Some(proved) = hybrid else {
+        return Err(AuthFailureReason::IdentityDowngrade);
+    };
+    let bound = match credential {
+        None | Some(ClientCredential::Key) => pins.get(peer) == Some(proved),
+        Some(ClientCredential::Certificate(claims)) => claims.subject_hybrid() == Some(proved),
+    };
+    if bound {
+        Ok(())
+    } else {
+        Err(AuthFailureReason::IdentityDowngrade)
+    }
+}
+
 /// Agent keys admitted for a node: the current one and, during a rotation, the new one.
 pub const MAX_AGENT_KEYS: usize = 2;
 
@@ -89,6 +149,53 @@ pub struct AccessPolicy {
     nodes: BTreeSet<NodeId>,
     clients: HashMap<Fingerprint, ClientGrant>,
     cert_trust: CertTrust,
+    /// v2 pins (PQ-AUTH): the hybrid identity a key must prove, keyed by its X25519-level
+    /// fingerprint (the one identity and revocation unit, finding AP-6).
+    hybrid: HybridPins,
+    /// The roles that must prove a pinned or certificate-bound hybrid identity (A12-1).
+    required: HybridRequirement,
+}
+
+/// v2 pins: X25519-level fingerprint → the fingerprint v2 its handshake must prove.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HybridPins(HashMap<Fingerprint, HybridFingerprint>);
+
+impl HybridPins {
+    /// Pins `hybrid` for `peer`. A key has one v2 identity, and a v2 identity one key.
+    pub(crate) fn pin(
+        &mut self,
+        peer: Fingerprint,
+        hybrid: HybridFingerprint,
+    ) -> Result<(), DomainError> {
+        if self.0.contains_key(&peer) || self.0.values().any(|h| *h == hybrid) {
+            return Err(DomainError::DuplicatePeer(peer));
+        }
+        self.0.insert(peer, hybrid);
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, peer: &Fingerprint) -> Option<&HybridFingerprint> {
+        self.0.get(peer)
+    }
+
+    /// `true` if `peer` has a v2 pin.
+    pub(crate) fn contains(&self, peer: &Fingerprint) -> bool {
+        self.0.contains_key(peer)
+    }
+
+    /// `Ok` if `peer` has no v2 pin, or the handshake proved exactly the pinned identity.
+    /// Fingerprint v2 comparison is constant-time.
+    pub(crate) fn check(
+        &self,
+        peer: &Fingerprint,
+        proved: Option<&HybridFingerprint>,
+    ) -> Result<(), AuthFailureReason> {
+        match (self.0.get(peer), proved) {
+            (None, _) => Ok(()),
+            (Some(pinned), Some(proved)) if pinned == proved => Ok(()),
+            (Some(_), _) => Err(AuthFailureReason::IdentityDowngrade),
+        }
+    }
 }
 
 impl AccessPolicy {
@@ -166,6 +273,69 @@ impl AccessPolicy {
         Ok(())
     }
 
+    /// Pins the v2 identity of a key that already has a role (PQ-AUTH, PROTOCOL §7.5.3): from
+    /// then on the key is admitted only through a hybrid IK handshake that proved `hybrid`.
+    ///
+    /// # Errors
+    /// [`DomainError::UnknownPeer`] if the key has no role, [`DomainError::DuplicatePeer`] if
+    /// it is already pinned or `hybrid` is another key's.
+    pub fn pin_hybrid(
+        &mut self,
+        peer: Fingerprint,
+        hybrid: HybridFingerprint,
+    ) -> Result<(), DomainError> {
+        if self.role(&peer).is_none() {
+            return Err(DomainError::UnknownPeer(peer));
+        }
+        self.hybrid.pin(peer, hybrid)
+    }
+
+    /// The v2 identity pinned for `peer`, if any.
+    #[must_use]
+    pub fn hybrid_identity(&self, peer: &Fingerprint) -> Option<&HybridFingerprint> {
+        self.hybrid.get(peer)
+    }
+
+    /// Requires a pinned or certificate-bound hybrid identity from the peers of the roles in
+    /// `required` (`require_hybrid_identity`, finding A12-1). Call it once every entry is in:
+    /// an entry of a required role without a v2 pin is refused here, at load time.
+    ///
+    /// # Errors
+    /// [`DomainError::HybridIdentityRequired`] with the first such entry (in key order); the
+    /// policy is then unchanged.
+    pub fn require_hybrid_identity(
+        &mut self,
+        required: HybridRequirement,
+    ) -> Result<(), DomainError> {
+        let mut unpinned: Vec<Fingerprint> = Vec::new();
+        if required.agents() {
+            unpinned.extend(self.agents.keys().filter(|k| !self.hybrid.contains(k)));
+        }
+        if required.clients() {
+            unpinned.extend(self.clients.keys().filter(|k| !self.hybrid.contains(k)));
+        }
+        if let Some(first) = unpinned.into_iter().min_by_key(|k| *k.as_bytes()) {
+            return Err(DomainError::HybridIdentityRequired(first));
+        }
+        self.required = required;
+        Ok(())
+    }
+
+    /// The roles that must prove a pinned or certificate-bound hybrid identity.
+    #[must_use]
+    pub const fn hybrid_requirement(&self) -> HybridRequirement {
+        self.required
+    }
+
+    /// The name of the entry of `peer`, for messages: its node or client name.
+    #[must_use]
+    pub fn entry_name(&self, peer: &Fingerprint) -> Option<&NodeId> {
+        match self.role(peer)? {
+            PeerRole::Agent { node } => Some(node),
+            PeerRole::Client { grant } => Some(&grant.name),
+        }
+    }
+
     /// The role of a key, or `None` if unknown.
     #[must_use]
     pub fn role(&self, peer: &Fingerprint) -> Option<PeerRole<'_>> {
@@ -209,7 +379,7 @@ impl AccessPolicy {
         &self.cert_trust
     }
 
-    /// Steps 1, 2, 5, 7–11 of PROTOCOL §15.4 and the table in §15.5.
+    /// [`Self::admit_hybrid`] for a handshake that proved no hybrid identity.
     ///
     /// # Errors
     /// The rejection reason, for the audit.
@@ -219,10 +389,28 @@ impl AccessPolicy {
         cert: Option<&Arc<CertClaims>>,
         now: UnixTime,
     ) -> Result<Admission<'_>, AuthFailureReason> {
-        // Step 1: the denylist applies to any credential and any role.
+        self.admit_hybrid(peer, None, cert, now)
+    }
+
+    /// Steps 1, 2, 5, 7–11 of PROTOCOL §15.4 and the table in §15.5, for a handshake that
+    /// proved the X25519-level identity `peer` and, with the hybrid IK suite, the hybrid
+    /// identity `hybrid` (PQ-AUTH). A key pinned in v2 needs exactly that hybrid identity.
+    ///
+    /// # Errors
+    /// The rejection reason, for the audit.
+    pub fn admit_hybrid(
+        &self,
+        peer: &Fingerprint,
+        hybrid: Option<&HybridFingerprint>,
+        cert: Option<&Arc<CertClaims>>,
+        now: UnixTime,
+    ) -> Result<Admission<'_>, AuthFailureReason> {
+        // Step 1: the denylist applies to any credential, any role and any handshake.
         if self.cert_trust.is_key_revoked(peer) {
             return Err(AuthFailureReason::KeyRevoked);
         }
+        // The v2 pin, before any certificate: no downgrade to a classical handshake.
+        self.hybrid.check(peer, hybrid)?;
         // Steps 5 and 7–10: a presented certificate is always verified (fail closed), even
         // for a whitelisted key.
         if let Some(claims) = cert {
@@ -234,23 +422,35 @@ impl AccessPolicy {
                 .check(claims, now)
                 .map_err(AuthFailureReason::Certificate)?;
         }
-        match self.role(peer) {
+        let admission = match self.role(peer) {
             // Step 11: a key has exactly one role.
             Some(PeerRole::Agent { .. }) if cert.is_some() => {
-                Err(AuthFailureReason::Certificate(CertRejection::RoleConflict))
+                return Err(AuthFailureReason::Certificate(CertRejection::RoleConflict));
             }
-            Some(PeerRole::Agent { node }) => Ok(Admission::Agent { node }),
+            Some(PeerRole::Agent { node }) => Admission::Agent { node },
             // The whitelist takes precedence: no union of permissions.
-            Some(PeerRole::Client { .. }) => Ok(Admission::Client {
+            Some(PeerRole::Client { .. }) => Admission::Client {
                 credential: ClientCredential::Key,
-            }),
-            None => match cert {
-                Some(claims) => Ok(Admission::Client {
-                    credential: ClientCredential::Certificate(Arc::clone(claims)),
-                }),
-                None => Err(AuthFailureReason::UnknownPeer),
             },
+            None => match cert {
+                Some(claims) => Admission::Client {
+                    credential: ClientCredential::Certificate(Arc::clone(claims)),
+                },
+                None => return Err(AuthFailureReason::UnknownPeer),
+            },
+        };
+        // `require_hybrid_identity` (A12-1): the credential that admitted the peer must be
+        // bound to the hybrid identity its handshake proved.
+        match &admission {
+            Admission::Agent { .. } if self.required.agents() => {
+                require_bound(&self.hybrid, peer, hybrid, None)?;
+            }
+            Admission::Client { credential } if self.required.clients() => {
+                require_bound(&self.hybrid, peer, hybrid, Some(credential))?;
+            }
+            _ => {}
         }
+        Ok(admission)
     }
 
     /// [`Self::may_open`] generalized: policy nodes ∩ effective scope of the credential.

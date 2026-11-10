@@ -22,12 +22,32 @@ pub enum NetError {
     /// The peer violated the protocol.
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
+    /// A message longer than the receiver accepts at this point (for example a message 1
+    /// over the largest legitimate one, PROTOCOL §10.1).
+    #[error("message too large")]
+    Oversized,
+    /// Invalid admission limits (PROTOCOL §10.1).
+    #[error("invalid admission limits: {0}")]
+    Admission(#[from] zt_application::admission::AdmissionConfigError),
+    /// A handshake suite set this build cannot run (PROTOCOL §7.5).
+    #[error("handshake suites: {0}")]
+    Suite(#[from] zt_domain::SuiteError),
     /// The connection was closed.
     #[error("connection closed")]
     Closed,
     /// The relay or the agent rejected the stream.
     #[error("stream rejected: {0:?}")]
     Rejected(RejectReason),
+    /// A task the service cannot run without stopped (for example the relay hub).
+    #[error("stopped: {0}")]
+    Stopped(&'static str),
+    /// No relay completed the connection within the client's overall deadline
+    /// (`connect_deadline_secs`, resilience R-4).
+    #[error(
+        "no relay completed the connection within {} s (connect_deadline_secs in client.toml)",
+        .0.as_secs()
+    )]
+    Deadline(std::time::Duration),
     /// The stream was closed by the other side.
     #[error("stream closed: {0:?}")]
     StreamClosed(CloseReason),

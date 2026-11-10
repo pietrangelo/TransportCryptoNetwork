@@ -5,11 +5,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::cert::{CertClaims, CertRejection, UnixTime};
-use crate::crypto::Fingerprint;
+use crate::crypto::{Fingerprint, HybridFingerprint};
 use crate::error::DomainError;
 use crate::events::AuthFailureReason;
 use crate::ids::NodeId;
-use crate::policy::ClientCredential;
+use crate::policy::{ClientCredential, HybridPins, require_bound};
 use crate::trust::CertTrust;
 
 /// Authorized clients of an agent.
@@ -17,6 +17,10 @@ use crate::trust::CertTrust;
 pub struct AuthorizedClients {
     keys: HashSet<Fingerprint>,
     trust: CertTrust,
+    /// v2 pins (PQ-AUTH), keyed by the X25519-level fingerprint.
+    hybrid: HybridPins,
+    /// `require_hybrid_identity = ["clients"]` (finding A12-1).
+    required: bool,
 }
 
 impl AuthorizedClients {
@@ -61,7 +65,55 @@ impl AuthorizedClients {
         self.keys.contains(key)
     }
 
-    /// Steps 1, 2, 5, 7–10 and 12 of PROTOCOL §15.4.
+    /// Pins the v2 identity of a whitelisted key (PQ-AUTH): from then on it is admitted only
+    /// through a hybrid IK handshake that proved `hybrid`.
+    ///
+    /// # Errors
+    /// [`DomainError::UnknownPeer`] if the key is not in the whitelist,
+    /// [`DomainError::DuplicatePeer`] if it is already pinned or `hybrid` is another key's.
+    pub fn pin_hybrid(
+        &mut self,
+        key: Fingerprint,
+        hybrid: HybridFingerprint,
+    ) -> Result<(), DomainError> {
+        if !self.keys.contains(&key) {
+            return Err(DomainError::UnknownPeer(key));
+        }
+        self.hybrid.pin(key, hybrid)
+    }
+
+    /// The v2 identity pinned for `key`, if any.
+    #[must_use]
+    pub fn hybrid_identity(&self, key: &Fingerprint) -> Option<&HybridFingerprint> {
+        self.hybrid.get(key)
+    }
+
+    /// Requires every client to prove a pinned or certificate-bound hybrid identity
+    /// (`require_hybrid_identity`, finding A12-1). Call it once every entry is in.
+    ///
+    /// # Errors
+    /// [`DomainError::HybridIdentityRequired`] with the first whitelisted key (in key order)
+    /// that has no v2 pin; nothing is changed then.
+    pub fn require_hybrid_identity(&mut self) -> Result<(), DomainError> {
+        if let Some(first) = self
+            .keys
+            .iter()
+            .filter(|k| !self.hybrid.contains(k))
+            .min_by_key(|k| *k.as_bytes())
+        {
+            return Err(DomainError::HybridIdentityRequired(*first));
+        }
+        self.required = true;
+        Ok(())
+    }
+
+    /// `true` if every client must prove a pinned or certificate-bound hybrid identity.
+    #[must_use]
+    pub const fn requires_hybrid_identity(&self) -> bool {
+        self.required
+    }
+
+    /// [`Self::admit_hybrid`] for a handshake that proved no hybrid identity.
     ///
     /// # Errors
     /// The rejection reason, for the audit.
@@ -72,10 +124,42 @@ impl AuthorizedClients {
         node: &NodeId,
         now: UnixTime,
     ) -> Result<ClientCredential, AuthFailureReason> {
+        self.admit_hybrid(peer, None, cert, node, now)
+    }
+
+    /// Steps 1, 2, 5, 7–10 and 12 of PROTOCOL §15.4, with the v2 pin of PQ-AUTH: `hybrid` is
+    /// the hybrid identity the handshake proved, if any.
+    ///
+    /// # Errors
+    /// The rejection reason, for the audit.
+    pub fn admit_hybrid(
+        &self,
+        peer: &Fingerprint,
+        hybrid: Option<&HybridFingerprint>,
+        cert: Option<&Arc<CertClaims>>,
+        node: &NodeId,
+        now: UnixTime,
+    ) -> Result<ClientCredential, AuthFailureReason> {
         // Step 1.
         if self.trust.is_key_revoked(peer) {
             return Err(AuthFailureReason::KeyRevoked);
         }
+        self.hybrid.check(peer, hybrid)?;
+        let credential = self.admit_credential(peer, cert, node, now)?;
+        if self.required {
+            require_bound(&self.hybrid, peer, hybrid, Some(&credential))?;
+        }
+        Ok(credential)
+    }
+
+    /// [`Self::admit_hybrid`] after the denylist and the v2 pin.
+    fn admit_credential(
+        &self,
+        peer: &Fingerprint,
+        cert: Option<&Arc<CertClaims>>,
+        node: &NodeId,
+        now: UnixTime,
+    ) -> Result<ClientCredential, AuthFailureReason> {
         let Some(claims) = cert else {
             // Step 2: only the whitelist decides.
             return if self.keys.contains(peer) {
@@ -105,7 +189,7 @@ impl AuthorizedClients {
         Ok(ClientCredential::Certificate(Arc::clone(claims)))
     }
 
-    /// For hot revocation and expiry: is the credential still valid?
+    /// [`Self::still_admits_hybrid`] for a session without a hybrid identity.
     #[must_use]
     pub fn still_admits(
         &self,
@@ -114,7 +198,25 @@ impl AuthorizedClients {
         node: &NodeId,
         now: UnixTime,
     ) -> bool {
-        if self.trust.is_key_revoked(peer) {
+        self.still_admits_hybrid(peer, None, credential, node, now)
+    }
+
+    /// For hot revocation and expiry: is the credential still valid, and does the session's
+    /// hybrid identity still satisfy the v2 pin (a reload may add one)?
+    #[must_use]
+    pub fn still_admits_hybrid(
+        &self,
+        peer: &Fingerprint,
+        hybrid: Option<&HybridFingerprint>,
+        credential: &ClientCredential,
+        node: &NodeId,
+        now: UnixTime,
+    ) -> bool {
+        if self.trust.is_key_revoked(peer)
+            || self.hybrid.check(peer, hybrid).is_err()
+            || (self.required
+                && require_bound(&self.hybrid, peer, hybrid, Some(credential)).is_err())
+        {
             return false;
         }
         match credential {
@@ -136,6 +238,8 @@ impl FromIterator<Fingerprint> for AuthorizedClients {
         Self {
             keys: keys.into_iter().collect(),
             trust: CertTrust::default(),
+            hybrid: HybridPins::default(),
+            required: false,
         }
     }
 }

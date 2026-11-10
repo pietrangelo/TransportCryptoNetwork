@@ -6,25 +6,53 @@
 [Unit]
 Description=TCN relay (zt-relay)
 Documentation=https://github.com/pietrangelo/TransportCryptoNetwork/blob/main/docs/OPERATIONS.md
-After=network-online.target
+After=network-online.target time-sync.target
 Wants=network-online.target
+# Restarts are never given up on (the backoff below spaces them out).
+StartLimitIntervalSec=0
 
 [Service]
-# notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away).
+# notify: READY=1 arrives only once SIGHUP is handled (systemctl reload is safe right away);
+# every SIGHUP is announced with RELOADING=1 and closed with READY=1.
 Type=notify
 NotifyAccess=main
 User=tcn
 Group=tcn
+# /run/zt-relay: where the running process publishes the outcome of each reload for
+# `zt-relay reload` ($RUNTIME_DIRECTORY).
+RuntimeDirectory=zt-relay
+RuntimeDirectoryMode=0700
 # For IPv6 dual-stack: --listen [::]:7443
 # Key rotation: in a drop-in --key /etc/tcn/relay.next.key
 # --previous-key /etc/tcn/relay.key and a restart (OPERATIONS §8). Every systemctl reload,
 # even one just for the policy, also rereads the keys.
+# Metrics (OPERATIONS §17): written every 15 s to /run/zt-relay/metrics.prom, read by
+# `zt-relay status`. For node_exporter, add --metrics-file in a drop-in with ReadWritePaths=
+# for its textfile directory. Nothing listens for metrics.
 ExecStart=/usr/local/bin/zt-relay --log-format json run --listen 0.0.0.0:7443 --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml
-# Reloads the policy and live-revokes connections that are no longer allowed.
-ExecReload=/bin/kill -HUP $MAINPID
-# always: even a signal (e.g. a mistimed SIGHUP) counts as a clean exit.
+# Reloads the policy (and the keys) and live-revokes connections that are no longer
+# allowed. `reload` sends SIGHUP to the running relay and waits for its own verdict: the
+# relay validates its files with its own ExecStart= arguments (drop-ins included), so
+# `systemctl reload` fails exactly when the relay rejected them and kept the previous
+# policy (OPERATIONS §4). It takes no file arguments on purpose (review 0010, A10-1).
+ExecReload=/usr/local/bin/zt-relay --log-format json reload --pid $MAINPID
+# SIGTERM drains (OPERATIONS §14): no new connections, sessions get up to --drain-timeout
+# (60 s by default) before Close Drained. TimeoutStopSec leaves room for it.
+TimeoutStopSec=90s
+# The hub kicks the watchdog only while it makes progress (WATCHDOG=1 every 20 s).
+WatchdogSec=60s
+# always: even a signal (e.g. a mistimed SIGHUP) counts as a clean exit. A configuration
+# error (exit 78: a file that was read and is invalid) is not restarted: it needs an operator,
+# not a loop. A missing or unreadable file (provisioning not finished, a late mount) exits 1
+# and is retried with the backoff below.
 Restart=always
+RestartPreventExitStatus=78
 RestartSec=2s
+# Exponential restart backoff up to 60 s (systemd 254 and later; older versions ignore it).
+RestartSteps=5
+RestartMaxDelaySec=60s
+# No core dumps: the process holds secret keys (zt-relay also sets PR_SET_DUMPABLE 0).
+LimitCORE=0
 LimitNOFILE=16384
 Environment=RUST_LOG=info
 

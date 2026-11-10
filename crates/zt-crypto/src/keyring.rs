@@ -49,6 +49,11 @@ impl Keyring {
     pub const fn previous(&self) -> Option<&Identity> {
         self.previous.as_ref()
     }
+
+    /// The keys a responder tries, in order: the current one, then the previous one.
+    pub fn identities(&self) -> impl Iterator<Item = &Identity> {
+        std::iter::once(&self.current).chain(self.previous.as_ref())
+    }
 }
 
 impl From<Identity> for Keyring {

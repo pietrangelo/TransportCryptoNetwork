@@ -2,6 +2,19 @@
 
 [graph]
 all-features = true
+# The platforms TCN is built and tested for: the release targets (release.yml) and the CI and
+# developer hosts. Listing them makes cargo-deny ignore dependencies that no real build
+# compiles: libcrux-ml-kem pulls `hax-lib` (and through it the unmaintained
+# `proc-macro-error2`, RUSTSEC-2026-0173) only under `cfg(hax)`, a cfg set exclusively by the
+# hax verification toolchain, never by rustc for any of these targets.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
 
 [advisories]
 # Every RustSec advisory (vulnerabilities, unmaintained crates, yanks) fails the build.

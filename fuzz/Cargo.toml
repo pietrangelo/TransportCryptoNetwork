@@ -17,6 +17,10 @@ zt-proto = { path = "../crates/zt-proto" }
 zt-crypto = { path = "../crates/zt-crypto" }
 zt-net = { path = "../crates/zt-net" }
 
+# The same vendored snow as the workspace (docs/pq-snow.md): fuzz/ is its own workspace.
+[patch.crates-io]
+snow = { path = "../vendor/snow" }
+
 [[bin]]
 name = "frame_decoder"
 path = "fuzz_targets/frame_decoder.rs"
@@ -27,6 +31,13 @@ bench = false
 [[bin]]
 name = "noise_responder"
 path = "fuzz_targets/noise_responder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_initiator"
+path = "fuzz_targets/noise_initiator.rs"
 test = false
 doc = false
 bench = false
@@ -62,6 +73,41 @@ bench = false
 [[bin]]
 name = "cert_verify"
 path = "fuzz_targets/cert_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admission"
+path = "fuzz_targets/admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kem_inputs"
+path = "fuzz_targets/kem_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_v2_decoder"
+path = "fuzz_targets/cert_v2_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_v2_verify"
+path = "fuzz_targets/cert_v2_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hybrid_ik"
+path = "fuzz_targets/hybrid_ik.rs"
 test = false
 doc = false
 bench = false

@@ -1,7 +1,8 @@
 use crate::cert::{CertClaims, CertRef, CertRejection};
-use crate::crypto::Fingerprint;
+use crate::crypto::{Fingerprint, HybridFingerprint};
 use crate::frame::CloseReason;
 use crate::ids::{NodeId, SessionId};
+use crate::suite::HandshakeSuite;
 
 /// Why an authentication attempt failed.
 ///
@@ -22,6 +23,9 @@ pub enum AuthFailureReason {
     KeyRevoked,
     /// The presented certificate was not accepted (PROTOCOL §15.4).
     Certificate(CertRejection),
+    /// The key is pinned with its v2 identity (PQ-AUTH) and the handshake did not prove that
+    /// very hybrid identity: a classical or `IKhfs` handshake, or another ML-KEM key.
+    IdentityDowngrade,
 }
 
 impl AuthFailureReason {
@@ -66,6 +70,8 @@ pub enum DomainEvent {
         target: NodeId,
         /// The certificate that authorized the client, if it is not the whitelist.
         certificate: Option<CertRef>,
+        /// The client's fingerprint v2, if its handshake proved a hybrid identity (PQ-AUTH).
+        client_v2: Option<HybridFingerprint>,
     },
     /// An authentication attempt failed.
     AuthenticationFailed {
@@ -118,6 +124,34 @@ pub enum DomainEvent {
         /// The expired certificate.
         certificate: CertRef,
     },
+    /// A known peer completed message 1 with a suite that is not in the accepted set of its
+    /// role (PROTOCOL §7.5): it gets no message 2.
+    HandshakeSuiteRejected {
+        /// The identity of the peer.
+        peer: Fingerprint,
+        /// The suite it used.
+        suite: HandshakeSuite,
+    },
+    /// Registrations for one node keep replacing each other: two agents with the same key (a
+    /// cloned machine). Reported, never blocked (resilience R-2).
+    AgentFlapping {
+        /// The node.
+        node: NodeId,
+        /// The agent key both connections use.
+        fingerprint: Fingerprint,
+        /// Takeovers within the detection window.
+        count: u32,
+    },
+    /// A peer proved a hybrid identity (PQ-AUTH) but was admitted by a v1 entry or a
+    /// classically bound certificate: only its X25519 key was checked against the
+    /// configuration, so a quantum adversary holding that key alone would match too (PQ
+    /// analysis §4.6). Recorded after key confirmation.
+    ClassicalIdentityMatch {
+        /// The X25519-level fingerprint the entry matched.
+        peer: Fingerprint,
+        /// The hybrid identity the handshake proved, for the pin to configure.
+        peer_v2: HybridFingerprint,
+    },
 }
 
 impl DomainEvent {
@@ -134,6 +168,9 @@ impl DomainEvent {
             Self::ConnectionDrained { .. } => "connection_drained",
             Self::AccessRevoked { .. } => "access_revoked",
             Self::CertificateExpired { .. } => "certificate_expired",
+            Self::HandshakeSuiteRejected { .. } => "handshake_suite_rejected",
+            Self::AgentFlapping { .. } => "agent_flapping",
+            Self::ClassicalIdentityMatch { .. } => "classical_identity_match",
         }
     }
 
@@ -146,6 +183,9 @@ impl DomainEvent {
                 | Self::AccessDenied { .. }
                 | Self::ProtocolViolation { .. }
                 | Self::AccessRevoked { .. }
+                | Self::HandshakeSuiteRejected { .. }
+                | Self::AgentFlapping { .. }
+                | Self::ClassicalIdentityMatch { .. }
         )
     }
 }

@@ -153,7 +153,8 @@ async fn relay(keys: Keyring, policy: AccessPolicy) -> SocketAddr {
 fn endpoint(addr: SocketAddr, key: &PublicKey) -> RelayEndpoint {
     RelayEndpoint {
         address: addr.to_string(),
-        public_key: *key,
+        public_key: (*key).into(),
+        suite: zt_domain::HandshakeSuite::NoiseIk25519,
     }
 }
 
@@ -180,6 +181,9 @@ async fn start_agent_with(
         ),
         timeouts: timeouts(),
         max_streams,
+        client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+        reconnect: zt_application::reconnect::ReconnectConfig::default(),
     };
     tokio::spawn(agent::run(Arc::new(keys), config));
 }
@@ -188,9 +192,12 @@ fn client_config(relays: Vec<RelayEndpoint>, node_key: &PublicKey) -> ClientConf
     ClientConfig {
         relays,
         node: node("web-01"),
-        node_key: *node_key,
+        node_key: (*node_key).into(),
+        node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),
+        failover: zt_net::client::FailoverConfig::default(),
+        require_outer_suite: None,
     }
 }
 
@@ -870,6 +877,9 @@ async fn an_out_of_range_max_streams_is_refused_without_panic() {
             authorized_clients: Revocable::fixed(zt_domain::AuthorizedClients::new()),
             timeouts: timeouts(),
             max_streams: max,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         };
         let keys: Keyring = Identity::generate().unwrap().into();
         tokio::time::timeout(Duration::from_secs(2), agent::run(Arc::new(keys), config))

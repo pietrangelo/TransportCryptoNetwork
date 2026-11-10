@@ -12,7 +12,9 @@ members = [
     "bins/zt-ca",
 ]
 # The cargo-fuzz targets require nightly: they stay outside the workspace (see fuzz/README.md).
-exclude = ["fuzz"]
+# `vendor/` holds patched third-party crates (`[patch.crates-io]` below): they are not members,
+# so their own tests, lints and dev-dependencies stay out of the workspace.
+exclude = ["fuzz", "vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,7 +26,7 @@ publish = false
 
 # A single source of truth for versions. The crates inherit them with `workspace = true`.
 [workspace.dependencies]
-rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "net", "time"] }
 # --- internal ---
 zt-domain = { path = "crates/zt-domain" }
 zt-proto  = { path = "crates/zt-proto" }
@@ -42,16 +44,39 @@ zeroize   = { version = "1.9.1", features = ["zeroize_derive"] }
 tokio      = { version = "1.54.1", default-features = false }
 tokio-util = { version = "0.7.20", default-features = false, features = ["codec"] }
 futures    = { version = "0.3.34", default-features = false, features = ["std"] }
-clap       = { version = "4.6.7", features = ["derive"] }
+# `env`: options that `agent.env` sets on new installations (TCN_ACCEPT_CLIENT_SUITES).
+clap       = { version = "4.6.7", features = ["derive", "env"] }
 tracing    = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
 
 # --- cryptography (Phase 2: Noise handshake and Ed25519 identities) ---
-snow          = { version = "0.10.0", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+# `hfs` (PQ-1): the Noise HFS modifier of the hybrid suite. The KEM comes from zt-crypto
+# (libcrux), never from snow: no `pqclean` feature. snow is the vendored, patched copy below.
+snow          = { version = "0.10.0", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom", "hfs"] }
 ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+# Review 0012 (A12-6): the responder's pre-filter replays snow's first message-1 steps with
+# snow's own primitives: the same crates and versions as the vendored snow, already in the graph.
+blake2           = { version = "0.10.6", default-features = false }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+curve25519-dalek = { version = "4.1.3", default-features = false }
 sha2          = "0.11.1"
 hex           = "0.4.3"
 getrandom     = "0.4.3"
+# PQ-0: ML-KEM-768 (FIPS 203). Exact pin: the formally verified code is a specific release.
+# Portable + AVX2 only: the NEON (simd128) backend is disabled through `.cargo/config.toml`
+# until it is verified (docs/analysis/pq.md §5, GHSA-2cgv-28vr-rv6j).
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+# SHAKE256 for the derivation of the static ML-KEM key from the seed (PQ-AUTH, D12). Already in
+# the graph through `ml-dsa`.
+shake = { version = "=0.1.0", default-features = false, features = ["zeroize"] }
+# PQ-AUTH: ML-DSA-65 (FIPS 204) for the composite CA signature of certificate v2. Exact pin: the
+# CA verifies after signing with this exact verifier, the one the fleet runs (finding AP-5);
+# >= 0.1.2 for the fixes of RUSTSEC-2025-0144, CVE-2026-24850 and GHSA-h37v-hp6w-2pp8.
+ml-dsa = { version = "=0.1.2", default-features = false, features = ["zeroize"] }
+# Test-only differential oracle for ML-DSA (an independent implementation, decision D11).
+libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["std", "mldsa65"] }
+# Test-only differential oracle for ML-KEM (an independent implementation).
+ml-kem = { version = "=0.3.4", default-features = false }
 
 # --- configuration ---
 serde = { version = "1.0.229", features = ["derive"] }
@@ -60,6 +85,9 @@ toml  = "1.2.1"
 # --- test ---
 proptest   = "1.12.0"
 tokio-test = "0.4.6"
+# R-2: deterministic network simulation behind `zt_net::net` (dev-dependency only, D-9 of
+# docs/analysis/resilience.md). Exact pin: the simulator's scheduling is part of the tests.
+turmoil    = "=0.7.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -81,6 +109,12 @@ dbg_macro = "deny"
 print_stdout = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+
+# PQ-1: snow 0.10.0 with a minimal patch (the ML-KEM-768 KEM name, panics of the HFS paths
+# turned into errors, the KEM shared secret wiped). Every change is listed and tested in
+# vendor/snow/PATCHES.md; docs/pq-snow.md has the decision. Remove once upstream releases it.
+[patch.crates-io]
+snow = { path = "vendor/snow" }
 
 # Hardening of the release binaries.
 [profile.release]

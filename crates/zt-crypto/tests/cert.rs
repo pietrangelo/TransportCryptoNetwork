@@ -260,7 +260,10 @@ fn sign_then_verify_yields_the_claims() {
     let trust = trust_for(&[ca.public_key().to_bytes()]);
     let claims = verify_certificate(&cert, &subject.fingerprint(), &trust).unwrap();
     assert_eq!(claims.ca(), &ca.public_key().fingerprint());
-    assert_eq!(claims.ca_key(), body.ca_key());
+    assert_eq!(
+        claims.authority_key(),
+        &zt_domain::CaKeyRef::Ed25519(*body.ca_key())
+    );
     assert_eq!(claims.subject(), &subject.fingerprint());
     assert_eq!(claims.serial(), body.serial());
     assert_eq!(claims.name(), body.name());

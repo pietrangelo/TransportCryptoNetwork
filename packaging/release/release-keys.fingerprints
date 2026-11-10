@@ -1,0 +1,10 @@
+# TCN release keys: the pinned fingerprints (review 0013, A13-4).
+#
+# One line per public key, as `tcn-release.sh fingerprint DIR` prints it: the SHA-256 of the DER
+# public key. `tcn-release.sh verify` trusts only the keys pinned in its own copy of these lines
+# (or in the file given with --pins); SECURITY.md publishes the same lines. The three must agree
+# (packaging/release/tests/spec.sh checks it). A rotation adds the new pair next to the old one
+# through a reviewed pull request to main, announced out of band (REPOSITORY_SECURITY.md).
+#
+# No release key has been generated yet: nothing is pinned, and verify refuses every key until
+# the maintainer's key ceremony adds the first pair here.

@@ -274,7 +274,7 @@ fn authorities_and_revocations_are_announced() {
     // A CA with two keys is announced as WARN, with both fingerprints.
     let (log, _guard2) = capture();
     let (new, old) = (ca_key(), ca_key());
-    announce_authorities("agent", &trust(&[new, old], &lab));
+    announce_authorities("agent", &trust(&[new.clone(), old.clone()], &lab));
     let text = log.text();
     let rotating = lines_of(&text, "authorities_in_use")
         .into_iter()
@@ -295,7 +295,7 @@ fn authorities_and_revocations_are_announced() {
 async fn a_ca_rotation_is_reported_until_it_is_completed() {
     let (log, _guard) = capture();
     let (new, old, lab) = (ca_key(), ca_key(), ca_key());
-    let (current, updater) = Revocable::new(trust(&[new, old], &lab));
+    let (current, updater) = Revocable::new(trust(&[new.clone(), old.clone()], &lab));
     let task = tokio::spawn(watch_authorities(
         "relay",
         current,
@@ -321,7 +321,7 @@ async fn a_ca_rotation_is_reported_until_it_is_completed() {
     assert_eq!(pending(&log), 3, "{}", log.text());
 
     // Reload still in rotation: announcements and warning immediately.
-    updater.replace(trust(&[new, old], &lab));
+    updater.replace(trust(&[new.clone(), old.clone()], &lab));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(pending(&log), 4, "{}", log.text());
     assert_eq!(lines_of(&log.text(), "authorities_in_use").len(), 4);
@@ -345,7 +345,7 @@ fn announcements_never_contain_certificate_bytes_or_secrets() {
     let mut t = CertTrust::new();
     t.add_authority(
         node("ops-ca"),
-        &[trusted, ca_key()],
+        &[trusted.clone(), ca_key()],
         AllowedNodes::All,
         DEFAULT_AUTHORITY_LIFETIME_SECS,
     )

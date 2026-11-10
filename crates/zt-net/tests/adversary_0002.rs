@@ -110,7 +110,8 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
         AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay.to_string(),
-                public_key: relay_key,
+                public_key: relay_key.into(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -121,17 +122,24 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
             ),
             timeouts: timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
     let config = ClientConfig {
         relays: vec![zt_net::RelayEndpoint {
             address: relay.to_string(),
-            public_key: relay_key,
+            public_key: relay_key.into(),
+            suite: zt_domain::HandshakeSuite::NoiseIk25519,
         }],
         node: node("web-01"),
-        node_key: agent_id.public_key(),
+        node_key: agent_id.public_key().into(),
+        node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
         certificate: None,
         timeouts: timeouts(),
+        failover: zt_net::client::FailoverConfig::default(),
+        require_outer_suite: None,
     };
 
     // Innocent session, waited for until the agent is registered.
@@ -157,7 +165,7 @@ async fn open_close_by_a_rejected_client_does_not_kill_other_sessions() {
 
     // The attacker: Open, waits for OpenAck, Close — several times.
     let tcp = TcpStream::connect(relay).await.unwrap();
-    let mut ch = channel::connect(tcp, &admin, &relay_key, Channel::Outer, &timeouts())
+    let mut ch = channel::connect(tcp, &admin, &relay_key.into(), Channel::Outer, &timeouts())
         .await
         .unwrap();
     for n in 1..=5 {
@@ -216,7 +224,8 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
         AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay_addr.to_string(),
-                public_key: relay_id.public_key(),
+                public_key: relay_id.public_key().into(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -227,6 +236,9 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
             ),
             timeouts: timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
 
@@ -242,7 +254,7 @@ async fn replayed_end_to_end_handshake_never_reaches_sshd() {
     ));
 
     // Message 1 captured from a real client session.
-    let (msg1, _) = noise::initiate(&client_id, &agent_id.public_key(), Channel::EndToEnd).unwrap();
+    let (msg1, _) = noise::initiate(&client_id, agent_id.public_key(), Channel::EndToEnd).unwrap();
     for n in 1..=3 {
         agent_ch
             .send(
@@ -308,7 +320,8 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
         AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: relay_addr.to_string(),
-                public_key: relay_id.public_key(),
+                public_key: relay_id.public_key().into(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -319,6 +332,9 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
             ),
             timeouts: slow,
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         },
     ));
     let (tcp, _) = listener.accept().await.unwrap();
@@ -332,7 +348,7 @@ async fn relay_exceeding_stream_credit_gets_the_stream_closed() {
         agent_ch.recv().await.unwrap(),
         Some(Frame::Register { .. })
     ));
-    let (msg1, _) = noise::initiate(&client_id, &agent_id.public_key(), Channel::EndToEnd).unwrap();
+    let (msg1, _) = noise::initiate(&client_id, agent_id.public_key(), Channel::EndToEnd).unwrap();
     agent_ch
         .send(
             &Frame::Open {

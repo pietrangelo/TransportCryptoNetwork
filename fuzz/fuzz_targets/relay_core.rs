@@ -94,6 +94,7 @@ fn trust(bits: u8) -> CertTrust {
             &[TrustedCaKey {
                 key: CertKey::from_bytes([CA; 32]),
                 fingerprint: fp(CA),
+                composite: None,
             }],
             allowed,
             lifetime,
@@ -180,7 +181,7 @@ fn may_stay(
         Some(_) => return !trust.is_key_revoked(peer),
         None => {}
     }
-    let Some(authority) = trust.authority_for_key(cert.ca_key()) else {
+    let Some(authority) = trust.authority_for(cert.authority_key()) else {
         return false;
     };
     let nb = cert.not_before().as_secs();
@@ -274,6 +275,7 @@ fuzz_target!(|data: &[u8]| {
                 Input::Connected {
                     conn: ConnId(conn),
                     peer,
+                    hybrid: None,
                     certificate,
                 }
             }
@@ -309,13 +311,19 @@ fuzz_target!(|data: &[u8]| {
                 // The system clock jumps (NTP, suspended VM) forward or backward; the monotonic
                 // one does not.
                 let Some(jump) = bytes.next() else { return };
-                let delta = u64::from(jump & 0x7f) * 3_600;
-                unix = if jump & 0x80 != 0 {
-                    unix.saturating_sub(delta)
+                // A zero jump starts the drain instead (finding A10-5): new streams are
+                // rejected from then on.
+                if jump == 0 {
+                    Input::DrainStarted
                 } else {
-                    unix.saturating_add(delta)
-                };
-                Input::Tick
+                    let delta = u64::from(jump & 0x7f) * 3_600;
+                    unix = if jump & 0x80 != 0 {
+                        unix.saturating_sub(delta)
+                    } else {
+                        unix.saturating_add(delta)
+                    };
+                    Input::Tick
+                }
             }
             _ => {
                 let Some(bits) = bytes.next() else { return };

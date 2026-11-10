@@ -41,13 +41,20 @@ fn key() -> String {
 }
 
 fn run(dir: &Dir, extra: &[&str]) -> Output {
+    run_env(dir, extra, &[])
+}
+
+/// Like [`run`], with extra environment variables.
+fn run_env(dir: &Dir, extra: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.args(["run", "--node", "web-01", "--key"])
         .arg(dir.0.join("agent.key"))
         .arg("--authorized-clients")
         .arg(dir.0.join("clients.toml"))
         .args(extra)
-        .env_remove("RUST_LOG");
+        .env_remove("RUST_LOG")
+        .env_remove("TCN_ACCEPT_CLIENT_SUITES")
+        .envs(env.iter().copied());
     // A valid agent does not terminate: it is stopped after a moment.
     let mut child = cmd
         .stdout(std::process::Stdio::null())
@@ -378,4 +385,183 @@ fn a_ca_key_equal_to_a_pinned_relay_key_is_refused_at_start_and_on_reload() {
         "{stderr}"
     );
     assert!(!stderr.contains("authorized_clients_reloaded"), "{stderr}");
+}
+
+// ---------- PQ-1: end-to-end handshake suites ----------
+
+const CLASSIC: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+const HFS: &str = "Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+
+/// The hybrid suite is accepted from clients end to end, alone or with the classical one.
+#[test]
+fn the_agent_accepts_the_hybrid_suite_from_clients() {
+    let dir = setup("pq-accept");
+    let relay = key();
+    for accepted in [format!("{CLASSIC},{HFS}"), HFS.to_owned()] {
+        let out = run(
+            &dir,
+            &[
+                "--relay",
+                "127.0.0.1:9",
+                "--relay-key",
+                &relay,
+                "--accept-client-suites",
+                &accepted,
+            ],
+        );
+        keeps_running(&out);
+    }
+}
+
+/// New installations set the accepted suites in `agent.env` (OPERATIONS §9), so the option
+/// has an environment variable. An unset variable keeps the built-in default.
+#[test]
+fn the_accepted_suites_can_come_from_the_environment() {
+    let dir = setup("pq-env");
+    let relay = key();
+    let args = ["--relay", "127.0.0.1:9", "--relay-key", &relay];
+    let both = format!("{CLASSIC},{HFS}");
+    keeps_running(&run_env(
+        &dir,
+        &args,
+        &[("TCN_ACCEPT_CLIENT_SUITES", both.as_str())],
+    ));
+    fails_with(
+        &run_env(
+            &dir,
+            &args,
+            &[(
+                "TCN_ACCEPT_CLIENT_SUITES",
+                "Noise_XX_25519_ChaChaPoly_BLAKE2s",
+            )],
+        ),
+        "suite",
+    );
+}
+
+/// The relay pin is the outer channel: since PQ-1 (Phase 3) the hybrid suite is a valid pin,
+/// for all relays or per relay; an unknown name still stops the agent.
+#[test]
+fn the_hybrid_suite_towards_the_relays_is_accepted() {
+    let dir = setup("pq-relay");
+    let (a, b) = (key(), key());
+    for suites in [
+        HFS.to_owned(),
+        format!("{HFS},Noise_IK_25519_ChaChaPoly_BLAKE2s"),
+    ] {
+        let out = run(
+            &dir,
+            &[
+                "--relay",
+                "127.0.0.1:9,127.0.0.1:10",
+                "--relay-key",
+                &format!("{a},{b}"),
+                "--relay-suite",
+                &suites,
+            ],
+        );
+        assert!(
+            out.status.code().is_none() || out.status.success(),
+            "valid relay suites refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    fails_with(
+        &run(
+            &dir,
+            &[
+                "--relay",
+                "127.0.0.1:9",
+                "--relay-key",
+                &a,
+                "--relay-suite",
+                "Noise_IKhfs_25519+Kyber1024_ChaChaPoly_BLAKE2s",
+            ],
+        ),
+        "suite",
+    );
+}
+
+#[test]
+fn repeated_or_unknown_accepted_suites_are_refused() {
+    let dir = setup("pq-bad");
+    let relay = key();
+    for accepted in [
+        format!("{HFS},{HFS}"),
+        "noise_ikhfs_25519+mlkem768_chachapoly_blake2s".to_owned(),
+        "Noise_IKhfs_25519+Kyber1024_ChaChaPoly_BLAKE2s".to_owned(),
+    ] {
+        fails_with(
+            &run(
+                &dir,
+                &[
+                    "--relay",
+                    "127.0.0.1:9",
+                    "--relay-key",
+                    &relay,
+                    "--accept-client-suites",
+                    &accepted,
+                ],
+            ),
+            "suite",
+        );
+    }
+}
+
+/// Spec (PQ-AUTH, D13): `keygen` prints the v1 and the v2 public key with their fingerprints;
+/// the v2 key is the one this seed derives.
+#[test]
+fn keygen_prints_both_public_keys() {
+    let dir = setup("keygen-v2");
+    let path = dir.0.join("new.key");
+    let out = Command::new(BIN)
+        .args(["keygen", "--out", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let secret = std::fs::read_to_string(&path).unwrap();
+    let id = Identity::from_secret_hex(&secret).unwrap();
+    let value = |name: &str| {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.trim() == name).then(|| v.trim().trim_matches('"').to_owned())
+        })
+    };
+    assert_eq!(value("public_key"), Some(id.public_key().to_string()));
+    assert_eq!(value("fingerprint"), Some(id.fingerprint().to_string()));
+    assert_eq!(
+        value("public_key_v2"),
+        Some(id.hybrid_public_key().to_string())
+    );
+    assert_eq!(
+        value("fingerprint_v2"),
+        Some(id.hybrid_fingerprint().to_string())
+    );
+}
+
+/// Spec (OPERATIONS §15): `pubkey` prints the same lines for an existing key, and leaves the
+/// file as it was.
+#[test]
+fn pubkey_prints_the_keys_of_an_existing_file() {
+    let dir = setup("pubkey-v2");
+    let path = dir.0.join("node.key");
+    let made = Command::new(BIN)
+        .args(["keygen", "--out", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    let before = std::fs::read(&path).unwrap();
+    let shown = Command::new(BIN)
+        .args(["pubkey", "--key", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    assert_eq!(shown.stdout, made.stdout);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let missing = Command::new(BIN)
+        .args(["pubkey", "--key", dir.0.join("none.key").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
 }

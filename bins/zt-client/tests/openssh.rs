@@ -16,6 +16,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -49,7 +50,7 @@ fn text(b: &[u8]) -> String {
 /// sshd on 127.0.0.1 (free port), relay and agent in-process, ssh configuration ready.
 struct Lab {
     fleet: Fleet,
-    _client: ClientDir,
+    client: ClientDir,
     dir: PathBuf,
     ssh_config: PathBuf,
     _sshd: Child,
@@ -57,8 +58,17 @@ struct Lab {
 
 impl Lab {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// With `hybrid`, the agent accepts both suites and the client pins the hybrid one for
+    /// `web-01` (PQ-1); the relay is configured as always.
+    async fn start_with(hybrid: bool) -> Self {
         let fleet = Fleet::start().await;
         let client = fleet.client_dir(&fleet.ansible);
+        if hybrid {
+            client.pin_last_node_suite("Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s");
+        }
         let dir = client.dir.join("ssh");
         std::fs::create_dir_all(&dir).unwrap();
         let keygen = |name: &str| {
@@ -109,7 +119,20 @@ impl Lab {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        fleet.start_agent(addr).await;
+        if hybrid {
+            fleet
+                .start_agent_with(
+                    addr,
+                    zt_domain::AcceptedSuites::new([
+                        zt_domain::HandshakeSuite::NoiseIk25519,
+                        zt_domain::HandshakeSuite::NoiseIkhfs25519MlKem768,
+                    ])
+                    .unwrap(),
+                )
+                .await;
+        } else {
+            fleet.start_agent(addr).await;
+        }
 
         let host_pub = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
         std::fs::write(dir.join("known_hosts"), format!("web-01 {host_pub}")).unwrap();
@@ -132,7 +155,7 @@ impl Lab {
         .unwrap();
         Self {
             fleet,
-            _client: client,
+            client,
             dir,
             ssh_config,
             _sshd: sshd,
@@ -175,6 +198,29 @@ async fn ssh_runs_a_command_through_tcn() {
     let out = run(lab.ssh().arg("echo tcn-ok")).await;
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "tcn-ok\n");
+}
+
+/// PQ-1: real OpenSSH over the hybrid end-to-end suite, through an unchanged relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_runs_a_command_over_the_hybrid_suite() {
+    let lab = Lab::start_with(true).await;
+    let out = run(lab.ssh().arg("echo tcn-pq-ok")).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "tcn-pq-ok\n");
+    let upload = lab.dir.join("pq-upload.bin");
+    random_file(&upload, 4 * 1024 * 1024);
+    let out = run(lab
+        .ssh()
+        .arg("sha256sum")
+        .stdin(std::fs::File::open(&upload).unwrap()))
+    .await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let remote = text(&out.stdout);
+    assert_eq!(
+        remote.split_whitespace().next().unwrap(),
+        sha256(&upload).await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -260,7 +306,7 @@ async fn ansible_playbook_runs_through_tcn() {
     std::fs::write(
         d.join("ansible.cfg"),
         format!(
-            "[defaults]\nhost_key_checking = True\nlocal_tmp = {d}/ansible-local\nremote_tmp = /tmp/.tcn-ansible\n\
+            "[defaults]\nhost_key_checking = True\ntimeout = 10\nlocal_tmp = {d}/ansible-local\nremote_tmp = /tmp/.tcn-ansible\n\
              [ssh_connection]\nssh_args = -F {cfg} -o ControlMaster=auto -o ControlPersist=5s -o ControlPath={d}/cm-%%C\npipelining = True\n",
             d = d.display(),
             cfg = lab.ssh_config.display()
@@ -299,4 +345,256 @@ async fn ansible_playbook_runs_through_tcn() {
         "deployed via tcn\n"
     );
     let _ = (&lab.fleet, NEEDS);
+}
+
+/// A relay that accepts TCP and never answers.
+async fn silent_relay() -> SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+/// Rewrites the lab's `client.toml` with `top` (top-level keys) and these relays, keeping the
+/// `[[nodes]]` entries.
+fn rewrite_relays(lab: &Lab, top: &str, relays: &[(String, zt_crypto::PublicKey)]) {
+    let path = lab.client.config();
+    let old = std::fs::read_to_string(&path).unwrap();
+    let nodes = &old[old.find("[[nodes]]").unwrap()..];
+    let mut toml = format!("{top}key = \"client.key\"\n");
+    for (addr, key) in relays {
+        let _ = write!(
+            toml,
+            "\n[[relays]]\naddress = \"{addr}\"\npublic_key = \"{key}\"\n"
+        );
+    }
+    toml.push('\n');
+    toml.push_str(nodes);
+    std::fs::write(&path, toml).unwrap();
+}
+
+/// R-4 (A5-4): a first relay that never answers costs `ssh` the stagger (about 2 s), not the
+/// handshake timeout: the hedge reaches the second relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_hedges_past_a_silent_first_relay() {
+    let lab = Lab::start().await;
+    let silent = silent_relay().await;
+    rewrite_relays(
+        &lab,
+        "",
+        &[
+            (
+                silent.to_string(),
+                zt_crypto::Identity::generate().unwrap().public_key(),
+            ),
+            (lab.fleet.relay.to_string(), lab.fleet.relay_id.public_key()),
+        ],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab.ssh().arg("echo tcn-hedged")).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "tcn-hedged\n");
+    assert!(started.elapsed() < Duration::from_secs(6));
+}
+
+/// R-4: with no relay answering, `ssh` fails after `connect_deadline_secs` with exit status
+/// 255 (what Ansible retries) and the reason from `zt-client` on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_reports_the_failover_deadline() {
+    let lab = Lab::start().await;
+    let silent = silent_relay().await;
+    rewrite_relays(
+        &lab,
+        "connect_deadline_secs = 2\n",
+        &[(
+            silent.to_string(),
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab.ssh().arg("true")).await;
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{stderr}");
+    assert!(
+        stderr.contains("zt-client: no relay completed the connection within 2 s"),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(6));
+}
+
+// ---------- Review 0011: failover under Ansible's ConnectTimeout (A11-2, A11-4) ----------
+
+/// A TCP proxy whose forwarding can be frozen (bytes are read and held): a half-open link.
+async fn freezable_proxy(
+    target: SocketAddr,
+    frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = l.accept().await {
+            let outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+            let (ri, wi) = inbound.into_split();
+            let (ro, wo) = outbound.into_split();
+            for (mut r, mut w, f) in [
+                (
+                    Box::new(ri) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(wo) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    frozen.clone(),
+                ),
+                (Box::new(ro), Box::new(wi), frozen.clone()),
+            ] {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    loop {
+                        let n = match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        while f.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+    addr
+}
+
+/// Finding A11-2: relay B, listed first, is alive and completes the outer handshake, but its
+/// link to the agent is half-open (G4; or B is overloaded or compromised and sits on `Open`).
+/// Relay A is healthy. `ssh` runs with `-o ConnectTimeout=<connect_timeout>`, which Ansible
+/// always passes (`[defaults] timeout`, 10 s by default) and which OpenSSH applies to the
+/// banner exchange through a `ProxyCommand`.
+async fn stalled_first_relay(connect_timeout: u32) -> (std::process::Output, Duration) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zt_domain::{AccessPolicy, AllowedNodes, ClientGrant};
+    let lab = Lab::start().await;
+    // Relay B: same policy as the lab's relay A, default (production) timeouts.
+    let relay_b_id = zt_crypto::Identity::generate().unwrap();
+    let mut policy = AccessPolicy::new();
+    policy
+        .add_agent(lab.fleet.agent_id.fingerprint(), common::node("web-01"))
+        .unwrap();
+    policy
+        .add_client(
+            lab.fleet.ansible.fingerprint(),
+            ClientGrant {
+                name: common::node("ansible"),
+                allowed: AllowedNodes::Only([common::node("web-01")].into_iter().collect()),
+            },
+        )
+        .unwrap();
+    let server = zt_net::relay::RelayServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        zt_crypto::Identity::from_secret_hex(&relay_b_id.to_secret_hex()).unwrap(),
+        policy,
+        zt_net::relay::RelayConfig::default(),
+    )
+    .await
+    .unwrap();
+    let relay_b = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+    // A second agent process for web-01 (same key), registered with B through the proxy.
+    let frozen = Arc::new(AtomicBool::new(false));
+    let via = freezable_proxy(relay_b, frozen.clone()).await;
+    let config = zt_net::agent::AgentConfig {
+        relays: vec![zt_net::RelayEndpoint {
+            address: via.to_string(),
+            public_key: relay_b_id.public_key().into(),
+            suite: zt_domain::HandshakeSuite::NoiseIk25519,
+        }],
+        node: common::node("web-01"),
+        ssh_target: "127.0.0.1:9".into(),
+        authorized_clients: zt_net::Revocable::fixed(
+            [lab.fleet.ansible.fingerprint()]
+                .into_iter()
+                .collect::<zt_domain::AuthorizedClients>(),
+        ),
+        timeouts: zt_net::Timeouts::default(),
+        max_streams: 16,
+        client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+        reconnect: zt_net::agent::ReconnectConfig::default(),
+    };
+    tokio::spawn(zt_net::agent::run(
+        Arc::new(zt_crypto::Keyring::single(
+            zt_crypto::Identity::from_secret_hex(&lab.fleet.agent_id.to_secret_hex()).unwrap(),
+        )),
+        config,
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The agent link of B is now half-open.
+    frozen.store(true, Ordering::SeqCst);
+    rewrite_relays(
+        &lab,
+        "",
+        &[
+            (relay_b.to_string(), relay_b_id.public_key()),
+            (lab.fleet.relay.to_string(), lab.fleet.relay_id.public_key()),
+        ],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab
+        .ssh()
+        .arg("-o")
+        .arg(format!("ConnectTimeout={connect_timeout}"))
+        .arg("echo tcn-failover"))
+    .await;
+    (out, started.elapsed())
+}
+
+/// Finding A11-2: under Ansible's default `ConnectTimeout = 10`, a first relay that stalls
+/// after its handshake no longer ends `ssh` before failover: the `OpenAck` wait (4 s with two
+/// relays) leaves the healthy relay enough time, banner exchange included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_fails_over_a_stalled_relay_within_ansibles_connect_timeout() {
+    let (out, at) = stalled_first_relay(10).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "tcn-failover\n");
+    assert!(
+        at >= Duration::from_secs(3) && at < Duration::from_secs(8),
+        "{at:?}"
+    );
+}
+
+/// Finding A11-4: with the default timeouts (no `connect_deadline_secs`), one silent relay
+/// ends at the 5 s handshake timeout; `ssh` exits 255 (what Ansible retries) with the reason
+/// from `zt-client` on stderr, inside Ansible's 10 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs OpenSSH (sshd, ssh, scp, ssh-keygen) and ansible-playbook"]
+async fn ssh_reports_a_silent_relay_with_the_default_timeouts() {
+    let lab = Lab::start().await;
+    let silent = silent_relay().await;
+    rewrite_relays(
+        &lab,
+        "",
+        &[(
+            silent.to_string(),
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let started = std::time::Instant::now();
+    let out = run(lab.ssh().arg("-o").arg("ConnectTimeout=10").arg("true")).await;
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{stderr}");
+    assert!(
+        stderr.contains("zt-client: timed out: handshake"),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
 }

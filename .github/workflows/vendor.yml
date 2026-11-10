@@ -1,0 +1,53 @@
+name: vendor
+
+# The vendored crates (vendor/, finding A9-1 of review 0009): vendor/snow must be the crates.io
+# release plus exactly the patch series in vendor/patches/snow, and RustSec must be checked
+# against that release, which `cargo deny` on the workspace cannot do for a path crate. The
+# daily run catches an advisory published between pull requests.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * *"
+
+# Read-only: no job writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: vendor-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  snow-identity:
+    # Download, SHA-256, patch series, byte-for-byte comparison, then upstream's own tests
+    # (with the HFS paths the patches touch) on the patched release.
+    name: snow-identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97.0"
+      - run: ./.github/scripts/check-vendored-snow.sh --test
+
+  snow-advisories:
+    # RustSec against the upstream release of every vendored crate.
+    name: snow-advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: vendor/upstream-advisories/Cargo.toml
+          command-arguments: advisories

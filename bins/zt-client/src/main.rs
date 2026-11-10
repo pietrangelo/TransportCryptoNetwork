@@ -17,7 +17,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use zt_crypto::{Identity, PublicKey, cert_key};
-use zt_domain::{CertBody, CertScope, CloseReason, NodeId, RejectReason, UnixTime};
+use zt_domain::{
+    AnyCertBody, CertScope, CloseReason, HandshakeSuite, NodeId, RejectReason, UnixTime,
+};
 use zt_net::config::{self, ClientSettings};
 use zt_net::{NetError, Timeouts, client};
 
@@ -44,6 +46,13 @@ enum Command {
         /// File to create.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Prints the public keys of an existing key file (v1 and `tcn-pub-v2:`, OPERATIONS §15),
+    /// without changing it.
+    Pubkey {
+        /// The secret key file.
+        #[arg(long)]
+        key: PathBuf,
     },
     /// Connects stdin/stdout to the node's SSH daemon (usage: `ProxyCommand zt-client connect %n`).
     Connect {
@@ -73,20 +82,39 @@ fn main() -> ExitCode {
         .init();
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Keygen { out } => keygen(&out),
+        Command::Keygen { out } => keygen(&out).map_err(Failure::from),
+        Command::Pubkey { key } => pubkey(&key).map_err(Failure::from),
         Command::Connect { strip_suffix, node } => match node.as_slice() {
             [name] => connect(cli.config, strip_suffix.as_deref(), name),
-            _ => Err("expected exactly one node name, and no option after it".into()),
+            _ => Err(Failure::from(
+                "expected exactly one node name, and no option after it".to_owned(),
+            )),
         },
-        Command::Certificate => certificate(cli.config.as_deref()),
+        Command::Certificate => certificate(cli.config.as_deref()).map_err(Failure::from),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
+        Err(failure) => {
             // On stderr OpenSSH shows it to the user, who is the right recipient.
-            let _ = writeln!(std::io::stderr(), "zt-client: {message}");
-            ExitCode::FAILURE
+            let _ = writeln!(std::io::stderr(), "zt-client: {}", failure.message);
+            ExitCode::from(failure.code)
         }
+    }
+}
+
+/// `EX_TEMPFAIL` (sysexits.h): no relay completed the connection within the deadline; trying
+/// again later may work. OpenSSH itself then exits with 255, which Ansible retries.
+const EXIT_TEMPFAIL: u8 = 75;
+
+/// A failed command: the message for stderr and the exit status.
+struct Failure {
+    message: String,
+    code: u8,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self { message, code: 1 }
     }
 }
 
@@ -104,6 +132,7 @@ fn certificate(flag: Option<&Path>) -> Result<(), String> {
     let body = &cert.body;
     let identity = config::load_identity(&settings.key).map_err(|e| e.to_string())?;
     reject_leaked_secret(cert_path, body, &identity)?;
+    check_hybrid_subject(cert_path, body, &identity)?;
     let mut out = String::new();
     let _ = writeln!(out, "file        = {}", cert_path.display());
     let _ = writeln!(out, "name        = {}", body.name());
@@ -116,20 +145,32 @@ fn certificate(flag: Option<&Path>) -> Result<(), String> {
             .join(", "),
     };
     let _ = writeln!(out, "nodes       = {nodes}");
-    match PublicKey::from_canonical_bytes(body.ca_key().as_bytes()) {
-        Ok(ca) => {
-            let _ = writeln!(out, "ca          = {}", ca.fingerprint());
+    let _ = writeln!(out, "version     = {}", body.version());
+    match body {
+        AnyCertBody::V1(body) => {
+            match PublicKey::from_canonical_bytes(body.ca_key().as_bytes()) {
+                Ok(ca) => {
+                    let _ = writeln!(out, "ca          = {}", ca.fingerprint());
+                }
+                Err(_) => {
+                    let _ = writeln!(out, "ca          = invalid key");
+                }
+            }
+            match PublicKey::from_canonical_bytes(body.subject_key().as_bytes()) {
+                Ok(subject) => {
+                    let _ = writeln!(out, "subject     = {}", subject.fingerprint());
+                }
+                Err(_) => {
+                    let _ = writeln!(out, "subject     = invalid key");
+                }
+            }
         }
-        Err(_) => {
-            let _ = writeln!(out, "ca          = invalid key");
-        }
-    }
-    match PublicKey::from_canonical_bytes(body.subject_key().as_bytes()) {
-        Ok(subject) => {
-            let _ = writeln!(out, "subject     = {}", subject.fingerprint());
-        }
-        Err(_) => {
-            let _ = writeln!(out, "subject     = invalid key");
+        AnyCertBody::V2(body) => {
+            let _ = writeln!(out, "ca_fp       = {}", body.ca_fp());
+            let _ = writeln!(out, "subject     = {}", body.subject().classical());
+            if let Some(hybrid) = body.subject().hybrid() {
+                let _ = writeln!(out, "subject_v2  = {hybrid}");
+            }
         }
     }
     let _ = writeln!(out, "serial      = {}", body.serial());
@@ -156,7 +197,7 @@ enum Validity {
     Expired,
 }
 
-fn check_validity(body: &CertBody, now: UnixTime) -> Validity {
+fn check_validity(body: &AnyCertBody, now: UnixTime) -> Validity {
     if now >= body.not_after() {
         Validity::Expired
     } else if now < body.not_before() {
@@ -168,6 +209,74 @@ fn check_validity(body: &CertBody, now: UnixTime) -> Validity {
     }
 }
 
+/// A hybrid-bound certificate passes only a handshake that proves its fingerprint v2: the
+/// client's own (finding A12-7 of review 0012).
+fn check_hybrid_subject(
+    path: &Path,
+    body: &AnyCertBody,
+    identity: &Identity,
+) -> Result<(), String> {
+    match hybrid_subject(body) {
+        Some(bound) if *bound != identity.hybrid_fingerprint() => Err(format!(
+            "{}: the certificate is bound to the fingerprint v2 {bound}, not to this client's \
+             fingerprint v2 {}: it would be refused on every hop",
+            path.display(),
+            identity.hybrid_fingerprint()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The fingerprint v2 a hybrid-bound certificate (`subject_kind = 0x02`) is bound to.
+fn hybrid_subject(body: &AnyCertBody) -> Option<&zt_domain::HybridFingerprint> {
+    match body {
+        AnyCertBody::V1(_) => None,
+        AnyCertBody::V2(body) => body.subject().hybrid(),
+    }
+}
+
+/// A hybrid-bound certificate goes in message 1 of both hops, and passes only the hybrid IK
+/// suite (finding A12-7 of review 0012): a node pinned to another suite, or relays none of
+/// which is, refuse the client whatever happens, so that is an error before any connection;
+/// with some relays on another suite failover to them would be refused, so it is a warning
+/// that names them.
+fn check_hybrid_hops(config: &zt_net::client::ClientConfig, path: &Path) -> Result<(), String> {
+    let hybrid = |suite: HandshakeSuite| suite.requires_hybrid_identity();
+    if !hybrid(config.node_suite) {
+        return Err(format!(
+            "{}: the certificate is bound to a fingerprint v2 and passes only the hybrid IK \
+             suite, but node {} is pinned to {}: pin it to the hybrid IK suite with its \
+             tcn-pub-v2 key (OPERATIONS §16)",
+            path.display(),
+            config.node,
+            config.node_suite.protocol_name()
+        ));
+    }
+    let classical: Vec<&str> = config
+        .relays
+        .iter()
+        .filter(|r| !hybrid(r.suite))
+        .map(|r| r.address.as_str())
+        .collect();
+    if classical.len() == config.relays.len() {
+        return Err(format!(
+            "{}: the certificate is bound to a fingerprint v2 and passes only the hybrid IK \
+             suite, but no relay is pinned to it: pin the relays to the hybrid IK suite with \
+             their tcn-pub-v2 keys (OPERATIONS §16)",
+            path.display()
+        ));
+    }
+    if !classical.is_empty() {
+        warn(&format!(
+            "warning: {}: the certificate passes only the hybrid IK suite; a failover to the \
+             relay(s) {} pinned to another suite would be refused",
+            path.display(),
+            classical.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Loads the configured certificate and checks, before any connection, that it is for
 /// `identity` and has not expired. A certificate not yet valid or close to expiry only
 /// causes a warning on stderr (the relay and agent clocks decide).
@@ -177,15 +286,26 @@ fn load_own_certificate(
 ) -> Result<config::CertificateFile, String> {
     let cert = config::load_certificate(path).map_err(|e| e.to_string())?;
     reject_leaked_secret(path, &cert.body, identity)?;
-    if *cert.body.subject_key() != cert_key(&identity.public_key()) {
+    let subject = match &cert.body {
+        AnyCertBody::V1(body) => (*body.subject_key() == cert_key(&identity.public_key()))
+            .then_some(())
+            .ok_or_else(|| {
+                PublicKey::from_canonical_bytes(body.subject_key().as_bytes())
+                    .map_or_else(|_| "invalid".to_owned(), |k| k.fingerprint().to_string())
+            }),
+        AnyCertBody::V2(body) => (*body.subject().classical() == identity.fingerprint())
+            .then_some(())
+            .ok_or_else(|| body.subject().classical().to_string()),
+    };
+    if let Err(subject) = subject {
         return Err(format!(
-            "{}: the certificate is for another key (subject {}), not for this client's key {}",
+            "{}: the certificate is for another key (subject {subject}), not for this client's \
+             key {}",
             path.display(),
-            PublicKey::from_canonical_bytes(cert.body.subject_key().as_bytes())
-                .map_or_else(|_| "invalid".to_owned(), |k| k.fingerprint().to_string()),
             identity.fingerprint()
         ));
     }
+    check_hybrid_subject(path, &cert.body, identity)?;
     let (nb, na) = (
         zt_net::utc_text(cert.body.not_before()),
         zt_net::utc_text(cert.body.not_after()),
@@ -214,7 +334,15 @@ fn load_own_certificate(
 /// the content of the key file, 64 hex characters like a public key): the secret is now in a
 /// public file and in the CA log, so the key must be regenerated (finding 0006-6). The
 /// message never reports the secret.
-fn reject_leaked_secret(path: &Path, body: &CertBody, identity: &Identity) -> Result<(), String> {
+fn reject_leaked_secret(
+    path: &Path,
+    body: &AnyCertBody,
+    identity: &Identity,
+) -> Result<(), String> {
+    // A v2 certificate carries fingerprints, not keys: a secret cannot leak into it.
+    let AnyCertBody::V1(body) = body else {
+        return Ok(());
+    };
     if identity.is_own_secret(body.subject_key().as_bytes()) {
         return Err(format!(
             "{}: secret key leaked into a certificate: regenerate the client key \
@@ -229,13 +357,22 @@ fn warn(message: &str) {
     let _ = writeln!(std::io::stderr(), "zt-client: {message}");
 }
 
+fn pubkey(key: &Path) -> Result<(), String> {
+    let identity = config::load_identity(key).map_err(|e| e.to_string())?;
+    write!(
+        std::io::stdout(),
+        "{}",
+        config::public_identity_text(&identity)
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn keygen(out: &Path) -> Result<(), String> {
     let identity = config::create_identity(out).map_err(|e| e.to_string())?;
-    writeln!(
+    write!(
         std::io::stdout(),
-        "public_key  = \"{}\"\nfingerprint = {}",
-        identity.public_key(),
-        identity.fingerprint()
+        "{}",
+        config::public_identity_text(&identity)
     )
     .map_err(|e| e.to_string())
 }
@@ -274,7 +411,7 @@ fn config_path(flag: Option<PathBuf>) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("no configuration: use --config or {CONFIG_ENV}"))
 }
 
-fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Result<(), String> {
+fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Result<(), Failure> {
     // Everything local is validated before opening any connection.
     let node = target(name, strip_suffix)?;
     let settings: ClientSettings =
@@ -286,6 +423,14 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
     let not_after = match settings.certificate.as_deref() {
         Some(path) => {
             let cert = load_own_certificate(path, &identity)?;
+            // PQ-SUNSET: under the profile only a hybrid-bound certificate v2 is sent.
+            if settings.pq_only {
+                zt_net::sunset::check_certificate(&path.display().to_string(), &cert)
+                    .map_err(|e| e.to_string())?;
+            }
+            if hybrid_subject(&cert.body).is_some() {
+                check_hybrid_hops(&config, path)?;
+            }
             config.certificate = Some(cert.bytes);
             Some(cert.body.not_after())
         }
@@ -297,19 +442,77 @@ fn connect(flag: Option<PathBuf>, strip_suffix: Option<&str>, name: &str) -> Res
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
+    let metrics = zt_net::metrics::ClientMetrics::new();
     let result = runtime.block_on(async {
         let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-        client::connect(&identity, &config, local).await
+        client::connect_observed(&identity, &config, local, zt_net::net::TcpDialer, &metrics).await
     });
+    // Optional (R-5): the last session's outcome for node_exporter. A failed write never
+    // changes the session's own outcome.
+    if let Some(path) = &settings.metrics_file
+        && let Err(err) = zt_net::metrics::write_textfile(path, &metrics.render())
+    {
+        warn(&format!(
+            "metrics file {} not written: {err}",
+            path.display()
+        ));
+    }
     // Reading stdin runs on a blocking thread that cannot be interrupted: if the session
     // has ended on the node side we do not wait for ssh to close stdin.
     runtime.shutdown_background();
-    result.map_err(|e| describe(&e, &node, not_after))
+    let suite = config.node_suite;
+    result.map_err(|e| Failure {
+        message: describe(&e, &node, not_after, suite),
+        code: exit_code(&e),
+    })
+}
+
+/// 75 (`EX_TEMPFAIL`) when trying again later may succeed: the deadline, and every give-up
+/// that says nothing about the right of access (finding A11-4): a relay unreachable, silent
+/// or dropping the connection without a reply (restart, overload, R-1 admission; also a client
+/// key the relay does not know, which it cannot tell apart), a node offline or draining, a
+/// rate limit. 1 for a definitive answer: a policy refusal, a failed handshake with a pinned
+/// key, a protocol error, the local configuration.
+fn exit_code(err: &NetError) -> u8 {
+    let temporary = matches!(
+        err,
+        NetError::Deadline(_)
+            | NetError::Io(_)
+            | NetError::Timeout(_)
+            | NetError::Closed
+            | NetError::Rejected(RejectReason::NodeOffline | RejectReason::RateLimited)
+            | NetError::StreamClosed(CloseReason::Drained)
+    );
+    if temporary { EXIT_TEMPFAIL } else { 1 }
 }
 
 /// Message for the ssh user. It never contains bytes received from the network. `not_after`
-/// is the expiry of the certificate used, if any.
-fn describe(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> String {
+/// is the expiry of the certificate used, if any; `suite` is the suite pinned for the node.
+fn describe(
+    err: &NetError,
+    node: &NodeId,
+    not_after: Option<UnixTime>,
+    suite: HandshakeSuite,
+) -> String {
+    let text = describe_error(err, node, not_after);
+    // The agent does not say why it refused (no oracle), but the client knows its own pin: an
+    // agent that does not accept the suite closes with `Unauthorized`, one older than PQ-1
+    // sees an invalid handshake (finding A9-6).
+    let refused_by_agent = matches!(
+        err,
+        NetError::StreamClosed(CloseReason::Unauthorized | CloseReason::ProtocolViolation)
+    );
+    if refused_by_agent && suite != HandshakeSuite::NoiseIk25519 {
+        format!(
+            "{text}, or the agent does not accept the pinned suite {} (OPERATIONS §12)",
+            suite.protocol_name()
+        )
+    } else {
+        text
+    }
+}
+
+fn describe_error(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> String {
     let expired = not_after.is_some_and(|na| zt_net::unix_now() >= na);
     match err {
         NetError::StreamClosed(CloseReason::Unauthorized) if expired => {
@@ -345,5 +548,74 @@ fn describe(err: &NetError, node: &NodeId, not_after: Option<UnixTime>) -> Strin
              not in the relay policy, or relay restart)"
             .into(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    const HFS: HandshakeSuite = HandshakeSuite::NoiseIkhfs25519MlKem768;
+
+    /// Finding A9-6: a client pinned to the hybrid suite, refused by an agent that does not
+    /// accept it, is told so, not only that its key is not authorized.
+    #[test]
+    fn a_refusal_names_the_pinned_hybrid_suite() {
+        let node = NodeId::try_from("web-01").unwrap();
+        for err in [
+            NetError::StreamClosed(CloseReason::Unauthorized),
+            // An agent older than PQ-1 sees an invalid handshake.
+            NetError::StreamClosed(CloseReason::ProtocolViolation),
+        ] {
+            let text = describe(&err, &node, None, HFS);
+            assert!(
+                text.contains("does not accept the pinned suite")
+                    && text.contains(HFS.protocol_name())
+                    && text.contains("OPERATIONS"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Finding A11-4: what is temporary exits 75, a definitive answer 1.
+    #[test]
+    fn temporary_failures_exit_with_tempfail() {
+        for err in [
+            NetError::Deadline(std::time::Duration::from_secs(8)),
+            NetError::Io(std::io::ErrorKind::ConnectionRefused.into()),
+            NetError::Timeout("handshake"),
+            NetError::Closed,
+            NetError::Rejected(RejectReason::NodeOffline),
+            NetError::Rejected(RejectReason::RateLimited),
+            NetError::StreamClosed(CloseReason::Drained),
+        ] {
+            assert_eq!(exit_code(&err), EXIT_TEMPFAIL, "{err:?}");
+        }
+        for err in [
+            NetError::Rejected(RejectReason::NotAuthorized),
+            NetError::Rejected(RejectReason::UnknownNode),
+            NetError::StreamClosed(CloseReason::Unauthorized),
+            NetError::Protocol("unexpected frame"),
+        ] {
+            assert_eq!(exit_code(&err), 1, "{err:?}");
+        }
+    }
+
+    /// With the classical suite the messages stay as they were.
+    #[test]
+    fn a_classical_refusal_does_not_mention_suites() {
+        let node = NodeId::try_from("web-01").unwrap();
+        let text = describe(
+            &NetError::StreamClosed(CloseReason::Unauthorized),
+            &node,
+            None,
+            HandshakeSuite::NoiseIk25519,
+        );
+        assert_eq!(
+            text,
+            "access denied by the agent of web-01 (client key not authorized there)"
+        );
     }
 }

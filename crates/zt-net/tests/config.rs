@@ -130,7 +130,8 @@ fn secret_keys_require_private_permissions_and_are_never_overwritten() {
 
     let big = dir.join("big.toml");
     let mut f = std::fs::File::create(&big).unwrap();
-    f.write_all(&vec![b'#'; 2 * 1024 * 1024]).unwrap();
+    f.write_all(&vec![b'#'; zt_net::config::MAX_TRUST_FILE_LEN + 1])
+        .unwrap();
     assert!(matches!(
         zt_net::config::load_policy(&big),
         Err(ConfigError::TooLarge(_))
@@ -508,19 +509,19 @@ fn no_relay_key_may_double_as_a_node_key() {
 
 #[test]
 fn relay_endpoints_pair_addresses_and_keys() {
-    use zt_crypto::PublicKey;
-    let k = || key().parse::<PublicKey>().unwrap();
+    use zt_crypto::PeerKey;
+    let k = || key().parse::<PeerKey>().unwrap();
     let (a, b) = (k(), k());
     let addrs = |n: usize| {
         (0..n)
             .map(|i| format!("r{i}.example.org:7443"))
             .collect::<Vec<_>>()
     };
-    let ok = zt_net::config::relay_endpoints("t", &addrs(2), &[a, b]).unwrap();
+    let ok = zt_net::config::relay_endpoints("t", &addrs(2), &[a.clone(), b.clone()]).unwrap();
     assert_eq!(ok.len(), 2);
     assert_eq!(ok[1].public_key, b);
     assert!(
-        zt_net::config::relay_endpoints("t", &addrs(2), &[a]).is_err(),
+        zt_net::config::relay_endpoints("t", &addrs(2), std::slice::from_ref(&a)).is_err(),
         "count mismatch"
     );
     assert!(
@@ -528,7 +529,7 @@ fn relay_endpoints_pair_addresses_and_keys() {
         "empty"
     );
     assert!(
-        zt_net::config::relay_endpoints("t", &addrs(2), &[a, a]).is_err(),
+        zt_net::config::relay_endpoints("t", &addrs(2), &[a.clone(), a]).is_err(),
         "same key twice"
     );
     let nine: Vec<_> = (0..=zt_net::MAX_RELAYS).map(|_| k()).collect();

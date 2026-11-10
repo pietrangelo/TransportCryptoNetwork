@@ -1,0 +1,7 @@
+# cargo-deny for vendor/upstream-advisories: only `check advisories` is run here. Every
+# RustSec advisory against the upstream release of a vendored crate (vulnerability,
+# unmaintained, unsound, yanked) fails the check (finding A9-1 of review 0009).
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []

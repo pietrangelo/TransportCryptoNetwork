@@ -11,5 +11,9 @@ publish.workspace = true
 zt-domain.workspace = true
 bytes.workspace = true
 
+[dev-dependencies]
+# Finding A8-7: admission invariants under arbitrary event sequences.
+proptest.workspace = true
+
 [lints]
 workspace = true

@@ -149,16 +149,20 @@ impl Relay {
         ClientConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.addr.clone(),
-                public_key: self.key.public_key(),
+                public_key: self.key.public_key().into(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: NodeId::try_from("web-01").unwrap(),
-            node_key: Identity::generate().unwrap().public_key(),
+            node_key: Identity::generate().unwrap().public_key().into(),
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: Timeouts {
                 handshake: Duration::from_secs(2),
                 open: Duration::from_secs(2),
                 ..Timeouts::default()
             },
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         }
     }
 
@@ -184,21 +188,26 @@ async fn try_connect(relay: &Relay, who: &Identity) -> Result<(), NetError> {
 
 #[tokio::test]
 async fn audit_events_are_json_with_a_stable_kind_and_no_secrets() {
+    // A revoked key is a known identity: it gets its own line. A stranger's key (anyone can
+    // make one up) is only counted in `preauth_summary` (finding AP-3).
+    let revoked = Identity::generate().unwrap();
+    let denylist = format!("serials = []\nkeys = [\"{}\"]\n", revoked.public_key());
+    let dir = CaDir::new("audit", &policy_text(&[]), Some(&denylist));
+    let revocations = dir.revocations_arg();
+    let relay = dir.start(&["--revocations", &revocations]);
     let stranger = Identity::generate().unwrap();
-    let relay = Relay::start("audit", &[]);
     let _ = try_connect(&relay, &stranger).await;
-    let event =
-        relay.wait_for(|v| v["target"] == "zt_audit" && v["fields"]["event_kind"] != "keys_in_use");
-    assert_eq!(event["fields"]["event_kind"], "authentication_failed");
+    let _ = try_connect(&relay, &revoked).await;
+    let event = relay.wait_for(|v| v["fields"]["event_kind"] == "authentication_failed");
     assert_eq!(event["level"], "WARN");
     assert!(event["timestamp"].is_string());
     // Structured fields, not a `Debug` string to parse (finding 0004-4).
     assert_eq!(
         event["fields"]["peer"],
-        stranger.fingerprint().to_string(),
+        revoked.fingerprint().to_string(),
         "{event}"
     );
-    assert_eq!(event["fields"]["reason"], "UnknownPeer", "{event}");
+    assert_eq!(event["fields"]["reason"], "key_revoked", "{event}");
     assert!(event["fields"].get("event").is_none(), "{event}");
     let text = event.to_string();
     assert!(!text.contains(relay.key.to_secret_hex().as_str()));
@@ -306,6 +315,10 @@ fn ready_is_notified_only_once_sighup_is_handled() {
             status.is_none(),
             "round {round}: SIGHUP after READY killed the relay"
         );
+        // The reload's own `RELOADING=1` and `READY=1` (finding A10-1) belong to this round.
+        notify.set_nonblocking(true).unwrap();
+        while notify.recv(&mut buf).is_ok() {}
+        notify.set_nonblocking(false).unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -391,7 +404,7 @@ async fn sighup_rotates_the_relay_key_without_a_restart() {
 
     let reaches = |relay: &Relay, pin: &Identity| {
         let mut config = relay.config();
-        config.relays[0].public_key = pin.public_key();
+        config.relays[0].public_key = pin.public_key().into();
         let who = Identity::from_secret_hex(&client.to_secret_hex()).unwrap();
         async move {
             let (_app, local) = tokio::io::duplex(1024);
@@ -686,13 +699,26 @@ async fn sighup_reloads_revocations_and_cuts_a_revoked_certificate() {
     let mut live = zt_net::channel::connect_with_payload(
         tcp,
         &alice,
-        &relay.key.public_key(),
+        &relay.key.public_key().into(),
         zt_crypto::noise::Channel::Outer,
         &cert,
         &relay.config().timeouts,
     )
     .await
     .unwrap();
+    // Key confirmation (PROTOCOL §10.1): the relay counts the connection as established only
+    // after a first authentic frame.
+    live.send(
+        &zt_domain::Frame::Ping { nonce: 1 },
+        &relay.config().timeouts,
+    )
+    .await
+    .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), live.recv()).await;
+    assert!(
+        matches!(pong, Ok(Ok(Some(zt_domain::Frame::Pong { nonce: 1 })))),
+        "{pong:?}"
+    );
 
     std::fs::write(
         relay.dir.join("revoked.toml"),
@@ -891,7 +917,7 @@ async fn a_relay_key_reload_equal_to_a_pinned_ca_key_is_refused() {
     // The relay still replies with the previous key and admits a certificate from the new CA.
     let (other_cert, _) = issue(&other, &alice);
     let mut config = relay.config();
-    config.relays[0].public_key = fresh.public_key();
+    config.relays[0].public_key = fresh.public_key().into();
     config.certificate = Some(std::sync::Arc::from(other_cert.as_slice()));
     let (_app, local) = tokio::io::duplex(1024);
     let r = tokio::time::timeout(

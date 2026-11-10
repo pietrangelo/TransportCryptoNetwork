@@ -1,0 +1,20 @@
+# Advisory coverage for the vendored crates (finding A9-1 of review 0009).
+#
+# A `[patch.crates-io]` path crate has no registry source in the workspace's Cargo.lock, so
+# `cargo deny check advisories` no longer matches it against RustSec. This standalone package
+# depends on the crates.io release that each `vendor/` crate was taken from, so that its own
+# Cargo.lock names that release and `cargo deny` checks it (CI workflow `vendor`, on every
+# pull request and daily). It is never built: it is only resolved.
+[package]
+name = "tcn-vendored-upstreams"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Must be the version of vendor/snow (checked by .github/scripts/check-vendored-snow.sh).
+snow = { version = "=0.10.0", default-features = false }

@@ -127,7 +127,8 @@ impl Fleet {
         let config = AgentConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
-                public_key: self.relay_id.public_key(),
+                public_key: self.relay_id.public_key().into(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node("web-01"),
             ssh_target: ssh.to_string(),
@@ -138,6 +139,9 @@ impl Fleet {
             ),
             timeouts: fast_timeouts(),
             max_streams: 16,
+            client_suites: zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+            identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+            reconnect: zt_application::reconnect::ReconnectConfig::default(),
         };
         tokio::spawn(agent::run(
             Arc::new(zt_crypto::Keyring::single(
@@ -163,12 +167,16 @@ impl Fleet {
         ClientConfig {
             relays: vec![zt_net::RelayEndpoint {
                 address: self.relay.to_string(),
-                public_key: self.relay_id.public_key(),
+                public_key: self.relay_id.public_key().into(),
+                suite: zt_domain::HandshakeSuite::NoiseIk25519,
             }],
             node: node(target),
-            node_key: self.agent_id.public_key(),
+            node_key: self.agent_id.public_key().into(),
+            node_suite: zt_domain::HandshakeSuite::NoiseIk25519,
             certificate: None,
             timeouts: fast_timeouts(),
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         }
     }
 }
@@ -286,7 +294,7 @@ async fn unknown_client_key_gets_no_answer() {
 async fn client_detects_a_relay_impostor() {
     let fleet = Fleet::start(test_relay_config()).await;
     let mut config = fleet.client_config("web-01");
-    config.relays[0].public_key = fleet.stranger.public_key();
+    config.relays[0].public_key = fleet.stranger.public_key().into();
     let (_app, local) = tokio::io::duplex(1024);
     let err = client::connect(&fleet.ansible, &config, local)
         .await
@@ -362,15 +370,16 @@ async fn garbage_on_the_wire_does_not_affect_other_peers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn silent_connections_are_dropped_after_the_handshake_timeout() {
-    let mut config = test_relay_config();
-    config.timeouts.handshake = Duration::from_millis(300);
+async fn silent_connections_are_dropped_at_the_msg1_deadline() {
+    // The message 1 deadline cannot go below 5 s (finding AP-20, PROTOCOL §10.1).
+    let config = test_relay_config();
+    assert_eq!(config.admission.msg1_deadline, Duration::from_secs(5));
     let fleet = Fleet::start(config).await;
     let mut tcp = TcpStream::connect(fleet.relay).await.unwrap();
     // Slowloris: half a length prefix and then silence.
     tcp.write_all(&[0x00]).await.unwrap();
     let mut buf = [0_u8; 8];
-    let read = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf)).await;
+    let read = tokio::time::timeout(Duration::from_secs(7), tcp.read(&mut buf)).await;
     assert!(
         matches!(read, Ok(Ok(0) | Err(_))),
         "expected hang-up, got {read:?}"
@@ -380,8 +389,8 @@ async fn silent_connections_are_dropped_after_the_handshake_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handshake_floods_from_one_address_are_rate_limited() {
     let mut config = test_relay_config();
-    config.handshake_burst = 3;
-    config.handshake_refill = Duration::from_secs(3600);
+    config.admission.source_burst = 3;
+    config.admission.source_refill = Duration::from_secs(3600);
     let fleet = Fleet::start(config).await;
     // The first 3 connections pass the limiter (and then fail the handshake by timeout or
     // close); the fourth is closed immediately.

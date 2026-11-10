@@ -160,6 +160,147 @@ async fn falls_back_to_the_next_relay_when_the_first_is_down() {
     assert!(out.success, "stderr: {}", out.stderr);
 }
 
+/// A relay that accepts TCP and never answers (overloaded, or a proxy that swallows the
+/// connection). The accepted sockets are kept open for as long as the task runs.
+async fn silent_relay() -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+/// Prepends `line` to `client.toml` (top-level keys must precede the tables).
+fn prepend(dir: &common::ClientDir, line: &str) {
+    let path = dir.config();
+    let toml = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{line}\n{toml}")).unwrap();
+}
+
+/// R-4 (A5-4): a relay that never completes the handshake is hedged after the stagger (2 s
+/// plus jitter): the session goes through the next relay in about 2 s, not after the 10 s of
+/// the handshake timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_first_relay_is_hedged_after_the_stagger() {
+    let fleet = Fleet::start().await;
+    let ssh = Counting::start(true).await;
+    fleet.start_agent(ssh.addr).await;
+    let silent = silent_relay().await;
+    let other = zt_crypto::Identity::generate().unwrap().public_key();
+    let dir = common::ClientDir::with_relays(
+        &fleet.ansible,
+        &[
+            (silent.to_string(), other),
+            (fleet.relay.to_string(), fleet.relay_id.public_key()),
+        ],
+        &[("web-01", fleet.agent_id.public_key())],
+    );
+    let started = std::time::Instant::now();
+    let mut child = dir.spawn("web-01");
+    assert_eq!(echo_through(&mut child, b"hedged").await, b"hedged");
+    let at = started.elapsed();
+    assert!(
+        at >= Duration::from_secs(2) && at < Duration::from_secs(5),
+        "{at:?}"
+    );
+    let out = finish(child, Duration::from_secs(10)).await;
+    assert!(out.success, "stderr: {}", out.stderr);
+}
+
+/// R-4: when no relay completes the connection within `connect_deadline_secs`, `zt-client`
+/// exits with 75 (`EX_TEMPFAIL`: try again later) and says so on stderr; stdout (the SSH channel)
+/// stays empty. OpenSSH then exits with 255, which Ansible retries (`retries`, OPERATIONS §5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_deadline_exits_with_tempfail_and_a_clear_message() {
+    let silent = silent_relay().await;
+    let me = zt_crypto::Identity::generate().unwrap();
+    let dir = common::ClientDir::new(
+        &me,
+        &silent.to_string(),
+        &zt_crypto::Identity::generate().unwrap().public_key(),
+        &[(
+            "web-01",
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    prepend(&dir, "connect_deadline_secs = 1");
+    let started = std::time::Instant::now();
+    let child = dir.spawn("web-01");
+    let out = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("zt-client did not give up")
+        .unwrap();
+    let at = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "stderr: {stderr}");
+    assert!(out.stdout.is_empty());
+    assert!(at < Duration::from_secs(3), "{at:?}");
+    assert!(
+        stderr.contains("zt-client: no relay completed the connection within 1 s")
+            && stderr.contains("connect_deadline_secs"),
+        "{stderr}"
+    );
+}
+
+/// Runs `zt-client connect web-01` against `relay` with the default failover settings and
+/// returns its exit status, stderr and duration.
+async fn connect_to(relay: &str) -> (Option<i32>, String, Duration) {
+    let me = zt_crypto::Identity::generate().unwrap();
+    let dir = common::ClientDir::new(
+        &me,
+        relay,
+        &zt_crypto::Identity::generate().unwrap().public_key(),
+        &[(
+            "web-01",
+            zt_crypto::Identity::generate().unwrap().public_key(),
+        )],
+    );
+    let started = std::time::Instant::now();
+    let child = dir.spawn("web-01");
+    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("zt-client did not give up")
+        .unwrap();
+    assert!(out.stdout.is_empty());
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        started.elapsed(),
+    )
+}
+
+/// Finding A11-4: every give-up that says nothing about the right of access is temporary,
+/// not only the deadline. A relay that refuses TCP (restart, crash) exits with 75 at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusing_relay_exits_with_tempfail() {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (code, stderr, at) = connect_to(&closed.to_string()).await;
+    assert_eq!(code, Some(75), "stderr: {stderr}");
+    assert!(stderr.contains("zt-client:"), "{stderr}");
+    assert!(at < Duration::from_secs(3), "{at:?}");
+}
+
+/// Finding A11-4 with the default timeouts: a relay that accepts TCP and stays silent ends at
+/// the 5 s handshake timeout, before the 8 s deadline, and that is temporary too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_relay_exits_with_tempfail_with_the_defaults() {
+    let silent = silent_relay().await;
+    let (code, stderr, at) = connect_to(&silent.to_string()).await;
+    assert_eq!(code, Some(75), "stderr: {stderr}");
+    assert!(stderr.contains("timed out: handshake"), "{stderr}");
+    assert!(
+        at >= Duration::from_secs(5) && at < Duration::from_secs(7),
+        "{at:?}"
+    );
+}
+
 // ---------- Phase 6, step 9: certificates (OPERATIONS §10.4, PROTOCOL §15.6) ----------
 
 /// Spec: `zt-client certificate` prints name, nodes, CA, serial and validity of the
@@ -307,4 +448,184 @@ async fn a_certificate_carrying_the_client_secret_is_refused() {
     )
     .await;
     assert!(out.success, "stderr: {}", out.stderr);
+}
+
+// ---------- Review 0012, A12-7: hybrid-bound certificates ----------
+
+/// A certificate v2 bound to `subject`'s X25519 key and to `hybrid` (`subject_kind = 0x02`).
+fn hybrid_bound(subject: &zt_crypto::Identity, hybrid: zt_domain::HybridFingerprint) -> Vec<u8> {
+    let ca = zt_crypto::CompositeCaSigningKey::generate().unwrap();
+    let now = common::now_secs();
+    let body = zt_domain::CertBodyV2::new(
+        ca.public_key().ca_fp(),
+        zt_domain::CertSubject::Hybrid {
+            classical: subject.fingerprint(),
+            hybrid,
+        },
+        zt_domain::CertSerial::try_from([0x3d; 16]).unwrap(),
+        zt_domain::UnixTime::from_secs(now - 60),
+        zt_domain::UnixTime::from_secs(now + 3_600),
+        common::node("alice"),
+        zt_domain::CertScope::All,
+    )
+    .unwrap();
+    zt_crypto::sign_certificate_v2(&ca, &body).unwrap()
+}
+
+/// A12-7: a hybrid-bound certificate passes only a hybrid IK handshake that proves exactly
+/// its fingerprint v2, and the client sends it on both hops. `zt-client` therefore refuses,
+/// before any connection and naming the cause: a certificate bound to another fingerprint v2
+/// than the client's own key, and a relay or node not pinned to the hybrid IK suite. With
+/// every hop on the hybrid IK suite the certificate is used (here the relay is unreachable).
+#[tokio::test]
+async fn a_hybrid_bound_certificate_needs_hybrid_hops_and_the_clients_own_key() {
+    use common::ClientDir;
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let me = zt_crypto::Identity::generate().unwrap();
+    let (relay, agent) = (
+        zt_crypto::Identity::generate().unwrap(),
+        zt_crypto::Identity::generate().unwrap(),
+    );
+    let bait = Counting::start(false).await;
+    let write = |dir: &ClientDir, relay_suite: Option<&str>, node_suite: Option<&str>| {
+        let line =
+            |suite: Option<&str>| suite.map_or_else(String::new, |s| format!("suite = \"{s}\"\n"));
+        let toml = format!(
+            "certificate = \"client.cert\"\nkey = \"client.key\"\n\n\
+             [[relays]]\naddress = \"{}\"\npublic_key = \"{}\"\n{}\n\
+             [[nodes]]\nnode = \"web-01\"\npublic_key = \"{}\"\n{}",
+            bait.addr,
+            relay.hybrid_public_key(),
+            line(relay_suite),
+            agent.hybrid_public_key(),
+            line(node_suite),
+        );
+        std::fs::write(dir.config(), toml).unwrap();
+    };
+    let dir = ClientDir::new(&me, &bait.addr.to_string(), &relay.public_key(), &[]);
+    // Bound to another key's fingerprint v2.
+    let other = zt_crypto::Identity::generate()
+        .unwrap()
+        .hybrid_fingerprint();
+    dir.add_certificate(&hybrid_bound(&me, other), 0o644);
+    write(&dir, Some(HYBRID), Some(HYBRID));
+    let config = dir.config();
+    for child in [
+        spawn_with(&["--config", config.to_str().unwrap(), "certificate"], &[]),
+        dir.spawn("web-01"),
+    ] {
+        let out = finish(child, Duration::from_secs(10)).await;
+        assert!(!out.success);
+        assert!(out.stderr.contains("fingerprint v2"), "{}", out.stderr);
+    }
+    // Bound to the client's own key, with a classical hop.
+    std::fs::write(
+        dir.dir.join("client.cert"),
+        zt_crypto::encode_certificate_text(&hybrid_bound(&me, me.hybrid_fingerprint())),
+    )
+    .unwrap();
+    for (relay_suite, node_suite, named) in [
+        (None, Some(HYBRID), "relay"),
+        (Some(HYBRID), None, "web-01"),
+    ] {
+        write(&dir, relay_suite, node_suite);
+        let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+        assert!(!out.success);
+        assert!(out.stderr.contains("hybrid IK"), "{}", out.stderr);
+        assert!(out.stderr.contains(named), "{}", out.stderr);
+    }
+    assert_eq!(bait.count(), 0, "a connection was attempted");
+    // Every hop on the hybrid IK suite: the certificate is accepted locally and the client
+    // goes to the network.
+    write(&dir, Some(HYBRID), Some(HYBRID));
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(15)).await;
+    assert!(!out.stderr.contains("hybrid IK"), "{}", out.stderr);
+    assert!(bait.count() >= 1, "{}", out.stderr);
+}
+
+// ---------- Phase 7, PQ-SUNSET (OPERATIONS §19) ----------
+
+/// A certificate v2 bound only to `subject`'s X25519 key (`subject_kind = 0x01`).
+fn classical_v2(subject: &zt_crypto::Identity) -> Vec<u8> {
+    let ca = zt_crypto::CompositeCaSigningKey::generate().unwrap();
+    let now = common::now_secs();
+    let body = zt_domain::CertBodyV2::new(
+        ca.public_key().ca_fp(),
+        zt_domain::CertSubject::Classical(subject.fingerprint()),
+        zt_domain::CertSerial::try_from([0x3e; 16]).unwrap(),
+        zt_domain::UnixTime::from_secs(now - 60),
+        zt_domain::UnixTime::from_secs(now + 3_600),
+        common::node("alice"),
+        zt_domain::CertScope::All,
+    )
+    .unwrap();
+    zt_crypto::sign_certificate_v2(&ca, &body).unwrap()
+}
+
+/// `pq_only = true` in `client.toml`: a certificate v1, or a certificate v2 not bound to the
+/// client's hybrid identity, is refused before any connection, naming the profile; a
+/// hybrid-bound certificate goes to the network. A `client.toml` that still pins a classical
+/// suite does not load.
+#[tokio::test]
+async fn a_pq_only_client_refuses_v1_certificates_before_connecting() {
+    use common::ClientDir;
+    const HYBRID: &str = "Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s";
+    let me = zt_crypto::Identity::generate().unwrap();
+    let (relay, agent) = (
+        zt_crypto::Identity::generate().unwrap(),
+        zt_crypto::Identity::generate().unwrap(),
+    );
+    let bait = Counting::start(false).await;
+    let dir = ClientDir::new(&me, &bait.addr.to_string(), &relay.public_key(), &[]);
+    let write = |node_suite: &str| {
+        let toml = format!(
+            "pq_only = true\ncertificate = \"client.cert\"\nkey = \"client.key\"\n\n\
+             [[relays]]\naddress = \"{}\"\npublic_key = \"{}\"\nsuite = \"{HYBRID}\"\n\n\
+             [[nodes]]\nnode = \"web-01\"\npublic_key = \"{}\"\nsuite = \"{node_suite}\"\n",
+            bait.addr,
+            relay.hybrid_public_key(),
+            agent.hybrid_public_key(),
+        );
+        std::fs::write(dir.config(), toml).unwrap();
+    };
+    write(HYBRID);
+    let v1_ca = zt_crypto::CaSigningKey::generate().unwrap();
+    let now = common::now_secs();
+    let v1_body = zt_domain::CertBody::new(
+        zt_crypto::cert_key(&v1_ca.public_key()),
+        zt_crypto::cert_key(&me.public_key()),
+        zt_domain::CertSerial::try_from([0x3f; 16]).unwrap(),
+        zt_domain::UnixTime::from_secs(now - 60),
+        zt_domain::UnixTime::from_secs(now + 3_600),
+        common::node("alice"),
+        zt_domain::CertScope::All,
+    )
+    .unwrap();
+    let v1 = zt_crypto::sign_certificate(&v1_ca, &v1_body).unwrap();
+    for cert in [v1, classical_v2(&me)] {
+        std::fs::write(
+            dir.dir.join("client.cert"),
+            zt_crypto::encode_certificate_text(&cert),
+        )
+        .unwrap();
+        let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+        assert!(!out.success);
+        assert!(out.stderr.contains("pq_only"), "{}", out.stderr);
+    }
+    // A classical node pin: the configuration itself is refused.
+    write("Noise_IK_25519_ChaChaPoly_BLAKE2s");
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(10)).await;
+    assert!(!out.success);
+    assert!(out.stderr.contains("pq_only"), "{}", out.stderr);
+    assert_eq!(bait.count(), 0, "a connection was attempted");
+    // The end state: the certificate is used and the client goes to the network.
+    write(HYBRID);
+    std::fs::write(
+        dir.dir.join("client.cert"),
+        zt_crypto::encode_certificate_text(&hybrid_bound(&me, me.hybrid_fingerprint())),
+    )
+    .unwrap();
+    let out = finish(dir.spawn("web-01"), Duration::from_secs(15)).await;
+    assert!(!out.stderr.contains("pq_only"), "{}", out.stderr);
+    assert!(bait.count() >= 1, "{}", out.stderr);
 }

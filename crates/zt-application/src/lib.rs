@@ -5,11 +5,22 @@
 //! - [`relay::RelayCore`]: authorization, stream routing, flow control and limits of the
 //!   relay. It receives events ([`relay::Input`]) and produces actions ([`relay::Output`]);
 //!   the network adapters execute the actions.
+//! - [`admission`]: pre-authentication pool, per-source budget refunded after key
+//!   confirmation, per-identity concurrency, aggregated pre-authentication logging.
 //! - [`ratelimit`]: token bucket with an injected clock.
+//! - [`failover`]: how the client tries its relays (deadline, per-step timeouts, hedge).
 //!
 //! Time enters only as a `now: Instant` parameter; randomness only through the
 //! [`relay::SessionIds`] port. Everything is therefore deterministic in tests.
 #![forbid(unsafe_code)]
 
+pub mod admission;
+pub mod efficiency;
+pub mod failover;
+pub mod flapping;
+pub mod identity_lines;
+pub mod lifecycle;
+pub mod liveness;
 pub mod ratelimit;
+pub mod reconnect;
 pub mod relay;

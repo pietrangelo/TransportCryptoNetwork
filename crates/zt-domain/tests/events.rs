@@ -23,6 +23,7 @@ fn every_event_has_a_stable_snake_case_kind() {
                 client: fp,
                 target: node.clone(),
                 certificate: None,
+                client_v2: None,
             },
             "session_established",
         ),

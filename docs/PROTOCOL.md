@@ -114,23 +114,34 @@ X25519 form is used (Edwards → Montgomery map). The **fingerprint** is
 `SHA-256("TCN fingerprint v1\0" || x25519_public)`, displayed as `SHA256:<hex>`.
 Small-order public keys are rejected at load time.
 
+From PQ-AUTH every node also has a static ML-KEM-768 key **derived from the same seed** and a
+v2 public form, `tcn-pub-v2:<hex>` (Ed25519 ‖ ML-KEM encapsulation key), with the
+**fingerprint v2** `SHA256v2:<hex>` (§7.5.3). There is no new secret file. The v1 fingerprint
+stays the unit of roles, pins and revocation.
+
 ### 7.3 Handshake
-`Noise_IK_25519_ChaChaPoly_BLAKE2s`, with a different prologue per channel. The payload of
+The suite pinned by the initiator (§7.5): `Noise_IK_25519_ChaChaPoly_BLAKE2s` (the classical
+suite, the default), `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the hybrid suite) or
+`Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s` (the hybrid IK suite, §7.5.3), on
+either channel. Each channel and suite has its own prologue. The
+payload of
 message 2 MUST be empty (the initiator rejects a message 2 with a payload); the payload of
 message 1 is either empty or contains a client certificate (§15.3), and a responder rejects a
 payload that is neither empty nor a valid certificate.
 
 | Channel | Initiator | Responder | Prologue |
 | :- | :- | :- | :- |
-| outer | agent or client | relay | `TCN/1 outer` |
-| end-to-end | client | agent (inside `Data` frames) | `TCN/1 end-to-end` |
+| outer | agent or client | relay | classical: `TCN/1 outer`; hybrid: `TCN/2 outer` ‖ `0x01`; hybrid IK: `TCN/3 outer` ‖ `0x02` ‖ … (§7.5.3) |
+| end-to-end | client | agent (inside `Data` frames) | classical: `TCN/1 end-to-end`; hybrid: `TCN/2 end-to-end` ‖ `0x01`; hybrid IK: `TCN/3 end-to-end` ‖ `0x02` ‖ … |
 
 The initiator pins the responder's key. The responder learns the initiator's identity from the
 first message and, if it is not on its whitelist, **does not respond**: it closes without
 sending the second message.
 
-On the end-to-end channel the client's first transport message MUST have `TCN/1 ready` as its
-plaintext. IK message 1 can be replayed by anyone who observes it (the relay): only after this
+On the end-to-end channel the client's first transport message MUST have the confirmation of
+its suite as its plaintext: `TCN/1 ready` for the classical suite, `TCN/2 ready` for the hybrid
+one, `TCN/3 ready` for the hybrid IK suite. The confirmation of the other suite, or any other plaintext, closes the stream
+(`ProtocolViolation`) without contacting sshd. IK message 1 can be replayed by anyone who observes it (the relay): only after this
 confirmation does the agent contact sshd and register the session.
 
 ### 7.4 Rekey
@@ -141,6 +152,287 @@ message closes the channel; a forged message does not increment the receiver's c
 period has a key derived one-way from the previous one, so a copy of the process memory does
 not decrypt recorded traffic from past periods. With the 30 s keepalive an idle channel changes
 key every ~8.5 hours; an SSH session every ~16 MiB.
+
+### 7.5 Handshake suites
+A **suite** fixes the Noise protocol name, the prologues and the message sizes of a handshake.
+Each suite has one identifier, its Noise protocol name, which is also its only spelling in
+configuration: exact, with no case folding, trimming or aliases.
+
+| Suite | Id | Message 1 | Message 2 | This release |
+| :- | :- | -: | -: | :- |
+| `Noise_IK_25519_ChaChaPoly_BLAKE2s` | `0x00` | 96 + payload | 48 | supported, the default |
+| `Noise_IKhfs_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x01` | 1 296 + payload | 1 152 | supported on both channels (end to end since PQ-1, outer since Phase 3) |
+| `Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s` | `0x02` | 3 568 + payload | 2 240 | supported on both channels (PQ-AUTH, §7.5.3); needs v2 keys |
+
+Message 1 of the classical suite is `e` (32) + encrypted `s` (32 + 16) + the payload tag (16).
+In IKhfs, `e1` (the 1 184-byte ML-KEM-768 encapsulation key) follows `es`, so it is encrypted
+too (+ 16). Message 2 carries `ekem1` (1 088 + 16) between `ee` and `se`.
+
+Rules:
+
+- **No suite travels in the clear.** There is no envelope, magic or version byte in front of
+  message 1. A responder finds the suite by trying, in turn, each suite it accepts whose
+  message 1 can have the received length, with its current key and then its previous one
+  (§14). A length outside every accepted suite's bounds is refused without running Noise, and
+  with the same error as an invalid message (no oracle). The classical suite is byte for byte
+  the handshake of earlier releases: v1 peers interoperate in both directions.
+- **Domain separation.** The classical suite keeps the `TCN/1` prologues. From PQ-1 on, a new
+  suite has its own prologue (`TCN/2 <channel>` followed by its id; `TCN/3 <channel>` ‖ `0x02`
+  for the hybrid IK suite), so that a message of one suite is never valid as another.
+- **The initiator pins one suite** per relay and per node (`suite`, OPERATIONS §5). It never
+  falls back to another: if the responder does not accept that suite, it does not answer.
+- **The responder accepts explicit sets, per role.** The relay has one set for agents and
+  one for clients (`relay.toml`, OPERATIONS §4.1). The agent has one set for clients on the
+  end-to-end channel (`--accept-client-suites`). The sets are not ordered and there is no
+  "minimum suite". The default is the classical suite alone. It does not change between
+  releases: a release that adds a suite does not accept it until it is configured. On the relay
+  the role is known only after message 1. A peer whose suite is accepted for the other role
+  gets no message 2 and produces `handshake_suite_rejected` (WARN).
+- A suite that this build cannot run **on that channel** is a configuration error at startup,
+  on every side. Every suite of this release runs on both channels.
+
+#### 7.5.1 The hybrid suite on the end-to-end channel (PQ-1)
+
+The end-to-end handshake is opaque `Data` payload for the relay, so the hybrid suite needs no
+change on the relays: a relay of any earlier release forwards it. Its message 1 (at most
+1 296 + 4 328 = 5 624 bytes) and message 2 (1 152 bytes) fit one `Data` frame
+(`MAX_PAYLOAD_LEN`, checked with `const` assertions); the frame budget does not change.
+
+Transcript, with the prologue `TCN/2 end-to-end` ‖ `0x01` and the protocol name above
+(Noise §5 and the HFS extension, revision 1):
+
+```text
+<- s
+...
+-> e, es, e1, s, ss        e1: ML-KEM-768 encapsulation key (1 184), encrypted under es
+<- e, ee, ekem1, se        ekem1: ML-KEM-768 ciphertext (1 088), encrypted; then MixKey(ss_kem)
+```
+
+The KEM is `libcrux-ml-kem` (FIPS 203), plugged into snow through its resolver; snow's own KEM
+code is not used (docs/pq-snow.md, `vendor/snow/PATCHES.md`). A wrong ciphertext gives a
+different shared secret (implicit rejection): message 2 then fails its AEAD tag like any other
+corruption, with the same error and no oracle on which field was wrong.
+
+The agent (responder) handles message 1 as follows:
+
+1. A length above the largest message 1 of any suite this build runs end to end (5 624
+   bytes) is refused before Noise runs, as a malformed certificate. The bound does not depend
+   on the accepted set, so that a known client with a large certificate is still named in
+   step 3 (review 0009, A9-5).
+2. It tries the accepted suites whose message 1 can have that length.
+3. Only if none succeeds, it tries the other suites it supports on this channel, to recognise
+   a known client whose suite it does not accept. The result of this step is a value without
+   `accept` (`noise::Responded::Unaccepted`, A9-3): that client gets no message 2. The agent
+   records `handshake_suite_rejected` (WARN, with `peer`, `suite` and `confirmed = false`)
+   and closes the stream with `Unauthorized`. An unknown key produces no per-suite line,
+   whatever its suite. A message 1 valid for no suite is `handshake_failed`, or a malformed
+   certificate if it is longer than any accepted message 1.
+4. The confirmation of the suite (`TCN/2 ready`) must arrive before sshd is contacted.
+
+`handshake_suite_rejected` is written before any proof that the client is live: message 1 can
+be replayed (§7.3), and there is no message 2 to confirm. A compromised relay that recorded a
+client's message 1 can produce it at will, so the agent rate-limits it per identity, like the
+relay (§10.1), together with every `authentication_failed` line that names a peer.
+
+Cost: steps 2 and 3 run on every agent whose accepted set is not every supported suite (the
+default, classical-only agent included). An invalid message 1 costs one trial per key for
+each suite whose length bounds fit, accepted or not: with both suites and two keys (during a
+rotation), up to four trials, on any agent (the `both suites` row of docs/pq-snow.md §5 is the
+two-trial case). The trials of step 3 are read-only: no KEM operation happens before
+`accept`.
+
+What IKhfs gives, and what it does not (AP-23):
+
+- **Gives:** confidentiality of the end-to-end session against an adversary who records the
+  traffic today and has a quantum computer later ("harvest now, decrypt later"), as long as
+  ML-KEM-768 holds; if ML-KEM fails, X25519 alone, as in the classical suite.
+- **Does not give post-quantum authentication.** Identities remain X25519 static keys: a
+  quantum adversary *active during the handshake* can impersonate either side.
+- **Does not hide identities post-quantumly.** The client's static key in message 1 is
+  encrypted under `es` (X25519 only): a recorded handshake reveals it to a future quantum
+  adversary, and with it which client reached which agent.
+- **Does not change IK's properties:** no protection against key-compromise impersonation of
+  the responder, message 1 replayable (hence the confirmation, §7.3).
+- **Leaks lengths.** The suite is visible to anyone who sees the sizes of the `Data` frames
+  (1 296 + payload vs 96 + payload).
+- **The relay channel** runs the hybrid suite only where it is pinned and accepted (§7.5.2);
+  otherwise the routing metadata and the client's identity towards the relay are X25519 only.
+- **HFS is not a final standard.** The pattern follows the Noise HFS extension (revision 1),
+  not an RFC; the protocol name binds the exact construction, and a different construction
+  would get a new suite id.
+
+Memory: the agent's and the client's ML-KEM decapsulation key and seed are wiped when dropped;
+snow wipes its KEM output buffer. Not wiped in this release: snow's internal HKDF and DH
+temporaries, and the copies libcrux makes of its by-value arguments.
+
+#### 7.5.2 The hybrid suite on the outer channel (PQ-1, Phase 3)
+
+The same construction as §7.5.1 on the hops client ↔ relay and agent ↔ relay, with the prologue
+`TCN/2 outer` ‖ `0x01`. The prologue binds the channel: an outer hybrid message 1 is never valid
+end to end and the reverse, so a relay cannot replay a client's end-to-end message 1 to another
+relay as an outer one. The outer channel has no confirmation string: its key confirmation is
+the first authentic transport frame (`Register`, `Open` or `Ping`, §10.1), which a replayed
+message 1 can never produce. An end-to-end confirmation (`TCN/1 ready`, `TCN/2 ready`) never
+decodes as a frame.
+
+- **Relay (responder).** It accepts one set per role (`relay.toml`, OPERATIONS §4.1). It tries
+  the union of the two sets on message 1 (the role is known only from the key), then checks
+  the suite against the role's set: an agent whose suite is accepted only for clients, or the
+  reverse, gets no message 2, and the relay writes `handshake_suite_rejected` (WARN,
+  `confirmed = false`, rate-limited per identity, §10.1). An unknown key produces no per-suite
+  line. Message 1 is buffered up to the largest legitimate message 1 of the union (5 624 bytes
+  when the hybrid suite is accepted for either role); the first-frame cap of §10.1 applies only
+  after message 2 has been written.
+- **Initiators.** The agent pins one suite per relay (`--relay-suite`), the client one per
+  relay (`suite` in `[[relays]]`, `relay_suite` for the single-relay form). Neither ever
+  retries another suite. A client may still fail over to the next relay before `OpenAck`
+  (§13), with that relay's own pin. Failover never lowers the pin **of a relay**, but with
+  mixed pins (during the rollout of OPERATIONS §13) it can land on a relay pinned to the
+  classical suite: an active attacker who resets the hybrid-pinned relays gets a classical
+  hop for that session. `zt-client` warns when failover changes the suite, and
+  `require_outer_suite` in `client.toml` makes any relay pinned to another suite a
+  configuration error, so failover cannot leave the required suite (review 0010, A10-9).
+- **Audit.** Every summary interval the relay writes `outer_suites_confirmed` with the number
+  of key-confirmed handshakes per role and suite, one field per suite of §7.5, absent when
+  zero: `agents_ik` and `clients_ik` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`), `agents_ikhfs` and
+  `clients_ikhfs` (`Noise_IKhfs_25519+MLKEM768_…`: hybrid key exchange, **classical**
+  authentication), `agents_hybrid_ik` and `clients_hybrid_ik` (the hybrid IK suite of §7.5.3).
+  No identities. This is the signal for the sunset of the classical suite (OPERATIONS §13) and
+  for the pq-only profile (OPERATIONS §19), and replays never count. Before review 0014 (A14-1)
+  the line had `*_classical` and `*_hybrid` fields, where `*_hybrid` counted `IKhfs` and the
+  hybrid IK suite was not counted at all. The
+  agent writes `relay_registered` with the pinned `suite` for every relay session, once
+  `Register` is sent: message 2 proved that the relay accepts the suite for agents, but the
+  relay can still refuse the registration itself and close.
+- **Cost.** About 1.2 KiB more in each direction per connection and the CPU of
+  docs/pq-snow.md §5, once per connection; the transport is unchanged. The relay does no KEM
+  work before the policy and suite decisions (encapsulation happens when message 2 is
+  written).
+- **Properties.** Those of §7.5.1 for the hop: hybrid forward secrecy of the routing metadata
+  and of the client's certificate in later transport frames against a recording adversary; no
+  post-quantum authentication and no post-quantum hiding of the static key or of the
+  certificate in message 1 (both are encrypted under `es`, X25519 only).
+
+#### 7.5.3 The hybrid IK suite: post-quantum authentication (PQ-AUTH)
+
+Suite `0x02`, `Noise_IKhfs+psk0+psk2_25519+MLKEM768_ChaChaPoly_BLAKE2s`, adds post-quantum
+**authentication** of both parties to IKhfs (decision D12). Node keys never sign: each side is
+authenticated by an encapsulation to its static ML-KEM-768 key **and** by its X25519 static key
+(DH), so an impersonator must break both.
+
+**Static keys (D12).** A node's ML-KEM-768 key is derived from its Ed25519 seed:
+`d ‖ z = SHAKE256("TCN ML-KEM-768 seed v1\0" ‖ seed, 64)`, then FIPS 203
+`ML-KEM.KeyGen_internal(d, z)`. Key files, permissions and rotation (§14) do not change; the
+decapsulation key is wiped on drop. Public form (D13): `tcn-pub-v2:` followed by exactly 2 432
+lowercase hex characters, Ed25519 (32) ‖ `ek` (1 184). A parser refuses another length,
+uppercase, spaces, a non-canonical or small-order Ed25519 key and an `ek` that fails the FIPS 203
+§7.2 modulus check. Fingerprint v2: `SHA-256("TCN fingerprint v2\0" ‖ x25519 ‖ ek)`, shown as
+`SHA256v2:<hex>`; the distinct prefix and domain keep it from ever being read as a v1 one.
+
+**Transcript.** Composed at the TCN layer on the vendored snow, with no new snow patch
+(docs/pq-snow.md §6):
+
+```text
+<- s, ek_r                                  (pinned: tcn-pub-v2)
+-> ct1 ‖ [psk0] e, es, e1, s, ss, {ek_i ‖ payload}
+<- ct2 ‖ e, ee, ekem1, se, [psk2], {}
+
+ct1, ss1 = Encaps(ek_r)   psk0 = SHA-256("TCN/3 skem-i\0" ‖ ct1 ‖ ss1)
+ct2, ss2 = Encaps(ek_i)   psk2 = SHA-256("TCN/3 skem-r\0" ‖ ct2 ‖ ss2)
+prologue = "TCN/3 <channel>" ‖ 0x02 ‖ SHA-256(ek_r) ‖ ct1
+```
+
+- `ct1` travels in clear in front of Noise message 1. The responder decapsulates it with its
+  static key (with the current key, then the previous one, §14) before Noise runs: this is
+  its only KEM operation before the authorization decision, and a responder that does not
+  accept the suite never does it (it cannot even name the initiator, review 0012 A12-4). `psk0` keys every encrypted field
+  of message 1, so the initiator's static key, `ek_i` and certificate are hidden from a future
+  quantum adversary, and only the holder of `dk_r` reads message 1.
+- `ek_i` is the first 1 184 bytes of the message 1 payload; the responder checks it (FIPS 203
+  §7.2) and computes the initiator's fingerprint v2 over the X25519 key Noise authenticated and
+  that `ek_i`. A failure of any kind is the same `handshake_failed`, no oracle.
+- `ct2` travels in clear in front of Noise message 2; `psk2` is mixed at the end of message 2,
+  so the transport keys depend on `ss2`. **The initiator's KEM authentication completes at key
+  confirmation (AP-12)**: before the first authentic transport frame (outer channel, §10.1) or
+  the confirmation `TCN/3 ready` (end to end, §7.3), the fingerprint v2 is only claimed. The
+  responder may use it to **refuse** before message 2 (a v2 pin that does not match, §15.4),
+  never to grant more than the X25519 key would.
+- The prologue binds the channel and suite (domain separation from `TCN/1` and `TCN/2`), the
+  responder's pinned `ek` and `ct1`: a `ct1` cut from another handshake, another channel or
+  another responder key fails Noise message 1.
+
+Sizes: message 1 = `ct1` (1 088) + IKhfs message 1 (1 296) + `ek_i` (1 184) = 3 568 + payload;
+message 2 = `ct2` (1 088) + IKhfs message 2 (1 152) = 2 240. With the longest certificate of
+any version (§15.14) message 1 is at most `3 568 + 7 670 = 11 238` bytes: within a Noise message,
+a `Data` frame (`const` assertions) and the relay's pre-authentication cap for the accepted
+union (§10.1).
+
+**Pins and accepted sets.** The initiator needs the responder's v2 key: a hybrid IK pin with a
+v1 key is a configuration error (`client.toml`, `--relay-key`, OPERATIONS §15), and the
+handshake API refuses it (`HybridKeyRequired`). A v2 key may be pinned with any suite. The
+responder accepts the suite only if it is in the role's set (§7.5); there is no fallback.
+
+**Responder cost (review 0012, A12-6).** Nothing on the wire names the suite or the responder
+key, so a responder that accepts several suites first runs a cheap test per suite and key: the
+steps of Noise message 1 up to its first authenticated decryption (`s` in IK, `e1` in IKhfs and
+in the hybrid IK suite), with the same primitives. The classical and IKhfs suites carry `e` at
+offset 0 and share one X25519 multiplication per key; the hybrid IK suite costs one
+decapsulation and one multiplication per key, and is tested last and only when the length
+fits it. Noise runs in full on the first suite and key that pass, and only on that one: an
+invalid message 1 never builds a Noise state, and a message crafted to pass several tests still
+gets one trial. With the three suites accepted, an invalid message 1 costs about 1.3 times the
+classical responder of the release before PQ-AUTH with the same keys (docs/pq-snow.md §6).
+
+**Policy entries (AP-6).** A `tcn-pub-v2:` key in the relay policy or in `clients.toml` is
+keyed by its v1 fingerprint, like a v1 key, and also **pins the hybrid identity**: that peer is
+then admitted only by a hybrid IK handshake that proves exactly that fingerprint v2. A classical
+or IKhfs handshake with the right X25519 key, or a hybrid IK one with another ML-KEM key, is
+refused before message 2 with `authentication_failed reason = identity_downgrade`. A v1 and a v2
+entry of the same key are one identity: listing both is a duplicate. A hybrid peer admitted by
+a v1 entry (whitelist or certificate v1, or a v2 certificate not bound to its hybrid identity)
+works, and after key confirmation the relay and the agent write `classical_identity_match`
+(WARN, `peer`, `peer_v2`): the configuration checked only its X25519 key.
+`session_established` and `e2e_session_started` carry `peer_v2` for a hybrid IK session.
+
+A responder never needs the initiator's `ek` from its configuration (message 1 carries it), so
+the relay policy and `clients.toml` also take the compact pin `tcn-pin-v2:<64 hex>:<64 hex>`:
+the Ed25519 key and the fingerprint v2, 139 characters instead of 2 443 (review 0012, A12-2).
+It pins exactly like the `tcn-pub-v2:` key it is printed from (`keygen`, `pubkey`). An
+initiator needs `ek_r`, so `client.toml` and `--relay-key` refuse the compact pin.
+
+**Requiring hybrid identities (review 0012, A12-1).** Pins are per entry, and a
+certificate-only client has no entry to pin. `require_hybrid_identity`, at the top of the
+relay policy (`["agents"]`, `["clients"]` or both) and of `clients.toml` (`["clients"]`), is an
+explicit set of roles, like the accepted suites (AP-7): for a role in it, a peer is admitted
+only through the hybrid IK suite with exactly the fingerprint v2 of its v2 pin or of its
+hybrid-bound certificate (`subject_kind = 0x02`). A classical or IKhfs handshake, a v1 or
+classical-kind certificate, or a hybrid IK handshake with another ML-KEM key, is refused before
+message 2 with `identity_downgrade`, never only warned about; an entry of that role without a
+v2 key or pin is a load error. The setting is reloaded with the file, and a reload that adds it
+closes the sessions that no longer satisfy it.
+
+**Certificates.** A certificate v2 with `subject_kind = 0x02` names the subject's fingerprint
+v2 (§15.14): it is accepted only from a hybrid IK handshake that proved it, and is
+`key_mismatch` over any other suite.
+
+What it gives, and what it does not:
+
+- **Gives:** authentication of both parties against an adversary with a quantum computer
+  *during* the handshake, as long as ML-KEM-768 holds (and, if it fails, X25519 as before); the
+  confidentiality of IKhfs; post-quantum hiding of the initiator's identity and certificate.
+  The responder's guarantee holds **per peer**: for a peer pinned by its v2 key, or holding a
+  hybrid-bound certificate, and fleet-wide only for the roles in `require_hybrid_identity`. A
+  peer admitted through a v1 entry or a classical-kind certificate is authenticated by its
+  X25519 key only, which a quantum computer recovers from the public key.
+- **Does not hide** that a hybrid IK handshake took place (the sizes), nor which responder is
+  reached (its address names it).
+- **Does not change IK's properties:** message 1 is replayable (hence key confirmation), and
+  the responder has no KCI protection beyond what the KEM adds.
+- **Revocation and roles stay classical-keyed**: revoking a key (v1 or v2 form) revokes every
+  handshake of that X25519 key (§15.8).
+- The decapsulation with the static key is reachable before authentication by anyone who can
+  open a connection to a responder that accepts the suite; it relies on libcrux's constant-time
+  code (docs/pq-snow.md §5).
 
 ## 8. Lifecycle
 
@@ -155,6 +447,17 @@ key every ~8.5 hours; an SSH session every ~16 MiB.
    it, closes with `Close Unauthorized`. After that, `Data` frames carry the encrypted SSH bytes.
 4. A `Close` from one side is forwarded to the other. The loss of a connection closes all of its
    streams with `PeerGone`.
+5. **Drain** (a graceful stop, OPERATIONS §14). A draining relay closes its listening socket at
+   once (new connections are refused, so clients and agents move to another relay, §13),
+   answers a new `Open` on a connection that is already open with `Reject NodeOffline` (the
+   client moves on, §13), and keeps routing the open streams, under the policy in force and its reloads (a revocation
+   still cuts a session). When the last stream ends, or at the drain deadline (60 s by
+   default), it sends `Close Drained` on both sides of every stream still open and closes
+   every connection. A draining agent answers every new `Open` with `Reject NodeOffline`, so
+   the relay and the client treat the node as offline on that path; a stream it acknowledged
+   before the drain and whose end-to-end handshake is not finished is waited for and then
+   closed with `Close Drained` instead of becoming a session. It keeps its open sessions and
+   drops its relay connections after the last one or at its deadline.
 
 A peer that violates a rule (frame order, role, credit, rate) loses the connection. The
 exception is frames **in flight** on a stream that is already closed (for example `Data` or
@@ -180,13 +483,114 @@ therefore bounded by `streams × MAX_WINDOW`.
 
 | Limit | Value |
 | :- | -: |
-| concurrent connections to the relay | 4 096 |
-| handshakes per IPv4 address or per IPv6 /64 prefix | burst of 20, then 1 every 3 s |
+| unconfirmed connections to the relay (pre-authentication pool) | 1 024 |
+| unconfirmed connections at once per IPv4 address or IPv6 /64 / per IPv6 /48 | 50 / 100 |
+| confirmed connections to the relay (established pool) | 8 192 |
+| share of the established pool that only agents may use | 10 % (819) |
+| confirmed connections per identity | 512 |
+| unconfirmed handshakes per IPv4 address or IPv6 /64 prefix | burst of 64, then 1 every 3 s |
+| refunds of that budget per identity | burst of 512, then 10 per second |
+| new IPv6 /64 prefixes per /48 | burst of 64, then 1 per second |
 | `Open` per client connection | burst of 64, then 10 per second |
 | streams per client / per agent | 32 / 64 |
 | `Ping` per connection | burst of 10, then 1 every 5 s |
-| handshake / idle / write | 10 s / 90 s / 30 s |
-| agent and client keepalive | 30 s |
+| relay: complete message 1 / message 2 sent / first authentic frame | 5 s / 10 s / 5 s after message 2 |
+| initiator handshake / idle / write | 10 s / 90 s / 30 s |
+| relay idle per role: agents / clients (`relay.toml` `[liveness]`, 15–3600 s) | 90 s / 90 s |
+| agent and client keepalive (`Ping`) | 10 s |
+| agent: relay link dead after | 3 keepalive intervals with no inbound frame at all |
+| TCP on every socket: `TCP_USER_TIMEOUT` / keepalive idle, interval, probes | 20 s / 10 s, 5 s, 3 |
+| agent reconnect: first delay after a failure / cap / spread after a session that lived 10 s | full jitter over 1 s, doubling / 30 s / uniform over 10 s |
+| `agent_flapping`: registration takeovers of one node | 3 in 60 s, reported once per window |
+| drain deadline (`--drain-timeout`, 1–3600 s) | 60 s |
+
+Liveness (resilience R-2). The agent sends a `Ping` every keepalive interval and declares the
+relay link dead when **no frame at all** (not only no `Pong`) arrived for three intervals; it
+then reconnects. Any inbound frame counts, so a busy link never pings itself to death. The
+relay's idle timeout per role is the other side of the same check: it drops a silent agent and
+its registration, so a client gets `NodeOffline` at once instead of an `Open` that is never
+acknowledged. Its default stays at 90 s, three times the 30 s keepalive of agents before R-2,
+until the whole fleet is upgraded (OPERATIONS §4.1). `TCP_USER_TIMEOUT` makes the kernel give
+up on a peer that stops acknowledging within 20 s, whatever the application timers say. On a
+client this also means that 20–25 s of path loss (Wi-Fi roaming, a tunnel) ends the
+interactive session, where before R-2 the limit was the 90 s idle timeout.
+
+The relay's admission limits are set in `relay.toml` (OPERATIONS §4.1). Every value is checked
+at startup: none may be zero, none may be absurd, the message 1 deadline lies between 5 s
+and the handshake deadline, the per-source refill is 3 s or slower, one identity may not hold
+more than the established pool, a source may not hold more than its /48, and a /48 may not hold
+more than half of the pre-authentication pool. The relay logs the limits in force at startup
+(`admission_limits_in_use`).
+
+### 10.1 Admission on the relay
+A connection passes through two pools:
+
+```text
+accept ─(per-source token, pre-auth slot)─▶ unconfirmed ─first authentic frame─▶ established
+   │ refused: dropped without a reply          │ token refunded, identity charged
+   ▼                                           ▼ closed: slot freed, token stays spent
+ counted in preauth_summary                  counted in preauth_summary
+```
+
+1. **At accept** the connection takes a slot in the pre-authentication pool and one token
+   from the budget of its source (IPv4 address or IPv6 /64, plus the /48 bucket for new /64s).
+   A source holds at most `max_pending_per_source` unconfirmed connections at once, and all the
+   /64s of one IPv6 /48 together at most `max_pending_per_wide`. A full pool, a source at its
+   cap or an empty budget drops the connection without a reply. The pool and the caps are
+   checked first, so they do not spend the source's tokens.
+2. **Message 1** must be complete within `msg1_deadline` (≥ 5 s), however slowly it trickles
+   in. Its length prefix is checked on sight: over the largest legitimate message 1 of the
+   accepted suites (7 766 bytes for the classical suite, 8 966 with the hybrid one, 11 238 with
+   the hybrid IK suite, §15.3, §7.5.2, §7.5.3), the connection is closed
+   before any byte of the message is buffered. Until key confirmation (step 4) the limit is the
+   largest legitimate first transport message: 87 bytes, the tag and a `Register` or `Open` with
+   a 63-byte name. A longer prefix is refused on sight and counted as `oversized`. After key
+   confirmation the limit is the usual Noise maximum (§7.1).
+3. **Message 2** is sent if the policy (§15.4) and the suite (§7.5) accept the peer, within
+   `handshake_timeout` from accept.
+4. **Key confirmation.** Message 1 can be a recording (§7.3), so message 2 proves nothing about
+   the initiator. Only the first authentic transport frame does (`Register` from an agent, `Open`
+   or `Ping` from a client). It must arrive within `first_frame_deadline` after message 2. Only
+   then does the connection reach the relay core, move to the established pool and count
+   against its identity's concurrency limit. The source gets its token back if the identity
+   still has refunds (`identity_refund_burst`, then one every `identity_refund_refill`).
+   Clients may fill the established pool only up to `max_established` minus the agents' share
+   (`agent_reserve_percent`); agents may use all of it. A confirmed identity that is refused
+   here (its concurrency limit, or a full pool) gets `Reject RateLimited` in answer to its
+   `Open`, and the relay writes an `admission_refused` line that names it.
+
+Consequences:
+
+- The per-source budget limits **unconfirmed** handshakes, and the refunds bound confirmed ones.
+  A fleet controller that opens hundreds of sessions from one address (4 waves of
+  `forks = 50`) is not throttled, because every confirmed session gives its token back. One
+  identity that loops connect, handshake, first frame, close from one address gets 512
+  handshakes at once, then 10 per second plus the source's 1 every 3 s. Replays and scanners
+  never confirm, so they spend the budget for good.
+- The pre-authentication pool is still global. With the defaults, one source holds at most 50 of
+  its 1 024 slots and one /48 at most 100, so filling it takes at least 21 IPv4 addresses (or
+  /64s in different /48s), or 11 IPv6 /48s, each holding its slots for the 5 s of
+  `msg1_deadline` at a time. An operator who expects such an attacker raises `max_preauth` or
+  lowers the caps (OPERATIONS §4.1).
+- The /48 caps the slots its /64s hold at once, not the handshakes they start: in a burst one
+  /48 can start up to `wide_burst` × `source_burst` (4 096) unconfirmed handshakes over time,
+  at most 100 at once.
+- Replays of a recorded message 1 never enter the established pool and never charge the
+  victim's identity: they cannot lock the victim out.
+- A stolen identity holds at most `max_per_identity` confirmed connections, however many
+  addresses it has.
+- Failures before confirmation never produce one log line per connection: they are
+  aggregated (§15.11). An `authentication_failed` line is written only for a key the
+  configuration knows (whitelisted or revoked), or for a certificate rejected after a pinned CA's
+  signature was verified. Any other key is one that anyone could have made up.
+- A recorded message 1 of a known identity can be replayed at will, for example one of a key
+  revoked since or one whose certificate has expired since. So the line about a known identity
+  (`authentication_failed`, `handshake_suite_rejected`, `admission_refused`) is written in full
+  once per identity and `summary_interval` (on the agent, `authentication_failed` with a peer
+  and `handshake_suite_rejected`, once per identity and 10 s, review 0009 A9-2). The repeats are counted in one
+  `<event>_repeated{peer, …, count}` line per identity and interval. At most 256 identities are
+  logged per interval; beyond them the events are only counted (`suppressed_identities` in
+  `preauth_summary`).
 
 ## 11. The client as `ProxyCommand`
 
@@ -203,8 +607,10 @@ connects OpenSSH's stdin/stdout to the end-to-end channel.
 - **Closing.** EOF on stdin closes the stream (`Close Normal`); a close from the node side
   closes stdout and terminates the process even if stdin remains open. There is no half-close:
   SSH does not need it, because its channel EOF travels inside the SSH protocol.
-- **Exit code.** 0 only for `Close Normal` or local EOF; 1 for any other outcome, including an
-  error `Close` from the agent (for example sshd unreachable); 2 for invalid arguments.
+- **Exit code.** 0 only for `Close Normal` or local EOF; 75 (`EX_TEMPFAIL`) when the client gave
+  up for a reason that says nothing about the right of access (§13, step 6); 1 for any other
+  outcome, including an error `Close` from the agent (for example sshd unreachable); 2 for
+  invalid arguments.
 - **No write timeout on stdout.** A suspended `ssh` stops reading: the window bounds the memory
   and the session resumes when ssh starts reading again.
 
@@ -234,7 +640,15 @@ changes on the wire.
 
 - **Agent**: has a list of relays (at most 8, each with its own pinned key) and maintains a
   session to **each** of them, in parallel and with independent backoffs. An unreachable or
-  slow relay does not affect the sessions to the others.
+  slow relay does not affect the sessions to the others. The backoff is sans-IO
+  (`ReconnectPolicy`): after a failure the delay is uniform between 0 and an exponential bound
+  (1 s, doubling, at most 30 s, "full jitter"); after a session that lived at least 10 s (a
+  relay restart or drain) the first reconnect is uniform over the spread window
+  (`--reconnect-spread`, 10 s by default), so a fleet comes back over the window and not in
+  one wave. From then on the spread is also the floor of the failure bound
+  (`max(spread, min(30 s, 1 s·2ⁿ⁻¹))`): a relay still down when the first retries arrive does
+  not turn them into one-second retries that pile up when it returns (review 0010, A10-4).
+  Without randomness (the system RNG fails) the delay is the bound, never zero.
 - **Client**: has an ordered list of relays (at most 8) and tries them in the given order. It
   moves on to the next one **only** for errors that occur before the `OpenAck` and that say
   nothing about the right of access:
@@ -243,7 +657,7 @@ changes on the wire.
   | :- | :- |
   | TCP refused, timeout, outer handshake failed (including wrong relay key), connection closed | tries the next relay |
   | `Reject NodeOffline`, `Reject RateLimited` | tries the next relay |
-  | `Reject NotAuthorized`, `Reject UnknownNode` | stops: the policy has answered (fail closed) |
+  | `Reject NotAuthorized`, `Reject UnknownNode` (or any other `Reject`) | stops every attempt: the policy has answered (fail closed) |
   | any error after the `OpenAck` (end-to-end handshake, `Close` from the agent, data) | stops |
 
   After the `OpenAck` the client has already talked to the agent: retrying on another relay
@@ -257,11 +671,76 @@ changes on the wire.
   others: revocation is complete only when all relays have reloaded the policy (or when the
   agents remove the key from their authorized clients, §12).
 
-- **Timing**: attempts are sequential, each with its own timeouts (connection, handshake,
-  `Open`). In the worst case, with *N* relays all unreachable by timeout, the client takes *N*
-  times the duration of one attempt before giving up. It is advisable to put the closest and
-  most reliable relays first; an OpenSSH `ConnectTimeout` shorter than the total interrupts the
-  client before it has tried them all.
+- **Timing: deadline, per-step timeouts and a limited hedge** (resilience R-4, sans-IO
+  `FailoverPlan` in `zt-application`; closes backlog A5-4). Nothing changes on the wire.
+
+  | Parameter | Value | Counted from |
+  | :- | :- | :- |
+  | overall deadline (`connect_deadline_secs` in `client.toml`, 1-300) | 8 s | the start of `zt-client connect` |
+  | TCP connect of one attempt | 3 s | the start of the attempt |
+  | outer handshake and `Open` | 5 s | the connect |
+  | `OpenAck` | time left ÷ (relays not started + 1), between 2 s and 4 s | the end of the outer handshake |
+  | stagger before a hedge | 2 s plus a random 0-0.5 s | the start of the attempt in flight |
+
+  The defaults are chosen so that one failed relay of any kind followed by a healthy one gives
+  a session within about 6 s, inside the 10 s `ConnectTimeout` that Ansible passes to `ssh` by
+  default, end-to-end handshake and SSH banner included (review 0011, A11-2). Sharing the
+  `OpenAck` wait out over the relays left keeps relays that handshake and then sit on `Open`
+  from using up the deadline before a healthy later relay is tried: with the defaults, three
+  such relays and a healthy fourth fit (A11-3). The 2 s floor keeps a long relay list from
+  turning a merely slow `OpenAck` into a failure; with more than four relays, those after the
+  fourth are reached only if earlier ones fail faster.
+
+  1. Relay 1 starts alone. A failure starts the next relay at once.
+  2. **Hedge.** If the attempt in flight has **not completed TCP connect and the outer
+     handshake** after the stagger (a black-holed relay, or one that accepts and never
+     answers), the next relay starts in parallel. At most **two** attempts are in flight.
+  3. **No hedge on a slow `OpenAck`** (review 0007, AP-10). The agent answers `Open` at once,
+     so a relay that has completed the handshake but has not relayed the `OpenAck` is
+     overloaded, not dead: hedging then would double the load exactly when the relays can
+     least take it. The client waits up to the `OpenAck` timeout and only then moves on.
+  4. **The first `OpenAck` wins.** Every other attempt is cancelled, in a way the relay can
+     account for (review 0011, A11-1):
+     - before TCP connect, it is dropped (the relay has charged nothing);
+     - during the outer handshake, it **completes the handshake** (within the handshake step
+       timeout from its connect) and sends one authentic frame, a `Ping`, which opens nothing,
+       then EOF. That is the key confirmation of §10.1: the relay gives back the per-source
+       token it took at accept, so hedging does not spend a client's admission budget. Only
+       the holder of the client key can produce that frame, so a replayed message 1 still
+       gets no refund (review 0007, AP-1); the identity's refund rate still applies;
+     - after `Open` (which, once started, is always completed), it sends `Close Normal` for
+       the stream (at most 1 s), so the relay and the agent release the stream slot at once,
+       and listens 1 s more for a policy `Reject` that crossed the `Close` (step 5), then EOF.
+
+     The losers end in the background of the session. Message 1 of the end-to-end channel is
+     sent on **one** relay only, after its `OpenAck`; nothing is retried after it.
+  5. A **policy answer** from any relay before an `OpenAck` aborts every attempt. Accepted
+     change: if relay 2 acknowledges first, a later `NotAuthorized` from a slower relay 1 does
+     not end the session (differing policies are a configuration error); when the client sees
+     it, it logs a WARN `relays disagree on the policy` naming both relays (A11-6).
+  6. **Deadline.** When it passes before any `OpenAck`, every attempt is cancelled and
+     `zt-client` exits with status **75** (`EX_TEMPFAIL`) and `zt-client: no relay completed
+     the connection within N s (connect_deadline_secs in client.toml)` on stderr; `ssh` then
+     exits with 255. The deadline is for establishment only: the end-to-end handshake and the
+     session after the `OpenAck` keep their own timeouts. When every relay has failed before
+     the deadline, the client stops at once with the last relay's error; it exits with 75 too
+     when that error says nothing about the right of access (I/O, timeout, connection closed,
+     `NodeOffline`, `RateLimited`, `Close Drained`), with 1 otherwise (A11-4). The deadline is
+     therefore not the only temporary failure: black-holed or silent relays end at their step
+     timeouts, before it.
+
+  The attempts are futures of the client's own task, not spawned tasks: whatever ends the
+  client (a result, an error, or dropping it) closes every connection. With
+  `require_outer_suite` (§7.5.2) every relay is pinned to the same suite, so neither failover
+  nor a hedge can land on a weaker hop; a `ClientConfig` built in code that lists a relay
+  pinned to another suite is refused before any connection; without it (the default, needed
+  while pins are mixed during the rollout of OPERATIONS §13) a hedge, like failover, may hand
+  the session to a relay pinned to another suite when the preferred one is slow or delayed by
+  an on-path attacker (A11-7; the client warns). A client has at most two outer handshakes in
+  flight, and at most one per relay of its list in total; the losers confirm their key (step
+  4), so the per-source budget of §10.1 still counts only handshakes that never complete. Put
+  the closest and most reliable relays first. An OpenSSH `ConnectTimeout` shorter than the
+  deadline plus about 2 s interrupts the client before it has finished.
 
 ## 14. Key rotation
 
@@ -420,19 +899,30 @@ end-to-end channel the agent would have to respond to unknown clients. The `Open
 
 Message 1 can be replayed (§7.3). A replayed message 1 with a valid certificate does not
 complete the handshake (it needs the client's ephemeral key), costs the responder at most one
-extra signature verification, within the handshake limit (§10), and produces no success event:
+extra signature verification, within the per-source budget (§10.1), and produces no success event:
 the events that name an accepted certificate (§15.11) are recorded only after an authentic
-transport message from the client (`Open` on the outer channel, `TCN/1 ready` on the end-to-end
-one).
+transport message from the client (`Open` on the outer channel, the suite's confirmation on the
+end-to-end one, §7.3).
 
 Compatibility: a relay or agent older than Phase 6 ignores the payload of message 1; a client
 with a certificate and without an entry in its policy is therefore treated as an unknown key (no
 response). A client without a certificate changes nothing. The frames' `version` byte and the
 prologues remain unchanged.
 
-Sizes: message 1 with the largest certificate is `96 + 4 328 + 16` bytes long and fits both in
-a Noise message and in the payload of a `Data` frame (verified with a `const` assertion). A
-responder rejects a message 1 payload longer than `MAX_CERT_LEN` without interpreting it.
+Sizes: message 1 with the largest certificate is `96 + 4 328 = 4 424` bytes long, where the 96
+bytes already include the payload's AEAD tag (§7.5). It fits both in a Noise message and in the
+payload of a `Data` frame (verified with a `const` assertion), and it is the relay's
+pre-authentication buffer cap for the classical suite (§10.1). Releases before PQ-0 counted the
+tag twice (`96 + 4 328 + 16`); that bound was 16 bytes too loose and never refused a legitimate
+message. Under the hybrid suite (end-to-end only) the bound is `1 296 + 4 328 = 5 624` bytes,
+which also fits a `Data` frame.
+
+With certificates v2 (§15.14) the payload bound is the longest certificate of any version,
+`MAX_ANY_CERT_LEN = 7 670`: message 1 is at most `96 + 7 670 = 7 766` bytes under the
+classical suite, `1 296 + 7 670 = 8 966` under the HFS suite (IKhfs) and `3 568 + 7 670 =
+11 238` under the hybrid IK suite (§7.5.3); the relay's pre-authentication cap is the largest
+of these over the suites it accepts (§10.1). A responder rejects a message 1 payload longer than
+`MAX_ANY_CERT_LEN` without interpreting it.
 
 ### 15.4 Verification: order of checks
 
@@ -598,10 +1088,13 @@ artefact to distribute and compare (`sha256sum`).
 | Entry | Effect |
 | :- | :- |
 | `serials` | that certificate is rejected (step 7) |
-| `keys` | that key is rejected with **any** credential: all its certificates, from any CA, and its whitelist entry (step 1). This is the revocation of a person or a machine |
+| `keys` | that key is rejected with **any** credential and **any** suite: all its certificates, from any CA, and its whitelist entry (step 1). This is the revocation of a person or a machine. An entry is a v1 key (64 hex), a v2 key (`tcn-pub-v2:`) or a v1 fingerprint (`SHA256:`) |
 
 The denylist also applies to open connections and sessions, like any reload (§12). A key is
-compared by fingerprint (X25519 form), so `P` and `−P` are the same entry.
+compared by fingerprint (X25519 form), so `P` and `−P` are the same entry. Every form of entry
+is reduced to that v1 fingerprint (AP-6): a key revoked by its v2 form cannot connect with a
+classical handshake, and the reverse. A fingerprint v2 (`SHA256v2:`) would match nothing, so it
+is a load error, whose message names the problem but never echoes the fingerprint.
 
 With a pinned CA, `--revocations` is **mandatory** (even with an empty file): relays and agents
 do not start, and a reload fails, if the configuration has `[[authorities]]` but no denylist.
@@ -660,13 +1153,19 @@ only serial number (hexadecimal), CA and client fingerprints, name and expiry.
 | `event_kind` | Level | When, and added fields |
 | :- | :- | :- |
 | `authentication_failed` | WARN | a check from §15.4 fails: `reason` (`key_revoked` or `certificate`), `cert_check`; `ca`, `serial`, `cert_name` and `not_after` only after step 6 (signature verified), on relay and agent |
-| `session_established` (relay), `e2e_session_started` (agent) | INFO | `credential` = `key` or `certificate`; for a certificate also `ca`, `serial`, `cert_name`, `not_after`. Recorded only after an authentic message from the client (§15.3) |
+| `session_established` (relay), `e2e_session_started` (agent) | INFO | `credential` = `key` or `certificate`; for a certificate also `ca`, `serial`, `cert_name`, `not_after` and `cert_version` (1 or 2, §15.14). Recorded only after an authentic message from the client (§15.3) |
 | `access_denied` | WARN | as today, with the same certificate fields |
 | `access_revoked` | WARN | as today, with the same certificate fields |
 | `certificate_expired` | INFO | (relay and agent) a session authorised by a certificate was closed at expiry: `peer`, `ca`, `serial` |
 | `authorities_in_use` | INFO, WARN with two keys | at startup and on every reload, for each CA: `authority`, `fingerprints`, `max_lifetime` |
 | `ca_rotation_pending` | WARN | at startup, on every reload and every hour, for each CA with two keys |
 | `revocations_in_use` | INFO | at startup and on every reload: `serials`, `keys` (how many entries) |
+
+From R-1 on (§10.1), the relay writes `authentication_failed` only for a key the configuration
+knows, or for a certificate rejected after its signature was verified (from `serial_revoked`
+on). Other failures before key confirmation are counted in `preauth_summary`. On the agent
+every rejection keeps its own line: a flood there needs a compromised relay, and its streams
+are bounded per relay.
 
 Comparing the serial numbers seen in the audits with the `zt-ca` issuance register
 (OPERATIONS §10) reveals a certificate that the CA did not issue, i.e. a compromised CA.
@@ -677,6 +1176,9 @@ Comparing the serial numbers seen in the audits with the `zt-ca` issuance regist
 | :- | -: | :- |
 | `MAX_CERT_LEN` | 4 328 bytes | 64 nodes of 63 bytes, 63-byte name; fits in a `Data` and in a message 1 |
 | `MIN_CERT_LEN` | 170 bytes | the shortest certificate (`scope = 0x01`, 1-byte name) |
+| `MAX_CERT_V2_LEN` | 7 670 bytes | v2: hybrid subject, 64 nodes of 63 bytes, 63-byte name, 3 373-byte composite signature (§15.14) |
+| `MIN_CERT_V2_LEN` | 3 480 bytes | the shortest v2 certificate (classical subject, `scope = 0x01`, 1-byte name) |
+| `MAX_ANY_CERT_LEN` | 7 670 bytes | the message 1 payload bound of every suite |
 | `MAX_CERT_NODES` | 64 | beyond that, use `scope = 0x01` with a dedicated CA |
 | `MAX_CERT_LIFETIME` | 86 400 s | "short" by construction |
 | `max_lifetime` of a CA | 60..=86 400 s, default 28 800 | per CA |
@@ -688,7 +1190,7 @@ Comparing the serial numbers seen in the audits with the `zt-ca` issuance regist
 
 The cost of a message 1 with a certificate, for its receiver, is at most one extra signature
 verification compared with today, and only after the binding check (step 4): it stays within
-the per-address handshake limit (§10) on the relay and within the per-relay stream quota on the
+the per-source budget of unconfirmed handshakes (§10.1) on the relay and within the per-relay stream quota on the
 agent. The relay core keeps, for each connection with a certificate, only the verified data (at
 most 64 nodes), not the certificate bytes.
 
@@ -720,7 +1222,106 @@ db 2d 3c ba 5d 72 ca 67 09 bf 1d 94 12 1b f3 74
 The vector was computed outside the project; as for framing, if the test
 `reference_vector_matches_the_protocol` contradicts it, this document must be corrected.
 
-### 15.14 Attacks considered
+### 15.14 Certificate v2: composite ML-DSA-65 + Ed25519 (PQ-AUTH)
+
+A certificate v1 is only as strong as Ed25519: an adversary with a quantum computer who
+recovers a CA secret key from its public key can mint certificates for any key. Certificate v2
+is signed by a **composite** CA key, an Ed25519 key **and** an ML-DSA-65 key (FIPS 204), and is
+valid only when **both** signatures verify (decision D11 of `docs/pq-resilience-plan.md`). The
+classical half keeps the security of v1 if ML-DSA or its implementation fails; the ML-DSA half
+holds against a quantum adversary. Node keys still never sign (§15.2).
+
+**Format.** The fields after `serial` are those of §15.1 (rules 4–6 apply unchanged):
+
+```
+ offset    size field
+ --------  ---  -------------------------------------------------------------
+   0        4   magic         "TCNC"
+   4        1   version       0x02
+   5        1   sig_alg       0x02 (ML-DSA-65 + Ed25519); 0x03 and 0x04 are reserved, refused
+   6       32   ca_fp         SHA-256("TCN CA fingerprint v2\0" ‖ sig_alg ‖ ed25519 ‖ mldsa65)
+  38        1   subject_kind  0x01 classical, 0x02 hybrid
+  39       32   subject_fp    the client's fingerprint (§7.2, X25519 form)
+ (71       32   subject_fp_v2 only with subject_kind 0x02: hybrid fingerprint, §7.5.3)
+   …       16   serial        as §15.1
+   …        8   not_before
+   …        8   not_after
+   …        …   name, scope, node_count, nodes   as §15.1
+ L-3373  3309   sig_M         ML-DSA-65 signature
+ L-64      64   sig_E         Ed25519 signature
+```
+
+Decoder rules, in addition to those of §15.1:
+
+1. The version byte selects the decoder; each version has its own length bounds, checked
+   **before** any other field: v1 `170..=4 328`, v2 `MIN_CERT_V2_LEN..=MAX_CERT_V2_LEN`
+   (`3 480..=7 670`). Any other version is an error.
+2. `sig_alg` MUST be `0x02`; `subject_kind` MUST be `0x01` or `0x02`.
+3. After the last node exactly 3 373 bytes MUST remain (`sig_M ‖ sig_E`).
+
+The encoding remains canonical: one byte representation per content, apart from the
+signatures. Certificate v2 names its subject by **fingerprint**, not by key: the binding
+(step 4) compares fingerprints, in constant time, before any signature.
+
+**Signature.** Both components sign the same message
+`M' = "TCN client certificate v2\0" ‖ TBS`, where TBS is bytes `[0, L-3373)`:
+
+- `sig_E = Ed25519-Sign(ed_secret, M')` (pure Ed25519, deterministic);
+- `sig_M = ML-DSA-65.Sign(mldsa_secret, M', ctx = "TCN-cert-v2")`, hedged (fresh 32-byte
+  `rnd`), FIPS 204 external interface with the context string.
+
+The v2 context differs from the v1 one, so neither component of a v2 certificate verifies as a
+v1 certificate, and the FIPS 204 `ctx` separates certificate signatures from any other use of
+the ML-DSA key.
+
+**Verification** (§15.4 steps 3–6 for v2):
+
+1. step 3: format, rules above;
+2. step 4: `subject_fp` equals the fingerprint the handshake authenticated; with
+   `subject_kind = 0x02`, `subject_fp_v2` also equals the hybrid fingerprint the handshake
+   authenticated (suite `IKhfs+psk0+psk2`, §7.5.3). A hybrid-bound certificate never passes a
+   classical handshake: that would be a downgrade;
+3. step 5: a pinned **composite** key whose `ca_fp` equals the certificate's. The pin decides
+   the algorithm, not the certificate: a v1 (Ed25519) pin never verifies a v2 certificate, and
+   a composite pin never verifies a v1 certificate, even with the same Ed25519 bytes (finding
+   AP-13). A CA does not certify itself: the Ed25519 half of the pin MUST NOT be the subject;
+4. step 6: **Ed25519 first** (`verify_strict`), **then** ML-DSA-65 with the pinned ML-DSA key
+   and `ctx = "TCN-cert-v2"`. Both MUST pass. The order means that, until a quantum computer
+   exists, only a holder of a CA-signed TBS for its own authenticated key reaches the ML-DSA
+   verifier (finding AP-5).
+
+Steps 7–11 (denylist, time, scope, roles) are unchanged and version-independent.
+
+**The ML-DSA verifier** is RustCrypto `ml-dsa` at one exact version, the same in the fleet and
+in `zt-ca`. `zt-ca` verifies every certificate it signs with that verifier before writing it
+(verify-after-sign, finding AP-5): a certificate the fleet would reject never leaves the CA.
+The verifier passes the NIST ACVP key-generation vectors and the Wycheproof ML-DSA-65
+verification and signing vectors, and agrees on all of them, and on mutated signatures, with
+the independent `libcrux-ml-dsa` (test-only).
+
+**Keys and files.**
+
+| Text | Content |
+| :- | :- |
+| `tcn-ca-secret-v2:` + 128 hex | Ed25519 seed (32) ‖ ML-DSA-65 seed ξ (32); `zt-ca` only, mode `0600`, zeroized in memory |
+| `tcn-ca-pub-v2:` + 3 968 hex | Ed25519 public key (32) ‖ ML-DSA-65 public key (1 952); in `[[authorities]]` |
+| `tcn-client-cert-v2:` + hex | a certificate v2; the prefix MUST match the version byte |
+| `TCNCA2:` + 64 hex | `ca_fp`, as `zt-ca inspect` shows it |
+
+In the audit logs a composite CA is named by the fingerprint of its Ed25519 half, as a v1 CA,
+so that the conflict checks of §15.9 (a CA key that is also a peer key, a key in two entries)
+cover both versions. A composite key MUST NOT reuse the Ed25519 key of the v1 key it replaces.
+
+**Migration** uses the CA rotation of §15.9: an `[[authorities]]` entry pins the composite key
+next to the v1 key (`public_keys = ["tcn-ca-pub-v2:…", "<v1 key>"]`), both kinds of certificate
+are accepted during the overlap, and removing the v1 key ends v1 acceptance. There is no
+automatic downgrade: a v1 certificate passes only where a v1 key is pinned (OPERATIONS §10.8).
+
+**Sizes.** A v2 certificate with a classical subject is 3 480 bytes at least and 7 638 bytes at
+most; with a hybrid subject, 32 bytes more (7 670). The message 1 payload bound of every suite
+is the longest certificate of any version, `MAX_ANY_CERT_LEN = 7 670`.
+
+### 15.15 Attacks considered
 
 | Attack | Defence |
 | :- | :- |
@@ -738,10 +1339,21 @@ The vector was computed outside the project; as for framing, if the test
 | certificate name equal to that of another client | names authorise nothing; audits always have fingerprint, CA and serial |
 | removing the certificate to fall back on the whitelist (downgrade) | the payload is authenticated by Noise: removing it requires the client's secret key; whitelist precedence is the operator's choice, not the peer's |
 | compromised relay forging or altering certificates towards the agent | the relay does not have the CA key; the end-to-end certificate is encrypted towards the agent; the agent verifies it by itself, including its own node being in scope |
-| compromised relay replaying end-to-end message 1 | as today: without `TCN/1 ready` no sshd and no registered session (finding 0002-3) |
+| compromised relay replaying end-to-end message 1 | as today: without the suite's confirmation (`TCN/1 ready` or `TCN/2 ready`) no sshd and no registered session (finding 0002-3) |
 | replayed message 1 to make a client appear in the audits | success events are recorded only after an authentic message (§15.3) |
 | CA signing a certificate for an agent's key | `role_conflict` on the relay; the key cannot open streams |
 | relay and agent clock moved backwards | accepted residual risk (§15.6); NTS recommended; denylist |
+| quantum forgery of a CA signature (Ed25519 broken) | certificate v2: the ML-DSA-65 component must also verify (§15.14) |
+| stripping or swapping one component of a v2 signature; a v2 body with a v1 signature | both components are mandatory and sign `"TCN client certificate v2\0" ‖ TBS`; the lengths are fixed; the v1 and v2 contexts differ |
+| CA algorithm confusion (a v2 certificate checked with a v1 pin or the reverse; a reserved `sig_alg`) | the pin carries the algorithm; `ca_fp` covers `sig_alg` and both keys; `0x03`/`0x04` refused (§15.14) |
+| crafted ML-DSA signatures against the verifier (hint encoding, `use_hint`) | Ed25519 verified first; exact pin of `ml-dsa`; ACVP and Wycheproof vectors; differential tests against `libcrux-ml-dsa`; fuzz target `cert_v2_verify`; verify-after-sign in `zt-ca` |
+| a hybrid-bound certificate presented over a classical handshake | `subject_fp_v2` must equal the hybrid fingerprint the handshake authenticated (§15.14) |
+| quantum impersonation of a node during the handshake (X25519 broken) | hybrid IK suite: each side is also authenticated by an encapsulation to its static ML-KEM key (§7.5.3) |
+| downgrade of a v2-pinned peer to the classical or IKhfs suite, or to another ML-KEM key | the v2 entry pins the fingerprint v2: `identity_downgrade` before message 2; the initiator pins one suite and never falls back |
+| revoking a key by its v2 form and connecting with a v1 handshake (or the reverse); a `SHA256v2:` denylist entry that matches nothing | every denylist form is reduced to the X25519-level fingerprint; `SHA256v2:` is a load error (§15.8) |
+| tampered `ct1` or `ct2`, or `ct1` from another handshake, channel or responder key | implicit rejection gives another secret, so the PSK, and the AEAD tags fail; the prologue binds `SHA-256(ek_r)` and `ct1` |
+| replay of a hybrid IK message 1 | as for every suite: no key confirmation without `dk_i` (and the X25519 key), so no session (AP-12) |
+| malformed `tcn-pub-v2:` keys (length, case, weak or non-canonical Ed25519, `ek` over the modulus) | strict parser (§7.5.3); the same `handshake_failed` for an invalid `ek_i` in message 1 |
 
 ## 16. Out of scope
 

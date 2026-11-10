@@ -1,8 +1,12 @@
 //! Certificate trust: pinned CAs, denylist, checks 5 and 7–10 of PROTOCOL §15.4.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use crate::cert::{CertClaims, CertKey, CertRejection, CertScope, CertSerial, UnixTime};
+use crate::cert::{
+    CaFingerprint, CaKeyRef, CertClaims, CertKey, CertRejection, CertScope, CertSerial,
+    MLDSA65_PUBLIC_KEY_LEN, UnixTime,
+};
 use crate::crypto::Fingerprint;
 use crate::error::DomainError;
 use crate::ids::NodeId;
@@ -12,14 +16,88 @@ use crate::limits::{
 };
 use crate::policy::AllowedNodes;
 
-/// A pinned CA public key: the 32 bytes (byte-by-byte comparison with `ca_key`) and the
-/// fingerprint (X25519 form, for conflicts with peer keys and for the logs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A pinned CA public key: the 32 Ed25519 bytes (byte-by-byte comparison with `ca_key`, or
+/// the Ed25519 component of a composite key) and their fingerprint (X25519 form, for conflicts
+/// with peer keys and for the logs). A composite (v2) key also carries its ML-DSA-65 half and
+/// its [`CaFingerprint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedCaKey {
     /// The 32 Ed25519 bytes, already validated by `zt-crypto` as a canonical, non-weak point.
     pub key: CertKey,
     /// The fingerprint of the key.
     pub fingerprint: Fingerprint,
+    /// The ML-DSA-65 half of a composite (v2) key; `None` for a v1 (Ed25519) key.
+    pub composite: Option<CompositeCaPin>,
+}
+
+/// The ML-DSA-65 half of a pinned composite CA key and the key's fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeCaPin {
+    ca_fp: CaFingerprint,
+    mldsa_key: Arc<[u8]>,
+}
+
+impl CompositeCaPin {
+    /// A composite pin. `ca_fp` is computed by `zt-crypto` over the whole key.
+    ///
+    /// # Errors
+    /// [`DomainError::InvalidLength`] for an ML-DSA-65 key of the wrong length.
+    pub fn new(ca_fp: CaFingerprint, mldsa_key: &[u8]) -> Result<Self, DomainError> {
+        if mldsa_key.len() != MLDSA65_PUBLIC_KEY_LEN {
+            return Err(DomainError::InvalidLength {
+                what: "ML-DSA-65 public key",
+                expected: MLDSA65_PUBLIC_KEY_LEN,
+                actual: mldsa_key.len(),
+            });
+        }
+        Ok(Self {
+            ca_fp,
+            mldsa_key: Arc::from(mldsa_key),
+        })
+    }
+
+    /// The fingerprint of the composite key, as certificates v2 name it.
+    #[must_use]
+    pub const fn ca_fp(&self) -> &CaFingerprint {
+        &self.ca_fp
+    }
+
+    /// The 1 952 bytes of the ML-DSA-65 public key.
+    #[must_use]
+    pub fn mldsa_key(&self) -> &[u8] {
+        &self.mldsa_key
+    }
+}
+
+impl TrustedCaKey {
+    /// `true` if this pin is the key `reference` names, **with its algorithm**: an Ed25519
+    /// reference never matches a composite pin, even with the same Ed25519 bytes, and vice
+    /// versa (finding AP-13).
+    #[must_use]
+    pub fn matches(&self, reference: &CaKeyRef) -> bool {
+        match (reference, &self.composite) {
+            (CaKeyRef::Ed25519(key), None) => self.key == *key,
+            (CaKeyRef::Composite(fp), Some(pin)) => pin.ca_fp == *fp,
+            _ => false,
+        }
+    }
+
+    /// `true` if the two pins share a component key (AP-13, finding A12-5 of review 0012): the
+    /// Ed25519 key (by bytes or fingerprint, whatever the algorithm) or the ML-DSA-65 key of
+    /// two composites. A rotation that kept one half would not rotate it.
+    fn shares_a_component(&self, other: &Self) -> bool {
+        let mldsa = match (&self.composite, &other.composite) {
+            (Some(a), Some(b)) => a.mldsa_key == b.mldsa_key,
+            _ => false,
+        };
+        self.key == other.key || self.fingerprint == other.fingerprint || mldsa
+    }
+
+    /// The certificate version this key signs: 1 or 2.
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        if self.composite.is_some() { 2 } else { 1 }
+    }
 }
 
 /// An `[[authorities]]` entry.
@@ -66,9 +144,10 @@ impl Authority {
         in_cert && self.allowed.permits(node)
     }
 
-    /// `true` if `key` is one of this CA's pinned keys (byte by byte).
-    fn pins(&self, key: &CertKey) -> bool {
-        self.keys.iter().any(|k| k.key == *key)
+    /// The pinned key that `reference` names, with its algorithm.
+    #[must_use]
+    pub fn pin_for(&self, reference: &CaKeyRef) -> Option<&TrustedCaKey> {
+        self.keys.iter().find(|k| k.matches(reference))
     }
 }
 
@@ -156,10 +235,12 @@ impl CertTrust {
         allowed: AllowedNodes,
         max_lifetime_secs: u64,
     ) -> Result<(), DomainError> {
-        // All checks before any modification: no partial effects.
+        // All checks before any modification: no partial effects. The Ed25519 bytes are
+        // compared whatever the algorithm: a composite key never reuses the Ed25519 key of the
+        // v1 key it replaces, even in the same entry (finding AP-13).
         let distinct = match keys {
             [_] => true,
-            [a, b] => a.key != b.key && a.fingerprint != b.fingerprint,
+            [a, b] => !a.shares_a_component(b),
             _ => false,
         };
         if !distinct || keys.len() > MAX_AUTHORITY_KEYS {
@@ -183,7 +264,7 @@ impl CertTrust {
                 .authorities
                 .iter()
                 .flat_map(|a| a.keys.iter())
-                .any(|k| k.key == key.key || k.fingerprint == key.fingerprint);
+                .any(|k| k.shares_a_component(key));
             if taken {
                 return Err(DomainError::DuplicatePeer(key.fingerprint));
             }
@@ -214,10 +295,18 @@ impl CertTrust {
         !self.authorities.is_empty() && self.revocations.is_none()
     }
 
-    /// The CA that pins exactly these 32 bytes.
+    /// The CA that pins exactly these 32 bytes as a v1 (Ed25519) key.
     #[must_use]
     pub fn authority_for_key(&self, key: &CertKey) -> Option<&Authority> {
-        self.authorities.iter().find(|a| a.pins(key))
+        self.authority_for(&CaKeyRef::Ed25519(*key))
+    }
+
+    /// The CA that pins the key `reference` names, with its algorithm (finding AP-13).
+    #[must_use]
+    pub fn authority_for(&self, reference: &CaKeyRef) -> Option<&Authority> {
+        self.authorities
+            .iter()
+            .find(|a| a.pin_for(reference).is_some())
     }
 
     /// The fingerprints of all CA keys.
@@ -240,9 +329,9 @@ impl CertTrust {
     /// # Errors
     /// The first check that fails.
     pub fn check(&self, claims: &CertClaims, now: UnixTime) -> Result<&Authority, CertRejection> {
-        // Step 5: the CA that pins exactly `ca_key`.
+        // Step 5: the CA that pins exactly the key the certificate names, with its algorithm.
         let authority = self
-            .authority_for_key(claims.ca_key())
+            .authority_for(claims.authority_key())
             .ok_or(CertRejection::UnknownAuthority)?;
         // Step 7. Without a denylist (configuration cannot be started, `needs_revocations`) no
         // serial can be said to be unrevoked: fail closed.

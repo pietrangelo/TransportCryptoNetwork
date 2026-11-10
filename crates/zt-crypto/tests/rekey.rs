@@ -18,7 +18,7 @@ use zt_crypto::noise::{self, Channel, REKEY_INTERVAL, Transport};
 fn pair() -> (Transport, Transport) {
     let a = Identity::generate().unwrap();
     let b = Identity::generate().unwrap();
-    let (msg1, waiting) = noise::initiate(&a, &b.public_key(), Channel::Outer).unwrap();
+    let (msg1, waiting) = noise::initiate(&a, b.public_key(), Channel::Outer).unwrap();
     let (msg2, resp) = noise::respond(&b, &msg1, Channel::Outer)
         .unwrap()
         .accept()

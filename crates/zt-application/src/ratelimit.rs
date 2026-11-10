@@ -62,6 +62,12 @@ impl TokenBucket {
         }
     }
 
+    /// Gives one token back, never above the capacity (R-1: the refund after key confirmation).
+    pub fn refund(&mut self, now: Instant) {
+        self.refill(now);
+        self.tokens = self.tokens.saturating_add(1).min(self.capacity);
+    }
+
     /// `true` if the bucket is full (equivalent to a new one, hence removable).
     pub fn is_full(&mut self, now: Instant) -> bool {
         self.refill(now);
@@ -135,6 +141,14 @@ impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
         let allowed = bucket.try_take(now);
         self.buckets.insert(key.clone(), bucket);
         allowed
+    }
+
+    /// Gives one token back to `key`. Nothing happens for a key without a bucket (it was
+    /// evicted because it was full, so there is nothing to give back).
+    pub fn refund(&mut self, key: &K, now: Instant) {
+        if let Some(bucket) = self.buckets.get_mut(key) {
+            bucket.refund(now);
+        }
     }
 
     /// `true` if `key` already has a bucket.
@@ -271,5 +285,12 @@ impl HandshakeGate {
             return false;
         }
         self.narrow.check(&narrow, now)
+    }
+
+    /// Gives back the per-address token of a handshake from `addr` whose key was confirmed
+    /// (R-1, finding G1). The /48 token is not given back: it counts the appearance of new
+    /// /64s, which a confirmation does not undo.
+    pub fn refund(&mut self, addr: IpAddr, now: Instant) {
+        self.narrow.refund(&source_key(addr), now);
     }
 }

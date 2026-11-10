@@ -102,6 +102,19 @@ pub fn raw_msg1(seed: [u8; 32], responder: &PublicKey, ch: Channel, payload: &[u
 
 /// Sends a raw `msg1` to the relay (2-byte big-endian length, like the codec) and returns
 /// message 2, if it arrives. `None`: the relay closed without replying.
+/// A TCP connection to `relay` from the loopback address `127.0.0.<host>`, for tests that need
+/// several sources.
+pub async fn connect_from(relay: SocketAddr, host: u8) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, host)),
+            0,
+        ))
+        .unwrap();
+    socket.connect(relay).await.unwrap()
+}
+
 pub async fn probe_relay(relay: SocketAddr, msg1: &[u8]) -> Option<Vec<u8>> {
     let mut tcp = TcpStream::connect(relay).await.unwrap();
     let len = u16::try_from(msg1.len()).unwrap().to_be_bytes();
@@ -147,19 +160,31 @@ pub fn next_serial() -> CertSerial {
     CertSerial::try_from(b).unwrap()
 }
 
-/// An offline CA.
+/// An offline CA: v1 (Ed25519) or, with `v2`, composite ML-DSA-65 + Ed25519 (PQ-AUTH).
 pub struct Ca {
     pub key: CaSigningKey,
+    pub v2: Option<zt_crypto::CompositeCaSigningKey>,
 }
 
 impl Ca {
     pub fn new() -> Self {
         Self {
             key: CaSigningKey::generate().unwrap(),
+            v2: None,
+        }
+    }
+    /// A composite CA, which issues certificates v2.
+    pub fn new_v2() -> Self {
+        Self {
+            key: CaSigningKey::generate().unwrap(),
+            v2: Some(zt_crypto::CompositeCaSigningKey::generate().unwrap()),
         }
     }
     pub fn trusted(&self) -> TrustedCaKey {
-        trusted_ca_key(&self.key.public_key())
+        match &self.v2 {
+            Some(v2) => zt_crypto::trusted_composite_ca_key(&v2.public_key()).unwrap(),
+            None => trusted_ca_key(&self.key.public_key()),
+        }
     }
     /// A certificate for `subject` valid in `[nb, na)`.
     pub fn issue_at(
@@ -170,6 +195,22 @@ impl Ca {
         na: u64,
     ) -> (Arc<[u8]>, CertSerial) {
         let serial = next_serial();
+        if let Some(v2) = &self.v2 {
+            let body = zt_domain::CertBodyV2::new(
+                v2.public_key().ca_fp(),
+                zt_domain::CertSubject::Classical(subject.fingerprint()),
+                serial,
+                zt_domain::UnixTime::from_secs(nb),
+                zt_domain::UnixTime::from_secs(na),
+                node("alice"),
+                scope,
+            )
+            .unwrap();
+            return (
+                Arc::from(zt_crypto::sign_certificate_v2(v2, &body).unwrap()),
+                serial,
+            );
+        }
         let body = CertBody::new(
             cert_key(&self.key.public_key()),
             cert_key(subject),
@@ -182,6 +223,34 @@ impl Ca {
         .unwrap();
         (
             Arc::from(sign_certificate(&self.key, &body).unwrap()),
+            serial,
+        )
+    }
+    /// A v2 certificate bound to the hybrid identity of `subject` (`subject_kind = 0x02`),
+    /// valid from a minute ago for one hour.
+    pub fn issue_hybrid(
+        &self,
+        subject: &zt_crypto::HybridPublicKey,
+        scope: CertScope,
+    ) -> (Arc<[u8]>, CertSerial) {
+        let v2 = self.v2.as_ref().expect("a composite CA");
+        let now = now_secs();
+        let serial = next_serial();
+        let body = zt_domain::CertBodyV2::new(
+            v2.public_key().ca_fp(),
+            zt_domain::CertSubject::Hybrid {
+                classical: subject.fingerprint(),
+                hybrid: subject.hybrid_fingerprint(),
+            },
+            serial,
+            zt_domain::UnixTime::from_secs(now - 60),
+            zt_domain::UnixTime::from_secs(now + 3_540),
+            node("alice"),
+            scope,
+        )
+        .unwrap();
+        (
+            Arc::from(zt_crypto::sign_certificate_v2(v2, &body).unwrap()),
             serial,
         )
     }
@@ -248,8 +317,11 @@ pub fn agent_clients(whitelist: &[Fingerprint], trust: CertTrust) -> AuthorizedC
 pub fn relay_config() -> RelayConfig {
     RelayConfig {
         timeouts: timeouts(),
-        handshake_burst: 1_000,
-        wide_handshake_burst: 1_000,
+        admission: zt_application::admission::AdmissionConfig {
+            source_burst: 1_000,
+            wide_burst: 1_000,
+            ..zt_application::admission::AdmissionConfig::default()
+        },
         ..RelayConfig::default()
     }
 }
@@ -258,14 +330,42 @@ pub fn relay_config() -> RelayConfig {
 pub struct Relay {
     pub addr: SocketAddr,
     pub key: PublicKey,
+    /// The relay's v2 public key (PQ-AUTH), for the hybrid IK suite.
+    pub hybrid: zt_crypto::HybridPublicKey,
     pub policy: Updater<AccessPolicy>,
 }
 
+impl Relay {
+    /// The key a peer pins for this relay with `suite`: the v2 key for the hybrid IK suite.
+    pub fn pin(&self, suite: zt_domain::HandshakeSuite) -> zt_crypto::PeerKey {
+        if suite.requires_hybrid_identity() {
+            self.hybrid.clone().into()
+        } else {
+            self.key.into()
+        }
+    }
+}
+
+/// The key a peer pins for `id` with `suite` (PQ-AUTH).
+pub fn pin_of(id: &Identity, suite: zt_domain::HandshakeSuite) -> zt_crypto::PeerKey {
+    if suite.requires_hybrid_identity() {
+        id.hybrid_public_key().into()
+    } else {
+        id.public_key().into()
+    }
+}
+
 pub async fn start_relay(policy: AccessPolicy) -> Relay {
+    start_relay_with(policy, relay_config()).await
+}
+
+/// Like [`start_relay`], with explicit limits.
+pub async fn start_relay_with(policy: AccessPolicy, config: RelayConfig) -> Relay {
     let id = Identity::generate().unwrap();
     let key = id.public_key();
+    let hybrid = id.hybrid_public_key();
     let (rx, updater) = Revocable::new(policy);
-    let server = RelayServer::bind("127.0.0.1:0".parse().unwrap(), id, rx, relay_config())
+    let server = RelayServer::bind("127.0.0.1:0".parse().unwrap(), id, rx, config)
         .await
         .unwrap();
     let addr = server.local_addr().unwrap();
@@ -273,6 +373,7 @@ pub async fn start_relay(policy: AccessPolicy) -> Relay {
     Relay {
         addr,
         key,
+        hybrid,
         policy: updater,
     }
 }
@@ -302,9 +403,55 @@ impl Lab {
         policies: Vec<AccessPolicy>,
         clients: AuthorizedClients,
     ) -> Self {
+        let configs = policies.into_iter().map(|p| (p, relay_config())).collect();
+        Self::start_configured(agent, configs, clients).await
+    }
+
+    /// Like [`Lab::start_with`], with explicit relay limits.
+    pub async fn start_configured(
+        agent: Arc<Identity>,
+        relays_config: Vec<(AccessPolicy, RelayConfig)>,
+        clients: AuthorizedClients,
+    ) -> Self {
+        Self::start_suites(
+            agent,
+            relays_config,
+            clients,
+            zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        )
+        .await
+    }
+
+    /// Like [`Lab::start_configured`], with the suites the agent accepts from clients on the
+    /// end-to-end channel (PQ-1). The relays are always configured as before.
+    pub async fn start_suites(
+        agent: Arc<Identity>,
+        relays_config: Vec<(AccessPolicy, RelayConfig)>,
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+    ) -> Self {
+        Self::start_outer(
+            agent,
+            relays_config,
+            clients,
+            client_suites,
+            zt_domain::HandshakeSuite::NoiseIk25519,
+        )
+        .await
+    }
+
+    /// Like [`Lab::start_suites`], with the suite the agent pins towards every relay (PQ-1
+    /// on the outer channel).
+    pub async fn start_outer(
+        agent: Arc<Identity>,
+        relays_config: Vec<(AccessPolicy, RelayConfig)>,
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+        relay_suite: zt_domain::HandshakeSuite,
+    ) -> Self {
         let mut relays = Vec::new();
-        for p in policies {
-            relays.push(start_relay(p).await);
+        for (p, c) in relays_config {
+            relays.push(start_relay_with(p, c).await);
         }
         let (ssh, sshd) = counting_echo().await;
         let (clients_rx, clients) = Revocable::new(clients);
@@ -315,7 +462,8 @@ impl Lab {
                     .iter()
                     .map(|r| zt_net::RelayEndpoint {
                         address: r.addr.to_string(),
-                        public_key: r.key,
+                        public_key: r.pin(relay_suite),
+                        suite: relay_suite,
                     })
                     .collect(),
                 node: node("web-01"),
@@ -323,6 +471,9 @@ impl Lab {
                 authorized_clients: clients_rx,
                 timeouts: timeouts(),
                 max_streams: 16,
+                client_suites,
+                identity_log_interval: zt_net::agent::IDENTITY_LOG_INTERVAL,
+                reconnect: zt_application::reconnect::ReconnectConfig::default(),
             },
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -335,19 +486,46 @@ impl Lab {
     }
 
     pub fn config(&self, certificate: Option<&Arc<[u8]>>) -> ClientConfig {
+        self.config_suite(certificate, zt_domain::HandshakeSuite::NoiseIk25519)
+    }
+
+    /// Like [`Lab::config`], with the end-to-end suite the client pins for the node.
+    pub fn config_suite(
+        &self,
+        certificate: Option<&Arc<[u8]>>,
+        node_suite: zt_domain::HandshakeSuite,
+    ) -> ClientConfig {
+        self.config_outer(
+            certificate,
+            zt_domain::HandshakeSuite::NoiseIk25519,
+            node_suite,
+        )
+    }
+
+    /// Like [`Lab::config_suite`], with the outer suite the client pins for every relay.
+    pub fn config_outer(
+        &self,
+        certificate: Option<&Arc<[u8]>>,
+        relay_suite: zt_domain::HandshakeSuite,
+        node_suite: zt_domain::HandshakeSuite,
+    ) -> ClientConfig {
         ClientConfig {
             relays: self
                 .relays
                 .iter()
                 .map(|r| zt_net::RelayEndpoint {
                     address: r.addr.to_string(),
-                    public_key: r.key,
+                    public_key: r.pin(relay_suite),
+                    suite: relay_suite,
                 })
                 .collect(),
             node: node("web-01"),
-            node_key: self.agent.public_key(),
+            node_key: pin_of(&self.agent, node_suite),
+            node_suite,
             certificate: certificate.cloned(),
             timeouts: timeouts(),
+            failover: zt_net::client::FailoverConfig::default(),
+            require_outer_suite: None,
         }
     }
 
@@ -357,8 +535,17 @@ impl Lab {
         who: &Arc<Identity>,
         certificate: Option<&Arc<[u8]>>,
     ) -> Result<(DuplexStream, JoinHandle<Result<(), NetError>>), String> {
+        self.session_with(who, self.config(certificate)).await
+    }
+
+    /// Like [`Lab::session`], with an explicit client configuration.
+    pub async fn session_with(
+        &self,
+        who: &Arc<Identity>,
+        config: ClientConfig,
+    ) -> Result<(DuplexStream, JoinHandle<Result<(), NetError>>), String> {
         let (mut app, local) = tokio::io::duplex(64 * 1024);
-        let (who, config) = (Arc::clone(who), self.config(certificate));
+        let who = Arc::clone(who);
         let task = tokio::spawn(async move { client::connect(&who, &config, local).await });
         app.write_all(b"ping").await.map_err(|e| e.to_string())?;
         let mut buf = [0_u8; 4];
@@ -377,13 +564,19 @@ impl Lab {
         who: &Arc<Identity>,
         certificate: Option<&Arc<[u8]>>,
     ) -> Result<(), NetError> {
+        self.refused_with(who, &self.config(certificate)).await
+    }
+
+    /// Like [`Lab::refused`], with an explicit client configuration.
+    pub async fn refused_with(
+        &self,
+        who: &Arc<Identity>,
+        config: &ClientConfig,
+    ) -> Result<(), NetError> {
         let (_app, local) = tokio::io::duplex(1024);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            client::connect(who, &self.config(certificate), local),
-        )
-        .await
-        .expect("client hung")
+        tokio::time::timeout(Duration::from_secs(10), client::connect(who, config, local))
+            .await
+            .expect("client hung")
     }
 }
 
@@ -427,6 +620,28 @@ pub enum AgentAnswer {
 
 impl FakeRelay {
     pub async fn start(clients: AuthorizedClients) -> Self {
+        Self::start_suites(
+            clients,
+            zt_domain::AcceptedSuites::only(zt_domain::HandshakeSuite::NoiseIk25519),
+        )
+        .await
+    }
+
+    /// Like [`FakeRelay::start`], with the suites the agent accepts from clients (PQ-1).
+    pub async fn start_suites(
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+    ) -> Self {
+        Self::start_logging(clients, client_suites, zt_net::agent::IDENTITY_LOG_INTERVAL).await
+    }
+
+    /// Like [`FakeRelay::start_suites`], with the agent's per-identity log interval (finding
+    /// A9-2).
+    pub async fn start_logging(
+        clients: AuthorizedClients,
+        client_suites: zt_domain::AcceptedSuites,
+        identity_log_interval: Duration,
+    ) -> Self {
         let relay_id = Identity::generate().unwrap();
         let relay_keys = zt_crypto::Keyring::single(copy_of(&relay_id));
         let agent = Arc::new(Identity::generate().unwrap());
@@ -438,13 +653,17 @@ impl FakeRelay {
             zt_net::agent::AgentConfig {
                 relays: vec![zt_net::RelayEndpoint {
                     address: addr.to_string(),
-                    public_key: relay_id.public_key(),
+                    public_key: relay_id.public_key().into(),
+                    suite: zt_domain::HandshakeSuite::NoiseIk25519,
                 }],
                 node: node("web-01"),
                 ssh_target: ssh.to_string(),
                 authorized_clients: Revocable::fixed(clients),
                 timeouts: timeouts(),
                 max_streams: 16,
+                client_suites,
+                identity_log_interval,
+                reconnect: zt_application::reconnect::ReconnectConfig::default(),
             },
         ));
         let (tcp, _) = listener.accept().await.unwrap();
@@ -495,6 +714,63 @@ impl FakeRelay {
                 }
                 Some(_) => {}
                 None => return AgentAnswer::Silent,
+            }
+        }
+    }
+
+    /// `Open web-01` on stream `n`, then `msg1`: message 2 if the agent sends one.
+    pub async fn msg2(&mut self, n: u32, msg1: Vec<u8>) -> Result<Vec<u8>, AgentAnswer> {
+        self.open(n, msg1).await;
+        match self.next_on(n).await {
+            Ok(payload) => Ok(payload),
+            Err(answer) => Err(answer),
+        }
+    }
+
+    async fn open(&mut self, n: u32, msg1: Vec<u8>) {
+        self.ch
+            .send(
+                &Frame::Open {
+                    stream: sid(n),
+                    target: node("web-01"),
+                },
+                &timeouts(),
+            )
+            .await
+            .unwrap();
+        self.data(n, msg1).await;
+    }
+
+    /// A `Data` with `payload` on stream `n`.
+    pub async fn data(&mut self, n: u32, payload: Vec<u8>) {
+        self.ch
+            .send(
+                &Frame::Data {
+                    stream: sid(n),
+                    payload: FramePayload::try_from(payload).unwrap(),
+                },
+                &timeouts(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The next `Data` payload on stream `n`, or how the stream ended.
+    pub async fn next_on(&mut self, n: u32) -> Result<Vec<u8>, AgentAnswer> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Ok(frame) = tokio::time::timeout_at(deadline, self.ch.recv()).await else {
+                return Err(AgentAnswer::Silent);
+            };
+            match frame.unwrap() {
+                Some(Frame::Data { stream, payload }) if stream == sid(n) => {
+                    return Ok(payload.into_bytes().to_vec());
+                }
+                Some(Frame::Close { stream, reason }) if stream == sid(n) => {
+                    return Err(AgentAnswer::Closed(reason));
+                }
+                Some(_) => {}
+                None => return Err(AgentAnswer::Silent),
             }
         }
     }
@@ -559,4 +835,17 @@ pub fn field(line: &str, key: &str) -> Option<String> {
     let (_, rest) = line.split_once(&format!("\"{key}\":\""))?;
     let (value, _) = rest.split_once('"')?;
     Some(value.to_owned())
+}
+
+/// `"key":<number>` in a JSON line.
+pub fn number(line: &str, key: &str) -> Option<u64> {
+    let (_, rest) = line.split_once(&format!("\"{key}\":"))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The sum of the numeric field `key` over `lines` (for example the `preauth_summary` lines:
+/// a burst of failures may straddle two intervals).
+pub fn summed(lines: &[String], key: &str) -> u64 {
+    lines.iter().filter_map(|line| number(line, key)).sum()
 }

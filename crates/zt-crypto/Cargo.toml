@@ -13,15 +13,27 @@ thiserror.workspace = true
 snow.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
+shake.workspace = true
 zeroize.workspace = true
 hex.workspace = true
 getrandom.workspace = true
+libcrux-ml-kem.workspace = true
+ml-dsa.workspace = true
+subtle.workspace = true
+blake2.workspace = true
+chacha20poly1305.workspace = true
+curve25519-dalek.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
 # Phase 6: attack tests (signatures with -s, hand-written msg2 payloads). Crate already in graph.
 ed25519-dalek = { workspace = true, features = ["hazmat", "digest"] }
+# Raw snow for the attack tests (malicious peers with a chosen KEM behaviour).
 snow.workspace = true
+# `zeroize`: the oracle satisfies the `ZeroizeOnDrop` bound of `Kem::DecapsulationKey`.
+ml-kem = { workspace = true, features = ["zeroize"] }
+# The ML-DSA differential oracle (decision D11): test-only.
+libcrux-ml-dsa.workspace = true
 
 [lints]
 workspace = true

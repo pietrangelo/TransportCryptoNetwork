@@ -39,6 +39,26 @@ jobs:
         env:
           PROPTEST_CASES: "10000"
       - run: cargo build --release --workspace --locked
+      # The fuzzing targets have their own Cargo.lock: it must be up to date (finding A8-7),
+      # and the targets must build with it.
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+
+  aarch64:
+    # The KEM vectors and the libcrux backend check on aarch64, on every PR, not only at
+    # release time (finding A8-6).
+    name: aarch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo test -p zt-crypto --locked
+      - run: ./.github/scripts/check-libcrux-backend.sh target/debug/build
 
   e2e-openssh:
     # Real ssh, scp and ansible-playbook through relay, agent and zt-client (ProxyCommand).
@@ -65,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frame_decoder, noise_responder, transport_decrypt, config_parsers, relay_core, cert_decoder, cert_verify]
+        target: [frame_decoder, noise_responder, noise_initiator, kem_inputs, transport_decrypt, config_parsers, relay_core, cert_decoder, cert_verify, cert_v2_decoder, cert_v2_verify, hybrid_ik, admission]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +97,9 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      # A stale fuzz/Cargo.lock would be silently re-resolved by `cargo fuzz` (finding A8-7).
+      - run: cargo +nightly metadata --locked --format-version 1 > /dev/null
+        working-directory: fuzz
       - run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=60 -rss_limit_mb=1024
         working-directory: fuzz
         env:
@@ -86,6 +109,22 @@ jobs:
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts
+
+  release-signing:
+    # PQ-REL: the release signing tool against its specification and attack tests, with a
+    # pinned OpenSSL >= 3.5 (SLH-DSA) built from source; throwaway keys only.
+    name: release-signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ./.github/scripts/build-openssl.sh "$RUNNER_TEMP/openssl"
+      - run: |
+          export OPENSSL="$RUNNER_TEMP/openssl/bin/openssl"
+          VERBOSE=1 packaging/release/tests/spec.sh
+          VERBOSE=1 packaging/release/tests/attacks.sh
 
   deny:
     # Supply chain: RustSec advisories, allowed licences, sources only from crates.io.

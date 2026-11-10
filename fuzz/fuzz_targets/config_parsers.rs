@@ -7,6 +7,9 @@
 //!
 //! Phase 6: the `[[authorities]]` blocks of the policy and of the authorized clients (they come
 //! from the same parsers), the `revoked.toml` denylist and the client certificate file.
+//!
+//! Review 0008 (finding A8-7): `relay.toml` (handshake suites and admission limits). An
+//! accepted file always gives limits that validate.
 #![no_main]
 
 use std::path::Path;
@@ -46,6 +49,10 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Err(e) = config::parse_revocations("f", text) {
         check(text, e);
+    }
+    match config::parse_relay_settings("f", text) {
+        Ok(settings) => assert_eq!(settings.admission.validate(), Ok(())),
+        Err(e) => check(text, e),
     }
     match config::parse_certificate_file("f", text) {
         // An accepted file contains a certificate that conforms to the format.

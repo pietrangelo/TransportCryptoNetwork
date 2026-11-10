@@ -1,0 +1,13 @@
+# Build settings shared by every build of the workspace.
+
+[env]
+# libcrux-ml-kem enables its NEON backend on every aarch64 build. That backend is not covered by
+# the formal verification and had a wrong-result advisory (GHSA-2cgv-28vr-rv6j), so TCN builds
+# the portable backend on aarch64 until NEON is verified (docs/analysis/pq.md §5). The AVX2
+# backend on x86_64 is verified and selected at run time only if the CPU supports it.
+#
+# `force = true`: a value in the environment (for example LIBCRUX_DISABLE_SIMD128=0) does not
+# override this one (finding A8-6). This file is only read when cargo runs inside the
+# repository; crates/zt-crypto/build.rs refuses an aarch64 build that does not see the
+# variable, and the release workflow checks the libcrux build-script output.
+LIBCRUX_DISABLE_SIMD128 = { value = "1", force = true }

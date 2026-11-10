@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 use zt_domain::flow::Window;
 use zt_domain::{
     AccessPolicy, Admission, AuthFailureReason, CertClaims, CertRef, ClientCredential, CloseReason,
-    DomainEvent, Fingerprint, Frame, NodeId, RejectReason, SessionId, StreamId, UnixTime,
+    DomainEvent, Fingerprint, Frame, HybridFingerprint, NodeId, RejectReason, SessionId, StreamId,
+    UnixTime,
 };
 
+use crate::flapping::{FlapConfig, FlapDetector};
 use crate::ratelimit::TokenBucket;
 
 /// Identifier of an authenticated connection, assigned by the network adapter.
@@ -44,6 +46,9 @@ pub enum Input {
         conn: ConnId,
         /// The peer's identity.
         peer: Fingerprint,
+        /// The peer's hybrid identity, with the hybrid IK suite (PQ-AUTH, PROTOCOL §7.5.3):
+        /// proved in full, since the core sees a connection only after key confirmation.
+        hybrid: Option<HybridFingerprint>,
         /// The certificate presented in message 1, already verified (steps 3–6 of
         /// PROTOCOL §15.4); `None` without a certificate.
         certificate: Option<Arc<CertClaims>>,
@@ -67,6 +72,13 @@ pub enum Input {
         /// The new policy.
         policy: Arc<AccessPolicy>,
     },
+    /// Start of a drain (graceful stop, PROTOCOL §13): from now on a new `Open`, also on a
+    /// connection established before, is rejected with `NodeOffline` (the client tries another
+    /// relay); the open streams go on (finding A10-5).
+    DrainStarted,
+    /// End of a drain (graceful stop, PROTOCOL §13): every stream still open is closed with
+    /// `Close Drained` on both sides, then every connection.
+    Shutdown,
 }
 
 /// Actions the network adapter must execute.
@@ -111,6 +123,8 @@ pub struct RelayLimits {
     pub open_burst: u32,
     /// One more `Open` every `open_refill`.
     pub open_refill: Duration,
+    /// When registration takeovers of one node are reported as `agent_flapping`.
+    pub flapping: FlapConfig,
 }
 
 impl Default for RelayLimits {
@@ -123,6 +137,7 @@ impl Default for RelayLimits {
             ping_refill: Duration::from_secs(5),
             open_burst: 64,
             open_refill: Duration::from_millis(100),
+            flapping: FlapConfig::default(),
         }
     }
 }
@@ -143,6 +158,17 @@ enum Role {
 }
 
 /// The audit reference of a credential: `None` for the whitelist.
+/// `true` if the credential is a certificate v2 bound to this very hybrid identity: then the
+/// configuration (the CA) did check more than the X25519 key.
+fn bound_to_hybrid(role: &Role, peer_v2: &HybridFingerprint) -> bool {
+    matches!(
+        role,
+        Role::Client {
+            credential: ClientCredential::Certificate(claims)
+        } if claims.subject_hybrid() == Some(peer_v2)
+    )
+}
+
 fn cert_ref(credential: &ClientCredential) -> Option<CertRef> {
     match credential {
         ClientCredential::Key => None,
@@ -192,6 +218,8 @@ impl RecentlyClosed {
 #[derive(Debug)]
 struct Conn {
     peer: Fingerprint,
+    /// The hybrid identity the handshake proved (PQ-AUTH), rechecked against v2 pins.
+    hybrid: Option<HybridFingerprint>,
     role: Role,
     streams: BTreeSet<StreamId>,
     pings: TokenBucket,
@@ -228,6 +256,8 @@ struct Route {
     state: StreamState,
     session: SessionId,
     client: Fingerprint,
+    /// The client's hybrid identity, for audit.
+    client_v2: Option<HybridFingerprint>,
     target: NodeId,
     /// The client's certificate, for audit (`None` for the whitelist).
     certificate: Option<CertRef>,
@@ -246,11 +276,15 @@ pub struct RelayCore<S> {
     conns: HashMap<ConnId, Conn>,
     agents: HashMap<NodeId, ConnId>,
     routes: HashMap<(ConnId, StreamId), Route>,
+    flapping: FlapDetector,
+    /// A drain started: new streams are rejected.
+    draining: bool,
 }
 
 impl<S: SessionIds> RelayCore<S> {
     /// A relay with no connections.
     pub fn new(policy: Arc<AccessPolicy>, limits: RelayLimits, ids: S) -> Self {
+        let limits_flapping = limits.flapping;
         Self {
             policy,
             limits,
@@ -258,6 +292,8 @@ impl<S: SessionIds> RelayCore<S> {
             conns: HashMap::new(),
             agents: HashMap::new(),
             routes: HashMap::new(),
+            flapping: FlapDetector::new(limits_flapping),
+            draining: false,
         }
     }
 
@@ -273,6 +309,27 @@ impl<S: SessionIds> RelayCore<S> {
         self.conns.len()
     }
 
+    /// Number of nodes with a registered agent.
+    #[must_use]
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
+    }
+
+    /// The peer of `conn` was admitted as an agent (review 0013, A13-1: the byte budget sheds
+    /// an agent's normal credit only as a last resort).
+    #[must_use]
+    pub fn is_agent(&self, conn: ConnId) -> bool {
+        self.conns
+            .get(&conn)
+            .is_some_and(|c| matches!(c.role, Role::Agent { .. }))
+    }
+
+    /// Number of streams (sessions) open or opening: what a drain waits for.
+    #[must_use]
+    pub fn client_stream_count(&self) -> usize {
+        self.routes.len() / 2
+    }
+
     /// Processes an event and returns the actions to execute, in order.
     pub fn handle(&mut self, input: Input, now: Now) -> Vec<Output> {
         let mut out = Vec::new();
@@ -280,8 +337,9 @@ impl<S: SessionIds> RelayCore<S> {
             Input::Connected {
                 conn,
                 peer,
+                hybrid,
                 certificate,
-            } => self.on_connected(conn, peer, certificate.as_ref(), now, &mut out),
+            } => self.on_connected(conn, peer, hybrid, certificate.as_ref(), now, &mut out),
             Input::Received { conn, frame } => {
                 if self.conns.contains_key(&conn)
                     && let Err(rule) = self.on_frame(conn, frame, now, &mut out)
@@ -292,14 +350,59 @@ impl<S: SessionIds> RelayCore<S> {
             Input::Disconnected { conn } => self.teardown(conn, &mut out),
             Input::Tick => self.on_tick(now, &mut out),
             Input::PolicyUpdated { policy } => self.on_policy(policy, now.unix, &mut out),
+            Input::DrainStarted => self.draining = true,
+            Input::Shutdown => self.on_shutdown(&mut out),
         }
         out
+    }
+
+    /// Closes every stream with `Close Drained` and then every connection.
+    fn on_shutdown(&mut self, out: &mut Vec<Output>) {
+        let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
+        ids.sort_unstable();
+        for &conn in &ids {
+            let Some(Conn {
+                role: Role::Client { .. },
+                streams,
+                ..
+            }) = self.conns.get(&conn)
+            else {
+                continue;
+            };
+            let streams: Vec<StreamId> = streams.iter().copied().collect();
+            for stream in streams {
+                let Some(route) = self.remove_route(conn, stream) else {
+                    continue;
+                };
+                let (agent, agent_stream) = route.peer;
+                for (to, s) in [(conn, stream), (agent, agent_stream)] {
+                    out.push(Output::Send {
+                        conn: to,
+                        frame: Frame::Close {
+                            stream: s,
+                            reason: CloseReason::Drained,
+                        },
+                    });
+                }
+                out.push(Output::Audit(DomainEvent::ConnectionDrained {
+                    session: route.session,
+                    reason: CloseReason::Drained,
+                }));
+            }
+        }
+        for conn in ids {
+            out.push(Output::Close { conn });
+        }
+        self.conns.clear();
+        self.agents.clear();
+        self.routes.clear();
     }
 
     fn on_connected(
         &mut self,
         conn: ConnId,
         peer: Fingerprint,
+        hybrid: Option<HybridFingerprint>,
         certificate: Option<&Arc<CertClaims>>,
         now: Now,
         out: &mut Vec<Output>,
@@ -307,9 +410,13 @@ impl<S: SessionIds> RelayCore<S> {
         if self.conns.contains_key(&conn) {
             return;
         }
-        // Steps 1, 5 and 7–11 of PROTOCOL §15.4 rechecked with the policy and clock at the
-        // moment the connection reaches the core: a reload in the meantime is not lost.
-        let role = match self.policy.admit(&peer, certificate, now.unix) {
+        // Steps 1, 5 and 7–11 of PROTOCOL §15.4 and the v2 pin rechecked with the policy and
+        // clock at the moment the connection reaches the core: a reload in the meantime is
+        // not lost.
+        let admitted = self
+            .policy
+            .admit_hybrid(&peer, hybrid.as_ref(), certificate, now.unix);
+        let role = match admitted {
             Err(reason) => {
                 out.push(Output::Audit(DomainEvent::AuthenticationFailed {
                     peer: Some(peer),
@@ -328,6 +435,16 @@ impl<S: SessionIds> RelayCore<S> {
             },
             Ok(Admission::Client { credential }) => Role::Client { credential },
         };
+        // A hybrid identity matched only through its X25519 key (pq.md §4.6).
+        if let Some(peer_v2) = hybrid
+            && self.policy.hybrid_identity(&peer).is_none()
+            && !bound_to_hybrid(&role, &peer_v2)
+        {
+            out.push(Output::Audit(DomainEvent::ClassicalIdentityMatch {
+                peer,
+                peer_v2,
+            }));
+        }
         let now = now.instant;
         let pings = TokenBucket::new(self.limits.ping_burst, self.limits.ping_refill, now);
         let opens = TokenBucket::new(self.limits.open_burst, self.limits.open_refill, now);
@@ -335,6 +452,7 @@ impl<S: SessionIds> RelayCore<S> {
             conn,
             Conn {
                 peer,
+                hybrid,
                 role,
                 streams: BTreeSet::new(),
                 pings,
@@ -448,7 +566,7 @@ impl<S: SessionIds> RelayCore<S> {
                 Ok(())
             }
             Frame::Pong { .. } => Err("unsolicited pong"),
-            Frame::Register { node } => self.on_register(conn, node, out),
+            Frame::Register { node } => self.on_register(conn, node, now.instant, out),
             other => {
                 if let Some(stream) = other.stream()
                     && !matches!(other, Frame::Open { .. })
@@ -537,6 +655,7 @@ impl<S: SessionIds> RelayCore<S> {
         &mut self,
         conn: ConnId,
         node: NodeId,
+        now: Instant,
         out: &mut Vec<Output>,
     ) -> Result<(), Violation> {
         let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
@@ -569,6 +688,15 @@ impl<S: SessionIds> RelayCore<S> {
             // New connection from the same agent (reconnection): the old one is drained.
             self.teardown_except_agent_entry(old, out);
             out.push(Output::Close { conn: old });
+            // A reconnection is normal; the same node taken over again and again is two
+            // agents with one key. Reported, never blocked (resilience R-2).
+            if let Some(count) = self.flapping.on_takeover(&node, now) {
+                out.push(Output::Audit(DomainEvent::AgentFlapping {
+                    node: node.clone(),
+                    fingerprint: peer,
+                    count,
+                }));
+            }
         }
         out.push(Output::Audit(DomainEvent::AgentRegistered {
             node,
@@ -587,6 +715,7 @@ impl<S: SessionIds> RelayCore<S> {
     ) -> Result<(), Violation> {
         let c = self.conns.get_mut(&conn).ok_or("unknown connection")?;
         let client = c.peer;
+        let client_v2 = c.hybrid;
         if c.streams.contains(&stream) {
             return Err("stream id reuse");
         }
@@ -623,9 +752,13 @@ impl<S: SessionIds> RelayCore<S> {
             out.push(reject(RejectReason::ResourceExhausted));
             return Ok(());
         }
-        let Some(&agent) = self.agents.get(&target) else {
-            out.push(reject(RejectReason::NodeOffline));
-            return Ok(());
+        // A draining relay looks like one without the node: the client moves on.
+        let agent = match self.agents.get(&target) {
+            Some(&agent) if !self.draining => agent,
+            _ => {
+                out.push(reject(RejectReason::NodeOffline));
+                return Ok(());
+            }
         };
         let max_agent = self.limits.max_streams_per_agent;
         let Some(agent_stream) = self
@@ -642,6 +775,7 @@ impl<S: SessionIds> RelayCore<S> {
             state: StreamState::Opening,
             session,
             client,
+            client_v2,
             target: target.clone(),
             certificate: certificate.clone(),
             send: Window::initial(),
@@ -683,6 +817,7 @@ impl<S: SessionIds> RelayCore<S> {
             client: route.client,
             target: route.target.clone(),
             certificate: route.certificate.clone(),
+            client_v2: route.client_v2,
         };
         if let Some(back) = self.routes.get_mut(&(peer, peer_stream)) {
             back.state = StreamState::Open;
@@ -755,12 +890,13 @@ impl<S: SessionIds> RelayCore<S> {
                 continue;
             };
             let peer = c.peer;
+            let hybrid = c.hybrid;
             // Is the saved credential still valid with the new policy? (denylist, CA still
-            // pinned per key, maximum lifetime, role.)
+            // pinned per key, maximum lifetime, role, v2 pin.)
             let (keeps, credential) = match &c.role {
                 Role::Agent { node, .. } => (
                     matches!(
-                        self.policy.admit(&peer, None, now),
+                        self.policy.admit_hybrid(&peer, hybrid.as_ref(), None, now),
                         Ok(Admission::Agent { node: current }) if current == node
                     ),
                     None,
@@ -768,7 +904,7 @@ impl<S: SessionIds> RelayCore<S> {
                 Role::Client { credential } => match credential {
                     ClientCredential::Key => (
                         matches!(
-                            self.policy.admit(&peer, None, now),
+                            self.policy.admit_hybrid(&peer, hybrid.as_ref(), None, now),
                             Ok(Admission::Client {
                                 credential: ClientCredential::Key
                             })
@@ -780,7 +916,10 @@ impl<S: SessionIds> RelayCore<S> {
                     // to the `Key` credential and its permissions, even if they are narrower than
                     // the certificate's.
                     ClientCredential::Certificate(claims) => {
-                        match self.policy.admit(&peer, Some(claims), now) {
+                        match self
+                            .policy
+                            .admit_hybrid(&peer, hybrid.as_ref(), Some(claims), now)
+                        {
                             Ok(Admission::Client { credential }) => (true, Some(credential)),
                             _ => (false, Some(credential.clone())),
                         }

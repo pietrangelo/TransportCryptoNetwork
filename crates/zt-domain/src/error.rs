@@ -63,6 +63,21 @@ pub enum DomainError {
     /// Unknown close code.
     #[error("unknown close reason code {0:#04x}")]
     UnknownCloseReason(u8),
+    /// A v2 pin (PQ-AUTH) for a key that has no role.
+    #[error("peer {0} has no entry to pin a v2 identity to")]
+    UnknownPeer(crate::Fingerprint),
+    /// A fingerprint v2 in the key denylist (finding AP-6): the unit of revocation is the
+    /// X25519-level identity, so the entry would match nothing. The text is never echoed.
+    #[error(
+        "a SHA256v2 fingerprint cannot be revoked: list the tcn-pub-v2 key or its SHA256 (v1) fingerprint"
+    )]
+    HybridFingerprintNotRevocable,
+    /// `require_hybrid_identity` (PQ-AUTH, finding A12-1) names a role that has an entry
+    /// without a v2 pin: that peer would be authenticated only classically.
+    #[error(
+        "peer {0} has no v2 identity (tcn-pub-v2 key or tcn-pin-v2 pin), but its role requires one"
+    )]
+    HybridIdentityRequired(crate::Fingerprint),
     /// The same key appears twice in the policy.
     #[error("peer {0} appears more than once in the access policy")]
     DuplicatePeer(crate::Fingerprint),

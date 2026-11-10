@@ -9,21 +9,25 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
+use zt_application::efficiency::WindowTuner;
 use zt_crypto::noise::{TAG_LEN, Transport};
 use zt_domain::flow::{INITIAL_WINDOW, MAX_WINDOW, MIN_CHARGE, MIN_WINDOW_UPDATE, Window, charge};
 use zt_domain::{CloseReason, Credit, Frame, FramePayload, StreamId};
 
+use crate::budget::Reservation;
+use crate::metrics::Traffic;
 use crate::{NetError, Timeouts};
-
-/// Plaintext of the first end-to-end transport message, sent by the client to prove that it
-/// completed the handshake (a relay replaying message 1 cannot produce it).
-pub(crate) const CONFIRM: &[u8] = b"TCN/1 ready";
 
 /// Local bytes read for each `Data`.
 pub(crate) const CHUNK: usize = 16 * 1024;
 
-/// Credit is returned once at least this much has been consumed.
+/// Credit is returned once at least this much has been consumed (during the handshake, before
+/// the window tuner takes over).
 const UPDATE_THRESHOLD: u32 = INITIAL_WINDOW / 4;
+
+/// The bytes a queued `Data` frame stands for when estimating a backlog.
+const FRAME_ESTIMATE: u32 = 16 * 1024 + 16;
+const _: () = assert!(FRAME_ESTIMATE as usize == CHUNK + TAG_LEN);
 
 /// Frames queued for a stream: the most a well-behaved peer can send within the credit.
 pub(crate) const STREAM_QUEUE: usize = {
@@ -48,13 +52,20 @@ pub(crate) struct StreamIo {
     recv: Window,
     /// Bytes delivered and not yet returned as credit.
     consumed: u32,
+    /// The receive window, reserved from the byte budget (R-6); `None` until the peer is
+    /// authenticated on the agent (review 0013, A13-2), and then without growth.
+    window: Option<Reservation>,
 }
 
 impl StreamIo {
+    /// `window` holds the initial receive window, reserved from the byte budget; the agent
+    /// passes `None` and reserves it with [`Self::hold_window`] once the client is
+    /// authenticated.
     pub(crate) fn new(
         stream: StreamId,
         rx: mpsc::Receiver<Frame>,
         tx: mpsc::Sender<Frame>,
+        window: Option<Reservation>,
     ) -> Self {
         Self {
             stream,
@@ -63,7 +74,13 @@ impl StreamIo {
             send: Window::initial(),
             recv: Window::initial(),
             consumed: 0,
+            window,
         }
+    }
+
+    /// The initial receive window, reserved from the byte budget after authentication.
+    pub(crate) fn hold_window(&mut self, window: Reservation) {
+        self.window = Some(window);
     }
 
     pub(crate) async fn send_frame(&self, frame: Frame) -> Result<(), NetError> {
@@ -176,6 +193,7 @@ pub(crate) async fn pump<L>(
     transport: Transport,
     local: L,
     local_write: Option<std::time::Duration>,
+    traffic: Traffic<'_>,
 ) -> Result<(), NetError>
 where
     L: AsyncRead + AsyncWrite + Unpin,
@@ -187,6 +205,7 @@ where
         send,
         recv,
         consumed,
+        window,
     } = io;
     let credit = Semaphore::new(usize::try_from(send.available()).unwrap_or(0));
     let transport = Mutex::new(transport);
@@ -199,8 +218,17 @@ where
         consumed,
         credit: &credit,
         transport: &transport,
+        delivered: traffic.to_local,
+        tuning: Tuning {
+            tuner: WindowTuner::new(),
+            window,
+            starved: false,
+            min_queued: usize::MAX,
+            grows: traffic.window_grows,
+            refusals: traffic.window_refusals,
+        },
     };
-    let up = uplink(stream, reader, &tx, &credit, &transport);
+    let up = uplink(stream, reader, &tx, &credit, &transport, traffic.from_local);
     let result = tokio::select! {
         r = up => r,
         r = down.run(&mut writer, local_write) => r,
@@ -231,6 +259,7 @@ async fn uplink<R: AsyncRead + Unpin>(
     tx: &mpsc::Sender<Frame>,
     credit: &Semaphore,
     transport: &Mutex<Transport>,
+    read: &crate::metrics::Counter,
 ) -> Result<(), NetError> {
     let mut buf = vec![0_u8; CHUNK];
     loop {
@@ -258,6 +287,7 @@ async fn uplink<R: AsyncRead + Unpin>(
                 .await;
             return Ok(());
         }
+        read.add(u64::try_from(n).unwrap_or(u64::MAX));
         let chunk = buf.get(..n).ok_or(NetError::Protocol("read overflow"))?;
         let ciphertext = lock(transport)?.encrypt(chunk)?;
         // Only this direction consumes credit: the permits are already available.
@@ -283,6 +313,68 @@ struct Downlink<'a> {
     consumed: u32,
     credit: &'a Semaphore,
     transport: &'a Mutex<Transport>,
+    /// Plaintext bytes written to the local side.
+    delivered: &'a crate::metrics::Counter,
+    tuning: Tuning<'a>,
+}
+
+/// Receive-window auto-tuning inside the byte budget (R6-E4).
+struct Tuning<'a> {
+    tuner: WindowTuner,
+    /// The reservation the window grows in; none: the window never grows.
+    window: Option<Reservation>,
+    /// The receiver waited on an empty queue since the last `WindowUpdate`: it keeps up, the
+    /// sender (or its window) is the bottleneck.
+    starved: bool,
+    /// The fewest frames queued at a receive since the last `WindowUpdate`.
+    min_queued: usize,
+    grows: Option<&'a crate::metrics::Counter>,
+    refusals: Option<&'a crate::metrics::Counter>,
+}
+
+impl Tuning<'_> {
+    /// Notes the queue before a receive.
+    fn before_recv(&mut self, queued: usize) {
+        if queued == 0 {
+            self.starved = true;
+        }
+        self.min_queued = self.min_queued.min(queued);
+    }
+
+    /// The growth of the window to grant with the next `WindowUpdate` (0 if none), taken from
+    /// the byte budget.
+    fn growth(&mut self) -> u32 {
+        let backlog = if self.starved {
+            0
+        } else {
+            u32::try_from(self.min_queued)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(FRAME_ESTIMATE)
+        };
+        self.starved = false;
+        self.min_queued = usize::MAX;
+        let wanted = self.tuner.wants_growth(backlog);
+        if wanted == 0 {
+            return 0;
+        }
+        if self
+            .window
+            .as_mut()
+            .is_some_and(|w| w.try_grow(usize::try_from(wanted).unwrap_or(usize::MAX)))
+        {
+            self.tuner.grew(wanted);
+            if let Some(c) = self.grows {
+                c.inc();
+            }
+            wanted
+        } else {
+            self.tuner.refused();
+            if let Some(c) = self.refusals {
+                c.inc();
+            }
+            0
+        }
+    }
 }
 
 impl Downlink<'_> {
@@ -292,6 +384,7 @@ impl Downlink<'_> {
         local_write: Option<std::time::Duration>,
     ) -> Result<(), NetError> {
         loop {
+            self.tuning.before_recv(self.rx.len());
             match self.rx.recv().await {
                 None
                 | Some(Frame::Close {
@@ -317,11 +410,18 @@ impl Downlink<'_> {
                             .map_err(|_| NetError::Timeout("local write"))??,
                         None => write.await?,
                     }
-                    self.consumed = self.consumed.saturating_add(charge(payload.len()));
-                    if self.consumed >= UPDATE_THRESHOLD {
-                        let credit = Credit::try_from(self.consumed)
+                    self.delivered
+                        .add(u64::try_from(plaintext.len()).unwrap_or(u64::MAX));
+                    let cost = charge(payload.len());
+                    self.tuning.tuner.on_delivered(cost);
+                    self.consumed = self.consumed.saturating_add(cost);
+                    if self.consumed >= self.tuning.tuner.update_threshold() {
+                        // The consumed bytes come back, plus the growth of the window if the
+                        // tuner asks for one and the budget has room for it.
+                        let granted = self.consumed.saturating_add(self.tuning.growth());
+                        let credit = Credit::try_from(granted)
                             .map_err(|_| NetError::Protocol("zero credit"))?;
-                        self.recv.grant(self.consumed).map_err(NetError::Protocol)?;
+                        self.recv.grant(granted).map_err(NetError::Protocol)?;
                         self.consumed = 0;
                         self.tx
                             .send(Frame::WindowUpdate {

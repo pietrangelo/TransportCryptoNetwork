@@ -64,6 +64,7 @@ fn ca(b: u8) -> TrustedCaKey {
     TrustedCaKey {
         key: CertKey::from_bytes([b; 32]),
         fingerprint: fp(b),
+        composite: None,
     }
 }
 
@@ -395,8 +396,13 @@ fn an_empty_effective_scope_admits_but_grants_nothing() {
 fn rotations_pending_lists_authorities_with_two_keys() {
     let mut t = CertTrust::new();
     let (new, old) = (ca(0xb1), ca(0xb2));
-    t.add_authority(node("web-ca"), &[new, old], only(&["web-01"]), EIGHT_HOURS)
-        .unwrap();
+    t.add_authority(
+        node("web-ca"),
+        &[new.clone(), old.clone()],
+        only(&["web-01"]),
+        EIGHT_HOURS,
+    )
+    .unwrap();
     t.add_authority(node("db-ca"), &[ca(DB_CA)], only(&["db-01"]), EIGHT_HOURS)
         .unwrap();
     t.set_revocations(revocations(&[], &[]));
