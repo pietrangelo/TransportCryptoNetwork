@@ -1093,3 +1093,65 @@ fn the_relay_logs_its_profile_and_classical_paths_at_startup_and_on_reload() {
         "a classical path under the profile"
     );
 }
+
+/// Finding A15-4: the pre-restart `check` is given exactly the arguments of `ExecStart=`
+/// (`run`'s own options included), so a typo or an out-of-range value in them fails the check
+/// instead of a restart loop. `check` and `run` agree on every case.
+#[test]
+fn check_takes_the_options_of_run_and_agrees_with_it() {
+    let cases: [(&str, &[&str], bool); 5] = [
+        ("none", &[], true),
+        (
+            "every-run-option",
+            &[
+                "--drain-timeout",
+                "120",
+                "--metrics-interval",
+                "30",
+                "--queue-budget-mib",
+                "64",
+            ],
+            true,
+        ),
+        ("drain-out-of-range", &["--drain-timeout", "99999"], false),
+        ("typo", &["--drain-timout", "120"], false),
+        ("budget-out-of-range", &["--queue-budget-mib", "8"], false),
+    ];
+    for (name, extra, valid) in cases {
+        let dir = setup(&format!("run-options-{name}"));
+        let check = command(&dir, "check").args(extra).output().unwrap();
+        assert_eq!(check.status.success(), valid, "{name}: {}", text(&check));
+        let run = startup_code(&dir, extra);
+        assert_eq!(check.status.code(), run, "{name}: check {}", text(&check));
+    }
+}
+
+/// Finding A15-5: `check` prints the descriptors the configured pools need, by the formula
+/// of the startup `fd_limit_low` warning, so that a deployment can compare it with the unit's
+/// `LimitNOFILE=` before it restarts the relay.
+#[test]
+fn check_prints_the_descriptor_need() {
+    let cases = [
+        ("", "descriptors_needed = 9280"),
+        (
+            "[admission]\nmax_preauth = 4096\nmax_established = 60000\n",
+            "descriptors_needed = 64160",
+        ),
+        (
+            "[proxy_protocol]\ntrusted = [\"192.0.2.0/24\"]\n",
+            "descriptors_needed = 10304",
+        ),
+    ];
+    for (i, (toml, want)) in cases.into_iter().enumerate() {
+        let dir = setup(&format!("descriptors-{i}"));
+        write(&dir.0, "relay.toml", toml);
+        let out = command(&dir, "check")
+            .arg("--config")
+            .arg(dir.0.join("relay.toml"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{i}: {}", text(&out));
+        assert!(stdout.lines().any(|l| l == want), "{i}: {stdout}");
+    }
+}

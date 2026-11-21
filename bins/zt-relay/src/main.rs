@@ -86,16 +86,8 @@ enum Command {
     Run {
         #[command(flatten)]
         args: RelayArgs,
-        /// On `SIGTERM`, how long the open sessions may go on (seconds, 1 to 3600) before
-        /// they are closed with `Close Drained`. Keep it below the unit's `TimeoutStopSec`.
-        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        drain_timeout: u64,
-        /// Where the reload state for `reload` is published. Default: `$RUNTIME_DIRECTORY`
-        /// (systemd's `RuntimeDirectory=`); without either, `reload` cannot be used.
-        #[arg(long)]
-        runtime_dir: Option<PathBuf>,
         #[command(flatten)]
-        metrics: MetricsArgs,
+        run: RunArgs,
     },
     /// Prints the metrics file the running relay writes (R-5): its age and every value.
     /// Exit 0 if fresh, 1 if missing or invalid, 2 if stale (older than three intervals).
@@ -105,11 +97,17 @@ enum Command {
         metrics_file: PathBuf,
     },
     /// Validates every file `run` loads at startup, with the same options and the same code,
-    /// and prints their SHA-256; exits 78 on an invalid file, 1 on a missing or unreadable one.
-    /// A pre-flight before a restart; `systemctl reload` uses `reload`.
+    /// and prints their SHA-256 and the descriptors the configured pools need
+    /// (`descriptors_needed = N`, to compare with `LimitNOFILE=`); exits 78 on an invalid file,
+    /// 1 on a missing or unreadable one. It takes every option of `run`, so a pre-flight before
+    /// a restart can be given exactly the arguments of `ExecStart=` (finding A15-4); `systemctl
+    /// reload` uses `reload`.
     Check {
         #[command(flatten)]
         args: RelayArgs,
+        /// Options of `run` only: validated as `run` validates them, otherwise unused.
+        #[command(flatten)]
+        run: RunArgs,
     },
     /// Asks the running relay to reload (`SIGHUP`) and reports its outcome: exit 0 if the
     /// relay applied the policy (warnings, e.g. a key file it could not reload, on stderr), 78
@@ -126,6 +124,21 @@ enum Command {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
         timeout: u64,
     },
+}
+
+/// The options of `run` beyond the files (also accepted, and validated, by `check`).
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// On `SIGTERM`, how long the open sessions may go on (seconds, 1 to 3600) before
+    /// they are closed with `Close Drained`. Keep it below the unit's `TimeoutStopSec`.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    drain_timeout: u64,
+    /// Where the reload state for `reload` is published. Default: `$RUNTIME_DIRECTORY`
+    /// (systemd's `RuntimeDirectory=`); without either, `reload` cannot be used.
+    #[arg(long)]
+    runtime_dir: Option<PathBuf>,
+    #[command(flatten)]
+    metrics: MetricsArgs,
 }
 
 /// Where and how often the metrics textfile is written (R-5, OPERATIONS §17), and the byte
@@ -375,17 +388,12 @@ fn run(command: Command) -> Result<(), Failure> {
             )
             .map_err(runtime_error)
         }
-        Command::Check { args } => check(&args),
-        Command::Run {
+        Command::Check { args, run: _ } => check(&args),
+        Command::Run { args, run } => serve(
             args,
-            drain_timeout,
-            runtime_dir,
-            metrics,
-        } => serve(
-            args,
-            Duration::from_secs(drain_timeout),
-            runtime_dir,
-            metrics,
+            Duration::from_secs(run.drain_timeout),
+            run.runtime_dir,
+            run.metrics,
         ),
         Command::Status { metrics_file } => {
             match metrics::status_command(
@@ -426,6 +434,11 @@ fn check(args: &RelayArgs) -> Result<(), Failure> {
     for line in startup.digests.to_string().split(", ") {
         writeln!(out, "{line}").map_err(runtime_error)?;
     }
+    let needed = lifecycle::descriptors_needed(
+        &startup.settings.admission,
+        startup.settings.proxy_protocol.is_some(),
+    );
+    writeln!(out, "descriptors_needed = {needed}").map_err(runtime_error)?;
     let report = sunset::relay_report(&startup.settings, &startup.policy);
     sunset::write_report(&mut out, startup.settings.pq_only, &report).map_err(runtime_error)
 }

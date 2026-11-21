@@ -66,7 +66,10 @@ every 10 s and reconnects when nothing at all arrived from the relay for 30 s (P
 
 Both services have a `check` subcommand that takes the same options as `run`, loads and
 validates every file `run` loads at startup (through the same code), prints `configuration OK`
-and the SHA-256 of the trust and settings files, and listens on nothing. It is a pre-flight
+and the SHA-256 of the trust and settings files (`zt-relay check` also prints
+`descriptors_needed = N`, see §4.1), and listens on nothing. Options of `run` alone
+(`--drain-timeout`, the metrics options) are validated the same way, so a pre-flight can be given
+exactly the arguments of `ExecStart=`. It is a pre-flight
 before a **restart**. It exits 0; 78 (`EX_CONFIG`) when a file was read and is invalid; 1 when
 a file is missing or unreadable. `run` exits the same way at startup: the units do not restart
 on 78 (an operator must fix the file) and do restart on 1 (provisioning not finished yet, a
@@ -165,7 +168,7 @@ listen_backlog = 4096            # accept queue (128..=65535); the kernel clamps
 
 # Absent by default: no PROXY header is ever parsed. See "Behind a TCP proxy" below.
 # [proxy_protocol]
-# trusted = ["203.0.113.0/24", "2001:db8:100::/48"]   # 1 to 64 prefixes, no /0, no overlap
+# trusted = ["203.0.113.0/24", "2001:db8:100::/48"]   # 1 to 64 prefixes, >= /8 and /16, no overlap
 # header_timeout_secs = 3        # accept -> complete header (1..=10)
 # allow_direct = false           # true: other sources connect without a header (migration)
 ```
@@ -213,7 +216,8 @@ How to size it:
   `max_preauth` with `[proxy_protocol]`). Past the soft `RLIMIT_NOFILE`, `accept` fails with
   `EMFILE` before admission can refuse anything, and everyone waits. At startup the relay
   compares the two and writes a WARN `fd_limit_low` (`limit`, `needed`) when the limit is lower
-  (also the gauges `tcn_relay_fd_limit` and `tcn_relay_fd_needed`); raise `LimitNOFILE=`
+  (also the gauges `tcn_relay_fd_limit` and `tcn_relay_fd_needed`; `zt-relay check` prints the
+  same need as `descriptors_needed = N` before any restart); raise `LimitNOFILE=`
   (16 384 in the shipped unit) or lower the pools. It is a warning, not a refusal: a shell's
   soft limit is often 1024.
 - Accept errors: resource exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) pauses accepting
@@ -228,9 +232,10 @@ would apply to the whole user base at once. With `[proxy_protocol]` the relay re
 PROXY v2 header (PROTOCOL §10.2) on every connection from a `trusted` prefix and admits the
 connection for the address in it; logs name the proxy as `via`. Rules:
 
-- List only the proxies' own prefixes, never a client network. `/0`, host bits set
-  (`10.0.0.1/8`), IPv4-mapped IPv6 prefixes, overlapping or duplicate entries, more than 64
-  entries, `header_timeout_secs` outside 1..=10 and unknown keys stop the relay at startup
+- List only the proxies' own prefixes, never a client network. `/0`, a prefix shorter than
+  `/8` (IPv4) or `/16` (IPv6) (so that no set of entries, such as `0.0.0.0/1` + `128.0.0.0/1`,
+  can trust the whole internet), host bits set (`10.0.0.1/8`), IPv4-mapped IPv6 prefixes,
+  overlapping or duplicate entries, more than 64 entries, `header_timeout_secs` outside 1..=10 and unknown keys stop the relay at startup
   (exit 78); the error names the entry's index, not its text.
 - The proxy must send version 2 (binary). Version 1 (text) is refused: check that your
   provider can emit v2. Its health checks may send a LOCAL header, admitted for the proxy's

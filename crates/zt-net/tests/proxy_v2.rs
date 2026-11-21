@@ -489,10 +489,85 @@ async fn per_source_caps_apply_to_the_real_peer() {
     for _ in 0..51 {
         same.push(send_from(s.relay.addr, PROXY_HOST, &header(real(200))).await);
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The header tasks reach admission in completion order, not in the order they were
+    // opened (finding A15-9): exactly one of the 51, whichever it is, is refused.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while preauth(&s.metrics, "source_limit") < 1.0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(preauth(&s.metrics, "source_limit"), 1.0);
-    let last = same.last_mut().unwrap();
-    assert!(closed_silently(last, Duration::from_millis(500)).await);
+    let mut open = 0;
+    for tcp in &mut same {
+        if still_open(tcp, Duration::from_millis(10)).await {
+            open += 1;
+        }
+    }
+    assert_eq!(open, 50, "exactly one of the 51 must be closed");
+    // The 51 other peers were not charged for it.
+    for tcp in &mut held {
+        assert!(still_open(tcp, Duration::from_millis(5)).await);
+    }
+}
+
+/// A stand-in TCP proxy on 127.0.0.1: every connection it accepts is forwarded to `relay`
+/// from 127.0.0.2 (the trusted proxy), behind a header naming `198.51.100.<n>`, a new `n` per
+/// connection.
+async fn forwarding_proxy(relay: SocketAddr) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut n = 0_u8;
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            n += 1;
+            let host = n;
+            tokio::spawn(async move {
+                let mut upstream = send_from(relay, PROXY_HOST, &header(real(host))).await;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Finding A15-10: the header slot is released once the header is read, not held for the
+/// connection's life. With `max_preauth = 2` (two header slots), three complete sessions
+/// through the proxy stay up together, and a fourth still gets in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_header_slot_is_released_after_the_header() {
+    let client = Arc::new(Identity::generate().unwrap());
+    let agent = Arc::new(Identity::generate().unwrap());
+    let policy = relay_policy(
+        &agent.fingerprint(),
+        &[client.fingerprint()],
+        CertTrust::new(),
+    );
+    let config = proxied_config(true, |a| {
+        a.max_preauth = 2;
+        a.max_pending_per_source = 1;
+        a.max_pending_per_wide = 1;
+    });
+    let metrics = Arc::clone(&config.metrics);
+    let lab = Lab::start_configured(
+        agent,
+        vec![(policy, config)],
+        agent_clients(&[client.fingerprint()], CertTrust::new()),
+    )
+    .await;
+    let mut via_proxy = lab.config(None);
+    via_proxy.relays[0].address = forwarding_proxy(lab.relays[0].addr).await.to_string();
+    let mut sessions = Vec::new();
+    for i in 0..4 {
+        let session = lab.session_with(&client, via_proxy.clone()).await;
+        sessions.push(session.unwrap_or_else(|e| panic!("proxied session {i}: {e}")));
+    }
+    for (app, _task) in &mut sessions {
+        common::assert_alive(app).await;
+    }
+    assert_eq!(failures(&metrics, "pool_full"), 0.0);
 }
 
 /// P-16: what an attacker puts in a header never reaches the logs, even at DEBUG.

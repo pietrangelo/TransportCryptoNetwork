@@ -186,3 +186,35 @@ fn errors_never_echo_the_text() {
     let err = IpPrefix::try_from(format!("{v6}/64").as_str()).unwrap_err();
     assert!(!err.to_string().contains("4242"), "{err}");
 }
+
+/// Finding A15-8: `/0` alone was refused, but complementary halves (`0.0.0.0/1` +
+/// `128.0.0.0/1`, `::/1` + `8000::/1`) trusted every address all the same. A prefix shorter
+/// than /8 (IPv4) or /16 (IPv6) is refused, so 64 prefixes cover at most a quarter of the
+/// IPv4 space and never the whole of either family.
+#[test]
+fn whole_space_through_short_prefixes_is_refused() {
+    for text in [
+        "0.0.0.0/1",
+        "128.0.0.0/1",
+        "0.0.0.0/7",
+        "::/1",
+        "8000::/1",
+        "2000::/3",
+        "fc00::/7",
+        "2001::/15",
+    ] {
+        assert_eq!(
+            IpPrefix::try_from(text).map(|_| ()),
+            Err(PrefixError::TooBroad),
+            "{text}"
+        );
+    }
+    // The shortest accepted lengths.
+    assert_eq!(p("10.0.0.0/8").prefix_len(), 8);
+    assert_eq!(p("2001::/16").prefix_len(), 16);
+    // The largest set that can be built covers a quarter of IPv4 at most.
+    let quarter: Vec<_> = (0..64_u8).map(|i| p(&format!("{i}.0.0.0/8"))).collect();
+    let set = PrefixSet::new(quarter).unwrap();
+    assert!(!set.contains(v4(64, 0, 0, 1)));
+    assert!(!set.contains(v4(203, 0, 113, 1)));
+}

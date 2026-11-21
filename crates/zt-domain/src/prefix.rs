@@ -5,6 +5,11 @@
 //! every address), never an IPv4-mapped IPv6 prefix (written as IPv4 instead, so that one
 //! address has one spelling). A set holds 1 to [`PrefixSet::MAX`] prefixes, none of which
 //! overlaps another.
+//!
+//! A prefix is also never shorter than [`IpPrefix::MIN_V4`] (IPv4) or [`IpPrefix::MIN_V6`]
+//! (IPv6): refusing `/0` alone would let complementary halves (`0.0.0.0/1` + `128.0.0.0/1`)
+//! trust every address all the same (finding A15-8). With these minimums a full set covers at
+//! most 64 /8s, a quarter of the IPv4 space, and a negligible share of the IPv6 space.
 
 use std::net::IpAddr;
 
@@ -23,6 +28,9 @@ pub enum PrefixError {
     /// `/0`: every address would be trusted.
     #[error("a /0 prefix would trust every address")]
     Everything,
+    /// Shorter than /8 (IPv4) or /16 (IPv6): a few such prefixes cover the whole space.
+    #[error("prefix shorter than /8 (IPv4) or /16 (IPv6)")]
+    TooBroad,
     /// Bits set after the prefix length.
     #[error("host bits set after the prefix length")]
     HostBits,
@@ -48,6 +56,11 @@ pub struct IpPrefix {
 }
 
 impl IpPrefix {
+    /// The shortest IPv4 prefix length accepted.
+    pub const MIN_V4: u8 = 8;
+    /// The shortest IPv6 prefix length accepted.
+    pub const MIN_V6: u8 = 16;
+
     /// The network address (host bits clear).
     #[must_use]
     pub const fn addr(&self) -> IpAddr {
@@ -116,13 +129,17 @@ impl TryFrom<&str> for IpPrefix {
         }
         let len: u8 = len.parse().map_err(|_| PrefixError::Syntax)?;
         let addr: IpAddr = addr.parse().map_err(|_| PrefixError::Syntax)?;
-        let (max, clear) = match addr {
-            IpAddr::V4(a) => (32, u32::from(a) & !mask32(len.min(32)) == 0),
+        let (max, min, clear) = match addr {
+            IpAddr::V4(a) => (32, Self::MIN_V4, u32::from(a) & !mask32(len.min(32)) == 0),
             IpAddr::V6(a) => {
                 if a.to_ipv4_mapped().is_some() {
                     return Err(PrefixError::Mapped);
                 }
-                (128, u128::from(a) & !mask128(len.min(128)) == 0)
+                (
+                    128,
+                    Self::MIN_V6,
+                    u128::from(a) & !mask128(len.min(128)) == 0,
+                )
             }
         };
         if len > max {
@@ -130,6 +147,9 @@ impl TryFrom<&str> for IpPrefix {
         }
         if len == 0 {
             return Err(PrefixError::Everything);
+        }
+        if len < min {
+            return Err(PrefixError::TooBroad);
         }
         if !clear {
             return Err(PrefixError::HostBits);
