@@ -979,12 +979,23 @@ impl HeaderPool {
     }
 
     fn try_take(&self) -> Option<HeaderSlot> {
-        let max = self.max;
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then(|| n.saturating_add(1))
-            })
-            .ok()?;
+        // A plain compare-exchange loop: `fetch_update` is deprecated on nightly (renamed
+        // `try_update`, which stable does not have yet), and the fuzz builds use nightly.
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         self.metrics.proxy_header_pending.inc();
         Some(HeaderSlot {
             used: Arc::clone(&self.used),

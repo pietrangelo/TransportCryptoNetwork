@@ -147,10 +147,10 @@ jobs:
       # The binary that ships (static musl), so ExecPaths= and seccomp meet the real thing.
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p zt-relay
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl --target-dir target --manifest-path packaging/tests/host/probe/Cargo.toml
-      - run: pipx install ansible-core==2.22.0 && pipx install ansible-lint==26.11.0
+      - run: pipx install --force ansible-core==2.22.0 && pipx install ansible-lint==26.11.0
       - run: shellcheck -x packaging/tests/host/*.sh deploy/ansible/tests/check.sh
       # Also tests the sysusers file; the ruleset matches on the user it creates.
-      - run: sudo systemd-sysusers packaging/systemd/tcn.sysusers
+      - run: sudo systemd-sysusers "$GITHUB_WORKSPACE/packaging/systemd/tcn.sysusers"
       - run: sudo STRICT=1 APPLY_SYSCTL=1 VERBOSE=1 packaging/tests/host/spec.sh
       # The Ansible role: syntax, lint, renderings, drift, nft -c, zt-relay check, fail-closed
       # verification. The PROXY renderings then feed the attack tests (P-19, P-20).
