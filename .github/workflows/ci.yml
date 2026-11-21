@@ -148,9 +148,10 @@ jobs:
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p zt-relay
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl --target-dir target --manifest-path packaging/tests/host/probe/Cargo.toml
       # Own venv: the runner image ships an ansible-core pipx venv that pipx cannot replace.
+      # ansible-core 2.22 needs Python 3.13; the runner has 3.12.
       - run: |
           python3 -m venv "$RUNNER_TEMP/ansible"
-          "$RUNNER_TEMP/ansible/bin/pip" install --quiet ansible-core==2.22.0 ansible-lint==26.11.0
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet ansible-core==2.21.6 ansible-lint==26.11.0
           echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
       - run: shellcheck -x packaging/tests/host/*.sh deploy/ansible/tests/check.sh
       # Also tests the sysusers file; the ruleset matches on the user it creates.
