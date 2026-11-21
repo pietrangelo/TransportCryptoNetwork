@@ -5,12 +5,17 @@ Standard library only, so it runs on a bare CI runner. Raw sockets need root; ev
 subcommand prints one result line that the shell script asserts on.
 
     pkt.py listen   --addr A --port P [--echo]           TCP listener (holds or echoes)
-    pkt.py connect  --dst D --port P [--src S] [--echo]  one connect: connected|echoed|refused|timeout|error:<errno>
+    pkt.py connect  --dst D --port P [--src S] [--sport SP] [--echo] [--hold T]
+                                                         one connect: connected|echoed|refused|timeout|error:<errno>
+                                                         (--sport: bind that source port first; --hold: keep it T s)
     pkt.py hold     --dst D --port P --src S -n N        N concurrent connects, one outcome per line
     pkt.py reload   --dst D --port P --cmd CMD           echo, run CMD, echo again on the same connection
     pkt.py udp      --dst D --port P                     refused (ICMP came back) | timeout
     pkt.py syn      --dst D --dport P (--src S | --src-net CIDR) -n N [--mss M] [--flags S|A]
     pkt.py ping     --dst D --src S -n N                 raw ICMP echo requests
+    pkt.py icmp-error --dst D --src S --inner-src A --inner-dst B --sport P --dport Q --mtu M
+                                                         one "fragmentation needed" (IPv4) or "packet too
+                                                         big" (IPv6) quoting the TCP segment A:P -> B:Q
     pkt.py sniff    --iface I --seconds T --what synack|rst|echo-reply [--dst-net CIDR]
                                                          prints "<total> <unique>" (unique: by port/id)
 """
@@ -105,6 +110,28 @@ def cmd_ping(args):
     print(f"sent {args.n}")
 
 
+def cmd_icmp_error(args):
+    src, dst = ipaddress.ip_address(args.src), ipaddress.ip_address(args.dst)
+    a, b = ipaddress.ip_address(args.inner_src), ipaddress.ip_address(args.inner_dst)
+    # The quoted packet: an IP header and the first 8 bytes of a TCP segment (ports, sequence).
+    inner_tcp = struct.pack("!HHI", args.sport, args.dport, random.getrandbits(32))
+    if src.version == 4:
+        inner = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 1500, 0, 0x4000, 64, socket.IPPROTO_TCP, 0, a.packed, b.packed)
+        inner = inner[:10] + struct.pack("!H", checksum(inner)) + inner[12:]
+        body = struct.pack("!BBHHH", 3, 4, 0, 0, args.mtu) + inner + inner_tcp
+        body = body[:2] + struct.pack("!H", checksum(body)) + body[4:]
+        proto = socket.IPPROTO_ICMP
+    else:
+        inner = struct.pack("!IHBB16s16s", 6 << 28, 1440, socket.IPPROTO_TCP, 64, a.packed, b.packed)
+        body = struct.pack("!BBHI", 2, 0, 0, args.mtu) + inner + inner_tcp
+        pseudo = src.packed + dst.packed + struct.pack("!I3xB", len(body), socket.IPPROTO_ICMPV6)
+        body = body[:2] + struct.pack("!H", checksum(pseudo + body)) + body[4:]
+        proto = socket.IPPROTO_ICMPV6
+    s = raw_socket(dst.version)
+    s.sendto(ip_packet(src, dst, proto, body), (str(dst), 0))
+    print("sent 1")
+
+
 def cmd_sniff(args):
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
     s.bind((args.iface, 0))
@@ -166,8 +193,13 @@ def family(addr):
 def dial(args):
     s = socket.socket(family(args.dst), socket.SOCK_STREAM)
     s.settimeout(args.timeout)
-    if args.src:
-        s.bind((args.src, 0))
+    sport = getattr(args, "sport", None)
+    if sport:
+        # What code inside the relay could do: bind the relay port, then dial.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if args.src or sport:
+        any_addr = "::" if family(args.dst) == socket.AF_INET6 else "0.0.0.0"
+        s.bind((args.src or any_addr, sport or 0))
     s.connect((args.dst, args.port))
     return s
 
@@ -195,7 +227,9 @@ def cmd_connect(args):
         except Exception as exc:  # noqa: BLE001
             print("connected-" + outcome(exc))
     else:
-        print("connected")
+        print("connected", flush=True)
+    if args.hold:
+        time.sleep(args.hold)
     s.close()
 
 
@@ -280,6 +314,8 @@ def main():
         c.add_argument("--echo", action="store_true")
         c.add_argument("-n", type=int, default=1)
         c.add_argument("--cmd", default="true")
+        c.add_argument("--sport", type=int)
+        c.add_argument("--hold", type=float, default=0.0)
     c = sub.add_parser("udp")
     c.add_argument("--dst", required=True)
     c.add_argument("--port", type=int, required=True)
@@ -296,6 +332,14 @@ def main():
     c.add_argument("--dst", required=True)
     c.add_argument("--src", required=True)
     c.add_argument("-n", type=int, default=1)
+    c = sub.add_parser("icmp-error")
+    c.add_argument("--dst", required=True)
+    c.add_argument("--src", required=True)
+    c.add_argument("--inner-src", required=True)
+    c.add_argument("--inner-dst", required=True)
+    c.add_argument("--sport", type=int, required=True)
+    c.add_argument("--dport", type=int, required=True)
+    c.add_argument("--mtu", type=int, default=1280)
     c = sub.add_parser("sniff")
     c.add_argument("--iface", required=True)
     c.add_argument("--seconds", type=float, required=True)
@@ -310,7 +354,7 @@ def main():
         p.error("syn needs --src or --src-net")
     {
         "connect": cmd_connect, "hold": cmd_hold, "reload": cmd_reload, "udp": cmd_udp, "syn": cmd_syn,
-        "ping": cmd_ping, "sniff": cmd_sniff, "listen": cmd_listen,
+        "ping": cmd_ping, "icmp-error": cmd_icmp_error, "sniff": cmd_sniff, "listen": cmd_listen,
     }[args.action](args)
 
 

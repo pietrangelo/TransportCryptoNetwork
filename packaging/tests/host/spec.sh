@@ -193,6 +193,28 @@ EOF
 }
 check "F-8 icmp_errors_are_never_rate_limited" icmp_errors_are_never_rate_limited
 
+rule_order() {
+  # rule_order CHAIN FIRST SECOND: in CHAIN, the first rule whose JSON contains FIRST comes
+  # before the first rule that contains SECOND.
+  python3 - "$work/table.json" "$@" <<'EOF'
+import json, sys
+path, chain, first, second = sys.argv[1:5]
+text = open(path).read()
+items = json.loads(text)["nftables"] if text else []
+rules = [json.dumps(i["rule"]["expr"]) for i in items if "rule" in i and i["rule"]["chain"] == chain]
+a = next((n for n, r in enumerate(rules) if first in r), None)
+b = next((n for n, r in enumerate(rules) if second in r), None)
+print(f"{chain}: {first!r} at rule {a}, {second!r} at rule {b}")
+sys.exit(0 if a is not None and b is not None and a < b else 1)
+EOF
+}
+# A15-2: the relay port is untracked, so an ICMP error about one of its connections is
+# "invalid" to conntrack: it must be accepted before the invalid drop (attacks.sh F-16).
+check "F-16 icmp_errors_come_before_the_invalid_drop (PMTUD)" rule_order input packet-too-big '"invalid"'
+check "F-16 neighbour_discovery_comes_before_the_invalid_drop" rule_order input nd-neighbor-solicit '"invalid"'
+# A15-1: the relay may answer from its port, never open a connection from it (attacks.sh F-9).
+check "F-9 egress_refuses_syns_from_the_relay_port_first" rule_order output '"reject"' '"accept"'
+
 a_ruleset_with_a_missing_user_is_rejected_atomically() {
   # F-12: a broken file (here: a user that does not exist) is refused as a whole, and the
   # table already loaded stays exactly as it was.

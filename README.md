@@ -49,6 +49,13 @@ their relays in order, only before `OpenAck`, within an 8 s overall deadline wit
 confirmed identities so a flood cannot starve legitimate users. Every I/O has a timeout and every
 queue is bounded.
 
+**Hardened relay host.** The relay host ships with a default-drop nftables ruleset (stateless
+relay port with per-source SYN meters, egress lock for the service user, management SSH limited to
+admin ranges), kernel sysctl hardening and a sandboxed systemd unit with memory, task, socket-bind
+and exec limits. Behind an upstream anti-DDoS TCP proxy the relay accepts strict PROXY protocol v2
+headers from trusted ranges only, so per-source admission still sees the real peer. An Ansible role
+deploys all of it with a firewall rollback timer (`docs/RELAY_HARDENING.md`).
+
 **Operations.** Metrics are written to a Prometheus textfile for node_exporter (no metrics port
 anywhere); security events go to the `zt_audit` JSON log, never secrets or payload. Releases are
 static musl binaries with a SLSA attestation and two offline signatures over `SHA256SUMS`
@@ -70,11 +77,14 @@ static musl binaries with a SLSA attestation and two offline signatures over `SH
 | `vendor/snow` | vendored `snow` with the minimal patch for the hybrid suites (`docs/pq-snow.md`) |
 | `docs/PROTOCOL.md` | specification of framing, handshake suites, lifecycle, flow control and certificates |
 | `docs/OPERATIONS.md` | keys, policy, startup, OpenSSH and Ansible, rollouts, metrics, the `pq_only` profile |
+| `docs/RELAY_HARDENING.md` | relay host hardening runbook: firewall, sysctl, sandbox, upstream DDoS, PROXY v2 |
 | `docs/METHODOLOGY.md` | hexagonal DDD, Adversarial TDD, coding rules |
 | `docs/pq-resilience-plan.md` | post-quantum and resilience roadmap, with `docs/analysis/` |
 | `docs/adversary/` | record of the adversary reviews |
 | `fuzz/` | `cargo-fuzz` targets (nightly) |
 | `packaging/systemd/` | systemd units and service user |
+| `packaging/nftables/`, `packaging/sysctl/` | relay host firewall and kernel settings, tested in `packaging/tests/host/` |
+| `deploy/ansible/` | Ansible role and playbook that deploy a hardened relay |
 | `packaging/release/` | offline release signing and verification, pinned key fingerprints |
 
 ## Development

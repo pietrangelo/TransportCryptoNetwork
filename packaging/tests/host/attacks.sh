@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Firewall attack tests of the relay host (docs/analysis/relay-hardening.md §4.3, rows F-1 to
-# F-14): two network namespaces joined by a veth pair, the packaged ruleset loaded in the
-# "relay" one, the namespace-scoped keys of the sysctl file applied there, and small Python
+# F-16; F-15 is in deploy/ansible/tests/check.sh): two network namespaces joined by a veth
+# pair, the packaged ruleset loaded in the "relay" one, the namespace-scoped keys of the sysctl file applied there, and small Python
 # listeners standing in for zt-relay (user tcn, port 7443) and for other services.
 #
 #   sudo packaging/tests/host/attacks.sh
 #   sudo PROXY_RULESET=/path/to/rendered-proxy.nft packaging/tests/host/attacks.sh   # + P-19
+#   sudo PROXY_DIRECT_RULESET=/path/to/rendered-proxy-allow-direct.nft ...           # + P-20
 #
 # Needs root, iproute2, nftables, python3 and the `tcn` user. Nothing outside the two
 # namespaces is touched.
@@ -49,6 +50,9 @@ ax ip link set za0 up
 # has no route at all (an unroutable source).
 rx ip route add 192.0.2.0/24 via "$ATTACKER"
 rx ip route add "$SPOOF_NET" via "$ATTACKER"
+# The spoofed sources that fill the SYN meter (F-3, A15-3): more addresses than the meter holds.
+FILL_NET=100.64.0.0/10
+rx ip route add "$FILL_NET" via "$ATTACKER"
 if has_ipv6; then
   rx ip addr add "$RELAY6/64" dev zr0 nodad
   ax ip addr add "$ATTACKER6/64" dev za0 nodad
@@ -81,6 +85,29 @@ for _ in $(seq 50); do
   if rx ss -ltn | grep -q ":$PORT " && rx ss -ltn | grep -q ':8080 ' && ax ss -ltn | grep -q ':8081 '; then break; fi
   sleep 0.1
 done
+
+# The relay stand-in can be stopped (to free its port) and started again.
+stop_relay_standin() {
+  local p
+  for p in $(ip netns pids "$R"); do
+    if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- "listen --addr 0.0.0.0 --port $PORT --echo"; then
+      kill "$p"
+    fi
+  done
+  for _ in $(seq 50); do
+    rx ss -ltn | grep -q ":$PORT " || return 0
+    sleep 0.1
+  done
+  return 1
+}
+start_relay_standin() {
+  as_tcn python3 "$pkt" listen --addr 0.0.0.0 --port "$PORT" --echo >/dev/null 2>&1 &
+  for _ in $(seq 50); do
+    rx ss -ltn | grep -q ":$PORT " && return 0
+    sleep 0.1
+  done
+  return 1
+}
 
 check "the relay stand-in listens on $PORT as user tcn" bash -c "ip netns exec $R ss -ltnpe | grep ':$PORT ' | grep -q 'uid:$(id -u tcn)'"
 check "the ruleset loads in the relay namespace" load "$ruleset"
@@ -181,6 +208,25 @@ the_relay_user_cannot_dial_out() {
 }
 check "F-9 the_relay_user_cannot_dial_out (loopback, internal network)" the_relay_user_cannot_dial_out
 
+the_relay_user_cannot_dial_out_from_the_relay_port() {
+  # Finding A15-1: SocketBindAllow= lets zt-relay bind its own port, and the output chain lets
+  # that port send. Code running inside the relay can close the listener, bind the port to a
+  # new socket and dial from it: the relay may answer from its port, never open a connection.
+  local ok=0
+  stop_relay_standin || { echo "the stand-in still listens"; return 1; }
+  expect_line refused as_tcn python3 "$pkt" connect --sport "$PORT" --dst 127.0.0.1 --port 8080 || ok=1
+  expect_line refused as_tcn python3 "$pkt" connect --sport "$PORT" --dst "$ATTACKER" --port 8081 || ok=1
+  # Control: without that rule the same dial connects (the rule is what stops it).
+  load "$(without 'zt-relay dial-out' dialout)" || ok=1
+  expect_line connected as_tcn python3 "$pkt" connect --sport "$PORT" --dst "$ATTACKER" --port 8081 || ok=1
+  load "$ruleset" || ok=1
+  start_relay_standin || ok=1
+  # The relay's own replies from that port still flow.
+  expect_line echoed pa connect --dst "$RELAY" --port "$PORT" --echo || ok=1
+  return $ok
+}
+check "F-9 the_relay_user_cannot_dial_out_from_the_relay_port (A15-1)" the_relay_user_cannot_dial_out_from_the_relay_port
+
 # --- F-11 -----------------------------------------------------------------------------------
 a_reload_keeps_established_relay_connections() {
   expect_line "before=echoed reload_rc=0 after=echoed" \
@@ -279,6 +325,96 @@ synack_reflection_is_bounded() {
 }
 check "F-14 synack_reflection_is_bounded" synack_reflection_is_bounded
 
+# --- F-3 (A15-3) ----------------------------------------------------------------------------
+set_elements() {
+  rx nft -j list set inet zt_relay "$1" | python3 -c '
+import json, sys
+print(next(len(i["set"].get("elem", [])) for i in json.load(sys.stdin)["nftables"] if "set" in i))'
+}
+
+a_full_syn_meter_still_bounds_new_sources() {
+  # Finding A15-3: once spoofed sources fill @syn_v4, a new source cannot be added, so it was
+  # not metered at all. Sources the full meter cannot track now share one ceiling.
+  local filled counts unique ok=0
+  rx nft flush set inet zt_relay syn_v4
+  for _ in 1 2 3 4 5 6 7 8; do
+    pa syn --dst "$RELAY" --dport "$PORT" --src-net "$FILL_NET" -n 10000 >/dev/null
+  done
+  filled=$(set_elements syn_v4)
+  sleep 1
+  counts=$(sniff_during 2.5 synack 203.0.113.250/32 -- pa syn --dst "$RELAY" --dport "$PORT" --src 203.0.113.250 -n 5000)
+  unique=${counts#* }
+  echo "meter entries after 80000 spoofed SYNs: $filled (full: 65536)"
+  echo "SYN-ACKs to a new source for 5000 SYNs while the meter is full: $unique (ceiling 1000/s, burst 1000)"
+  [ "$filled" -eq 65536 ] || ok=1
+  [ "$unique" -ge 500 ] && [ "$unique" -le 2500 ] || ok=1
+  rx nft flush set inet zt_relay syn_v4
+  return $ok
+}
+check "F-3 a_full_syn_meter_still_bounds_new_sources (A15-3)" a_full_syn_meter_still_bounds_new_sources
+
+# --- F-16 (A15-2) ---------------------------------------------------------------------------
+# snmp_value FILE KEY: a counter of the relay namespace's /proc/net/snmp (two-line "Icmp:"
+# format) or /proc/net/snmp6 (one "Key value" per line).
+snmp_value() {
+  rx cat "/proc/net/$1" | python3 -c '
+import sys
+key, lines = sys.argv[1], sys.stdin.read().splitlines()
+for i, line in enumerate(lines):
+    if line.split()[:1] == [key]:
+        print(line.split()[1]); break
+    head, _, names = line.partition(":")
+    if names and key.startswith(head) and key[len(head):] in names.split() and i + 1 < len(lines):
+        print(lines[i + 1].split()[names.split().index(key[len(head):]) + 1]); break
+else:
+    print(-1)' "$2"
+}
+
+# pmtu_delta RULESET CLIENT CLIENT_PORT RELAY_ADDR ROUTER FILE KEY: with RULESET loaded and a
+# connection CLIENT:CLIENT_PORT -> relay port open, a router sends "fragmentation needed" /
+# "packet too big" quoting the relay's side of it; prints how many reached the relay's stack.
+pmtu_delta() {
+  local rs=$1 client=$2 cport=$3 relay=$4 router=$5 file=$6 key=$7 before after holder
+  load "$rs" || return 1
+  pa connect --src "$client" --sport "$cport" --dst "$relay" --port "$PORT" --hold 2 >/dev/null &
+  holder=$!
+  sleep 0.5
+  before=$(snmp_value "$file" "$key")
+  pa icmp-error --src "$router" --dst "$relay" --inner-src "$relay" --inner-dst "$client" \
+    --sport "$PORT" --dport "$cport" --mtu 1280 >/dev/null
+  sleep 0.3
+  after=$(snmp_value "$file" "$key")
+  wait "$holder"
+  load "$ruleset"
+  echo $((after - before))
+}
+
+icmp_errors_about_relay_connections_reach_the_relay() {
+  # The relay port is untracked, so conntrack finds no entry for the connection an ICMP error
+  # quotes and classifies the error as invalid; dropping it there breaks path-MTU discovery.
+  local delivered control
+  delivered=$(pmtu_delta "$ruleset" "$LEGIT" 40001 "$RELAY" "$ATTACKER" snmp IcmpInDestUnreachs)
+  # Control: without the ICMP error accept rules the same message is dropped (the counter
+  # measures the firewall, not the sender).
+  control=$(pmtu_delta "$(without 'destination-unreachable' icmperr)" "$LEGIT" 40002 "$RELAY" "$ATTACKER" snmp IcmpInDestUnreachs)
+  echo "fragmentation-needed delivered: $delivered (control without the accept rules: $control)"
+  [ "$delivered" = 1 ] && [ "$control" = 0 ]
+}
+check "F-16 icmp_errors_about_relay_connections_reach_the_relay (PMTUD, A15-2)" icmp_errors_about_relay_connections_reach_the_relay
+
+packet_too_big_about_relay_connections_reaches_the_relay() {
+  local delivered control
+  delivered=$(pmtu_delta "$ruleset" "$ATTACKER6" 40003 "$RELAY6" "$ATTACKER6" snmp6 Icmp6InPktTooBigs)
+  control=$(pmtu_delta "$(without 'packet-too-big' ptb)" "$ATTACKER6" 40004 "$RELAY6" "$ATTACKER6" snmp6 Icmp6InPktTooBigs)
+  echo "packet-too-big delivered: $delivered (control without the accept rule: $control)"
+  [ "$delivered" = 1 ] && [ "$control" = 0 ]
+}
+if has_ipv6; then
+  check "F-16 packet_too_big_about_relay_connections_reaches_the_relay (PMTUD, A15-2)" packet_too_big_about_relay_connections_reaches_the_relay
+else
+  skip "F-16 packet_too_big_about_relay_connections_reaches_the_relay" "no IPv6 in this kernel"
+fi
+
 # --- F-4 ------------------------------------------------------------------------------------
 rotating_addresses_in_a_slash64_share_one_meter() {
   local counts unique ok=0
@@ -311,6 +447,22 @@ if [ -n "${PROXY_RULESET:-}" ]; then
   check "P-19 proxy_mode_drops_non_proxy_sources" proxy_mode_drops_non_proxy_sources
 else
   skip "P-19 proxy_mode_drops_non_proxy_sources" "set PROXY_RULESET to a rendered PROXY-mode ruleset"
+fi
+
+# --- P-20 (PROXY mode with allow_direct, rendered by the Ansible role; A15-6) ---------------
+allow_direct_admits_direct_peers() {
+  # The rendered ruleset trusts LEGIT as a proxy and, during a migration, admits direct peers.
+  local ok=0
+  load "$PROXY_DIRECT_RULESET" || return 1
+  expect_line echoed pa connect --src "$LEGIT" --dst "$RELAY" --port "$PORT" --echo || ok=1
+  expect_line echoed pa connect --src "$ATTACKER" --dst "$RELAY" --port "$PORT" --echo || ok=1
+  load "$ruleset" || ok=1
+  return $ok
+}
+if [ -n "${PROXY_DIRECT_RULESET:-}" ]; then
+  check "P-20 allow_direct_admits_direct_peers (A15-6)" allow_direct_admits_direct_peers
+else
+  skip "P-20 allow_direct_admits_direct_peers" "set PROXY_DIRECT_RULESET to a rendered allow_direct ruleset"
 fi
 
 summary

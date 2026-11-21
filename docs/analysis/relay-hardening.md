@@ -453,7 +453,7 @@ secure path the easy one and must never weaken verification:
 | `crates/zt-domain/src/prefix.rs` | `IpPrefix` value object (validated CIDR) |
 | `crates/zt-net/src/{relay,net,config,budget,metrics}.rs`, `bins/zt-relay/src/main.rs` | integration |
 | `fuzz/fuzz_targets/proxy_v2.rs` | new fuzz target (CI matrix) |
-| `docs/adversary/0015-relay-hardening.md` | step 5 review, at the end |
+| `docs/adversary/0015-relay-host-hardening.md` | step 5 review, at the end |
 
 ### 3.2 systemd unit
 
@@ -722,7 +722,7 @@ names are proposals, to be committed RED before the implementation.
 ## 5. Priorities: this PR versus later
 
 Commit order follows METHODOLOGY: RED spec tests, RED attack tests, then implementation,
-then the review `docs/adversary/0015-relay-hardening.md`.
+then the review `docs/adversary/0015-relay-host-hardening.md`.
 
 **In scope (this PR)**, in priority order:
 
