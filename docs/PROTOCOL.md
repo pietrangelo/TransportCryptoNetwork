@@ -572,6 +572,8 @@ Consequences:
   /64s in different /48s), or 11 IPv6 /48s, each holding its slots for the 5 s of
   `msg1_deadline` at a time. An operator who expects such an attacker raises `max_preauth` or
   lowers the caps (OPERATIONS §4.1).
+- Behind a TCP proxy every connection has the proxy's address: the caps apply to the real peer
+  only with PROXY protocol v2 (§10.2).
 - The /48 caps the slots its /64s hold at once, not the handshakes they start: in a burst one
   /48 can start up to `wide_burst` × `source_burst` (4 096) unconfirmed handshakes over time,
   at most 100 at once.
@@ -591,6 +593,60 @@ Consequences:
   `<event>_repeated{peer, …, count}` line per identity and interval. At most 256 identities are
   logged per interval; beyond them the events are only counted (`suppressed_identities` in
   `preauth_summary`).
+
+### 10.2 PROXY protocol v2 in front of the relay
+
+A relay behind a TCP proxy or scrubbing service sees every connection come from the proxy. To
+keep per-source admission (§10.1) meaningful, the relay accepts the **binary PROXY protocol
+version 2** from proxies listed in `relay.toml` `[proxy_protocol] trusted` (OPERATIONS §4.1).
+Without that section no header is ever parsed: the relay behaves exactly as before. Version 1
+(text) is not supported.
+
+```text
+accept ─ source in trusted? ─yes─▶ header pool slot ─ header within header_timeout ─▶ §10.1 for the
+   │                                (max_preauth)     (16 bytes, then exactly len)     header's source
+   │no
+   ├─ allow_direct = true ─▶ §10.1 for the TCP source (no header parsed)
+   └─ allow_direct = false ─▶ closed at once (untrusted)
+```
+
+The header a trusted proxy sends first:
+
+| Bytes | Content | Accepted |
+| :- | :- | :- |
+| 0-11 | signature `0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A` | exactly; anything else (no header, a v1 header) closes the connection |
+| 12 | version (high nibble), command (low nibble) | version 2; command LOCAL (0) or PROXY (1) |
+| 13 | address family and transport | `0x11` TCP/IPv4, `0x21` TCP/IPv6; `0x00` UNSPEC with LOCAL only |
+| 14-15 | body length, big-endian | at least the address block (12 for IPv4, 36 for IPv6), at most 512 |
+| 16- | source address, destination address, source port, destination port, then TLVs | see below |
+
+- The relay reads exactly the 16 fixed bytes, checks them, then reads exactly the declared body:
+  a length over 512 is refused before any body byte is read, and message 1, which may arrive
+  in the same segment, is never consumed.
+- **PROXY**: the source address and port are the peer for admission, logs and metrics; the
+  destination is ignored. An IPv4-mapped IPv6 source is the IPv4 address it maps (same
+  admission key as a direct IPv4 peer). An unspecified, multicast or broadcast source closes
+  the connection.
+- **LOCAL** (a proxy's health check): the body is ignored whole, and the connection is admitted
+  for the proxy's own address.
+- **TLVs** (type u8, length u16 big-endian, value) must tile the rest of the body exactly; a TLV
+  that runs past the body or a partial TLV at the end closes the connection. Their values are
+  ignored: no TLS, CRC32C or unique-id semantics.
+- Connections from trusted proxies hold a slot of a **header pool** of `max_preauth` slots
+  (separate from admission, since the peer is not known yet) until the header is complete, at
+  most `header_timeout` from accept. A full pool closes new ones. Then the header slot is
+  released and §10.1 applies unchanged, so a connection holds a slot for at most
+  `header_timeout` + `handshake_timeout` + `first_frame_deadline`. A draining relay closes
+  connections still in the header phase at once.
+- Every failure closes the connection without a reply and is counted in
+  `tcn_relay_proxy_header_failures_total{reason}` (`signature`, `version`, `command`,
+  `family`, `length`, `address`, `tlv`, `timeout`, `aborted`, `untrusted`, `pool_full`,
+  `draining`); no received byte is ever logged.
+- Trust is narrow: everything after the header is the usual end-to-end authenticated protocol,
+  so a proxy (or a forged header from a trusted address) can only change which source address
+  admission and logs see, never who authenticates or what a session carries. A header from an
+  untrusted source is never parsed: with `allow_direct = true` it is just an invalid message 1
+  charged to the real TCP source.
 
 ## 11. The client as `ProxyCommand`
 
