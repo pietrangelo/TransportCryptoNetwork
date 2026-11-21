@@ -126,6 +126,34 @@ jobs:
           VERBOSE=1 packaging/release/tests/spec.sh
           VERBOSE=1 packaging/release/tests/attacks.sh
 
+  host-hardening:
+    # The relay host (docs/analysis/relay-hardening.md §3.7): the unit's exposure score and
+    # sandbox, the nftables ruleset through the kernel, the sysctl file, firewall attacks in
+    # network namespaces, and the shipped unit at run time with a sandbox probe. The runner is
+    # ephemeral: the job applies the sysctl file and loads the ruleset on it.
+    name: host-hardening
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97.0"
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools nftables iproute2 shellcheck
+      # The binary that ships (static musl), so ExecPaths= and seccomp meet the real thing.
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p zt-relay
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl --target-dir target --manifest-path packaging/tests/host/probe/Cargo.toml
+      - run: shellcheck -x packaging/tests/host/*.sh
+      # Also tests the sysusers file; the ruleset matches on the user it creates.
+      - run: sudo systemd-sysusers packaging/systemd/tcn.sysusers
+      - run: sudo STRICT=1 APPLY_SYSCTL=1 VERBOSE=1 packaging/tests/host/spec.sh
+      - run: sudo STRICT=1 packaging/tests/host/attacks.sh
+      - run: sudo STRICT=1 LOAD_HOST_RULESET=1 packaging/tests/host/systemd-e2e.sh
+
   deny:
     # Supply chain: RustSec advisories, allowed licences, sources only from crates.io.
     name: deny
