@@ -318,6 +318,20 @@ the_required_values_are_set() {
 }
 check "the_required_values_are_set (relay-hardening.md §2(d))" the_required_values_are_set
 
+forwarding_is_set_before_the_conf_keys() {
+  # Writing ip_forward / conf.all.forwarding resets the conf.* keys to their defaults: on a host
+  # that had forwarding on (a CI runner with Docker), a later write undid accept_redirects=0.
+  local last_fwd first_conf
+  last_fwd=$(sysctl_entries | grep -nE '^-?net\.(ipv4\.ip_forward|ipv6\.conf\.all\.forwarding)=' | tail -n1 | cut -d: -f1)
+  first_conf=$(sysctl_entries | grep -nE '^-?net\.ipv[46]\.conf\.' | grep -v forwarding | head -n1 | cut -d: -f1)
+  if [ -n "$last_fwd" ] && [ -n "$first_conf" ] && [ "$last_fwd" -lt "$first_conf" ]; then
+    return 0
+  fi
+  echo "forwarding at line ${last_fwd:-none}, first conf.* key at line ${first_conf:-none}"
+  return 1
+}
+check "forwarding_is_set_before_the_conf_keys" forwarding_is_set_before_the_conf_keys
+
 if [ -n "${APPLY_SYSCTL:-}" ]; then
   applied_values_read_back() {
     # Ephemeral runner only: apply the file the way the host would at boot, read back.
