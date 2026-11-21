@@ -83,9 +83,13 @@ without() {
   printf '%s' "$out"
 }
 
+# The relay stand-in is dual-stack where the kernel has IPv6 (F-4 and F-16 reach it over IPv6).
+standin_addr=0.0.0.0
+if has_ipv6; then standin_addr=::; fi
+
 # Listeners: the relay (user tcn, echo) on the relay port, root services on 22 and 8080, and a
 # service on the attacker side that a compromised relay might dial.
-as_tcn python3 "$pkt" listen --addr 0.0.0.0 --port "$PORT" --echo >/dev/null 2>&1 &
+as_tcn python3 "$pkt" listen --addr "$standin_addr" --port "$PORT" --echo >/dev/null 2>&1 &
 rx python3 "$pkt" listen --addr 0.0.0.0 --port 22 >/dev/null 2>&1 &
 rx python3 "$pkt" listen --addr 0.0.0.0 --port 8080 >/dev/null 2>&1 &
 ax python3 "$pkt" listen --addr 0.0.0.0 --port 8081 >/dev/null 2>&1 &
@@ -98,7 +102,7 @@ done
 stop_relay_standin() {
   local p
   for p in $(ip netns pids "$R"); do
-    if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- "listen --addr 0.0.0.0 --port $PORT --echo"; then
+    if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- "listen --addr $standin_addr --port $PORT --echo"; then
       kill "$p"
     fi
   done
@@ -109,7 +113,7 @@ stop_relay_standin() {
   return 1
 }
 start_relay_standin() {
-  as_tcn python3 "$pkt" listen --addr 0.0.0.0 --port "$PORT" --echo >/dev/null 2>&1 &
+  as_tcn python3 "$pkt" listen --addr "$standin_addr" --port "$PORT" --echo >/dev/null 2>&1 &
   for _ in $(seq 50); do
     rx ss -ltn | grep -q ":$PORT " && return 0
     sleep 0.1

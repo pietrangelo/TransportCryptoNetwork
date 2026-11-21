@@ -295,6 +295,9 @@ def serve(conn, echo):
 def cmd_listen(args):
     s = socket.socket(family(args.addr), socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if s.family == socket.AF_INET6:
+        # "::" also accepts IPv4, whatever net.ipv6.bindv6only says.
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
     s.bind((args.addr, args.port))
     s.listen(4096)
     while True:
