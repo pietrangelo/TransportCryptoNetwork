@@ -1,0 +1,31 @@
+---
+# Renders the templates of the zt_relay role with its defaults plus one variant's variables
+# (tests/variants/*.yml, passed as extra vars) into OUT. No host is touched.
+#
+#   ansible-playbook -i localhost, -c local deploy/ansible/tests/render.yml \
+#     -e @deploy/ansible/tests/variants/direct.yml -e out=/tmp/render/direct
+- name: Render the zt_relay templates
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../roles/zt_relay/defaults/main.yml
+    - ../roles/zt_relay/vars/main.yml
+  tasks:
+    - name: Output directory
+      ansible.builtin.file:
+        path: "{{ out }}"
+        state: directory
+        mode: "0755"
+
+    - name: Templates
+      ansible.builtin.template:
+        src: "../roles/zt_relay/templates/{{ item }}.j2"
+        dest: "{{ out }}/{{ item }}"
+        mode: "0644"
+      loop: [zt-relay.nft, 10-ansible.conf, relay.toml]
+
+    - name: The argument vectors of ExecStart= and of the pre-restart check
+      ansible.builtin.copy:
+        content: "{{ {'run': zt_relay__run_argv, 'check': zt_relay__check_argv} | to_nice_json }}\n"
+        dest: "{{ out }}/argv.json"
+        mode: "0644"

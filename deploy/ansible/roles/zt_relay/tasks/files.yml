@@ -1,0 +1,130 @@
+---
+- name: User - sysusers file
+  ansible.builtin.copy:
+    src: "{{ zt_relay_packaging_dir }}/systemd/tcn.sysusers"
+    dest: /usr/lib/sysusers.d/tcn.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: zt_relay__sysusers
+
+- name: User - look up tcn
+  ansible.builtin.getent:
+    database: passwd
+    key: tcn
+    fail_key: false
+
+- name: User - create tcn (systemd-sysusers)
+  ansible.builtin.command:
+    argv: [systemd-sysusers, /usr/lib/sysusers.d/tcn.conf]
+  when: zt_relay__sysusers is changed or not (ansible_facts['getent_passwd']['tcn'] | default(none))
+  changed_when: true
+
+- name: Configuration directory (StrictModes - root 0755)
+  ansible.builtin.file:
+    path: /etc/tcn
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The key is generated on the host and never leaves it: no task reads its content.
+- name: Key - generate on the host
+  ansible.builtin.command:
+    argv: ["{{ zt_relay__binary }}", keygen, --out, /etc/tcn/relay.key]
+    creates: /etc/tcn/relay.key
+  no_log: true
+
+- name: Key - owned by tcn, 0600
+  ansible.builtin.file:
+    path: /etc/tcn/relay.key
+    owner: tcn
+    group: tcn
+    mode: "0600"
+
+- name: Key - public part, for the agents' and clients' configuration
+  ansible.builtin.command:
+    argv: ["{{ zt_relay__binary }}", pubkey, --key, /etc/tcn/relay.key]
+  register: zt_relay__pubkey
+  changed_when: false
+
+- name: Key - publish the public key as a fact
+  ansible.builtin.set_fact:
+    zt_relay_public_key: >-
+      {{ zt_relay__pubkey.stdout_lines | select('match', '^public_key ') | first
+      | regex_replace(zt_relay__pubkey_pattern, '\1') }}
+
+# Staging: the three files are checked together, then each is put in place with `validate:`
+# against the other two, so an invalid file never replaces a good one.
+- name: Staging directory
+  ansible.builtin.file:
+    path: /etc/tcn/staged
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stage the policy
+  ansible.builtin.copy:
+    src: "{{ zt_relay_policy_src }}"
+    dest: /etc/tcn/staged/policy.toml
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Stage the denylist
+  ansible.builtin.copy:
+    src: "{{ zt_relay_revocations_src }}"
+    dest: /etc/tcn/staged/revoked.toml
+    owner: root
+    group: root
+    mode: "0644"
+  when: zt_relay_revocations_src | length > 0
+
+- name: Stage relay.toml
+  ansible.builtin.template:
+    src: relay.toml.j2
+    dest: /etc/tcn/staged/relay.toml
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install relay.toml (validated by zt-relay check)
+  ansible.builtin.copy:
+    src: /etc/tcn/staged/relay.toml
+    dest: /etc/tcn/relay.toml
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+    validate: >-
+      {{ zt_relay__binary }} check --key /etc/tcn/relay.key --policy /etc/tcn/staged/policy.toml
+      --config %s{{ zt_relay__staged_revocations_arg }}
+  notify: Restart zt-relay
+
+- name: Install the denylist (validated by zt-relay check)
+  ansible.builtin.copy:
+    src: /etc/tcn/staged/revoked.toml
+    dest: /etc/tcn/revoked.toml
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+    validate: >-
+      {{ zt_relay__binary }} check --key /etc/tcn/relay.key --policy /etc/tcn/staged/policy.toml
+      --config /etc/tcn/staged/relay.toml --revocations %s
+  when: zt_relay_revocations_src | length > 0
+  notify: Reload zt-relay
+
+- name: Install the policy (validated by zt-relay check)
+  ansible.builtin.copy:
+    src: /etc/tcn/staged/policy.toml
+    dest: /etc/tcn/policy.toml
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+    validate: >-
+      {{ zt_relay__binary }} check --key /etc/tcn/relay.key --policy %s
+      --config /etc/tcn/staged/relay.toml{{ zt_relay__staged_revocations_arg }}
+  notify: Reload zt-relay

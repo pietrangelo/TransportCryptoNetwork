@@ -651,8 +651,10 @@ systemctl daemon-reload && systemctl enable --now zt-relay
 ```
 
 The units run as user `tcn` without capabilities, with a read-only file system, a system call
-filter and addresses restricted to IPv4/IPv6/Unix (`systemd-analyze security`: 1.2,
-"OK"). The permissions required by the binaries are those of OpenSSH's `StrictModes`: key
+filter and addresses restricted to IPv4/IPv6/Unix (`systemd-analyze security`: 1.1 for the
+relay, "OK"). An internet-facing relay host also needs the firewall, kernel settings and
+installation path of [`RELAY_HARDENING.md`](RELAY_HARDENING.md) (Ansible role
+`deploy/ansible/roles/zt_relay`). The permissions required by the binaries are those of OpenSSH's `StrictModes`: key
 `tcn:tcn 0600`, trust files and directories owned by root or by `tcn` and not writable by
 others. For the agent, `/etc/tcn/agent.env` contains `TCN_RELAY`, `TCN_RELAY_KEY` and `TCN_NODE`;
 if the relay's IP is fixed, enable `IPAddressDeny=any` / `IPAddressAllow=` in the unit.

@@ -85,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frame_decoder, noise_responder, noise_initiator, kem_inputs, transport_decrypt, config_parsers, relay_core, cert_decoder, cert_verify, cert_v2_decoder, cert_v2_verify, hybrid_ik, admission]
+        target: [frame_decoder, noise_responder, noise_initiator, kem_inputs, transport_decrypt, config_parsers, relay_core, cert_decoder, cert_verify, cert_v2_decoder, cert_v2_verify, hybrid_ik, admission, proxy_v2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,6 +125,38 @@ jobs:
           export OPENSSL="$RUNNER_TEMP/openssl/bin/openssl"
           VERBOSE=1 packaging/release/tests/spec.sh
           VERBOSE=1 packaging/release/tests/attacks.sh
+
+  host-hardening:
+    # The relay host (docs/analysis/relay-hardening.md §3.7): the unit's exposure score and
+    # sandbox, the nftables ruleset through the kernel, the sysctl file, firewall attacks in
+    # network namespaces, and the shipped unit at run time with a sandbox probe. The runner is
+    # ephemeral: the job applies the sysctl file and loads the ruleset on it.
+    name: host-hardening
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97.0"
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools nftables iproute2 shellcheck
+      # The binary that ships (static musl), so ExecPaths= and seccomp meet the real thing.
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p zt-relay
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl --target-dir target --manifest-path packaging/tests/host/probe/Cargo.toml
+      - run: pipx install ansible-core==2.22.0 && pipx install ansible-lint==26.11.0
+      - run: shellcheck -x packaging/tests/host/*.sh deploy/ansible/tests/check.sh
+      # Also tests the sysusers file; the ruleset matches on the user it creates.
+      - run: sudo systemd-sysusers packaging/systemd/tcn.sysusers
+      - run: sudo STRICT=1 APPLY_SYSCTL=1 VERBOSE=1 packaging/tests/host/spec.sh
+      # The Ansible role: syntax, lint, renderings, drift, nft -c, zt-relay check, fail-closed
+      # verification. The PROXY renderings then feed the attack tests (P-19, P-20).
+      - run: sudo env "PATH=$PATH" STRICT=1 OUT="$RUNNER_TEMP/render" deploy/ansible/tests/check.sh
+      - run: sudo STRICT=1 PROXY_RULESET="$RUNNER_TEMP/render/proxy/zt-relay.nft" PROXY_DIRECT_RULESET="$RUNNER_TEMP/render/proxy-allow-direct/zt-relay.nft" packaging/tests/host/attacks.sh
+      - run: sudo STRICT=1 LOAD_HOST_RULESET=1 packaging/tests/host/systemd-e2e.sh
 
   deny:
     # Supply chain: RustSec advisories, allowed licences, sources only from crates.io.

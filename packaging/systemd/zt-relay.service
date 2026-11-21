@@ -82,7 +82,28 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged
+# Also no io_uring (@aio), kernel keyring or resource controls: tokio uses epoll, and the
+# relay never calls setrlimit, setpriority or sched_setaffinity.
+SystemCallFilter=~@privileged @resources @aio @keyring
+PrivateIPC=yes
+# The relay listens on its port only: no other listener, even after a compromise. Change it
+# together with --listen (a drop-in that changes the port must repeat both) and with
+# RELAY_PORT of the firewall (docs/RELAY_HARDENING.md).
+SocketBindAllow=tcp:7443
+SocketBindDeny=any
+# Nothing but the relay itself may be executed (a dynamically linked build needs its loader
+# and library directories in ExecPaths=; the release binaries are static).
+NoExecPaths=/
+ExecPaths=/usr/local/bin/zt-relay
+# The last resort behind the queue budget (a quarter of the memory limit, OPERATIONS §18):
+# a relay host is dedicated, 20 % stays for sshd, journald and the kernel. Socket buffers are
+# charged to the cgroup too. No swap: keys are never written to it.
+MemoryHigh=70%
+MemoryMax=80%
+MemorySwapMax=0
+# Worker threads (one per core), the small blocking pool and the main thread; bounds a
+# thread or fork bomb.
+TasksMax=512
 UMask=0077
 ReadOnlyPaths=/etc/tcn
 

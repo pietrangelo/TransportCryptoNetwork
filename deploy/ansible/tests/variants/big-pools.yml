@@ -1,0 +1,8 @@
+---
+# Valid for zt-relay check, but the pools need more descriptors (2 x 4096 + 60000 + 64 in PROXY
+# mode would be more still) than LimitNOFILE: the role must refuse it (finding A15-5).
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_toml_extra: |
+  [admission]
+  max_preauth = 4096
+  max_established = 60000

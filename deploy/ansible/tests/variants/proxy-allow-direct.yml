@@ -1,0 +1,7 @@
+---
+# PROXY v2 during a migration (finding A15-6): the proxies send headers and other sources still
+# connect directly, so the firewall and the unit must let both in. The proxy is the one of
+# packaging/tests/host/attacks.sh (P-20).
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_proxy_v4: [198.51.100.3/32]
+zt_relay_proxy_allow_direct: true
