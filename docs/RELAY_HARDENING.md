@@ -22,7 +22,7 @@ installation of the binaries themselves is in [OPERATIONS §9](OPERATIONS.md#9-i
 | Spoofed SYN flood | relay port untracked (conntrack cannot fill), SYN cookies, `tcp_synack_retries=2` | the uplink (§5) |
 | One source opening connections fast | 50 SYN/s, burst 500, per IPv4 address or IPv6 /64, before conntrack; once spoofed sources fill the meter (65 536 entries), the sources it cannot track share 1000 SYN/s, burst 1000 | NATs above that rate retry after 1 s; while the meter is full, new sources compete for the shared ceiling (§4) |
 | Tiny-MSS segments (CVE-2019-11477 class) | SYNs with MSS < 536 dropped, `tcp_min_snd_mss=536` | — |
-| Code execution in `zt-relay` | no `execve` (`NoExecPaths=/`), no other listener (`SocketBindDeny=any`), no dial-out (nftables output rules for user `tcn`: it may answer from the relay port, never send a SYN from it or from anywhere else), no writes, ≤ 512 tasks, memory capped | the key and the policy are readable (they must be): relays need **different** keys (OPERATIONS §8) |
+| Code execution in `zt-relay` | no `execve` (`NoExecPaths=/`), no other listener (`SocketBindDeny=any`, where systemd enforces it: see the notes below), no dial-out (nftables output rules for user `tcn`: it may answer from the relay port, never send a SYN from it or from anywhere else), no writes, ≤ 512 tasks, memory capped | the key and the policy are readable (they must be): relays need **different** keys (OPERATIONS §8) |
 | Handshake floods from many real addresses | the relay's admission (OPERATIONS §4.1) | new sessions refused while `max_preauth` is full; established ones continue. Only §5 helps |
 | Volumetric floods (UDP reflection, Mpps) | nothing on the host can help | §5 |
 
@@ -281,6 +281,9 @@ once the clients use the proxy.
   before `nftables.service`.
 - `SocketBindAllow=`/`SocketBindDeny=` and `IPAddressAllow=` use cgroup BPF and need the
   unified cgroup hierarchy (cgroup v2, the default on current distributions).
+  `SocketBindDeny=` also needs a systemd built with `+BPF_FRAMEWORK` (`systemctl --version`):
+  Ubuntu's packages are built without it and accept the setting silently without enforcing it.
+  There a compromised relay can bind another port, which the firewall still makes unreachable.
 - The ICMP echo meter acts before conntrack's verdict: a ping flood keeps one ICMP identifier,
   so its requests would otherwise count as an established flow.
 - ICMP errors (destination unreachable, packet too big, time exceeded, parameter problem) and
