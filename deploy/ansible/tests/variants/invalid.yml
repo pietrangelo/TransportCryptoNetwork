@@ -1,0 +1,6 @@
+---
+# zt-relay check must refuse this relay.toml (exit 78): an invalid file never goes live.
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_toml_extra: |
+  [admission]
+  max_preauth = 0

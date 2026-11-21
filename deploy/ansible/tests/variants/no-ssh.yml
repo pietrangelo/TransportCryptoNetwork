@@ -1,0 +1,8 @@
+---
+zt_relay_ssh_inbound: false
+zt_relay_reverse_path_filter: false
+zt_relay_forward_chain: false
+zt_relay_listen_address: "[::]"
+zt_relay_port: 8443
+zt_relay_nft_extra_input:
+  - udp dport 546 ip6 saddr fe80::/10 accept comment "DHCPv6"
