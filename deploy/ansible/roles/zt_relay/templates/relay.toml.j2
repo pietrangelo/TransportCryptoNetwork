@@ -1,0 +1,19 @@
+# Managed by Ansible (role zt_relay). Read at startup only (OPERATIONS §4.1): a change restarts
+# the relay, after `zt-relay check` accepted the new file.
+{% if zt_relay_listen_backlog is not none %}
+
+[network]
+listen_backlog = {{ zt_relay_listen_backlog | int }}
+{% endif %}
+{% if zt_relay__proxy_mode %}
+
+[proxy_protocol]
+# Connections from these prefixes must start with a PROXY v2 header (docs/RELAY_HARDENING.md).
+trusted = [{% for p in zt_relay_proxy_v4 + zt_relay_proxy_v6 %}"{{ p }}"{{ ", " if not loop.last else "" }}{% endfor %}]
+header_timeout_secs = {{ zt_relay_proxy_header_timeout_secs | int }}
+allow_direct = {{ zt_relay_proxy_allow_direct | bool | lower }}
+{% endif %}
+{% if zt_relay_toml_extra %}
+
+{{ zt_relay_toml_extra }}
+{% endif %}

@@ -352,3 +352,53 @@ pub fn configuration_loaded(generation: &Generation, files: &crate::config::Dige
     );
     generation
 }
+
+/// The most threads of the relay's blocking pool (only the metrics export uses it): bounds
+/// the threads of the process, so that the unit's `TasksMax=` holds on any core count
+/// (docs/analysis/relay-hardening.md §2(a)-8).
+pub const MAX_BLOCKING_THREADS: usize = 8;
+
+/// The relay's tokio runtime: multi-threaded, every driver enabled, the blocking pool capped at
+/// [`MAX_BLOCKING_THREADS`].
+///
+/// # Errors
+/// The runtime cannot be built.
+pub fn relay_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .build()
+}
+
+/// The file descriptors the relay may need with `admission` (docs/analysis/relay-hardening.md
+/// §2(a)-3): the pre-authentication pool (twice in PROXY mode, for the header pool), the
+/// established pool, and 64 for the listener, the files and the runtime.
+#[must_use]
+pub fn descriptors_needed(
+    admission: &zt_application::admission::AdmissionConfig,
+    proxy_protocol: bool,
+) -> u64 {
+    let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let preauth = as_u64(admission.max_preauth);
+    let headers = if proxy_protocol { preauth } else { 0 };
+    preauth
+        .saturating_add(headers)
+        .saturating_add(as_u64(admission.max_established))
+        .saturating_add(DESCRIPTOR_HEADROOM)
+}
+
+/// The descriptors beyond the pools: the listener, the files, the runtime, stdio.
+const DESCRIPTOR_HEADROOM: u64 = 64;
+
+/// The soft `RLIMIT_NOFILE` of the process (`None`: unlimited or unknown).
+#[must_use]
+pub fn descriptor_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}

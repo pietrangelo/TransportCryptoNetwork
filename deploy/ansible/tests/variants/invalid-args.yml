@@ -1,0 +1,5 @@
+---
+# A valid relay.toml, but an extra `run` argument out of range: the pre-restart check, given
+# exactly the arguments of ExecStart=, must refuse it (finding A15-4).
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_extra_args: [--drain-timeout, "99999"]

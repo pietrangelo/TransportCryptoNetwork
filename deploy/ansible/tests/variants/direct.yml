@@ -1,0 +1,4 @@
+---
+# Must render byte-identical to packaging/nftables/zt-relay.nft (documentation prefixes).
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_admin_v6: ["2001:db8:1::/48"]

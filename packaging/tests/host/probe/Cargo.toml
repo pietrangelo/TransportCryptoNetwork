@@ -1,0 +1,20 @@
+# Sandbox probe of the host-hardening tests (docs/analysis/relay-hardening.md §3.7, rows
+# U-2..U-5, F-9): run under the relay's own unit, it tries what an attacker with code
+# execution inside zt-relay would try and prints one JSON line per attempt. Test-only: never
+# packaged or released. It has no dependencies and is its own workspace, so the relay's
+# workspace, lock file and supply-chain checks are unaffected.
+[package]
+name = "zt-relay-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+strip = true

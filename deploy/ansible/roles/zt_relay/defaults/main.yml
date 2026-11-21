@@ -1,0 +1,96 @@
+---
+# zt_relay: an internet-facing TCN relay host (docs/RELAY_HARDENING.md).
+#
+# Values that must agree are derived from one variable: zt_relay_port renders --listen,
+# SocketBindAllow= and the firewall's RELAY_PORT; zt_relay_run_args renders both ExecStart=
+# and the `zt-relay check` that runs before every restart.
+
+# --- the binary --------------------------------------------------------------------------------
+# How the binary reaches the host. It is always verified on the controller, never by running a
+# zt-* binary, and the role fails closed on anything else:
+#   local:   a binary you verified yourself (OPERATIONS §9); its SHA-256 is required.
+#   release: a downloaded release directory, verified with tcn-release.sh and your pins file.
+zt_relay_binary_source: local
+zt_relay_binary_local_path: ""        # controller path (local)
+zt_relay_binary_sha256: ""            # 64 hex digits (local)
+zt_relay_release_dir: ""              # controller dir with SHA256SUMS, its two .sig, keys/, archives
+zt_relay_release_tag: ""              # vX.Y.Z
+# Your out-of-band copy of the release key fingerprints (never the one from the download).
+zt_relay_release_pins_file: ""
+# The tcn-release.sh you already trust: by default the one of the checkout running this playbook.
+zt_relay_release_tool: "{{ playbook_dir }}/../../../packaging/release/tcn-release.sh"
+zt_relay_openssl: openssl             # OpenSSL >= 3.5 on the controller (SLH-DSA)
+zt_relay_install_dir: /usr/local/bin
+
+# The packaged files (unit, sysusers, sysctl) of the checkout running this playbook.
+zt_relay_packaging_dir: "{{ role_path }}/../../../../packaging"
+
+# --- network -------------------------------------------------------------------------------------
+zt_relay_port: 7443
+# "0.0.0.0" (IPv4) or "[::]" (dual stack with net.ipv6.bindv6only=0).
+zt_relay_listen_address: "0.0.0.0"
+zt_relay_ssh_port: 22
+# Management SSH: only these networks reach the host's SSH port. The role refuses to run with
+# both empty unless zt_relay_ssh_inbound is false (e.g. the host is managed through TCN itself).
+zt_relay_ssh_inbound: true
+zt_relay_admin_v4: []
+zt_relay_admin_v6: []
+zt_relay_ssh_max_per_source: 8
+
+# PROXY protocol v2 mode: a non-empty list puts the relay behind these upstream TCP proxies.
+# The relay port then accepts only them (firewall and IPAddressAllow=), relay.toml trusts them,
+# and the per-source SYN meter is not applied to them (it would throttle every user at once).
+zt_relay_proxy_v4: []
+zt_relay_proxy_v6: []
+zt_relay_proxy_header_timeout_secs: 3
+# A migration: other sources still connect directly (relay.toml allow_direct). The firewall and
+# the unit then admit every source on the relay port, and the SYN meter applies to all but the
+# proxies.
+zt_relay_proxy_allow_direct: false
+
+# Firewall meters (docs/RELAY_HARDENING.md, "Tuning"): new connections per IPv4 address or
+# IPv6 /64, ICMP echo per source.
+zt_relay_syn_rate: 50
+zt_relay_syn_burst: 500
+# The one ceiling shared by the sources a full SYN meter cannot track (a spoofed flood filled
+# it): new connections per second over all of them.
+zt_relay_syn_overflow_rate: 1000
+zt_relay_syn_overflow_burst: 1000
+zt_relay_ping_rate: 5
+zt_relay_ping_burst: 10
+# Strict reverse-path filter in nftables (turn off on multi-homed hosts with asymmetric routes).
+zt_relay_reverse_path_filter: true
+# Drop forwarded traffic (turn off on a host that also runs a container runtime).
+zt_relay_forward_chain: true
+# A zt-agent on the same host also runs as tcn: allow it to dial these relays and local SSH.
+zt_relay_colocated_agent: false
+zt_relay_peer_relays_v4: []
+zt_relay_peer_relays_v6: []
+zt_relay_peer_port: 7443
+# Extra rules for the input chain (complete nft statements), e.g. a provider's DHCPv6.
+zt_relay_nft_extra_input: []
+# Where the distribution's nftables.service reads its ruleset.
+zt_relay_nftables_conf: "{{ '/etc/sysconfig/nftables.conf' if ansible_facts['os_family'] | default('') == 'RedHat' else '/etc/nftables.conf' }}"
+# Seconds after which an applied ruleset is rolled back unless the controller reconnects.
+zt_relay_firewall_rollback_secs: 120
+
+# --- relay.toml and policy -----------------------------------------------------------------------
+# The accept queue (relay.toml [network] listen_backlog, 128..=65535; the kernel clamps it to
+# net.core.somaxconn, 4096 in packaging/sysctl). Unset: the relay's default (4096).
+zt_relay_listen_backlog: null
+# Further relay.toml content, verbatim (e.g. [handshake], [admission], [liveness] tables).
+zt_relay_toml_extra: ""
+# Controller paths of the policy (required) and of the denylist (required when the policy
+# pins a CA). The same policy goes to every relay (OPERATIONS §2).
+zt_relay_policy_src: ""
+zt_relay_revocations_src: ""
+# Extra `run` arguments (e.g. ["--drain-timeout", "120"]): one argument per item, no blanks,
+# quotes, `$`, `%` or `\` (systemd would split or expand them). The pre-restart check gets them too.
+zt_relay_extra_args: []
+# The unit's LimitNOFILE= (16384 in the shipped unit). The role refuses a relay.toml whose pools
+# may need more descriptors (`zt-relay check` prints descriptors_needed).
+zt_relay_limit_nofile: 16384
+
+# --- sysctl ----------------------------------------------------------------------------------------
+# Local overrides written to /etc/sysctl.d/91-zt-relay-local.conf, e.g. {"net.ipv4.conf.all.rp_filter": 2}.
+zt_relay_sysctl_overrides: {}

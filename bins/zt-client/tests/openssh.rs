@@ -332,7 +332,10 @@ async fn ansible_playbook_runs_through_tcn() {
         .arg(d.join("play.yml"))
         .env("ANSIBLE_CONFIG", d.join("ansible.cfg"))
         .env("ANSIBLE_HOME", d.join("ansible-home"))
-        .env("ANSIBLE_NOCOLOR", "1"))
+        .env("ANSIBLE_NOCOLOR", "1")
+        // ansible-core >= 2.22 refuses a non-blocking stdin, which tokio's `output()` would
+        // otherwise inherit from the test runner.
+        .stdin(Stdio::null()))
     .await;
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));

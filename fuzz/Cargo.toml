@@ -111,3 +111,10 @@ path = "fuzz_targets/hybrid_ik.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "proxy_v2"
+path = "fuzz_targets/proxy_v2.rs"
+test = false
+doc = false
+bench = false
