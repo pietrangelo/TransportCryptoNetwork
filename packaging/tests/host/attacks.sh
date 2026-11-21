@@ -15,6 +15,14 @@
 source "$(dirname "$0")/lib.sh"
 need_root
 
+# The `tcn` user runs pkt.py too, and may not read the checkout (a CI runner's home is 0750):
+# it gets a copy in a world-readable directory.
+pkt_dir=$(mktemp -d)
+on_exit "rm -rf '$pkt_dir'"
+install -m 0644 "$pkt" "$pkt_dir/pkt.py"
+chmod 0755 "$pkt_dir"
+pkt="$pkt_dir/pkt.py"
+
 R=zt-relay-ns
 A=zt-attacker-ns
 RELAY=198.51.100.1
