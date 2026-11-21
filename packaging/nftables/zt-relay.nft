@@ -1,0 +1,101 @@
+#!/usr/sbin/nft -f
+# packaging/nftables/zt-relay.nft: host firewall of an internet-facing zt-relay.
+# Loaded atomically (one transaction); only the table inet zt_relay is replaced, other
+# tables (cloud agents, container runtimes) are left alone, but a drop here is final.
+#
+# Manual install (docs/RELAY_HARDENING.md): the user tcn must exist first (systemd-sysusers),
+# put your management networks in admin_v4/admin_v6 (the examples are documentation
+# prefixes), then `nft -c -f` and load it from /etc/nftables.d/ through nftables.service.
+# The Ansible role (deploy/ansible/roles/zt_relay) renders this file from its template; with
+# the example variables of deploy/ansible/tests/render.yml it is identical (checked in CI).
+define RELAY_PORT = 7443
+define SSH_PORT = 22
+
+table inet zt_relay
+delete table inet zt_relay
+
+table inet zt_relay {
+	# Management SSH: only these networks. An empty set means no inbound SSH at all.
+	set admin_v4 { type ipv4_addr; flags interval; elements = { 192.0.2.0/24 } }
+	set admin_v6 { type ipv6_addr; flags interval; elements = { 2001:db8:1::/48 } }
+	# Who may reach the relay port: everyone (direct), or only the upstream proxies (PROXY v2).
+	set relay_src_v4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/0 } }
+	set relay_src_v6 { type ipv6_addr; flags interval; elements = { ::/0 } }
+	# Per-source meters; bounded, so a spoofed flood cannot grow them (a full set adds nobody:
+	# see the "SYN meter full" rules). A SYN meter entry lives 10 s after its source's last SYN,
+	# when its bucket would be full again anyway.
+	set syn_v4 { type ipv4_addr; size 65536; flags dynamic, timeout; timeout 10s; }
+	set syn_v6 { type ipv6_addr; size 65536; flags dynamic, timeout; timeout 10s; }
+	set ping_v4 { type ipv4_addr; size 16384; flags dynamic, timeout; timeout 1m; }
+	set ping_v6 { type ipv6_addr; size 16384; flags dynamic, timeout; timeout 1m; }
+	set ssh_v4 { type ipv4_addr; size 4096; flags dynamic; }
+	set ssh_v6 { type ipv6_addr; size 4096; flags dynamic; }
+
+	# Before conntrack: the relay port is stateless (the relay does its own connection
+	# accounting), so a SYN flood cannot fill the conntrack table.
+	chain raw_pre {
+		type filter hook prerouting priority raw; policy accept;
+		iif "lo" accept
+		fib saddr . iif oif missing counter drop comment "reverse path: spoofed or bogon source"
+		tcp dport $RELAY_PORT ip saddr != @relay_src_v4 counter drop
+		tcp dport $RELAY_PORT ip6 saddr != @relay_src_v6 counter drop
+		# Only the first MSS option is seen here: sysctl tcp_min_snd_mss = 536 is the backstop.
+		tcp dport $RELAY_PORT tcp flags & (fin | syn | rst | ack) == syn tcp option maxseg size 1-535 counter drop comment "tiny MSS"
+		# New connections per IPv4 address or IPv6 /64: above the largest legitimate burst
+		# behind one address (a NAT, a controller with forks); a dropped SYN is retried.
+		tcp dport $RELAY_PORT tcp flags & (fin | syn | rst | ack) == syn update @syn_v4 { ip saddr limit rate over 50/second burst 500 packets } counter drop
+		tcp dport $RELAY_PORT tcp flags & (fin | syn | rst | ack) == syn update @syn_v6 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 50/second burst 500 packets } counter drop
+		# Once spoofed sources fill a meter, new sources cannot be added and would not be metered
+		# at all: the sources it cannot track share one ceiling instead (finding A15-3).
+		tcp dport $RELAY_PORT tcp flags & (fin | syn | rst | ack) == syn ip saddr != @syn_v4 limit rate over 1000/second burst 1000 packets counter drop comment "SYN meter full"
+		tcp dport $RELAY_PORT tcp flags & (fin | syn | rst | ack) == syn ip6 saddr and ffff:ffff:ffff:ffff:: != @syn_v6 limit rate over 1000/second burst 1000 packets counter drop comment "SYN meter full"
+		tcp dport $RELAY_PORT notrack
+	}
+
+	chain raw_out {
+		type filter hook output priority raw; policy accept;
+		tcp sport $RELAY_PORT notrack
+	}
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		tcp dport $RELAY_PORT ct state untracked accept
+		# ICMP errors and neighbour discovery come before conntrack's verdict: an error about a
+		# relay-port connection (untracked) finds no conntrack entry and counts as invalid, so
+		# the invalid drop would break path-MTU discovery (finding A15-2). The kernel matches
+		# each error against its own sockets. Not rate limited: a global limit would let anyone
+		# starve PMTUD.
+		icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+		icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
+		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } ip6 hoplimit 255 accept
+		# Echo requests are metered before conntrack's verdict: a ping flood keeps one ICMP
+		# identifier, so after the first reply every request would be "established".
+		icmp type echo-request add @ping_v4 { ip saddr limit rate 5/second burst 10 packets } accept
+		icmpv6 type echo-request add @ping_v6 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate 5/second burst 10 packets } accept
+		icmp type echo-request counter drop comment "echo over the per-source meter"
+		icmpv6 type echo-request counter drop comment "echo over the per-source meter"
+		ct state vmap { invalid : drop, established : accept, related : accept }
+		tcp flags & (fin | syn | rst | ack) != syn ct state new counter drop
+		tcp dport $SSH_PORT ip saddr @admin_v4 add @ssh_v4 { ip saddr ct count over 8 } counter reject with tcp reset
+		tcp dport $SSH_PORT ip6 saddr @admin_v6 add @ssh_v6 { ip6 saddr ct count over 8 } counter reject with tcp reset
+		tcp dport $SSH_PORT ip saddr @admin_v4 accept
+		tcp dport $SSH_PORT ip6 saddr @admin_v6 accept
+		counter comment "dropped by policy"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+
+	# Egress: the relay never dials out. Its sockets may only answer from the relay port; no
+	# loopback, no cloud metadata service, no internal network for a compromised process.
+	chain output {
+		type filter hook output priority filter; policy accept;
+		# SocketBindAllow= lets zt-relay bind its port, so code running in it could bind that
+		# port to a new socket and dial from it: a server never sends a bare SYN (finding A15-1).
+		meta skuid "tcn" tcp sport $RELAY_PORT tcp flags & (syn | ack) == syn counter reject with tcp reset comment "zt-relay dial-out from the relay port"
+		meta skuid "tcn" tcp sport $RELAY_PORT accept
+		meta skuid "tcn" counter reject comment "zt-relay egress"
+	}
+}
