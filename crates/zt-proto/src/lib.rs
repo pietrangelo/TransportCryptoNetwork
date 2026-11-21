@@ -14,6 +14,7 @@ pub mod codec;
 mod decoder;
 mod encoder;
 mod error;
+pub mod proxy_v2;
 pub mod wire;
 
 pub use decoder::FrameDecoder;

@@ -1609,6 +1609,11 @@ pub struct RelaySettings {
     /// only, and the policy is checked by [`crate::sunset::check_policy`] at every load.
     /// `false` by default: the defaults stay compatible with a mixed fleet.
     pub pq_only: bool,
+    /// `[network] listen_backlog`: the accept backlog of the listening socket.
+    pub listen_backlog: u32,
+    /// `[proxy_protocol]`: strict PROXY protocol v2 from trusted proxies; `None` when the
+    /// section is absent (no header is ever parsed).
+    pub proxy_protocol: Option<crate::relay::ProxyProtocol>,
 }
 
 /// The default idle timeout of both roles: three times the keepalive of agents older than
@@ -1632,6 +1637,8 @@ impl Default for RelaySettings {
             agent_idle: DEFAULT_RELAY_IDLE,
             client_idle: DEFAULT_RELAY_IDLE,
             pq_only: false,
+            listen_backlog: crate::net::DEFAULT_LISTEN_BACKLOG,
+            proxy_protocol: None,
         }
     }
 }
@@ -1800,6 +1807,8 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
         agent_idle,
         client_idle,
         pq_only,
+        listen_backlog: crate::net::DEFAULT_LISTEN_BACKLOG,
+        proxy_protocol: None,
     })
 }
 

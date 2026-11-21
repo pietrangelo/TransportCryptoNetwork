@@ -14,7 +14,7 @@ zt-crypto.workspace = true
 zt-application.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros", "signal"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros", "signal"] }
 tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true

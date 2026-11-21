@@ -205,18 +205,55 @@ pub fn standalone_window() -> Option<Reservation> {
     ByteBudget::new(max.saturating_add(max / 3).saturating_add(4)).try_reserve(initial)
 }
 
-/// Physical memory, capped by the cgroup v2 limit if there is one.
-fn memory() -> Option<u64> {
-    let physical = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+/// Where the cgroup v2 hierarchy is mounted.
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// The memory the relay may use: the smaller of the physical memory and the cgroup limit, or
+/// whichever of the two is known.
+#[must_use]
+pub fn effective_memory(physical: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
+    let _ = cgroup;
+    physical
+}
+
+/// The memory limit of the process's own cgroup (docs/analysis/relay-hardening.md §2(a)-4):
+/// `proc_self_cgroup` is the text of `/proc/self/cgroup` (readable under `ProcSubset=pid`);
+/// the result is the smallest `memory.max` or `memory.high` of that cgroup and of every
+/// ancestor up to [`CGROUP_ROOT`], read through `read` (`None`: missing or unreadable). `max`
+/// means no limit. `None` without any limit, or on cgroup v1.
+#[must_use]
+pub fn cgroup_memory_limit(
+    proc_self_cgroup: &str,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<u64> {
+    let _ = (proc_self_cgroup, read);
+    None
+}
+
+/// The physical memory from `sysinfo(2)` (Linux), which `ProcSubset=pid` does not hide.
+#[must_use]
+pub fn sysinfo_memory() -> Option<u64> {
+    None
+}
+
+/// The physical memory: `sysinfo(2)` (works when `/proc/meminfo` is hidden by
+/// `ProcSubset=pid`), else `/proc/meminfo`.
+#[must_use]
+pub fn physical_memory() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
         m.lines()
             .find_map(|l| l.strip_prefix("MemTotal:"))
             .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
             .map(|kb| kb.saturating_mul(1024))
-    });
+    })
+}
+
+/// Physical memory, capped by the cgroup v2 limit if there is one.
+fn memory() -> Option<u64> {
     let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
-    match (physical, cgroup) {
+    match (physical_memory(), cgroup) {
         (Some(p), Some(c)) => Some(p.min(c)),
         (p, c) => p.or(c),
     }

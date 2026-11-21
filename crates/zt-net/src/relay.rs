@@ -64,6 +64,26 @@ pub struct RelayConfig {
     /// identity holding the most of it (the slowest reader) loses its largest connection, and
     /// no identity may hold more than a quarter of it (review 0013, A13-1).
     pub queue_budget: usize,
+    /// The accept backlog of the listening socket (`[network] listen_backlog`); the kernel
+    /// clamps it to `net.core.somaxconn`.
+    pub listen_backlog: u32,
+    /// Strict PROXY protocol v2 from trusted proxies (`[proxy_protocol]`); `None`: no header is
+    /// ever parsed.
+    pub proxy_protocol: Option<ProxyProtocol>,
+}
+
+/// `[proxy_protocol]` of `relay.toml` (docs/analysis/relay-hardening.md §3.5, PROTOCOL
+/// §10.2): connections from `trusted` sources must start with a PROXY v2 header, whose source
+/// address is then the peer for admission, logs and metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyProtocol {
+    /// The proxies' prefixes.
+    pub trusted: zt_domain::PrefixSet,
+    /// From accept to the complete header.
+    pub header_timeout: Duration,
+    /// `true`: other sources connect without a header (their TCP source is the peer);
+    /// `false`: they are closed at accept.
+    pub allow_direct: bool,
 }
 
 impl Default for RelayConfig {
@@ -77,6 +97,8 @@ impl Default for RelayConfig {
             client_idle: None,
             metrics: RelayMetrics::new(),
             queue_budget: crate::budget::default_queue_budget(),
+            listen_backlog: crate::net::DEFAULT_LISTEN_BACKLOG,
+            proxy_protocol: None,
         }
     }
 }
@@ -588,6 +610,7 @@ impl RelayServer<TcpListener> {
     ///
     /// # Errors
     /// Bind error.
+    #[allow(clippy::unused_async)] // async since the first release: callers await it
     pub async fn bind(
         addr: SocketAddr,
         keys: impl Into<crate::Revocable<Keyring>>,
@@ -595,7 +618,7 @@ impl RelayServer<TcpListener> {
         config: RelayConfig,
     ) -> Result<Self, NetError> {
         validate(&config)?;
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::net::listen(addr, config.listen_backlog)?;
         RelayServer::with_acceptor(listener, keys, policy, config)
     }
 }

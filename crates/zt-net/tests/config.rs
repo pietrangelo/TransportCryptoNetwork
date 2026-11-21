@@ -585,3 +585,110 @@ fn a_keyring_loads_both_keys_and_refuses_the_same_key_twice() {
     assert!(zt_net::config::load_keyring(&cur, Some(&cur)).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `[proxy_protocol]` of `relay.toml` (docs/analysis/relay-hardening.md §3.5).
+#[test]
+fn relay_toml_sets_the_proxy_protocol_section() {
+    use zt_net::config::parse_relay_settings;
+    let absent = parse_relay_settings("relay.toml", "").unwrap();
+    assert_eq!(absent.proxy_protocol, None);
+    let text = r#"
+        [network]
+        listen_backlog = 8192
+
+        [proxy_protocol]
+        trusted = ["203.0.113.0/24", "2001:db8:100::/48"]
+        header_timeout_secs = 5
+        allow_direct = true
+    "#;
+    let s = parse_relay_settings("relay.toml", text).unwrap();
+    assert_eq!(s.listen_backlog, 8192);
+    let p = s.proxy_protocol.unwrap();
+    assert_eq!(p.header_timeout, std::time::Duration::from_secs(5));
+    assert!(p.allow_direct);
+    let names: Vec<_> = p
+        .trusted
+        .prefixes()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(names, ["203.0.113.0/24", "2001:db8:100::/48"]);
+    // Defaults of the optional keys: 3 s, no direct connections.
+    let s = parse_relay_settings(
+        "relay.toml",
+        "[proxy_protocol]\ntrusted = [\"192.0.2.1/32\"]\n",
+    )
+    .unwrap();
+    let p = s.proxy_protocol.unwrap();
+    assert_eq!(p.header_timeout, std::time::Duration::from_secs(3));
+    assert!(!p.allow_direct);
+}
+
+/// P-15: the trusted list and the timeout are strict, and an error names the entry index,
+/// never its text.
+#[test]
+fn proxy_protocol_config_is_strict() {
+    use zt_net::config::parse_relay_settings;
+    let with =
+        |trusted: &str, extra: &str| format!("[proxy_protocol]\ntrusted = [{trusted}]\n{extra}");
+    let sixty_five: Vec<String> = (0..65)
+        .map(|i| format!("\"198.51.{}.{}/32\"", i / 200, i % 200 + 1))
+        .collect();
+    let cases: Vec<(String, Option<usize>, &str)> = vec![
+        (with("\"0.0.0.0/0\"", ""), Some(0), "0.0.0.0"),
+        (with("\"203.0.113.0/24\", \"::/0\"", ""), Some(1), "::/0"),
+        (with("\"10.0.0.1/8\"", ""), Some(0), "10.0.0.1"),
+        (with("\"::ffff:10.0.0.0/104\"", ""), Some(0), "ffff"),
+        (
+            with("\"10.0.0.0/8\", \"10.66.0.0/16\"", ""),
+            Some(1),
+            "10.66",
+        ),
+        (
+            with("\"10.0.0.0/8\", \"10.0.0.0/8\"", ""),
+            Some(1),
+            "10.0.0.0",
+        ),
+        (with("\"not-a-prefix\"", ""), Some(0), "not-a-prefix"),
+        (with("\"203.0.113.0/33\"", ""), Some(0), "203.0.113"),
+        (with(&sixty_five.join(", "), ""), Some(64), "198.51"),
+        (with("", ""), None, "trusted"),
+        (
+            with("\"192.0.2.0/24\"", "header_timeout_secs = 0"),
+            None,
+            "192.0.2",
+        ),
+        (
+            with("\"192.0.2.0/24\"", "header_timeout_secs = 11"),
+            None,
+            "192.0.2",
+        ),
+        (
+            with("\"192.0.2.0/24\"", "trusted_proxies = 1"),
+            None,
+            "192.0.2",
+        ),
+        (
+            "[proxy_protocol]\nheader_timeout_secs = 3\n".to_owned(),
+            None,
+            "#",
+        ),
+        (
+            "[proxy_protocol]\ntrusted = \"192.0.2.0/24\"\n".to_owned(),
+            None,
+            "#",
+        ),
+    ];
+    for (text, index, secret) in cases {
+        let err = parse_relay_settings("relay.toml", &text).unwrap_err();
+        assert!(matches!(err, ConfigError::Syntax { .. }), "{text}: {err:?}");
+        let message = err.to_string();
+        if let Some(i) = index {
+            assert!(
+                message.contains(&format!("trusted entry {i}")),
+                "{text}: {message}"
+            );
+            assert!(!message.contains(secret), "{text}: {message}");
+        }
+    }
+}

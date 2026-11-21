@@ -134,8 +134,31 @@ impl Running {
         extra: &[&str],
         slot: Option<std::sync::RwLockReadGuard<'static, ()>>,
     ) -> Self {
-        let mut child = command(dir, "run")
-            .args(extra)
+        let mut cmd = command(dir, "run");
+        cmd.args(extra);
+        Self::spawn(cmd, slot)
+    }
+
+    /// Like [`Running::start`], with the soft and hard `RLIMIT_NOFILE` set to `nofile`
+    /// (`prlimit(1)` runs the relay).
+    fn start_with_nofile(dir: &Dir, nofile: u64) -> Self {
+        let inner = command(dir, "run");
+        let mut cmd = Command::new("prlimit");
+        cmd.arg(format!("--nofile={nofile}:{nofile}"))
+            .arg("--")
+            .arg(inner.get_program())
+            .args(inner.get_args());
+        for (key, value) in inner.get_envs() {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
+        Self::spawn(cmd, Some(relay_slot()))
+    }
+
+    fn spawn(mut cmd: Command, slot: Option<std::sync::RwLockReadGuard<'static, ()>>) -> Self {
+        let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -321,6 +344,36 @@ fn unit(name: &str) -> String {
         .join("../../packaging/systemd")
         .join(name);
     std::fs::read_to_string(path).unwrap()
+}
+
+/// C-5 (docs/analysis/relay-hardening.md §4.1): a descriptor limit below what the pools may
+/// need is reported at startup, before `EMFILE` would lock everyone out; it is a warning, not
+/// a refusal (a shell's soft limit is often 1024).
+#[test]
+fn a_low_descriptor_limit_is_reported_at_startup() {
+    let dir = setup("fdlimit");
+    let relay = Running::start_with_nofile(&dir, 512);
+    let low = relay.event("fd_limit_low");
+    assert_eq!(low["level"], "WARN", "{low}");
+    assert_eq!(low["fields"]["limit"], 512, "{low}");
+    // max_preauth 1024 + max_established 8192 + 64.
+    assert_eq!(low["fields"]["needed"], 9280, "{low}");
+}
+
+/// C-5: with enough descriptors there is no warning.
+#[test]
+fn an_ample_descriptor_limit_is_not_reported() {
+    let dir = setup("fdlimit-ok");
+    let relay = Running::start_with_nofile(&dir, 16_384);
+    // The admission limits come after the descriptor check.
+    relay.event("admission_limits_in_use");
+    assert!(
+        !relay
+            .seen
+            .borrow()
+            .iter()
+            .any(|v| v["fields"]["event_kind"] == "fd_limit_low")
+    );
 }
 
 /// R3-C3, R3-C5, R3-C9: the units carry the lifecycle directives.
