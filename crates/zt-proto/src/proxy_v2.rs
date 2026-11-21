@@ -18,7 +18,7 @@
 //! carry a header and does not start with the signature is refused. TLV values are ignored
 //! (no TLS, CRC32C or unique-id semantics), but their framing must be exact.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use thiserror::Error;
 
@@ -117,7 +117,7 @@ pub enum Proxied {
 #[non_exhaustive]
 pub enum ProxyError {
     /// The first 12 bytes are not the version 2 signature (no header, or a version 1 header).
-    #[error("PROXY v2 signature missing")]
+    #[error("PROXY protocol signature missing")]
     Signature,
     /// A version other than 2.
     #[error("unsupported PROXY protocol version")]
@@ -173,27 +173,150 @@ impl ProxyError {
 /// [`ProxyError::Signature`], [`ProxyError::Version`], [`ProxyError::Command`],
 /// [`ProxyError::Family`], [`ProxyError::Length`], checked in this order.
 pub fn fixed(header: &[u8; FIXED_LEN]) -> Result<Fixed, ProxyError> {
-    let _ = header;
-    Err(ProxyError::Signature)
+    let [
+        s0,
+        s1,
+        s2,
+        s3,
+        s4,
+        s5,
+        s6,
+        s7,
+        s8,
+        s9,
+        s10,
+        s11,
+        ver_cmd,
+        fam,
+        len_hi,
+        len_lo,
+    ] = *header;
+    if [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11] != SIGNATURE {
+        return Err(ProxyError::Signature);
+    }
+    if ver_cmd >> 4 != 2 {
+        return Err(ProxyError::Version);
+    }
+    let command = match ver_cmd & 0x0F {
+        0 => Command::Local,
+        1 => Command::Proxy,
+        _ => return Err(ProxyError::Command),
+    };
+    let family = match (fam, command) {
+        (0x00, Command::Local) => Family::Unspec,
+        (0x11, _) => Family::Tcp4,
+        (0x21, _) => Family::Tcp6,
+        _ => return Err(ProxyError::Family),
+    };
+    let len = u16::from_be_bytes([len_hi, len_lo]);
+    let body_len = usize::from(len);
+    if body_len < family.block_len() || body_len > MAX_BODY {
+        return Err(ProxyError::Length);
+    }
+    Ok(Fixed {
+        command,
+        family,
+        len,
+    })
 }
 
 /// Parses the body announced by `fixed`; `body` must be exactly [`Fixed::body_len`] bytes.
+/// A LOCAL body is ignored whole (address block and TLVs), as the specification asks.
 ///
 /// # Errors
 /// [`ProxyError::Length`], [`ProxyError::Address`], [`ProxyError::Tlv`].
 pub fn body(fixed: &Fixed, body: &[u8]) -> Result<Proxied, ProxyError> {
-    let _ = (fixed, body);
-    Err(ProxyError::Length)
+    if body.len() != fixed.body_len() {
+        return Err(ProxyError::Length);
+    }
+    if fixed.command == Command::Local {
+        return Ok(Proxied::Local);
+    }
+    let (block, tlvs) = body
+        .split_at_checked(fixed.family.block_len())
+        .ok_or(ProxyError::Length)?;
+    let source = source_of(fixed.family, block)?;
+    check_tlvs(tlvs)?;
+    Ok(Proxied::Proxy { source })
+}
+
+/// The source address and port of an address block (destination ignored), canonical, and
+/// usable as a peer.
+fn source_of(family: Family, block: &[u8]) -> Result<SocketAddr, ProxyError> {
+    let ip = match family {
+        Family::Tcp4 => {
+            let octets: [u8; 4] = block
+                .get(..4)
+                .and_then(|b| b.try_into().ok())
+                .ok_or(ProxyError::Length)?;
+            IpAddr::V4(Ipv4Addr::from(octets))
+        }
+        Family::Tcp6 => {
+            let octets: [u8; 16] = block
+                .get(..16)
+                .and_then(|b| b.try_into().ok())
+                .ok_or(ProxyError::Length)?;
+            IpAddr::V6(Ipv6Addr::from(octets)).to_canonical()
+        }
+        Family::Unspec => return Err(ProxyError::Family),
+    };
+    // The source port follows both addresses.
+    let port_at = family
+        .block_len()
+        .checked_sub(4)
+        .ok_or(ProxyError::Length)?;
+    let port: [u8; 2] = block
+        .get(port_at..)
+        .and_then(|b| b.get(..2))
+        .and_then(|b| b.try_into().ok())
+        .ok_or(ProxyError::Length)?;
+    let unusable =
+        ip.is_unspecified() || ip.is_multicast() || ip == IpAddr::V4(Ipv4Addr::BROADCAST);
+    if unusable {
+        return Err(ProxyError::Address);
+    }
+    Ok(SocketAddr::new(ip, u16::from_be_bytes(port)))
+}
+
+/// Walks the TLV area for framing only: every TLV (type, u16 BE length, value) must lie
+/// entirely inside it, with nothing left over. Values are ignored.
+fn check_tlvs(mut rest: &[u8]) -> Result<(), ProxyError> {
+    while !rest.is_empty() {
+        let Some(&[_kind, hi, lo]) = rest.get(..3) else {
+            return Err(ProxyError::Tlv);
+        };
+        let value = usize::from(u16::from_be_bytes([hi, lo]));
+        rest = rest
+            .get(3..)
+            .and_then(|r| r.get(value..))
+            .ok_or(ProxyError::Tlv)?;
+    }
+    Ok(())
 }
 
 /// Parses a header at the start of `bytes`: the result and the number of bytes it took
-/// (exactly `16 + length`), or `None` if more bytes are needed. Never reads past the header.
+/// (exactly `16 + length`), or `None` if more bytes are needed. Never reads past the header,
+/// and refuses a wrong signature byte as soon as it is there.
 ///
 /// # Errors
 /// See [`fixed`] and [`body`].
 pub fn parse(bytes: &[u8]) -> Result<Option<(Proxied, usize)>, ProxyError> {
-    let _ = bytes;
-    Ok(None)
+    let Some(head) = bytes.get(..FIXED_LEN) else {
+        let seen = bytes.len().min(SIGNATURE.len());
+        if bytes.get(..seen) != SIGNATURE.get(..seen) {
+            return Err(ProxyError::Signature);
+        }
+        return Ok(None);
+    };
+    let head: &[u8; FIXED_LEN] = head.try_into().map_err(|_| ProxyError::Length)?;
+    let fixed = fixed(head)?;
+    let Some(total) = FIXED_LEN.checked_add(fixed.body_len()) else {
+        return Err(ProxyError::Length);
+    };
+    let Some(raw) = bytes.get(FIXED_LEN..total) else {
+        return Ok(None);
+    };
+    Ok(Some((body(&fixed, raw)?, total)))
 }
 
 /// Encodes a header (for proxies written in Rust, and for tests): `None` for a LOCAL header,
@@ -204,6 +327,37 @@ pub fn encode(
     addresses: Option<(SocketAddr, SocketAddr)>,
     tlvs: &[(u8, &[u8])],
 ) -> Option<Vec<u8>> {
-    let _ = (addresses, tlvs);
-    None
+    let mut body = Vec::new();
+    let (ver_cmd, family) = match addresses {
+        None => (0x20, 0x00),
+        Some((SocketAddr::V4(src), SocketAddr::V4(dst))) => {
+            body.extend_from_slice(&src.ip().octets());
+            body.extend_from_slice(&dst.ip().octets());
+            body.extend_from_slice(&src.port().to_be_bytes());
+            body.extend_from_slice(&dst.port().to_be_bytes());
+            (0x21, 0x11)
+        }
+        Some((SocketAddr::V6(src), SocketAddr::V6(dst))) => {
+            body.extend_from_slice(&src.ip().octets());
+            body.extend_from_slice(&dst.ip().octets());
+            body.extend_from_slice(&src.port().to_be_bytes());
+            body.extend_from_slice(&dst.port().to_be_bytes());
+            (0x21, 0x21)
+        }
+        Some(_) => return None,
+    };
+    for (kind, value) in tlvs {
+        body.push(*kind);
+        body.extend_from_slice(&u16::try_from(value.len()).ok()?.to_be_bytes());
+        body.extend_from_slice(value);
+        if body.len() > MAX_BODY {
+            return None;
+        }
+    }
+    let len = u16::try_from(body.len()).ok()?;
+    let mut out = SIGNATURE.to_vec();
+    out.extend_from_slice(&[ver_cmd, family]);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&body);
+    Some(out)
 }

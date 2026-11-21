@@ -112,7 +112,6 @@ pub const MAX_LISTEN_BACKLOG: u32 = 65_535;
 /// # Errors
 /// Socket, bind or listen error.
 pub fn listen(addr: SocketAddr, backlog: u32) -> std::io::Result<TcpListener> {
-    let _ = backlog;
     let socket = if addr.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
@@ -120,7 +119,7 @@ pub fn listen(addr: SocketAddr, backlog: u32) -> std::io::Result<TcpListener> {
     };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
-    socket.listen(128)
+    socket.listen(backlog)
 }
 
 /// What an `accept` error means for the accept loop.
@@ -148,8 +147,20 @@ impl AcceptErrorKind {
 /// Classifies an `accept` error.
 #[must_use]
 pub fn classify_accept_error(err: &std::io::Error) -> AcceptErrorKind {
-    let _ = err;
-    AcceptErrorKind::Resource
+    if err.kind() == std::io::ErrorKind::OutOfMemory {
+        return AcceptErrorKind::Resource;
+    }
+    #[cfg(unix)]
+    {
+        use rustix::io::Errno;
+        let resource = [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM];
+        if let Some(code) = err.raw_os_error()
+            && resource.iter().any(|e| e.raw_os_error() == code)
+        {
+            return AcceptErrorKind::Resource;
+        }
+    }
+    AcceptErrorKind::Connection
 }
 
 /// The back-off of the accept loop after resource errors: 10 ms, doubled after every
@@ -173,11 +184,15 @@ impl AcceptBackoff {
 
     /// One more resource error: how long to wait before the next `accept`.
     pub fn failed(&mut self) -> Duration {
-        Duration::from_millis(100)
+        let delay = self.next;
+        self.next = delay.saturating_mul(2).min(Self::MAX);
+        delay
     }
 
     /// A connection was accepted: the next failure waits [`Self::MIN`] again.
-    pub fn succeeded(&mut self) {}
+    pub fn succeeded(&mut self) {
+        self.next = Self::MIN;
+    }
 }
 
 impl Default for AcceptBackoff {

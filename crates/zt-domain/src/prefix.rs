@@ -56,7 +56,7 @@ impl IpPrefix {
 
     /// The prefix length.
     #[must_use]
-    pub const fn len(&self) -> u8 {
+    pub const fn prefix_len(&self) -> u8 {
         self.len
     }
 
@@ -64,24 +64,77 @@ impl IpPrefix {
     /// IPv4 address it maps.
     #[must_use]
     pub fn contains(&self, addr: IpAddr) -> bool {
-        let _ = addr;
-        false
+        match (self.addr, addr.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(a)) => u32::from(a) & mask32(self.len) == u32::from(net),
+            (IpAddr::V6(net), IpAddr::V6(a)) => {
+                u128::from(a) & mask128(self.len) == u128::from(net)
+            }
+            _ => false,
+        }
     }
 
-    /// `true` if the two prefixes share at least one address.
+    /// `true` if the two prefixes share at least one address: the shorter one contains the
+    /// other's network address.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        let _ = other;
-        false
+        if self.len <= other.len {
+            self.contains(other.addr)
+        } else {
+            other.contains(self.addr)
+        }
     }
+}
+
+/// The IPv4 netmask of `len` bits (`len` ≤ 32).
+fn mask32(len: u8) -> u32 {
+    32_u32
+        .checked_sub(u32::from(len))
+        .and_then(|host| u32::MAX.checked_shl(host))
+        .unwrap_or(0)
+}
+
+/// The IPv6 netmask of `len` bits (`len` ≤ 128).
+fn mask128(len: u8) -> u128 {
+    128_u32
+        .checked_sub(u32::from(len))
+        .and_then(|host| u128::MAX.checked_shl(host))
+        .unwrap_or(0)
 }
 
 impl TryFrom<&str> for IpPrefix {
     type Error = PrefixError;
 
     fn try_from(text: &str) -> Result<Self, PrefixError> {
-        let _ = text;
-        Err(PrefixError::Syntax)
+        let (addr, len) = text.split_once('/').ok_or(PrefixError::Syntax)?;
+        // Digits only: no sign, no blanks, no leading zeros beyond a single "0".
+        if len.is_empty()
+            || len.len() > 3
+            || !len.bytes().all(|b| b.is_ascii_digit())
+            || (len.len() > 1 && len.starts_with('0'))
+        {
+            return Err(PrefixError::Syntax);
+        }
+        let len: u8 = len.parse().map_err(|_| PrefixError::Syntax)?;
+        let addr: IpAddr = addr.parse().map_err(|_| PrefixError::Syntax)?;
+        let (max, clear) = match addr {
+            IpAddr::V4(a) => (32, u32::from(a) & !mask32(len.min(32)) == 0),
+            IpAddr::V6(a) => {
+                if a.to_ipv4_mapped().is_some() {
+                    return Err(PrefixError::Mapped);
+                }
+                (128, u128::from(a) & !mask128(len.min(128)) == 0)
+            }
+        };
+        if len > max {
+            return Err(PrefixError::Length);
+        }
+        if len == 0 {
+            return Err(PrefixError::Everything);
+        }
+        if !clear {
+            return Err(PrefixError::HostBits);
+        }
+        Ok(Self { addr, len })
     }
 }
 
@@ -105,6 +158,18 @@ impl PrefixSet {
     /// The index of the first offending entry and why: [`PrefixError::Empty`] (index 0),
     /// [`PrefixError::TooMany`], [`PrefixError::Overlap`].
     pub fn new(prefixes: Vec<IpPrefix>) -> Result<Self, (usize, PrefixError)> {
+        if prefixes.is_empty() {
+            return Err((0, PrefixError::Empty));
+        }
+        if prefixes.len() > Self::MAX {
+            return Err((Self::MAX, PrefixError::TooMany));
+        }
+        for (i, p) in prefixes.iter().enumerate() {
+            let earlier = prefixes.get(..i).unwrap_or_default();
+            if earlier.iter().any(|q| q.overlaps(p)) {
+                return Err((i, PrefixError::Overlap));
+            }
+        }
         Ok(Self(prefixes))
     }
 

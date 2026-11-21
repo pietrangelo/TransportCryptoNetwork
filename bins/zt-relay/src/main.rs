@@ -60,8 +60,8 @@ struct RelayArgs {
     /// the policy: if either file is invalid, both previous ones remain.
     #[arg(long)]
     revocations: Option<PathBuf>,
-    /// Handshake suites per role, admission limits and idle timeouts (`relay.toml`,
-    /// OPERATIONS §4.1). Without it, the classical suite and the defaults of PROTOCOL §10.1.
+    /// Handshake suites per role, admission limits, idle timeouts, listen backlog and PROXY
+    /// protocol (`relay.toml`, OPERATIONS §4.1). Without it, the classical suite and the defaults of PROTOCOL §10.1.
     /// Read at startup only: `SIGHUP` does not reload it.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -439,10 +439,8 @@ fn serve(
 ) -> Result<(), Failure> {
     // A watchdog too short for the hub's tick would kill a healthy relay (finding A10-3).
     lifecycle::check_watchdog().map_err(Failure::Config)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(runtime_error)?;
+    // The blocking pool is capped, so the unit's TasksMax= holds on any core count.
+    let runtime = lifecycle::relay_runtime().map_err(runtime_error)?;
     runtime.block_on(async {
         // First of all: from here on `SIGTERM` drains instead of killing.
         let terminate = Terminate::listen().map_err(runtime_error)?;
@@ -469,6 +467,8 @@ fn serve(
             suites: settings.suites,
             agent_idle: Some(settings.agent_idle),
             client_idle: Some(settings.client_idle),
+            listen_backlog: settings.listen_backlog,
+            proxy_protocol: settings.proxy_protocol.clone(),
             ..RelayConfig::default()
         };
         let generation = Generation::new();

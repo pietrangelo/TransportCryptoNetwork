@@ -366,6 +366,7 @@ pub const MAX_BLOCKING_THREADS: usize = 8;
 pub fn relay_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
         .build()
 }
 
@@ -377,12 +378,27 @@ pub fn descriptors_needed(
     admission: &zt_application::admission::AdmissionConfig,
     proxy_protocol: bool,
 ) -> u64 {
-    let _ = (admission, proxy_protocol);
-    0
+    let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let preauth = as_u64(admission.max_preauth);
+    let headers = if proxy_protocol { preauth } else { 0 };
+    preauth
+        .saturating_add(headers)
+        .saturating_add(as_u64(admission.max_established))
+        .saturating_add(DESCRIPTOR_HEADROOM)
 }
+
+/// The descriptors beyond the pools: the listener, the files, the runtime, stdio.
+const DESCRIPTOR_HEADROOM: u64 = 64;
 
 /// The soft `RLIMIT_NOFILE` of the process (`None`: unlimited or unknown).
 #[must_use]
 pub fn descriptor_limit() -> Option<u64> {
-    None
+    #[cfg(unix)]
+    {
+        rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }

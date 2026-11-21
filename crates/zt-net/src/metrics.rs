@@ -190,6 +190,25 @@ const REFUSALS: &[&str] = &[
     "unknown_ticket",
 ];
 
+const ACCEPT_ERRORS: &[&str] = &["resource", "connection"];
+
+/// Why a connection from a trusted proxy (or an untrusted source in PROXY mode) ended before
+/// admission: the parser's reasons, then the relay's.
+const PROXY_REASONS: &[&str] = &[
+    "signature",
+    "version",
+    "command",
+    "family",
+    "length",
+    "address",
+    "tlv",
+    "timeout",
+    "aborted",
+    "untrusted",
+    "pool_full",
+    "draining",
+];
+
 const AUTH_REASONS: &[&str] = &[
     "handshake_failed",
     "unknown_peer",
@@ -479,6 +498,14 @@ pub struct RelayMetrics {
     queue: Budgeted,
     pub(crate) queue_shed: Counter,
     pub(crate) queue_overflow: Counter,
+    accept_errors: ByLabel,
+    proxy_failures: ByLabel,
+    /// Connections in the PROXY header phase now.
+    pub(crate) proxy_header_pending: Gauge,
+    /// The soft `RLIMIT_NOFILE` at startup (-1: unlimited or unknown).
+    pub(crate) fd_limit: Gauge,
+    /// The descriptors the configured pools may need.
+    pub(crate) fd_needed: Gauge,
 }
 
 /// An initiator's role, as a label.
@@ -508,6 +535,11 @@ impl RelayMetrics {
             queue: Budgeted::default(),
             queue_shed: Counter::default(),
             queue_overflow: Counter::default(),
+            accept_errors: ByLabel::new(ACCEPT_ERRORS),
+            proxy_failures: ByLabel::new(PROXY_REASONS),
+            proxy_header_pending: Gauge::default(),
+            fd_limit: Gauge::default(),
+            fd_needed: Gauge::default(),
         })
     }
 
@@ -515,6 +547,14 @@ impl RelayMetrics {
     #[must_use]
     pub fn process(&self) -> &Process {
         &self.process
+    }
+
+    pub(crate) fn accept_error(&self, kind: &str) {
+        self.accept_errors.inc(kind);
+    }
+
+    pub(crate) fn proxy_failure(&self, reason: &str) {
+        self.proxy_failures.inc(reason);
     }
 
     /// Reports `budget` as the relay's queue budget.
@@ -660,6 +700,35 @@ impl RelayMetrics {
             "tcn_relay_queue_overflow_total",
             "Connections disconnected because their queue overflowed (a peer breaking the credit).",
             self.queue_overflow.get(),
+        );
+        out.family(
+            "tcn_relay_accept_errors_total",
+            "counter",
+            "Failed accepts: resource exhaustion (backed off) or one connection's error (retried).",
+        );
+        self.accept_errors
+            .render(&mut out, "tcn_relay_accept_errors_total", "kind");
+        out.family(
+            "tcn_relay_proxy_header_failures_total",
+            "counter",
+            "PROXY protocol connections closed before admission, by reason (no addresses).",
+        );
+        self.proxy_failures
+            .render(&mut out, "tcn_relay_proxy_header_failures_total", "reason");
+        out.gauge(
+            "tcn_relay_proxy_header_pending",
+            "Connections from trusted proxies still reading their PROXY header.",
+            self.proxy_header_pending.get(),
+        );
+        out.gauge(
+            "tcn_relay_fd_limit",
+            "The soft descriptor limit at startup (-1: unlimited or unknown).",
+            self.fd_limit.get(),
+        );
+        out.gauge(
+            "tcn_relay_fd_needed",
+            "Descriptors the configured pools may need (fd_limit_low below it).",
+            self.fd_needed.get(),
         );
         out.0
     }

@@ -172,7 +172,7 @@ impl Drop for Charge {
 }
 
 /// The relay's queue budget for a machine with `memory` bytes (the smaller of the physical
-/// memory and the cgroup limit): a quarter of it, from 128 MiB to 1 GiB; 1 GiB if unknown.
+/// memory and the limit of the process's own cgroup, [`effective_memory`]): a quarter of it, from 128 MiB to 1 GiB; 1 GiB if unknown.
 #[must_use]
 pub fn queue_budget_for(memory: Option<u64>) -> usize {
     memory.map_or(MAX_QUEUE_BUDGET, |m| {
@@ -212,8 +212,10 @@ pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// whichever of the two is known.
 #[must_use]
 pub fn effective_memory(physical: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
-    let _ = cgroup;
-    physical
+    match (physical, cgroup) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (p, c) => p.or(c),
+    }
 }
 
 /// The memory limit of the process's own cgroup (docs/analysis/relay-hardening.md §2(a)-4):
@@ -226,35 +228,75 @@ pub fn cgroup_memory_limit(
     proc_self_cgroup: &str,
     read: impl Fn(&std::path::Path) -> Option<String>,
 ) -> Option<u64> {
-    let _ = (proc_self_cgroup, read);
-    None
+    use std::path::{Component, Path, PathBuf};
+    // cgroup v2: the single "0::<path>" line.
+    let own = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let own = Path::new(own.trim_end());
+    // An absolute path of plain names only: never `..`, never anything outside the mount.
+    let mut parts = own.components();
+    if parts.next() != Some(Component::RootDir) || !parts.all(|c| matches!(c, Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = Path::new(CGROUP_ROOT);
+    let relative = own.strip_prefix("/").ok()?;
+    let limit_of = |dir: &Path| {
+        ["memory.max", "memory.high"]
+            .into_iter()
+            .filter_map(|file| read(&dir.join(file)))
+            .filter_map(|text| text.trim().parse::<u64>().ok())
+            .min()
+    };
+    let mut dir: PathBuf = root.join(relative);
+    let mut limit: Option<u64> = None;
+    loop {
+        limit = match (limit, limit_of(&dir)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if dir == root || !dir.pop() {
+            return limit;
+        }
+    }
 }
 
 /// The physical memory from `sysinfo(2)` (Linux), which `ProcSubset=pid` does not hide.
 #[must_use]
 pub fn sysinfo_memory() -> Option<u64> {
-    None
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let info = rustix::system::sysinfo();
+        #[allow(clippy::useless_conversion)] // `c_ulong` is `u32` on 32-bit targets
+        let total = u64::try_from(info.totalram).ok()?;
+        let unit = u64::from(info.mem_unit.max(1));
+        Some(total.saturating_mul(unit)).filter(|&m| m > 0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
 }
 
 /// The physical memory: `sysinfo(2)` (works when `/proc/meminfo` is hidden by
 /// `ProcSubset=pid`), else `/proc/meminfo`.
 #[must_use]
 pub fn physical_memory() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
-        m.lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))
-            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-            .map(|kb| kb.saturating_mul(1024))
+    sysinfo_memory().or_else(|| {
+        std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+            m.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                .map(|kb| kb.saturating_mul(1024))
+        })
     })
 }
 
-/// Physical memory, capped by the cgroup v2 limit if there is one.
+/// Physical memory, capped by the memory limit of the process's own cgroup.
 fn memory() -> Option<u64> {
-    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    match (physical_memory(), cgroup) {
-        (Some(p), Some(c)) => Some(p.min(c)),
-        (p, c) => p.or(c),
-    }
+        .and_then(|text| cgroup_memory_limit(&text, |p| std::fs::read_to_string(p).ok()));
+    effective_memory(physical_memory(), cgroup)
 }

@@ -7,8 +7,10 @@
     clippy::panic,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
+    clippy::float_cmp,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
+    clippy::single_match_else,
     missing_docs
 )]
 

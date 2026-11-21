@@ -24,15 +24,15 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
 fn prefixes_parse_in_canonical_form() {
     let a = p("203.0.113.0/24");
     assert_eq!(a.addr(), v4(203, 0, 113, 0));
-    assert_eq!(a.len(), 24);
+    assert_eq!(a.prefix_len(), 24);
     assert_eq!(a.to_string(), "203.0.113.0/24");
     let b = p("2001:db8:100::/48");
-    assert_eq!(b.len(), 48);
+    assert_eq!(b.prefix_len(), 48);
     assert_eq!(b.to_string(), "2001:db8:100::/48");
     // Host prefixes are fine.
-    assert_eq!(p("192.0.2.7/32").len(), 32);
-    assert_eq!(p("2001:db8::1/128").len(), 128);
-    assert_eq!(p("10.0.0.0/8").len(), 8);
+    assert_eq!(p("192.0.2.7/32").prefix_len(), 32);
+    assert_eq!(p("2001:db8::1/128").prefix_len(), 128);
+    assert_eq!(p("10.0.0.0/8").prefix_len(), 8);
 }
 
 #[test]

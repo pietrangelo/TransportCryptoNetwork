@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,11 +34,12 @@ use zt_domain::{
     Frame, HandshakeSuite, HybridFingerprint, InitiatorRole, PeerRole, RejectReason, SessionId,
     SuitePolicy,
 };
+use zt_proto::proxy_v2::{self, Proxied, ProxyError};
 
 use crate::budget::{ByteBudget, Charge};
 use crate::lifecycle::Progress;
 use crate::metrics::{RelayMetrics, RoleLabel, auth_reason};
-use crate::net::Acceptor;
+use crate::net::{AcceptBackoff, AcceptErrorKind, Acceptor, classify_accept_error};
 use crate::{NetError, Timeouts, channel, lock};
 use zt_application::lifecycle::{DrainController, DrainStep};
 
@@ -748,6 +749,7 @@ impl<A: Acceptor> RelayServer<A> {
             client_suites = config.suites.clients.names(),
             "handshake suites in use"
         );
+        descriptors_in_use(&config, &metrics);
         admission_limits_in_use(&config.admission);
         queue_budget_in_use(config.queue_budget, &config.limits);
         let admission = Arc::new(Mutex::new(Admission::new(
@@ -760,8 +762,30 @@ impl<A: Acceptor> RelayServer<A> {
             Arc::clone(&confirmed),
             config.admission.summary_interval,
         ));
-        let capacity = outbound_capacity(&config.limits);
-        let mut next_conn: u64 = 0;
+        let spawner = Spawner {
+            admission: Arc::clone(&admission),
+            keys,
+            policy,
+            hub: hub_tx.clone(),
+            timeouts: config.timeouts.clone(),
+            admission_config: config.admission.clone(),
+            suites: config.suites,
+            agent_idle: config.agent_idle.unwrap_or(config.timeouts.idle),
+            client_idle: config.client_idle.unwrap_or(config.timeouts.idle),
+            confirmed: Arc::clone(&confirmed),
+            metrics: Arc::clone(&metrics),
+            live: Arc::clone(&live),
+            capacity: outbound_capacity(&config.limits),
+            next_conn: Arc::new(AtomicU64::new(0)),
+        };
+        let (draining_tx, draining) = tokio::sync::watch::channel(false);
+        let dispatch = Dispatch {
+            proxy: config.proxy_protocol.clone(),
+            headers: HeaderPool::new(config.admission.max_preauth, Arc::clone(&metrics)),
+            draining,
+            spawner,
+        };
+        let mut errors = AcceptErrors::new(config.admission.summary_interval);
         loop {
             let accepted = tokio::select! {
                 () = &mut shutdown => break,
@@ -771,53 +795,283 @@ impl<A: Acceptor> RelayServer<A> {
                 }
                 accepted = listener.accept() => accepted,
             };
-            let (tcp, addr) = match accepted {
-                Ok(accepted) => accepted,
-                Err(err) => {
-                    // E.g. EMFILE: back off instead of spinning.
-                    tracing::warn!(error = %err, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+            match accepted {
+                Ok((tcp, addr)) => {
+                    errors.backoff.succeeded();
+                    dispatch.connection(tcp, addr);
                 }
-            };
-            // A refusal is counted in the summary; the connection is dropped without a reply.
-            let admitted = lock(&admission).on_accept(addr.ip(), mono_now());
-            let Ok(ticket) = admitted.inspect_err(|r| metrics.preauth_failure(r.as_str())) else {
-                tracing::debug!(%addr, "connection not admitted");
-                continue;
-            };
-            let admitted = Admitted {
-                admission: Arc::clone(&admission),
-                ticket,
-                source: addr.ip(),
-                metrics: Arc::clone(&metrics),
-            };
-            next_conn = next_conn.wrapping_add(1);
-            let conn = ConnId(next_conn);
-            let task = Connection {
-                conn,
-                // The keys in force at accept time: a reload applies to subsequent
-                // connections.
-                keys: keys.current(),
-                policy: policy.clone(),
-                hub: hub_tx.clone(),
-                timeouts: config.timeouts.clone(),
-                admission: config.admission.clone(),
-                suites: config.suites,
-                agent_idle: config.agent_idle.unwrap_or(config.timeouts.idle),
-                client_idle: config.client_idle.unwrap_or(config.timeouts.idle),
-                confirmed: Arc::clone(&confirmed),
-                metrics: Arc::clone(&metrics),
-                _live: Arc::clone(&live),
-                capacity,
-            };
-            tokio::spawn(task.serve(tcp, addr, admitted));
+                Err(err) => {
+                    if let Some(pause) = errors.failed(&err, &metrics) {
+                        tokio::time::sleep(pause).await;
+                    }
+                }
+            }
         }
+        // Connections still reading their PROXY header end now, not at their deadline.
+        let _ = draining_tx.send(true);
+        // The spawner's handles (and its count of live tasks) go before the drain waits.
+        drop(dispatch);
         metrics.process().set_draining(true);
         let drained = drain(listener, hub_task, &drain_tx, drain_timeout, &live).await;
         // The last interval's confirmed handshakes are not lost at shutdown (A10-10).
         confirmed.flush();
         drained
+    }
+}
+
+/// The accept loop's handling of `accept` errors.
+struct AcceptErrors {
+    backoff: AcceptBackoff,
+    last_warning: Option<tokio::time::Instant>,
+    warn_every: Duration,
+}
+
+impl AcceptErrors {
+    fn new(warn_every: Duration) -> Self {
+        Self {
+            backoff: AcceptBackoff::new(),
+            last_warning: None,
+            warn_every,
+        }
+    }
+
+    /// Counts `err` and returns how long to pause: a resource error (`EMFILE`...) backs off
+    /// instead of spinning; the error of one connection does not delay the next one. One WARN
+    /// per summary interval at most: a storm of errors is counted, not logged line by line.
+    fn failed(&mut self, err: &std::io::Error, metrics: &RelayMetrics) -> Option<Duration> {
+        let kind = classify_accept_error(err);
+        metrics.accept_error(kind.as_str());
+        let now = tokio::time::Instant::now();
+        if self
+            .last_warning
+            .is_none_or(|at| now.duration_since(at) >= self.warn_every)
+        {
+            self.last_warning = Some(now);
+            tracing::warn!(error = %err, kind = kind.as_str(), "accept failed");
+        }
+        (kind == AcceptErrorKind::Resource).then(|| self.backoff.failed())
+    }
+}
+
+/// Where an accepted connection goes: straight to admission, through the PROXY header phase
+/// (a trusted proxy), or nowhere (an untrusted source when only proxies may connect).
+struct Dispatch {
+    proxy: Option<ProxyProtocol>,
+    headers: HeaderPool,
+    draining: tokio::sync::watch::Receiver<bool>,
+    spawner: Spawner,
+}
+
+impl Dispatch {
+    fn connection<S>(&self, tcp: S, addr: SocketAddr)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        match &self.proxy {
+            Some(p) if p.trusted.contains(addr.ip()) => {
+                // The peer is not known before the header: a slot of the header pool, not of
+                // admission (docs/analysis/relay-hardening.md §3.5).
+                let Some(slot) = self.headers.try_take() else {
+                    self.spawner.metrics.proxy_failure("pool_full");
+                    tracing::debug!(via = %addr, "PROXY header pool full");
+                    return;
+                };
+                let deadline = crate::deadline(p.header_timeout);
+                tokio::spawn(proxied(
+                    self.spawner.clone(),
+                    tcp,
+                    addr,
+                    slot,
+                    deadline,
+                    self.draining.clone(),
+                ));
+            }
+            Some(p) if !p.allow_direct => {
+                self.spawner.metrics.proxy_failure("untrusted");
+                tracing::debug!(%addr, "connection from outside the trusted proxies");
+            }
+            _ => {
+                if let Some((task, admitted)) = self.spawner.admit(addr, None) {
+                    tokio::spawn(task.serve(tcp, addr, admitted));
+                }
+            }
+        }
+    }
+}
+
+/// Admits connections and starts their tasks: shared by the accept loop (direct peers) and the
+/// PROXY header tasks (proxied peers, admitted once their header is read).
+#[derive(Clone)]
+struct Spawner {
+    admission: Arc<Mutex<Admission>>,
+    keys: crate::Revocable<Keyring>,
+    policy: crate::Revocable<AccessPolicy>,
+    hub: mpsc::Sender<HubEvent>,
+    timeouts: Timeouts,
+    admission_config: AdmissionConfig,
+    suites: SuitePolicy,
+    agent_idle: Duration,
+    client_idle: Duration,
+    confirmed: Arc<ConfirmedSuites>,
+    metrics: Arc<RelayMetrics>,
+    /// Counts the live connection tasks (and header tasks) for the drain.
+    live: Arc<()>,
+    capacity: usize,
+    next_conn: Arc<AtomicU64>,
+}
+
+impl Spawner {
+    /// Admission of `peer` (PROTOCOL §10.1): the connection task and its ticket, or `None` if
+    /// refused (counted, closed without a reply). `via` is the proxy that carried it.
+    fn admit(&self, peer: SocketAddr, via: Option<SocketAddr>) -> Option<(Connection, Admitted)> {
+        let admitted = lock(&self.admission).on_accept(peer.ip(), mono_now());
+        let Ok(ticket) = admitted.inspect_err(|r| self.metrics.preauth_failure(r.as_str())) else {
+            tracing::debug!(peer_addr = %peer, via = via.map(tracing::field::display), "connection not admitted");
+            return None;
+        };
+        let admitted = Admitted {
+            admission: Arc::clone(&self.admission),
+            ticket,
+            source: peer.ip(),
+            metrics: Arc::clone(&self.metrics),
+        };
+        let conn = ConnId(
+            self.next_conn
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1),
+        );
+        let task = Connection {
+            conn,
+            // The keys in force at accept time: a reload applies to subsequent connections.
+            keys: self.keys.current(),
+            policy: self.policy.clone(),
+            hub: self.hub.clone(),
+            timeouts: self.timeouts.clone(),
+            admission: self.admission_config.clone(),
+            suites: self.suites,
+            agent_idle: self.agent_idle,
+            client_idle: self.client_idle,
+            confirmed: Arc::clone(&self.confirmed),
+            metrics: Arc::clone(&self.metrics),
+            _live: Arc::clone(&self.live),
+            capacity: self.capacity,
+            via,
+        };
+        Some((task, admitted))
+    }
+}
+
+/// The slots of connections from trusted proxies that are still reading their header
+/// (`max_preauth` of them, separate from admission: the peer is not known yet).
+struct HeaderPool {
+    used: Arc<AtomicUsize>,
+    max: usize,
+    metrics: Arc<RelayMetrics>,
+}
+
+impl HeaderPool {
+    fn new(max: usize, metrics: Arc<RelayMetrics>) -> Self {
+        Self {
+            used: Arc::new(AtomicUsize::new(0)),
+            max,
+            metrics,
+        }
+    }
+
+    fn try_take(&self) -> Option<HeaderSlot> {
+        let max = self.max;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then(|| n.saturating_add(1))
+            })
+            .ok()?;
+        self.metrics.proxy_header_pending.inc();
+        Some(HeaderSlot {
+            used: Arc::clone(&self.used),
+            metrics: Arc::clone(&self.metrics),
+        })
+    }
+}
+
+/// One slot of the [`HeaderPool`], given back on drop.
+struct HeaderSlot {
+    used: Arc<AtomicUsize>,
+    metrics: Arc<RelayMetrics>,
+}
+
+impl Drop for HeaderSlot {
+    fn drop(&mut self) {
+        self.used.fetch_sub(1, Ordering::AcqRel);
+        self.metrics.proxy_header_pending.dec();
+    }
+}
+
+/// Why a PROXY header was not read.
+enum HeaderError {
+    Proxy(ProxyError),
+    /// The connection ended or failed first.
+    Io,
+}
+
+/// Reads exactly one PROXY v2 header: the 16 fixed bytes, then exactly the body they declare
+/// (at most [`proxy_v2::MAX_BODY`], on the stack). Nothing after it is read.
+async fn read_header<IO>(io: &mut IO) -> Result<Proxied, HeaderError>
+where
+    IO: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut head = [0_u8; proxy_v2::FIXED_LEN];
+    io.read_exact(&mut head)
+        .await
+        .map_err(|_| HeaderError::Io)?;
+    let fixed = proxy_v2::fixed(&head).map_err(HeaderError::Proxy)?;
+    let mut buf = [0_u8; proxy_v2::MAX_BODY];
+    let body = buf
+        .get_mut(..fixed.body_len())
+        .ok_or(HeaderError::Proxy(ProxyError::Length))?;
+    io.read_exact(body).await.map_err(|_| HeaderError::Io)?;
+    proxy_v2::body(&fixed, body).map_err(HeaderError::Proxy)
+}
+
+/// A connection from a trusted proxy: its header within `deadline` (from accept), then the
+/// same admission and handshake as a direct connection, for the peer the header names (or the
+/// proxy itself for LOCAL). Every failure closes without a reply and is counted by reason.
+async fn proxied<IO>(
+    spawner: Spawner,
+    mut tcp: IO,
+    via: SocketAddr,
+    slot: HeaderSlot,
+    deadline: tokio::time::Instant,
+    mut draining: tokio::sync::watch::Receiver<bool>,
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let read = tokio::select! {
+        read = timeout_at(deadline, read_header(&mut tcp)) => read,
+        _ = draining.wait_for(|d| *d) => {
+            spawner.metrics.proxy_failure("draining");
+            return;
+        }
+    };
+    let reason = match read {
+        Ok(Ok(Proxied::Local)) => None,
+        Ok(Ok(Proxied::Proxy { source })) => Some(Ok(source)),
+        Ok(Err(HeaderError::Proxy(e))) => Some(Err(e.as_str())),
+        Ok(Err(HeaderError::Io)) => Some(Err("aborted")),
+        Err(_) => Some(Err("timeout")),
+    };
+    let peer = match reason {
+        None => via,
+        Some(Ok(source)) => source,
+        Some(Err(reason)) => {
+            spawner.metrics.proxy_failure(reason);
+            tracing::debug!(via = %via, reason, "PROXY header refused");
+            return;
+        }
+    };
+    drop(slot);
+    if let Some((task, admitted)) = spawner.admit(peer, Some(via)) {
+        task.serve(tcp, peer, admitted).await;
     }
 }
 
@@ -874,6 +1128,8 @@ struct Connection {
     /// Counts the live connection tasks for the drain.
     _live: Arc<()>,
     capacity: usize,
+    /// The trusted proxy that carried the connection (PROXY protocol v2), for the logs.
+    via: Option<SocketAddr>,
 }
 
 // `outer_suites_confirmed` names one field per suite: a new suite needs its own field there.
@@ -1009,6 +1265,28 @@ async fn summaries(
                 repeated_line(repeated);
             }
         }
+    }
+}
+
+/// The descriptor limit against what the pools may need (docs/analysis/relay-hardening.md
+/// §2(a)-3), once at startup: past the limit `accept` fails with `EMFILE` before admission can
+/// refuse anything. A warning, not a refusal: outside systemd a shell's soft limit is often
+/// 1024.
+fn descriptors_in_use(config: &RelayConfig, metrics: &RelayMetrics) {
+    let needed =
+        crate::lifecycle::descriptors_needed(&config.admission, config.proxy_protocol.is_some());
+    let limit = crate::lifecycle::descriptor_limit();
+    let gauge = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    metrics.fd_needed.set(gauge(needed));
+    metrics.fd_limit.set(limit.map_or(-1, gauge));
+    if let Some(limit) = limit.filter(|&l| l < needed) {
+        audit_line!(
+            true,
+            "fd_limit_low",
+            limit,
+            needed,
+            "the descriptor limit is below what the pools may need: raise LimitNOFILE or lower max_preauth/max_established"
+        );
     }
 }
 
@@ -1173,7 +1451,7 @@ impl Connection {
         {
             Ok(Ok(pending)) => pending,
             Ok(Err(err)) => {
-                tracing::debug!(%addr, error = %err, "handshake failed");
+                tracing::debug!(%addr, via = self.via.map(tracing::field::display), error = %err, "handshake failed");
                 admitted.record(msg1_failure(&err), None);
                 return None;
             }
@@ -1255,7 +1533,7 @@ impl Connection {
         ch.confirmed();
         self.confirmed.note(role, suite);
         self.metrics.handshake_confirmed(role_label(role), suite);
-        tracing::debug!(%addr, %peer, conn = self.conn.0, ?suite, "peer connected");
+        tracing::debug!(%addr, via = self.via.map(tracing::field::display), %peer, conn = self.conn.0, ?suite, "peer connected");
         Some((
             ch,
             Peer {

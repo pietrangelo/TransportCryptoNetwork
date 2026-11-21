@@ -1653,6 +1653,101 @@ struct RelayFile {
     admission: AdmissionSection,
     #[serde(default)]
     liveness: LivenessSection,
+    #[serde(default)]
+    network: NetworkSection,
+    #[serde(default)]
+    proxy_protocol: Option<ProxyProtocolSection>,
+}
+
+/// `[network]` of `relay.toml`: the listening socket.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkSection {
+    #[serde(default)]
+    listen_backlog: Option<i64>,
+}
+
+/// `[proxy_protocol]` of `relay.toml` (docs/analysis/relay-hardening.md §3.5): `trusted` is
+/// required, the rest optional.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyProtocolSection {
+    trusted: Vec<String>,
+    #[serde(default)]
+    header_timeout_secs: Option<u64>,
+    #[serde(default)]
+    allow_direct: bool,
+}
+
+/// `[proxy_protocol] header_timeout_secs` when absent.
+pub const DEFAULT_PROXY_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// The accepted range of `header_timeout_secs`.
+const PROXY_HEADER_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 1..=10;
+
+/// `[network] listen_backlog`, within its bounds.
+fn listen_backlog(origin: &str, value: Option<i64>) -> Result<u32, ConfigError> {
+    use crate::net::{DEFAULT_LISTEN_BACKLOG, MAX_LISTEN_BACKLOG, MIN_LISTEN_BACKLOG};
+    let Some(value) = value else {
+        return Ok(DEFAULT_LISTEN_BACKLOG);
+    };
+    u32::try_from(value)
+        .ok()
+        .filter(|v| (MIN_LISTEN_BACKLOG..=MAX_LISTEN_BACKLOG).contains(v))
+        .ok_or_else(|| ConfigError::Syntax {
+            path: origin.into(),
+            message: format!(
+                "[network] listen_backlog must be between {MIN_LISTEN_BACKLOG} and {MAX_LISTEN_BACKLOG}"
+            ),
+        })
+}
+
+/// `[proxy_protocol]`: an error names the entry index, never its text.
+fn proxy_protocol(
+    origin: &str,
+    section: Option<ProxyProtocolSection>,
+) -> Result<Option<crate::relay::ProxyProtocol>, ConfigError> {
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    let fail = |message: String| ConfigError::Syntax {
+        path: origin.into(),
+        message,
+    };
+    let max = zt_domain::PrefixSet::MAX;
+    if section.trusted.len() > max {
+        return Err(fail(format!(
+            "[proxy_protocol] trusted entry {max}: at most {max} prefixes"
+        )));
+    }
+    let prefixes = section
+        .trusted
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            zt_domain::IpPrefix::try_from(text.as_str())
+                .map_err(|e| fail(format!("[proxy_protocol] trusted entry {i}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let trusted = zt_domain::PrefixSet::new(prefixes).map_err(|(i, e)| match e {
+        zt_domain::PrefixError::Empty => fail("[proxy_protocol] trusted must not be empty".into()),
+        e => fail(format!("[proxy_protocol] trusted entry {i}: {e}")),
+    })?;
+    let header_timeout = match section.header_timeout_secs {
+        None => DEFAULT_PROXY_HEADER_TIMEOUT,
+        Some(s) if PROXY_HEADER_TIMEOUT_SECS.contains(&s) => std::time::Duration::from_secs(s),
+        Some(_) => {
+            return Err(fail(format!(
+                "[proxy_protocol] header_timeout_secs must be between {} and {}",
+                PROXY_HEADER_TIMEOUT_SECS.start(),
+                PROXY_HEADER_TIMEOUT_SECS.end()
+            )));
+        }
+    };
+    Ok(Some(crate::relay::ProxyProtocol {
+        trusted,
+        header_timeout,
+        allow_direct: section.allow_direct,
+    }))
 }
 
 /// `[liveness]` of `relay.toml`: the idle timeout per role (resilience R-2).
@@ -1801,14 +1896,16 @@ pub fn parse_relay_settings(origin: &str, text: &str) -> Result<RelaySettings, C
     };
     let agent_idle = idle(file.liveness.agent_idle_secs, "agent_idle_secs")?;
     let client_idle = idle(file.liveness.client_idle_secs, "client_idle_secs")?;
+    let listen_backlog = listen_backlog(origin, file.network.listen_backlog)?;
+    let proxy_protocol = proxy_protocol(origin, file.proxy_protocol)?;
     Ok(RelaySettings {
         admission,
         suites,
         agent_idle,
         client_idle,
         pq_only,
-        listen_backlog: crate::net::DEFAULT_LISTEN_BACKLOG,
-        proxy_protocol: None,
+        listen_backlog,
+        proxy_protocol,
     })
 }
 
