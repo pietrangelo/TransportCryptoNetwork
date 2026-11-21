@@ -117,6 +117,9 @@ pub fn listen(addr: SocketAddr, backlog: u32) -> std::io::Result<TcpListener> {
     } else {
         tokio::net::TcpSocket::new_v6()?
     };
+    // As std and mio do: on Unix a restarted relay rebinds while old connections are in
+    // TIME_WAIT (on Windows the option would let another socket steal the port).
+    #[cfg(unix)]
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(backlog)
