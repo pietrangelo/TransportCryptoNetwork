@@ -1,0 +1,92 @@
+---
+# The ruleset replaces only its own table (atomic, one transaction). A change is applied behind
+# a rollback timer: if the controller cannot reconnect within zt_relay_firewall_rollback_secs,
+# the previous ruleset comes back on its own (no SSH lock-out survives a mistake).
+- name: Firewall - nftables is installed
+  ansible.builtin.package:
+    name: nftables
+    state: present
+
+- name: Firewall - rules directory
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Firewall - nftables.service loads /etc/nftables.d
+  ansible.builtin.lineinfile:
+    path: "{{ zt_relay_nftables_conf }}"
+    line: include "/etc/nftables.d/*.nft"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Firewall - keep the previous ruleset file for the rollback
+  ansible.builtin.copy:
+    src: /etc/nftables.d/zt-relay.nft
+    dest: /etc/nftables.d/zt-relay.nft.previous
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  failed_when: false
+  changed_when: false
+
+- name: Firewall - is there a previous ruleset?
+  ansible.builtin.stat:
+    path: /etc/nftables.d/zt-relay.nft.previous
+  register: zt_relay__fw_previous
+
+- name: Firewall - render the ruleset (checked by nft -c before it is put in place)
+  ansible.builtin.template:
+    src: zt-relay.nft.j2
+    dest: /etc/nftables.d/zt-relay.nft
+    owner: root
+    group: root
+    mode: "0644"
+    validate: nft -c -f %s
+  register: zt_relay__fw_rendered
+
+# Not a handler on purpose: the rollback timer, the reconnect and the disarm must run right
+# here, in this order.
+- name: Firewall - apply behind the rollback timer
+  when: zt_relay__fw_rendered is changed  # noqa: no-handler
+  block:
+    - name: Firewall - arm the rollback
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --unit=zt-relay-firewall-rollback
+          - --on-active={{ zt_relay_firewall_rollback_secs }}
+          - /bin/sh
+          - -c
+          - >-
+            {% if zt_relay__fw_previous.stat.exists %}cp /etc/nftables.d/zt-relay.nft.previous /etc/nftables.d/zt-relay.nft
+            && nft -f /etc/nftables.d/zt-relay.nft{% else %}rm -f /etc/nftables.d/zt-relay.nft;
+            nft delete table inet zt_relay{% endif %}
+      changed_when: true
+
+    - name: Firewall - apply
+      ansible.builtin.command:
+        argv: [nft, -f, /etc/nftables.d/zt-relay.nft]
+      changed_when: true
+
+    - name: Firewall - reconnect through the new ruleset
+      ansible.builtin.meta: reset_connection
+
+    - name: Firewall - the controller still reaches the host
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ (zt_relay_firewall_rollback_secs | int) // 2 }}"
+
+    - name: Firewall - disarm the rollback
+      ansible.builtin.command:
+        argv: [systemctl, stop, zt-relay-firewall-rollback.timer]
+      changed_when: true
+
+- name: Firewall - nftables.service enabled (loads the ruleset at boot, after systemd-sysusers)
+  ansible.builtin.systemd_service:
+    name: nftables.service
+    enabled: true

@@ -1,0 +1,31 @@
+---
+- name: Variables are coherent
+  ansible.builtin.assert:
+    that:
+      - zt_relay_port | int >= 1 and zt_relay_port | int <= 65535
+      - zt_relay_policy_src | length > 0
+      - zt_relay_binary_source in ['local', 'release']
+      - (zt_relay_admin_v4 | length + zt_relay_admin_v6 | length) > 0 or not zt_relay_ssh_inbound
+      - zt_relay_listen_backlog is none or (zt_relay_listen_backlog | int >= 128 and zt_relay_listen_backlog | int <= 65535)
+      - zt_relay_firewall_rollback_secs | int >= 30
+      - zt_relay_limit_nofile | int >= 1024
+      - zt_relay_extra_args | select('match', '^[A-Za-z0-9_./:=,+@-]+$') | list | length == zt_relay_extra_args | length
+    fail_msg: >-
+      Invalid zt_relay variables: zt_relay_policy_src is required; zt_relay_binary_source must be
+      local or release; an empty admin set locks SSH out (set zt_relay_ssh_inbound: false if that is
+      intended); listen_backlog is 128..65535; zt_relay_limit_nofile is at least 1024; each item
+      of zt_relay_extra_args is one plain argument (no blanks, quotes, $, % or backslash).
+    quiet: true
+
+- name: Find other firewall managers
+  ansible.builtin.command:
+    argv: [systemctl, is-active, ufw.service, firewalld.service]
+  register: zt_relay__other_firewalls
+  changed_when: false
+  failed_when: false
+
+- name: No other firewall manager is active (two managers would fight over the ruleset)
+  ansible.builtin.assert:
+    that: "'active' not in zt_relay__other_firewalls.stdout_lines"
+    fail_msg: ufw or firewalld is active; disable it first (docs/RELAY_HARDENING.md).
+    quiet: true

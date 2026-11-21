@@ -1,0 +1,18 @@
+---
+# Example: deploy or upgrade the TCN relays, one at a time (docs/RELAY_HARDENING.md).
+#
+#   ansible-playbook -i deploy/ansible/inventory.example.ini deploy/ansible/playbooks/relay.yml
+#
+# serial: 1 is not optional: a restart drains the relay (OPERATIONS §14), so restarting every
+# relay at once would leave no listener for the reconnect wave (review 0007, AP-21).
+- name: TCN relays
+  hosts: tcn_relays
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  roles:
+    - role: zt_relay
+  post_tasks:
+    - name: Relay public key (for the agents' and clients' [[relays]] entries)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} {{ zt_relay_public_key }}"

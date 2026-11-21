@@ -1,0 +1,32 @@
+---
+- name: Sysctl - conntrack loaded at boot, before systemd-sysctl
+  ansible.builtin.copy:
+    src: "{{ zt_relay_packaging_dir }}/sysctl/zt-relay.modules-load.conf"
+    dest: /etc/modules-load.d/zt-relay.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl
+
+- name: Sysctl - packaged settings
+  ansible.builtin.copy:
+    src: "{{ zt_relay_packaging_dir }}/sysctl/90-zt-relay.conf"
+    dest: /etc/sysctl.d/90-zt-relay.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl
+
+- name: Sysctl - local overrides
+  ansible.builtin.copy:
+    content: |
+      # Managed by Ansible (role zt_relay, zt_relay_sysctl_overrides).
+      {% for key, value in zt_relay_sysctl_overrides | dictsort %}
+      {{ key }} = {{ value }}
+      {% endfor %}
+    dest: /etc/sysctl.d/91-zt-relay-local.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: zt_relay_sysctl_overrides | length > 0
+  notify: Apply sysctl

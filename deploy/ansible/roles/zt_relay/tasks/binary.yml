@@ -1,0 +1,37 @@
+---
+- name: Binary - hash of the installed one
+  ansible.builtin.stat:
+    path: "{{ zt_relay__binary }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: zt_relay__installed
+
+- name: Binary - replace it atomically when it differs
+  when: not zt_relay__installed.stat.exists or zt_relay__installed.stat.checksum != zt_relay__binary_sha256
+  block:
+    - name: Binary - copy next to the target
+      ansible.builtin.copy:
+        src: "{{ zt_relay__controller_binary }}"
+        dest: "{{ zt_relay__binary }}.new"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Binary - hash the copy on the host
+      ansible.builtin.stat:
+        path: "{{ zt_relay__binary }}.new"
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: zt_relay__copied
+
+    - name: Binary - the copy is the verified binary
+      ansible.builtin.assert:
+        that: zt_relay__copied.stat.checksum == zt_relay__binary_sha256
+        fail_msg: The binary changed between the controller and the host.
+        quiet: true
+
+    - name: Binary - atomic rename
+      ansible.builtin.command:
+        argv: [mv, -f, "{{ zt_relay__binary }}.new", "{{ zt_relay__binary }}"]
+      changed_when: true
+      notify: Restart zt-relay

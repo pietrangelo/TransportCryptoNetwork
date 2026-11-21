@@ -1,0 +1,29 @@
+---
+# relay.toml, unit, drop-in or binary changed: check exactly what will run (ExecStart='s
+# arguments, zt_relay_extra_args included), as the user it runs as, then restart. A failed check stops here and the running relay keeps going.
+- name: Check zt-relay as tcn
+  ansible.builtin.command:
+    argv: "{{ zt_relay__check_argv }}"
+  become: true
+  become_user: tcn
+  changed_when: false
+  listen: Restart zt-relay
+
+- name: Restart zt-relay after the check
+  ansible.builtin.systemd_service:
+    name: zt-relay.service
+    state: restarted
+    daemon_reload: true
+  listen: Restart zt-relay
+
+# Policy or denylist changed: the running relay validates them itself and keeps the previous
+# ones if they are invalid; `systemctl reload` then fails (OPERATIONS §4).
+- name: Reload zt-relay
+  ansible.builtin.systemd_service:
+    name: zt-relay.service
+    state: reloaded
+
+- name: Apply sysctl
+  ansible.builtin.shell:
+    cmd: modprobe nf_conntrack && /usr/lib/systemd/systemd-sysctl
+  changed_when: true

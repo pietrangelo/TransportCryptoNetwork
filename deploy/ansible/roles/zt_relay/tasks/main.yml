@@ -1,0 +1,41 @@
+---
+# Order matters: the user must exist before the ruleset (meta skuid "tcn") and the key; the
+# binary before anything validates with it; the firewall last, behind its rollback timer.
+- name: Preconditions
+  ansible.builtin.import_tasks: assert.yml
+
+- name: Verify the binary on the controller
+  ansible.builtin.import_tasks: verify.yml
+
+- name: Install the binary
+  ansible.builtin.import_tasks: binary.yml
+
+- name: User, key and configuration
+  ansible.builtin.import_tasks: files.yml
+
+- name: Descriptors against LimitNOFILE
+  ansible.builtin.import_tasks: descriptors.yml
+
+- name: Unit
+  ansible.builtin.import_tasks: unit.yml
+
+- name: Kernel settings
+  ansible.builtin.import_tasks: sysctl.yml
+
+- name: Firewall
+  ansible.builtin.import_tasks: nftables.yml
+
+- name: Apply pending restarts and reloads
+  ansible.builtin.meta: flush_handlers
+
+- name: The relay is enabled and running
+  ansible.builtin.systemd_service:
+    name: zt-relay.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: The unit's exposure score is at most 1.1 on this host
+  ansible.builtin.command:
+    argv: [systemd-analyze, security, --threshold=11, zt-relay.service]
+  changed_when: false

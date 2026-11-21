@@ -1,0 +1,25 @@
+---
+# The descriptors relay.toml's pools may need, computed by the relay itself (`zt-relay check`
+# prints `descriptors_needed = N`, the formula of its fd_limit_low warning: max_preauth twice in
+# PROXY mode, max_established, 64), against the LimitNOFILE= the drop-in sets (finding A15-5).
+# Past the limit `accept` fails with EMFILE before admission can refuse anything.
+- name: Descriptors - what the configured pools need (zt-relay check, ExecStart='s arguments)
+  ansible.builtin.command:
+    argv: "{{ zt_relay__check_argv }}"
+  register: zt_relay__check_output
+  changed_when: false
+
+- name: Descriptors - LimitNOFILE covers the pools
+  vars:
+    zt_relay__descriptors_needed: >-
+      {{ zt_relay__check_output.stdout_lines | select('match', '^descriptors_needed = [0-9]+$')
+      | map('regex_replace', '^descriptors_needed = ', '') | first | default(0) | int }}
+  ansible.builtin.assert:
+    that:
+      - zt_relay__descriptors_needed | int > 0
+      - zt_relay_limit_nofile | int >= zt_relay__descriptors_needed | int
+    fail_msg: >-
+      LimitNOFILE={{ zt_relay_limit_nofile }} is below the {{ zt_relay__descriptors_needed }}
+      descriptors that relay.toml's pools may need (or zt-relay check did not print them): raise
+      zt_relay_limit_nofile or lower max_preauth / max_established.
+    quiet: true
