@@ -16,9 +16,26 @@ updates:
     labels: [dependencies]
     commit-message:
       prefix: "deps"
+    # The responder pre-filter (review 0012, A12-6) replays snow's first message-1 steps with
+    # snow's own primitives, so these three crates must stay on the exact major/minor line the
+    # vendored snow (vendor/snow) depends on. A bump that moves them alone puts a second copy
+    # in the graph and breaks that invariant: move them together with snow, by hand.
+    ignore:
+      - dependency-name: blake2
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: chacha20poly1305
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: curve25519-dalek
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+      # "/" and "/fuzz" are separate workspaces with their own Cargo.lock, but fuzz/ reads the
+      # versions from the root Cargo.toml. One PR per directory updates only one lock file, so
+      # `--locked` fails in both. One PR per dependency across both directories keeps them in step.
+      cargo-major:
+        group-by: dependency-name
+        update-types: [major]
 
   - package-ecosystem: github-actions
     directory: "/"
