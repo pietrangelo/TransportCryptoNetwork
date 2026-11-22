@@ -1,0 +1,26 @@
+---
+- name: Unit - the packaged, hardened unit
+  ansible.builtin.copy:
+    src: "{{ zt_relay_packaging_dir }}/systemd/zt-relay.service"
+    dest: /etc/systemd/system/zt-relay.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart zt-relay
+
+- name: Unit - drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/zt-relay.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Unit - drop-in (ExecStart=, SocketBindAllow=, IPAddressAllow= in PROXY mode)
+  ansible.builtin.template:
+    src: 10-ansible.conf.j2
+    dest: /etc/systemd/system/zt-relay.service.d/10-ansible.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart zt-relay

@@ -1,0 +1,6 @@
+---
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_admin_v6: []
+zt_relay_colocated_agent: true
+zt_relay_peer_relays_v4: [203.0.113.7/32]
+zt_relay_extra_args: [--drain-timeout, "120"]

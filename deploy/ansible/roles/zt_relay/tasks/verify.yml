@@ -1,0 +1,111 @@
+---
+# Everything here runs on the controller (OPERATIONS §9: verify on a machine you trust, before
+# copying the binaries out). No zt-* binary is ever run to verify a release. Every path fails
+# closed: there is no variable that skips a check.
+
+- name: Local binary - checksum on the controller
+  when: zt_relay_binary_source == 'local'
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Local binary - the expected SHA-256 is given
+      ansible.builtin.assert:
+        that:
+          - zt_relay_binary_local_path | length > 0
+          - zt_relay_binary_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: zt_relay_binary_local_path and zt_relay_binary_sha256 (64 lowercase hex digits) are required.
+        quiet: true
+
+    - name: Local binary - hash it
+      ansible.builtin.stat:
+        path: "{{ zt_relay_binary_local_path }}"
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: zt_relay__local
+
+    - name: Local binary - the hash matches
+      ansible.builtin.assert:
+        that:
+          - zt_relay__local.stat.exists
+          - zt_relay__local.stat.checksum == zt_relay_binary_sha256
+        fail_msg: "{{ zt_relay_binary_local_path }} is missing or its SHA-256 is not zt_relay_binary_sha256."
+        quiet: true
+
+    - name: Local binary - use it
+      ansible.builtin.set_fact:
+        zt_relay__controller_binary: "{{ zt_relay_binary_local_path }}"
+        zt_relay__binary_sha256: "{{ zt_relay_binary_sha256 }}"
+
+- name: Release - signatures, pins and checksum on the controller
+  when: zt_relay_binary_source == 'release'
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Release - the inputs are given
+      ansible.builtin.assert:
+        that:
+          - zt_relay_release_dir | length > 0
+          - zt_relay_release_tag is match('^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
+          - zt_relay_release_pins_file | length > 0
+        fail_msg: zt_relay_release_dir, zt_relay_release_tag (vX.Y.Z) and zt_relay_release_pins_file are required.
+        quiet: true
+
+    - name: Release - read the pins file
+      ansible.builtin.slurp:
+        src: "{{ zt_relay_release_pins_file }}"
+      register: zt_relay__pins
+
+    - name: Release - at least one key is pinned (none is until the key ceremony; fail closed)
+      ansible.builtin.assert:
+        that: >-
+          (zt_relay__pins.content | b64decode).splitlines()
+          | select('match', '^(slh-dsa-sha2-128s|ed25519) sha256:[0-9a-f]{64}$') | list | length > 0
+        fail_msg: No release key is pinned in {{ zt_relay_release_pins_file }}; use zt_relay_binary_source=local.
+        quiet: true
+
+    - name: Release - both signatures by pinned keys (tcn-release.sh verify, OpenSSL >= 3.5)
+      ansible.builtin.command:
+        argv:
+          - "{{ zt_relay_release_tool }}"
+          - verify
+          - --pins
+          - "{{ zt_relay_release_pins_file }}"
+          - --tag
+          - "{{ zt_relay_release_tag }}"
+          - "{{ zt_relay_release_dir }}/keys"
+          - "{{ zt_relay_release_dir }}/SHA256SUMS"
+      environment:
+        OPENSSL: "{{ zt_relay_openssl }}"
+      changed_when: false
+
+    - name: Release - the archive matches the signed SHA256SUMS
+      ansible.builtin.shell:
+        cmd: set -o pipefail && grep -E '  {{ zt_relay__release_archive | regex_escape }}$' SHA256SUMS | sha256sum -c -
+        chdir: "{{ zt_relay_release_dir }}"
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Release - a scratch directory for the extracted binary
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: zt-relay
+      register: zt_relay__extract
+
+    - name: Release - extract zt-relay from the verified archive
+      ansible.builtin.unarchive:
+        src: "{{ zt_relay_release_dir }}/{{ zt_relay__release_archive }}"
+        dest: "{{ zt_relay__extract.path }}"
+        include: ["tcn-{{ zt_relay_release_tag }}-{{ zt_relay__release_target }}/zt-relay"]
+        remote_src: true
+
+    - name: Release - hash the extracted binary
+      ansible.builtin.stat:
+        path: "{{ zt_relay__extract.path }}/tcn-{{ zt_relay_release_tag }}-{{ zt_relay__release_target }}/zt-relay"
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: zt_relay__extracted
+
+    - name: Release - use it
+      ansible.builtin.set_fact:
+        zt_relay__controller_binary: "{{ zt_relay__extracted.stat.path }}"
+        zt_relay__binary_sha256: "{{ zt_relay__extracted.stat.checksum }}"

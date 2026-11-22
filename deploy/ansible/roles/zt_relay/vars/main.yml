@@ -1,0 +1,30 @@
+---
+# Derived values: not meant to be overridden.
+zt_relay__proxy_mode: "{{ (zt_relay_proxy_v4 | length + zt_relay_proxy_v6 | length) > 0 }}"
+# PROXY mode without allow_direct: the relay port and the unit admit the proxies only. With
+# allow_direct (a migration) every source reaches the relay port (finding A15-6).
+zt_relay__proxy_only: "{{ zt_relay__proxy_mode | bool and not zt_relay_proxy_allow_direct | bool }}"
+# The upstream proxies are exempt from the per-source SYN meter (every user at once).
+zt_relay__meter_proxies: "{{ zt_relay__proxy_mode | bool and zt_relay_proxy_allow_direct | bool }}"
+zt_relay__admin_v4: "{{ zt_relay_admin_v4 if zt_relay_ssh_inbound else [] }}"
+zt_relay__admin_v6: "{{ zt_relay_admin_v6 if zt_relay_ssh_inbound else [] }}"
+zt_relay__relay_src_v4: "{{ zt_relay_proxy_v4 if zt_relay__proxy_only | bool else ['0.0.0.0/0'] }}"
+zt_relay__relay_src_v6: "{{ zt_relay_proxy_v6 if zt_relay__proxy_only | bool else ['::/0'] }}"
+zt_relay__binary: "{{ zt_relay_install_dir }}/zt-relay"
+# The files and settings of the relay: one source for ExecStart= (`run`) and for the
+# `zt-relay check` that runs before every restart, so the check sees exactly what will run.
+zt_relay__revocations_arg: "{{ ' --revocations /etc/tcn/revoked.toml' if zt_relay_revocations_src else '' }}"
+zt_relay__relay_args: >-
+  --listen {{ zt_relay_listen_address }}:{{ zt_relay_port }}
+  --key /etc/tcn/relay.key --policy /etc/tcn/policy.toml --config /etc/tcn/relay.toml{{ zt_relay__revocations_arg }}
+# The whole argument vectors: ExecStart= renders the first, the pre-restart check (handlers) and
+# the descriptor check (tasks/descriptors.yml) run the second, so the check is given exactly the
+# arguments that will run, zt_relay_extra_args included (finding A15-4).
+zt_relay__run_options: "{{ (zt_relay__relay_args | split(' ')) + zt_relay_extra_args }}"
+zt_relay__run_argv: "{{ [zt_relay__binary, '--log-format', 'json', 'run'] + zt_relay__run_options }}"
+zt_relay__check_argv: "{{ [zt_relay__binary, '--log-format', 'json', 'check'] + zt_relay__run_options }}"
+# The validation of the staged files (tasks/files.yml) uses the staged denylist.
+zt_relay__staged_revocations_arg: "{{ ' --revocations /etc/tcn/staged/revoked.toml' if zt_relay_revocations_src else '' }}"
+zt_relay__pubkey_pattern: '^public_key\s*=\s*"?([^"]*)"?$'
+zt_relay__release_target: "{{ ansible_facts['architecture'] | default('x86_64') }}-unknown-linux-musl"
+zt_relay__release_archive: "tcn-{{ zt_relay_release_tag }}-{{ zt_relay__release_target }}.tar.gz"

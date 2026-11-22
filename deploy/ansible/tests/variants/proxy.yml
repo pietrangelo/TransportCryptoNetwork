@@ -1,0 +1,7 @@
+---
+# Behind a PROXY v2 front end; 198.51.100.3 is the proxy of packaging/tests/host/attacks.sh (P-19).
+zt_relay_admin_v4: [192.0.2.0/24]
+zt_relay_admin_v6: ["2001:db8:1::/48"]
+zt_relay_proxy_v4: [198.51.100.3/32]
+zt_relay_proxy_v6: ["2001:db8:100::/48"]
+zt_relay_listen_backlog: 4096

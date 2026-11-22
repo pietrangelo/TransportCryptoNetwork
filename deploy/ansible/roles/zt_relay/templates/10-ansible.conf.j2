@@ -1,0 +1,17 @@
+# Managed by Ansible (role zt_relay): changes here are overwritten.
+# The port below, --listen and the firewall's RELAY_PORT come from one variable (zt_relay_port).
+[Service]
+ExecStart=
+ExecStart={{ zt_relay__run_argv | join(' ') }}
+
+SocketBindAllow=
+SocketBindAllow=tcp:{{ zt_relay_port }}
+ExecPaths=
+ExecPaths={{ zt_relay__binary }}
+# Checked against what relay.toml's pools need (tasks/descriptors.yml).
+LimitNOFILE={{ zt_relay_limit_nofile | int }}
+{% if zt_relay__proxy_only | bool %}
+# PROXY protocol v2 mode: only the upstream proxies may exchange packets with the relay.
+IPAddressAllow={{ (zt_relay_proxy_v4 + zt_relay_proxy_v6) | join(' ') }}
+IPAddressDeny=any
+{% endif %}

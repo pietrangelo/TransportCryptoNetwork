@@ -26,6 +26,7 @@ mod ids;
 pub mod limits;
 mod payload;
 mod policy;
+pub mod prefix;
 pub mod suite;
 pub mod trust;
 
@@ -46,6 +47,7 @@ pub use policy::{
     AccessPolicy, Admission, AllowedNodes, ClientCredential, ClientGrant, HybridRequirement,
     MAX_AGENT_KEYS, PeerRole,
 };
+pub use prefix::{IpPrefix, PrefixError, PrefixSet};
 pub use suite::{
     AcceptedSuites, HandshakeChannel, HandshakeSuite, InitiatorRole, SuiteError, SuitePolicy,
 };

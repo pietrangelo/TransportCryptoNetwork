@@ -97,3 +97,109 @@ pub fn configure(stream: &TcpStream) {
         }
     }
 }
+
+/// The default listen backlog of the relay (`[network] listen_backlog`): the kernel's default
+/// `net.core.somaxconn` since Linux 5.4, which clamps it anyway.
+pub const DEFAULT_LISTEN_BACKLOG: u32 = 4096;
+/// The smallest listen backlog `relay.toml` accepts (mio's former fixed value).
+pub const MIN_LISTEN_BACKLOG: u32 = 128;
+/// The largest listen backlog `relay.toml` accepts.
+pub const MAX_LISTEN_BACKLOG: u32 = 65_535;
+
+/// A listening TCP socket on `addr` with `SO_REUSEADDR` and the given accept `backlog`
+/// (tokio's `TcpListener::bind` always asks for 128).
+///
+/// # Errors
+/// Socket, bind or listen error.
+pub fn listen(addr: SocketAddr, backlog: u32) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // As std and mio do: on Unix a restarted relay rebinds while old connections are in
+    // TIME_WAIT (on Windows the option would let another socket steal the port).
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
+}
+
+/// What an `accept` error means for the accept loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptErrorKind {
+    /// The process or the system is out of a resource (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`): retrying at once would spin, so the loop backs off.
+    Resource,
+    /// An error of one connection (`ECONNABORTED`, `EPROTO`, `EPERM`, a network error passed
+    /// on by `accept(2)`): the next connection is accepted at once.
+    Connection,
+}
+
+impl AcceptErrorKind {
+    /// The metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resource => "resource",
+            Self::Connection => "connection",
+        }
+    }
+}
+
+/// Classifies an `accept` error.
+#[must_use]
+pub fn classify_accept_error(err: &std::io::Error) -> AcceptErrorKind {
+    if err.kind() == std::io::ErrorKind::OutOfMemory {
+        return AcceptErrorKind::Resource;
+    }
+    #[cfg(unix)]
+    {
+        use rustix::io::Errno;
+        let resource = [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM];
+        if let Some(code) = err.raw_os_error()
+            && resource.iter().any(|e| e.raw_os_error() == code)
+        {
+            return AcceptErrorKind::Resource;
+        }
+    }
+    AcceptErrorKind::Connection
+}
+
+/// The back-off of the accept loop after resource errors: 10 ms, doubled after every
+/// consecutive failure up to 1 s, back to 10 ms after an accepted connection.
+#[derive(Debug, Clone)]
+pub struct AcceptBackoff {
+    next: Duration,
+}
+
+impl AcceptBackoff {
+    /// The first delay.
+    pub const MIN: Duration = Duration::from_millis(10);
+    /// The largest delay.
+    pub const MAX: Duration = Duration::from_secs(1);
+
+    /// A back-off at its first delay.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { next: Self::MIN }
+    }
+
+    /// One more resource error: how long to wait before the next `accept`.
+    pub fn failed(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = delay.saturating_mul(2).min(Self::MAX);
+        delay
+    }
+
+    /// A connection was accepted: the next failure waits [`Self::MIN`] again.
+    pub fn succeeded(&mut self) {
+        self.next = Self::MIN;
+    }
+}
+
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}

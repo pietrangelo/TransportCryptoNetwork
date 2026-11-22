@@ -66,7 +66,10 @@ every 10 s and reconnects when nothing at all arrived from the relay for 30 s (P
 
 Both services have a `check` subcommand that takes the same options as `run`, loads and
 validates every file `run` loads at startup (through the same code), prints `configuration OK`
-and the SHA-256 of the trust and settings files, and listens on nothing. It is a pre-flight
+and the SHA-256 of the trust and settings files (`zt-relay check` also prints
+`descriptors_needed = N`, see §4.1), and listens on nothing. Options of `run` alone
+(`--drain-timeout`, the metrics options) are validated the same way, so a pre-flight can be given
+exactly the arguments of `ExecStart=`. It is a pre-flight
 before a **restart**. It exits 0; 78 (`EX_CONFIG`) when a file was read and is invalid; 1 when
 a file is missing or unreadable. `run` exits the same way at startup: the units do not restart
 on 78 (an operator must fix the file) and do restart on 1 (provisioning not finished yet, a
@@ -116,10 +119,10 @@ no upgrade, option or restart: follow §12. On the relay hops (`--relay-suite`, 
 client's relay pins) the relays must accept it first: follow §13. The agent logs the suites in
 force at startup (`handshake_suites_in_use`).
 
-### 4.1 `relay.toml`: suites and admission limits
+### 4.1 `relay.toml`: suites, admission limits, network and PROXY protocol
 
-`zt-relay run --config /etc/tcn/relay.toml` sets the suites accepted per role and the
-admission limits (PROTOCOL §10.1). Without the option, or with an empty file, the defaults
+`zt-relay run --config /etc/tcn/relay.toml` sets the suites accepted per role, the
+admission limits (PROTOCOL §10.1), the listen backlog and the PROXY protocol (PROTOCOL §10.2). Without the option, or with an empty file, the defaults
 below apply. The file is read at startup only: `SIGHUP` does not reload it, so change it with a
 restart. Unknown keys, a zero, absurd or inconsistent limit (PROTOCOL §10), or an
 unknown suite stop the relay at startup. The relay logs the limits in force at startup
@@ -159,6 +162,15 @@ summary_interval_secs = 10       # preauth_summary and per-identity line interva
 [liveness]
 agent_idle_secs = 90             # a silent agent connection is dropped after this (15..=3600)
 client_idle_secs = 90            # same for client connections
+
+[network]
+listen_backlog = 4096            # accept queue (128..=65535); the kernel clamps it to somaxconn
+
+# Absent by default: no PROXY header is ever parsed. See "Behind a TCP proxy" below.
+# [proxy_protocol]
+# trusted = ["203.0.113.0/24", "2001:db8:100::/48"]   # 1 to 64 prefixes, >= /8 and /16, no overlap
+# header_timeout_secs = 3        # accept -> complete header (1..=10)
+# allow_direct = false           # true: other sources connect without a header (migration)
 ```
 
 `[liveness]` sets the relay's idle timeout per role (PROTOCOL §10). Agents of this release ping
@@ -196,6 +208,49 @@ How to size it:
   dropped (counted as `preauth_pool_full`) while established sessions keep working.
 - Every client sends a frame right after its handshake. A client that stays silent for
   `first_frame_deadline_secs` is closed and counted as `unconfirmed`.
+- `listen_backlog` is the kernel's accept queue: during a reconnect wave (a relay restart, a
+  NAT with many agents) connections wait there while the relay accepts them. Too small, and the
+  kernel drops SYNs and peers retry after 1 s, 3 s... The kernel caps it at
+  `net.core.somaxconn` (4096 by default since Linux 5.4).
+- File descriptors: the relay needs up to `max_preauth + max_established + 64` (plus another
+  `max_preauth` with `[proxy_protocol]`). Past the soft `RLIMIT_NOFILE`, `accept` fails with
+  `EMFILE` before admission can refuse anything, and everyone waits. At startup the relay
+  compares the two and writes a WARN `fd_limit_low` (`limit`, `needed`) when the limit is lower
+  (also the gauges `tcn_relay_fd_limit` and `tcn_relay_fd_needed`; `zt-relay check` prints the
+  same need as `descriptors_needed = N` before any restart); raise `LimitNOFILE=`
+  (16 384 in the shipped unit) or lower the pools. It is a warning, not a refusal: a shell's
+  soft limit is often 1024.
+- Accept errors: resource exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) pauses accepting
+  for 10 ms, doubling to 1 s while it lasts; the error of a single connection (`ECONNABORTED`
+  and the like) is retried at once. Both are counted in
+  `tcn_relay_accept_errors_total{kind="resource"|"connection"}`, with at most one WARN
+  `accept failed` per `summary_interval_secs`.
+
+**Behind a TCP proxy (PROXY protocol v2).** Behind a TCP proxy or scrubbing service every
+connection comes from the proxy's addresses, so `max_pending_per_source` and `source_burst`
+would apply to the whole user base at once. With `[proxy_protocol]` the relay requires a binary
+PROXY v2 header (PROTOCOL §10.2) on every connection from a `trusted` prefix and admits the
+connection for the address in it; logs name the proxy as `via`. Rules:
+
+- List only the proxies' own prefixes, never a client network. `/0`, a prefix shorter than
+  `/8` (IPv4) or `/16` (IPv6) (so that no set of entries, such as `0.0.0.0/1` + `128.0.0.0/1`,
+  can trust the whole internet), host bits set (`10.0.0.1/8`), IPv4-mapped IPv6 prefixes,
+  overlapping or duplicate entries, more than 64 entries, `header_timeout_secs` outside 1..=10 and unknown keys stop the relay at startup
+  (exit 78); the error names the entry's index, not its text.
+- The proxy must send version 2 (binary). Version 1 (text) is refused: check that your
+  provider can emit v2. Its health checks may send a LOCAL header, admitted for the proxy's
+  own address; a health check without any header is closed and counted as a `signature`
+  failure.
+- `allow_direct = false` (the default) closes every connection from other sources at once
+  (counted `untrusted`); the host firewall and the unit should also accept the relay port from
+  the proxies only (docs/RELAY_HARDENING.md). `allow_direct = true` is for a migration: other
+  sources connect directly and are admitted on their TCP address, and a header they send is
+  never parsed.
+- Connections from the proxies wait for their header in a pool of `max_preauth` slots, at
+  most `header_timeout_secs` each; then they take an admission slot like any other. Size
+  `LimitNOFILE` for `2 × max_preauth + max_established + 64` (10 304 with the defaults).
+- Failures are counted in `tcn_relay_proxy_header_failures_total{reason}` and never logged
+  per connection above DEBUG; `tcn_relay_proxy_header_pending` is the pool in use.
 
 ## 5. Client: `zt-client`
 
@@ -596,8 +651,10 @@ systemctl daemon-reload && systemctl enable --now zt-relay
 ```
 
 The units run as user `tcn` without capabilities, with a read-only file system, a system call
-filter and addresses restricted to IPv4/IPv6/Unix (`systemd-analyze security`: 1.2,
-"OK"). The permissions required by the binaries are those of OpenSSH's `StrictModes`: key
+filter and addresses restricted to IPv4/IPv6/Unix (`systemd-analyze security`: 1.1 for the
+relay, "OK"). An internet-facing relay host also needs the firewall, kernel settings and
+installation path of [`RELAY_HARDENING.md`](RELAY_HARDENING.md) (Ansible role
+`deploy/ansible/roles/zt_relay`). The permissions required by the binaries are those of OpenSSH's `StrictModes`: key
 `tcn:tcn 0600`, trust files and directories owned by root or by `tcn` and not writable by
 others. For the agent, `/etc/tcn/agent.env` contains `TCN_RELAY`, `TCN_RELAY_KEY` and `TCN_NODE`;
 if the relay's IP is fixed, enable `IPAddressDeny=any` / `IPAddressAllow=` in the unit.
@@ -1352,6 +1409,10 @@ inventory and its size is fixed (about 150 lines). Per-identity detail stays in 
 | `tcn_relay_forwarded_bytes_total` | counter | `Data` bytes forwarded |
 | `tcn_relay_queue_bytes`, `tcn_relay_queue_budget_bytes` | gauge | outbound queue and its budget (§18) |
 | `tcn_relay_queue_shed_total`, `tcn_relay_queue_overflow_total` | counter | connections shed by the budget (the identity holding the most, §18); peers breaking the credit |
+| `tcn_relay_accept_errors_total{kind}` | counter | failed accepts: `resource` (backed off) or `connection` (retried at once), §4.1 |
+| `tcn_relay_proxy_header_failures_total{reason}` | counter | PROXY protocol connections closed before admission (PROTOCOL §10.2) |
+| `tcn_relay_proxy_header_pending` | gauge | connections from trusted proxies still reading their header |
+| `tcn_relay_fd_limit`, `tcn_relay_fd_needed` | gauge | soft `RLIMIT_NOFILE` at startup (-1: unlimited) and what the pools may need (§4.1) |
 | `tcn_agent_relay_up{relay}` | gauge | 1 while registered with relay *n* (`--relay` order, 0-based) |
 | `tcn_agent_relay_registrations_total{relay}`, `tcn_agent_relay_session_failures_total{relay}` | counter | registrations; sessions ended by an error (reconnects) |
 | `tcn_agent_relay_consecutive_failures{relay}` | gauge | failures since the last registration |
@@ -1426,7 +1487,7 @@ it there is backpressure or a disconnection, never an out-of-memory (resilience 
 
 | Process | Option | Default | Past the budget |
 | :- | :- | :- | :- |
-| relay | `run --queue-budget-mib N` (16–65536) | a quarter of the memory (the cgroup limit included), from 128 MiB to 1 GiB | the **identity** (peer fingerprint) holding the most of the budget loses its largest connection at once, even in the middle of a write; ties go to the newest connection. An identity over its share (a quarter of the budget, never less than one connection's full credit) is shed even within the budget |
+| relay | `run --queue-budget-mib N` (16–65536) | a quarter of the memory (the relay's own cgroup limit included, see below), from 128 MiB to 1 GiB | the **identity** (peer fingerprint) holding the most of the budget loses its largest connection at once, even in the middle of a write; ties go to the newest connection. An identity over its share (a quarter of the budget, never less than one connection's full credit) is shed even within the budget |
 | agent | `run --buffer-budget-mib N` (16–65536) | the same rule | an authenticated session whose initial window (256 KiB) does not fit is closed (`Close Drained`); a window does not grow |
 
 **Relay.** Every frame queued towards a peer is counted until it is written, per connection and
@@ -1469,6 +1530,14 @@ initial window (A13-11).
 The client tunes its own window the same way, within a budget of its own. No wire change: old
 peers keep working, and the relay and every peer still refuse a window beyond 1 MiB.
 
+**Which memory.** The default budget takes the smaller of the physical memory, read with
+`sysinfo(2)` (`/proc/meminfo` is hidden by the unit's `ProcSubset=pid`), and the lowest
+`memory.max` or `memory.high` of the relay's **own** cgroup and of its ancestors (the path comes
+from `/proc/self/cgroup`, which `ProcSubset=pid` leaves visible). So `MemoryMax=512M` on the
+unit gives a 128 MiB budget, which sheds before the OOM killer acts; on a 512 MiB host without
+a limit it is 128 MiB as well. Only cgroup v2 is read; if neither value is known the budget is
+1 GiB. The startup line `queue budget in use` shows the result.
+
 **Sizing.** The budget is a ceiling on memory that *may* be buffered; it is only used while a
 reader is slower than its sender. Watch `tcn_relay_queue_bytes` against
 `tcn_relay_queue_budget_bytes` and `tcn_agent_buffer_bytes` against
@@ -1476,7 +1545,8 @@ reader is slower than its sender. Watch `tcn_relay_queue_bytes` against
 budget is too small for its traffic; on a host short of memory they are the budget doing its job.
 
 **The agent's runtime** has two worker threads (it serves few streams); the relay uses one per
-core.
+core, and its blocking pool (used only to write the metrics file) is capped at 8 threads, so a
+`TasksMax=` of a few hundred holds on any machine.
 
 **Soak.** A nightly workflow (`.github/workflows/soak.yml`, also started by hand) runs the relay,
 an agent and an echo server on localhost for 30 minutes: clients open sessions in a loop, the
